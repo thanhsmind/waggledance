@@ -5589,7 +5589,7 @@ mod bee_route_tests {
         assert!(body.contains("finished-feat"), "{body}");
 
         assert_eq!(
-            body.matches("0/1 cell done").count(),
+            body.matches("0/1 cells").count(),
             2,
             "both In Progress cards (gated-feat, progress-feat) must show one open cell not yet done: {body}"
         );
@@ -10817,7 +10817,7 @@ mod bee_route_tests {
     /// `running_workers` as an input, so the open cell stays counted as
     /// live on `state.feature`'s own feature-hub card ("demo", the only
     /// feature this fixture declares), and its own progress must keep
-    /// reading "0/1 cell done" even though a live worker names its one open
+    /// reading "0/1 cells" even though a live worker names its one open
     /// cell. The card lands under In Progress: the fixture's own session
     /// beat a minute ago and carries no lane, so `working-now-default-lane-1`
     /// folds it onto `state.feature` and the unapproved gate stops owing a
@@ -10858,7 +10858,7 @@ mod bee_route_tests {
             "the still-open cell must keep its feature counted as live work: {body}"
         );
         assert!(
-            body.contains("0/1 cell done"),
+            body.contains("0/1 cells"),
             "an open cell must keep reading as not-done even though a live worker names it: {body}"
         );
 
