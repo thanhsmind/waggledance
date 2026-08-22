@@ -43,6 +43,8 @@ History: `<session_id>.activity.jsonl`, last 50 transitions, same object +
 
 ## Read-time rules (never stored)
 
+- `feature` and `cell` may be absent (unbound session, no claim) — render
+  as "—", never as an error.
 - `signal`: `live` when `activity.at` within 90 s, else `no_signal`; `null`
   for dead/closed sessions.
 - Need-you = `state ∈ {blocked, waiting_input}`. **Approve only on
