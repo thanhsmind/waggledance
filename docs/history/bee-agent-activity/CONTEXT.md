@@ -67,3 +67,9 @@ uat approved or not; the card says `uat approved` / `uat pending` and how
 long it has been ready (latest cap). uat-approved first. Zero-cell grants
 are not ready. A stored `merge_ready` fact from bee, once written, is
 preferred; this derivation is the fallback.
+
+**R2 — Compact footer and branch on Ready to merge.** (decision `8b057354`)
+The progress bar, the "n/m cells done" label and the separate "Last
+activity" row collapse into one footer line — a ring glyph + `n/m cells`
+left, last-activity time right — on every card; the Ready to merge card
+shows its `wt/<feature>` branch line under the title.
