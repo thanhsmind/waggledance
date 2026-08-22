@@ -440,6 +440,13 @@ const RECENT_DETAIL_CAP: usize = 20;
 /// read; older is stale.
 const SESSION_LIVE_MINUTES: f64 = 30.0;
 
+/// A session's `activity` record is considered live within this many seconds
+/// of `activity.at`, `no_signal` past it (A1, the 90 s rule from
+/// `docs/history/research/bee-agent-activity-contract.md`). Much tighter
+/// than [`SESSION_LIVE_MINUTES`] on purpose: the heartbeat says the session
+/// process exists, this says the agent is still narrating.
+const ACTIVITY_LIVE_SECONDS: f64 = 90.0;
+
 /// Bound for the `.bee/logs/tools.jsonl` tail read (kanban-live-signals D1)
 /// — the file is ~1.4 MB and append-only; [`read_last_tool_call`] never
 /// opens more than its last this-many bytes.
@@ -511,6 +518,97 @@ pub struct BeeBacklog {
     pub findings: BeeFindings,
 }
 
+/// What bee's hook runtime last recorded a session's agent as doing
+/// (bee 2.20.0, `activity.state`). Five states are the whole contract
+/// (`docs/history/research/bee-agent-activity-contract.md`); anything else a
+/// newer bee writes lands in [`BeeActivityState::Unknown`] verbatim, rather
+/// than failing the read or being coerced into a state the record never
+/// claimed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeeActivityState {
+    /// UserPromptSubmit / PreToolUse / PostToolUse(Failure) — the agent is
+    /// running on its own.
+    Working,
+    /// `Notification:agent_needs_input` — a question to answer by typing.
+    /// Need-you, but never Approve-able (A3, A4).
+    WaitingInput,
+    /// `PermissionRequest` / `Notification:permission_prompt` — the one
+    /// state an Approve action is valid for (A4).
+    Blocked,
+    /// `Notification:idle_prompt|agent_completed`, `Stop` — control is back
+    /// with the human, nothing owed.
+    Idle,
+    /// `SessionEnd` with a reason other than clear/resume.
+    Exited,
+    /// A state string this reader does not know, carried verbatim.
+    Unknown(String),
+}
+
+impl BeeActivityState {
+    /// Need-you = `blocked ∪ waiting_input`, in every count that shows it
+    /// (A3). `no_signal` is a separate, muted marker and never need-you —
+    /// see [`BeeSignal`].
+    pub fn needs_you(&self) -> bool {
+        matches!(self, Self::WaitingInput | Self::Blocked)
+    }
+
+    /// The one word every view says beside the colour, so status never
+    /// speaks by colour alone and no view restates the mapping (A3).
+    pub fn word(&self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::WaitingInput => "needs an answer",
+            Self::Blocked => "needs approval",
+            Self::Idle => "idle",
+            Self::Exited => "exited",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Whether a session's activity record is still speaking. Derived at read,
+/// never stored (A1): `Live` within [`ACTIVITY_LIVE_SECONDS`] of
+/// `activity.at`, `NoSignal` past it, and `None` for a session that is not
+/// live at all or carries no activity object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeeSignal {
+    Live,
+    NoSignal,
+    None,
+}
+
+/// One session's `activity` object from `.bee/sessions/<id>.json` — what
+/// bee's Claude Code hooks last recorded (A1). Read only from the session
+/// file this snapshot already opens; the `<id>.activity.jsonl` history is
+/// the notifier's business, never this reader's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BeeActivity {
+    pub state: BeeActivityState,
+    /// The hook that produced the state (`PreToolUse`, `PermissionRequest`,
+    /// …). Empty when the record carried none.
+    pub event: String,
+    pub tool_name: Option<String>,
+    pub tool_use_id: Option<String>,
+    /// `activity.at` verbatim, RFC 3339 exactly as read.
+    pub at: String,
+    /// Seconds between `at` and the read, on the same `now` the heartbeat
+    /// age uses; negative if the record is somehow in the future.
+    pub age_seconds: Option<f64>,
+    /// `HERDR_PANE_ID` when the session runs in a herdr pane — the bridge
+    /// to the terminal view (A2).
+    pub pane: Option<String>,
+    /// Which checkout the session is in, joined to a project through the
+    /// same Boundary rule panes use (A2).
+    pub cwd: Option<String>,
+    /// The bound lane, else the active feature. Absent for an unbound
+    /// session — rendered as "—", never as an error.
+    pub feature: Option<String>,
+    /// The active claim's cell. Absent when the session holds no claim.
+    pub cell: Option<String>,
+}
+
 /// One `.bee/sessions/<uuid>.json` session, trimmed to what the cockpit may
 /// show. `transcript_path` is deliberately never carried here — it is an
 /// absolute path into the user's home.
@@ -529,6 +627,16 @@ pub struct BeeSession {
     /// session record's `"lane"` key. `None` when the record carries no
     /// lane (a session that has not claimed a feature yet).
     pub lane: Option<String>,
+    /// What the agent in this session is doing, from the record's
+    /// `"activity"` key (A1). `None` when the session file carries no
+    /// activity object — a bee older than 2.20.0, or a session whose hooks
+    /// never fired — and also when the object is malformed: a bad activity
+    /// is dropped, never allowed to fail the session parse.
+    pub activity: Option<BeeActivity>,
+    /// Derived at read from [`Self::live`] and the activity's age; see
+    /// [`BeeSignal`]. Never read from the file — bee's own `bee status
+    /// --json` computes the same value the same way.
+    pub signal: BeeSignal,
 }
 
 /// One `.bee/lanes/<feature>.json` per-feature lane record, mirroring the
@@ -2342,6 +2450,15 @@ fn parse_session(path: &Path, now: time::OffsetDateTime) -> Result<BeeSession, S
     let heartbeat_age_minutes = (now - heartbeat).as_seconds_f64() / 60.0;
     let live = heartbeat_age_minutes <= SESSION_LIVE_MINUTES;
 
+    let activity = v.get("activity").and_then(|a| parse_activity(a, now));
+    let signal = match (live, &activity) {
+        (false, _) | (_, None) => BeeSignal::None,
+        (true, Some(a)) => match a.age_seconds {
+            Some(age) if age <= ACTIVITY_LIVE_SECONDS => BeeSignal::Live,
+            _ => BeeSignal::NoSignal,
+        },
+    };
+
     Ok(BeeSession {
         id,
         started_at,
@@ -2350,6 +2467,43 @@ fn parse_session(path: &Path, now: time::OffsetDateTime) -> Result<BeeSession, S
         workspace_id,
         source,
         lane,
+        activity,
+        signal,
+    })
+}
+
+/// Parse one session record's `"activity"` object (A1). Every failure mode
+/// — not an object, no `state` string, no `at` string, an `at` this reader
+/// cannot parse — returns `None`, so a session with a malformed activity
+/// still reads as a session. Nothing here opens a file: the value comes
+/// from the session JSON [`parse_session`] already read, and the
+/// `<id>.activity.jsonl` history is deliberately never touched.
+fn parse_activity(v: &Value, now: time::OffsetDateTime) -> Option<BeeActivity> {
+    let obj = v.as_object()?;
+    let state = match obj.get("state").and_then(Value::as_str)? {
+        "working" => BeeActivityState::Working,
+        "waiting_input" => BeeActivityState::WaitingInput,
+        "blocked" => BeeActivityState::Blocked,
+        "idle" => BeeActivityState::Idle,
+        "exited" => BeeActivityState::Exited,
+        other => BeeActivityState::Unknown(other.to_string()),
+    };
+    let at = obj.get("at").and_then(Value::as_str)?;
+    let at_dt = parse_rfc3339(at)?;
+
+    let str_field = |key: &str| obj.get(key).and_then(Value::as_str).map(String::from);
+
+    Some(BeeActivity {
+        state,
+        event: str_field("event").unwrap_or_default(),
+        tool_name: str_field("tool_name"),
+        tool_use_id: str_field("tool_use_id"),
+        at: at.to_string(),
+        age_seconds: Some((now - at_dt).as_seconds_f64()),
+        pane: str_field("pane"),
+        cwd: str_field("cwd"),
+        feature: str_field("feature"),
+        cell: str_field("cell"),
     })
 }
 
@@ -5081,6 +5235,251 @@ mod tests {
             stale.heartbeat_age_minutes
         );
         assert!(stale.heartbeat_age_minutes > 30.0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- activity: bee 2.20.0's per-session agent record (A1) ---
+
+    /// An RFC 3339 stamp `seconds_ago` before now, the shape
+    /// `activity.at` carries.
+    fn activity_at(seconds_ago: i64) -> String {
+        (time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds_ago))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    /// The same session record [`session_json_with_age`] writes, with a raw
+    /// `activity` value spliced in.
+    fn session_json_with_activity(id: &str, minutes_ago: i64, activity: &str) -> String {
+        let base = session_json_with_age(id, minutes_ago);
+        format!(
+            "{},\"activity\":{activity}}}",
+            base.trim_end().trim_end_matches('}')
+        )
+    }
+
+    #[test]
+    fn session_activity_ten_seconds_old_parses_every_field_and_signals_live() {
+        let root = fresh_root("activity-live");
+        let at = activity_at(10);
+        write(
+            &root,
+            ".bee/sessions/act.json",
+            &session_json_with_activity(
+                "act",
+                1,
+                &format!(
+                    r#"{{"state":"blocked","event":"PermissionRequest","tool_name":"Bash","tool_use_id":"toolu_01x","at":"{at}","pane":"w4:p4","cwd":"/home/someone/projects/beehive--wt--x","feature":"agent-activity-hook","cell":"aah-4","waiting_on_set_by_hook":true}}"#
+                ),
+            ),
+        );
+
+        let snap = read_snapshot(&root);
+        let s = snap.sessions.iter().find(|s| s.id == "act").unwrap();
+        let a = s
+            .activity
+            .as_ref()
+            .expect("a well-formed activity object must parse");
+        assert_eq!(a.state, BeeActivityState::Blocked);
+        assert_eq!(a.event, "PermissionRequest");
+        assert_eq!(a.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(a.tool_use_id.as_deref(), Some("toolu_01x"));
+        assert_eq!(a.at, at, "at is carried verbatim, not reformatted");
+        assert_eq!(a.pane.as_deref(), Some("w4:p4"));
+        assert_eq!(
+            a.cwd.as_deref(),
+            Some("/home/someone/projects/beehive--wt--x")
+        );
+        assert_eq!(a.feature.as_deref(), Some("agent-activity-hook"));
+        assert_eq!(a.cell.as_deref(), Some("aah-4"));
+        let age = a.age_seconds.expect("age is derived from at");
+        assert!(
+            (5.0..30.0).contains(&age),
+            "a 10-second-old record ages to about 10 s: {age}"
+        );
+        assert_eq!(
+            s.signal,
+            BeeSignal::Live,
+            "within 90 s of activity.at the session is live"
+        );
+        assert!(a.state.needs_you());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn session_activity_two_minutes_old_is_no_signal() {
+        let root = fresh_root("activity-no-signal");
+        let at = activity_at(120);
+        write(
+            &root,
+            ".bee/sessions/quiet.json",
+            &session_json_with_activity(
+                "quiet",
+                1,
+                &format!(r#"{{"state":"working","event":"PreToolUse","at":"{at}"}}"#),
+            ),
+        );
+
+        let snap = read_snapshot(&root);
+        let s = snap.sessions.iter().find(|s| s.id == "quiet").unwrap();
+        assert_eq!(
+            s.activity.as_ref().map(|a| a.state.clone()),
+            Some(BeeActivityState::Working)
+        );
+        assert_eq!(
+            s.signal,
+            BeeSignal::NoSignal,
+            "past 90 s on activity.at the record has gone quiet"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn session_without_an_activity_object_has_no_activity_and_no_signal() {
+        let root = fresh_root("activity-absent");
+        write(
+            &root,
+            ".bee/sessions/plain.json",
+            &session_json_with_age("plain", 1),
+        );
+
+        let snap = read_snapshot(&root);
+        let s = snap.sessions.iter().find(|s| s.id == "plain").unwrap();
+        assert!(s.activity.is_none());
+        assert_eq!(s.signal, BeeSignal::None);
+        assert!(s.live, "an activity-free session is still a live session");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_malformed_session_activity_is_dropped_and_the_session_still_parses() {
+        let root = fresh_root("activity-malformed");
+        let at = activity_at(5);
+        // No "at" at all.
+        write(
+            &root,
+            ".bee/sessions/no-at.json",
+            &session_json_with_activity("no-at", 1, r#"{"state":"working"}"#),
+        );
+        // "state" is a number, not one of the five strings.
+        write(
+            &root,
+            ".bee/sessions/num-state.json",
+            &session_json_with_activity("num-state", 1, &format!(r#"{{"state":42,"at":"{at}"}}"#)),
+        );
+        // "at" is a string this reader cannot parse.
+        write(
+            &root,
+            ".bee/sessions/bad-at.json",
+            &session_json_with_activity(
+                "bad-at",
+                1,
+                r#"{"state":"working","at":"yesterday afternoon"}"#,
+            ),
+        );
+        // Not an object at all.
+        write(
+            &root,
+            ".bee/sessions/not-obj.json",
+            &session_json_with_activity("not-obj", 1, r#""working""#),
+        );
+
+        let snap = read_snapshot(&root);
+        assert_eq!(
+            snap.sessions.len(),
+            4,
+            "a bad activity never costs the session: {:?}",
+            snap.sessions.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+        for s in &snap.sessions {
+            assert!(s.activity.is_none(), "{} kept a malformed activity", s.id);
+            assert_eq!(s.signal, BeeSignal::None, "{}", s.id);
+        }
+        assert!(
+            snap.read_errors.is_empty(),
+            "a malformed activity is dropped silently, not reported: {:?}",
+            snap.read_errors
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_dead_session_with_fresh_activity_still_has_no_signal() {
+        let root = fresh_root("activity-dead-session");
+        let at = activity_at(5);
+        write(
+            &root,
+            ".bee/sessions/dead.json",
+            &session_json_with_activity(
+                "dead",
+                90,
+                &format!(r#"{{"state":"blocked","event":"PermissionRequest","at":"{at}"}}"#),
+            ),
+        );
+
+        let snap = read_snapshot(&root);
+        let s = snap.sessions.iter().find(|s| s.id == "dead").unwrap();
+        assert!(!s.live, "a 90-minute-old heartbeat is stale");
+        assert!(
+            s.activity.is_some(),
+            "the record still parses — only the signal is withheld"
+        );
+        assert_eq!(
+            s.signal,
+            BeeSignal::None,
+            "a session that is not live has no signal, however fresh its activity reads"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn activity_state_needs_you_only_for_waiting_input_and_blocked() {
+        assert!(BeeActivityState::Blocked.needs_you());
+        assert!(BeeActivityState::WaitingInput.needs_you());
+        assert!(!BeeActivityState::Working.needs_you());
+        assert!(!BeeActivityState::Idle.needs_you());
+        assert!(!BeeActivityState::Exited.needs_you());
+        assert!(!BeeActivityState::Unknown("compacting".into()).needs_you());
+
+        assert_eq!(BeeActivityState::Working.word(), "working");
+        assert_eq!(BeeActivityState::WaitingInput.word(), "needs an answer");
+        assert_eq!(BeeActivityState::Blocked.word(), "needs approval");
+        assert_eq!(BeeActivityState::Idle.word(), "idle");
+        assert_eq!(BeeActivityState::Exited.word(), "exited");
+        assert_eq!(
+            BeeActivityState::Unknown("compacting".into()).word(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn an_unknown_session_activity_state_is_carried_verbatim_not_an_error() {
+        let root = fresh_root("activity-unknown-state");
+        let at = activity_at(5);
+        write(
+            &root,
+            ".bee/sessions/newer.json",
+            &session_json_with_activity(
+                "newer",
+                1,
+                &format!(r#"{{"state":"compacting","event":"PreCompact","at":"{at}"}}"#),
+            ),
+        );
+
+        let snap = read_snapshot(&root);
+        let s = snap.sessions.iter().find(|s| s.id == "newer").unwrap();
+        assert_eq!(
+            s.activity.as_ref().map(|a| a.state.clone()),
+            Some(BeeActivityState::Unknown("compacting".into())),
+            "a state a newer bee writes is carried, never coerced"
+        );
+        assert_eq!(s.signal, BeeSignal::Live);
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -780,7 +780,7 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 .as_ref()
                 .map(|snap| suggested_projects(snap, &projects))
                 .unwrap_or_default();
-            let with_counts: Vec<_> = projects
+            let mut with_counts: Vec<_> = projects
                 .into_iter()
                 .map(|p| {
                     let c = st.engine.file_count(&p.id).unwrap_or(0);
@@ -835,6 +835,34 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
             // `bee_projects` narrows to for the Kanban tab.
             let all_projects: Vec<waggledance_core::domain::Project> =
                 with_counts.iter().map(|(p, _, _)| p.clone()).collect();
+            let bee_projects: Vec<waggledance_core::domain::Project> = with_counts
+                .iter()
+                .map(|(p, _, _)| p.clone())
+                .filter(is_bee_project)
+                .collect();
+            // cross-board D9 unchanged: nothing qualifying still means no
+            // roll-up read and no `spawn_blocking` task at all — the read
+            // has only moved AHEAD of the Terminals tab, because A2's pane
+            // join feeds the rail dots, the badges and the Pinned rows this
+            // page builds below, not only the Kanban cards it used to feed.
+            let rollups = if bee_projects.is_empty() {
+                Vec::new()
+            } else {
+                cross_project_rollup(st.bee_cache.clone(), bee_projects).await
+            };
+            let bee_by_project: std::collections::HashMap<String, ProjectBeeActivity> = rollups
+                .iter()
+                .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r)))
+                .collect();
+            // A3: every pane list this page already built from herdr now
+            // carries bee's own reading where a live session claims the
+            // pane — one stamp here, and the rail dot, the badge pills and
+            // the Pinned rows below all read it through `views::pane_tone`.
+            for (project, _, panes) in with_counts.iter_mut() {
+                if let Some(bee) = bee_by_project.get(&project.id) {
+                    apply_bee_activity(panes, &bee.pane);
+                }
+            }
             let terminals_panes =
                 terminals_menu_panes(snapshot.as_ref(), &with_counts, &all_projects);
             // D8: `snapshot: None` (the family switch off, or herdr timed
@@ -842,19 +870,13 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
             // other pane list here — `terminals_tab` reads that as "herdr
             // is not running" rather than "no agent running".
             let terminals_herdr_ok = snapshot.is_some();
-            let bee_projects: Vec<waggledance_core::domain::Project> = with_counts
-                .iter()
-                .map(|(p, _, _)| p.clone())
-                .filter(is_bee_project)
-                .collect();
-            let cross_features_html = if bee_projects.is_empty() {
+            let cross_features_html = if rollups.is_empty() {
                 // D9: nothing qualifies, so the section is not built at all —
                 // no roll-up read, no `spawn_blocking` task, and
                 // `views::home_page` below reads this empty string as
                 // "render exactly `project_list_page`'s own output".
                 String::new()
             } else {
-                let rollups = cross_project_rollup(st.bee_cache.clone(), bee_projects).await;
                 // card-terminals-1: the JOIN between a feature and the
                 // terminals running in its own checkout lives here, never in
                 // the view — `views::TerminalPaneView.cwd` is resolved
@@ -865,18 +887,34 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 // so the switch-off/herdr-down case (`snapshot: None`) flows
                 // through as an empty map for every project, same as it
                 // already does for every other pane list on this page.
+                let no_bee = ProjectBeeActivity::empty();
                 let feature_panes: std::collections::HashMap<
                     String,
                     std::collections::HashMap<String, Vec<views::TerminalPaneView>>,
                 > = rollups
                     .iter()
-                    .map(|(p, r)| (p.id.clone(), project_feature_panes(snapshot.as_ref(), p, r)))
+                    .map(|(p, r)| {
+                        let bee = bee_by_project.get(&p.id).unwrap_or(&no_bee);
+                        (
+                            p.id.clone(),
+                            project_feature_panes(snapshot.as_ref(), p, r, bee),
+                        )
+                    })
                     .collect();
+                // A2's card join, per project — what a card's own agent line
+                // and the widened need-you count read (A3/A6). Unlike the
+                // pane map above it needs no herdr snapshot at all, so a
+                // card still names its agent with the terminal switch off.
+                let feature_activity: std::collections::HashMap<String, views::BeeFeatureActivity> =
+                    bee_by_project
+                        .iter()
+                        .map(|(id, bee)| (id.clone(), bee.feature.clone()))
+                        .collect();
                 let pairs: Vec<(
                     &waggledance_core::domain::Project,
                     &waggledance_core::bee::BeeProjectRollup,
                 )> = rollups.iter().map(|(p, r)| (p, r)).collect();
-                views::bee_cross_project_features_section(&pairs, &feature_panes)
+                views::bee_cross_project_features_section(&pairs, &feature_panes, &feature_activity)
             };
             // home-terminal-parity-2: the same configured D8 preset labels
             // `terminal_page_inner` already threads into `terminal_page`, so
@@ -1138,8 +1176,27 @@ async fn api_agents(State(st): State<AppState>) -> Response {
     let Ok(projects) = st.engine.list_projects() else {
         return Json(json!([])).into_response();
     };
+    // A2/A3: the drawer says bee's own state where there is one, so this
+    // feed carries it. Read through the same cached rollup path every other
+    // bee surface uses (`cross_project_rollup`, `spawn_blocking` inside),
+    // over only the `.bee/`-holding projects — a project with no store
+    // contributes no sessions and so needs no read at all.
+    let bee_projects: Vec<waggledance_core::domain::Project> = projects
+        .iter()
+        .filter(|p| is_bee_project(p))
+        .cloned()
+        .collect();
+    let bee: std::collections::HashMap<String, ProjectBeeActivity> = if bee_projects.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        cross_project_rollup(st.bee_cache.clone(), bee_projects)
+            .await
+            .iter()
+            .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r)))
+            .collect()
+    };
     match st.herdr.snapshot().await {
-        Ok(snapshot) => Json(json!(agent_pane_rows(&snapshot, &projects))).into_response(),
+        Ok(snapshot) => Json(json!(agent_pane_rows(&snapshot, &projects, &bee))).into_response(),
         Err(_) => herdr_down_response(),
     }
 }
@@ -1761,11 +1818,17 @@ async fn bee_board(State(st): State<AppState>, Path(id): Path<String>) -> Respon
     if !rollup.snapshot.present {
         return not_found("this project has no .bee/ store");
     }
-    let feature_panes = project_feature_panes(herdr_snapshot.as_ref(), &project, &rollup);
+    // A2: read once, joined twice — the pane map stamps bee's state onto
+    // every badge this board draws, and the feature map is what a card's own
+    // agent line and the widened need-you count read (A3/A6). Both come off
+    // the rollup this route already has, so the board makes no extra read.
+    let bee = project_bee_activity(&project, &rollup);
+    let feature_panes = project_feature_panes(herdr_snapshot.as_ref(), &project, &rollup, &bee);
     Html(views::bee_board_page(
         &project,
         &rollup.snapshot,
         &feature_panes,
+        &bee.feature,
     ))
     .into_response()
 }
@@ -3216,9 +3279,155 @@ fn project_panes(
                 // `terminal_badges_nav` already renders no title span for
                 // an empty `title`, the same way it treats `kind == name`.
                 title: agent.map(|a| a.title.clone()).unwrap_or_default(),
+                // A2: filled afterwards by [`apply_bee_activity`], never
+                // here — this function is handed a herdr snapshot and a
+                // boundary, and knows nothing of `.bee/`. Every caller that
+                // has a bee store applies the join on the way out; every
+                // caller that does not leaves the pane exactly as herdr
+                // reported it.
+                bee_state: None,
+                bee_feature: None,
+                bee_no_signal: false,
             })
         })
         .collect()
+}
+
+/// A2's two joins for one project, built once from that project's own
+/// `.bee/sessions/*.json` and handed to every surface that needs either.
+struct ProjectBeeActivity {
+    /// `activity.pane == pane_id` — the bridge to the terminal view. Keyed
+    /// by herdr pane id; at most one session per pane (the freshest wins a
+    /// tie, see [`project_bee_activity`]).
+    pane: std::collections::HashMap<String, views::BeeActivityEntry>,
+    /// `activity.feature` — every live session on a feature, which is how a
+    /// board card finds its agent even when that session runs in no herdr
+    /// pane at all.
+    feature: views::BeeFeatureActivity,
+}
+
+impl ProjectBeeActivity {
+    fn empty() -> Self {
+        Self {
+            pane: std::collections::HashMap::new(),
+            feature: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// A2's session-to-project join: a session attaches to this project when
+/// `activity.cwd` validates through the SAME `Boundary` rule panes use
+/// ([`project_panes`]) — the project root plus each granted worktree's own
+/// sibling directory beside it, exactly the set
+/// [`project_feature_panes`] resolves for its own per-feature boundaries.
+/// One `Boundary` over all of them rather than one per worktree: this join
+/// only decides membership, and `activity.feature` — not the directory —
+/// is what says which feature a session belongs to.
+///
+/// Only LIVE sessions carrying an `activity` object are joined: a dead
+/// session's record is history, and A1 already derives
+/// [`waggledance_core::bee::BeeSignal::None`] for it. A `no_signal` session
+/// IS joined — its state still reads, muted — since A3 makes the muting a
+/// rendering rule, never a filter.
+///
+/// `cwd` is an unscrubbed absolute path and is used here for nothing but
+/// this boundary check; it never reaches a view.
+fn project_bee_activity(
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+) -> ProjectBeeActivity {
+    let snapshot = &rollup.snapshot;
+    let mut roots = vec![project.root_path.clone()];
+    if let Some(parent) = project.root_path.parent() {
+        for w in &snapshot.worktrees {
+            roots.push(parent.join(&w.id));
+        }
+    }
+    let Ok(boundary) = waggledance_core::paths_boundary::Boundary::new(roots) else {
+        // Fail closed, the same rule every other boundary reader here
+        // applies: with no working boundary there is no way to tell this
+        // project's sessions from another's, so it claims none.
+        return ProjectBeeActivity::empty();
+    };
+    // A6: the cell a session holds is an id; the board wants its title. The
+    // live buckets are the whole live cell store, so one pass over them is
+    // the map — an archived cell simply is not here, and the card falls
+    // back to the bare id.
+    let mut cell_titles: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for bucket in [
+        &snapshot.buckets.doing,
+        &snapshot.buckets.waiting,
+        &snapshot.buckets.stuck,
+        &snapshot.buckets.done,
+    ] {
+        for cell in bucket {
+            cell_titles.entry(cell.id.as_str()).or_insert(&cell.title);
+        }
+    }
+
+    let mut out = ProjectBeeActivity::empty();
+    for session in &snapshot.sessions {
+        if !session.live {
+            continue;
+        }
+        let Some(activity) = session.activity.as_ref() else {
+            continue;
+        };
+        let Some(cwd) = activity.cwd.as_deref() else {
+            continue;
+        };
+        if boundary
+            .validate_existing(std::path::Path::new(cwd))
+            .is_err()
+        {
+            continue;
+        }
+        let entry = views::BeeActivityEntry {
+            cell_title: activity
+                .cell
+                .as_deref()
+                .and_then(|id| cell_titles.get(id).map(|t| (*t).to_string())),
+            activity: activity.clone(),
+            signal: session.signal,
+        };
+        if let Some(pane) = activity.pane.as_deref() {
+            // Two live sessions claiming one pane id is bee's own
+            // impossibility, not this reader's to referee: the freshest
+            // record wins, and a tie keeps the first.
+            match out.pane.get(pane) {
+                Some(existing) if existing.activity.at >= entry.activity.at => {}
+                _ => {
+                    out.pane.insert(pane.to_string(), entry.clone());
+                }
+            }
+        }
+        if let Some(feature) = activity.feature.as_deref() {
+            out.feature
+                .entry(feature.to_string())
+                .or_default()
+                .push(entry);
+        }
+    }
+    out
+}
+
+/// A2/A3: stamp bee's own reading onto every pane a live session claims by
+/// pane id. Applied on the way OUT of [`project_panes`] rather than inside
+/// it, so the pane resolver stays a pure herdr-plus-boundary function and
+/// the surfaces with no bee store in reach (the terminal page's own pane
+/// list, the Unassigned group) keep herdr's status untouched.
+fn apply_bee_activity(
+    panes: &mut [views::TerminalPaneView],
+    by_pane: &std::collections::HashMap<String, views::BeeActivityEntry>,
+) {
+    for pane in panes.iter_mut() {
+        let Some(entry) = by_pane.get(&pane.pane_id) else {
+            continue;
+        };
+        pane.bee_state = Some(entry.activity.state.clone());
+        pane.bee_feature = entry.activity.feature.clone();
+        pane.bee_no_signal = entry.signal == waggledance_core::bee::BeeSignal::NoSignal;
+    }
 }
 
 /// card-terminals-1: one project's per-feature terminal panes for the
@@ -3252,6 +3461,7 @@ fn project_feature_panes(
     snapshot: Option<&herdr::Snapshot>,
     project: &waggledance_core::domain::Project,
     rollup: &waggledance_core::bee::BeeProjectRollup,
+    bee: &ProjectBeeActivity,
 ) -> std::collections::HashMap<String, Vec<views::TerminalPaneView>> {
     let mut out: std::collections::HashMap<String, Vec<views::TerminalPaneView>> =
         std::collections::HashMap::new();
@@ -3271,7 +3481,9 @@ fn project_feature_panes(
         let Ok(boundary) = waggledance_core::paths_boundary::Boundary::new(vec![sibling]) else {
             continue;
         };
-        out.insert(feature.to_string(), project_panes(snap, &boundary));
+        let mut panes = project_panes(snap, &boundary);
+        apply_bee_activity(&mut panes, &bee.pane);
+        out.insert(feature.to_string(), panes);
     }
 
     let Ok(project_boundary) =
@@ -3279,7 +3491,8 @@ fn project_feature_panes(
     else {
         return out;
     };
-    let main_panes = project_panes(snap, &project_boundary);
+    let mut main_panes = project_panes(snap, &project_boundary);
+    apply_bee_activity(&mut main_panes, &bee.pane);
     if main_panes.is_empty() {
         return out;
     }
@@ -3367,6 +3580,12 @@ fn unassigned_panes(
                 .and_then(|p| p.cwd.clone())
                 .unwrap_or_default();
             views::TerminalPaneView {
+                // A pane outside every registered project's boundary is
+                // outside every project's `.bee/` too — no session joins
+                // here, by the same rule that put the pane in this group.
+                bee_state: None,
+                bee_feature: None,
+                bee_no_signal: false,
                 pane_id: agent.pane_id.clone(),
                 kind: agent.kind.clone(),
                 name: agent.name.clone(),
@@ -3443,9 +3662,12 @@ fn terminals_menu_panes(
             view: pane,
         });
     }
+    // A3: bee's own state wins over herdr's screen-derived status here too
+    // — `views::pane_tone` is the one precedence, and `terminals_status_rank`
+    // still owns the three-way rank itself, so neither is re-derived.
     entries.sort_by_key(|e| {
         (
-            terminals_status_rank(&e.view.status),
+            terminals_status_rank(views::pane_tone(&e.view)),
             e.project_label.clone(),
             e.view.pane_id.clone(),
         )
@@ -3461,6 +3683,23 @@ fn terminals_status_rank(status: &str) -> u8 {
         "blocked" => 0,
         "working" => 1,
         _ => 2,
+    }
+}
+
+/// A3's machine spelling of a state, for the one surface that carries a
+/// state across a wire rather than rendering it: `/api/agents`. Mirrors
+/// [`waggledance_core::bee::BeeActivityState`]'s own serde `snake_case`
+/// naming so the feed and the session file agree; an `Unknown` state a
+/// newer bee wrote travels verbatim, exactly as the reader carried it.
+fn bee_state_slug(state: &waggledance_core::bee::BeeActivityState) -> String {
+    use waggledance_core::bee::BeeActivityState as S;
+    match state {
+        S::Working => "working".to_string(),
+        S::WaitingInput => "waiting_input".to_string(),
+        S::Blocked => "blocked".to_string(),
+        S::Idle => "idle".to_string(),
+        S::Exited => "exited".to_string(),
+        S::Unknown(other) => other.clone(),
     }
 }
 
@@ -3486,6 +3725,17 @@ struct AgentPaneRow {
     workspace: String,
     tab: String,
     url: String,
+    /// A3/A6: what bee's own hook runtime last recorded this pane's agent
+    /// doing — the MACHINE state (`blocked`, `waiting_input`, `working`,
+    /// `idle`, `exited`), never the human word, since this is a JSON feed
+    /// and `assets/app.js` both ranks and phrases the row from it
+    /// (`beeStateWord`, the client half of `BeeActivityState::word()`).
+    /// `null` when no live bee session claims the pane, in which case the
+    /// drawer renders exactly as it did before this feature.
+    bee_state: Option<String>,
+    /// The feature lane that session is bound to, or `null` for an unbound
+    /// session (A1).
+    feature: Option<String>,
 }
 
 /// drawer-title-1: the terminal title of the agent behind `pane_id`, or `""`
@@ -3522,6 +3772,7 @@ fn agent_title_for(snapshot: &herdr::Snapshot, pane_id: &str) -> String {
 fn agent_pane_rows(
     snapshot: &herdr::Snapshot,
     projects: &[waggledance_core::domain::Project],
+    bee: &std::collections::HashMap<String, ProjectBeeActivity>,
 ) -> Vec<AgentPaneRow> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rows = Vec::new();
@@ -3532,7 +3783,11 @@ fn agent_pane_rows(
         else {
             continue;
         };
-        for pane in project_panes(snapshot, &boundary) {
+        let mut project_panes = project_panes(snapshot, &boundary);
+        if let Some(activity) = bee.get(&project.id) {
+            apply_bee_activity(&mut project_panes, &activity.pane);
+        }
+        for pane in project_panes {
             if pane.status == "shell" {
                 continue;
             }
@@ -3540,6 +3795,8 @@ fn agent_pane_rows(
                 continue;
             }
             rows.push(AgentPaneRow {
+                bee_state: pane.bee_state.as_ref().map(bee_state_slug),
+                feature: pane.bee_feature.clone(),
                 project_id: Some(project.id.clone()),
                 project_name: project.name.clone(),
                 url: format!("/p/{}/_terminal/pane/{}", project.id, pane.pane_id),
@@ -3566,6 +3823,11 @@ fn agent_pane_rows(
             continue;
         }
         rows.push(AgentPaneRow {
+            // Same reason `unassigned_panes` itself carries none: a pane
+            // outside every project's boundary is outside every `.bee/`
+            // store this server reads.
+            bee_state: None,
+            feature: None,
             project_id: None,
             project_name: "(unassigned)".to_string(),
             url: "/_terminal/unassigned".to_string(),
@@ -5327,7 +5589,7 @@ mod bee_route_tests {
         assert!(body.contains("finished-feat"), "{body}");
 
         assert_eq!(
-            body.matches("0/1 cell done").count(),
+            body.matches("0/1 cells").count(),
             2,
             "both In Progress cards (gated-feat, progress-feat) must show one open cell not yet done: {body}"
         );
@@ -5973,30 +6235,108 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&sibling).ok();
     }
 
-    /// (console-theme-kanban ctk-8) The Ready to merge column's whole
-    /// membership rule, proven at the HTTP layer over real store files: a
-    /// feature whose `uat` gate is approved AND whose worktree is still
-    /// granted and unmerged is the state where `bee worktree merge` is
-    /// literally the next action, so it lands in Ready to merge -- and it
-    /// must leave In Progress to get there, since an open grant is itself
-    /// one of In Progress's own liveness pulls and would otherwise swallow
-    /// it first.
+    /// One `.bee/cells/<id>.json` for the Ready to merge rule's own tests
+    /// (bee-agent-activity R1): unlike `cell_json` it names its own feature
+    /// and can carry a `trace.capped_at`, which is what the column's
+    /// "ready <age>" reading and its ordering are derived from.
+    fn merge_cell_json(id: &str, feature: &str, status: &str, capped_at: Option<&str>) -> String {
+        let capped_field = capped_at
+            .map(|t| format!(r#", "capped_at": "{t}""#))
+            .unwrap_or_default();
+        format!(
+            r#"{{
+                "id": "{id}",
+                "feature": "{feature}",
+                "lane": "standard",
+                "title": "Cell {id}",
+                "action": "do the thing",
+                "verify": "cargo test",
+                "files": [],
+                "read_first": [],
+                "deps": [],
+                "decisions": [],
+                "must_haves": {{}},
+                "behavior_change": false,
+                "change_class": "behavior",
+                "pbi": null,
+                "status": "{status}",
+                "tier": "generation",
+                "trace": {{"worker": "w1"{capped_field}}}
+            }}"#
+        )
+    }
+
+    /// (console-theme-kanban ctk-8, widened by bee-agent-activity R1 —
+    /// decision `63bffb34`, supersedes `420cec71`) The Ready to merge
+    /// column's whole membership rule, proven at the HTTP layer over real
+    /// store files. ctk-8 read an approved `uat` gate as membership; R1
+    /// moves uat onto the card and makes membership "the work is done and
+    /// the worktree is still open": an unmerged grant, the `execution` gate
+    /// approved, at least one cell and every non-dropped one capped. The
+    /// feature must leave In Progress to get there, since an open grant is
+    /// itself one of In Progress's own liveness pulls and would otherwise
+    /// swallow it first.
     ///
-    /// The second feature is the other half of the rule: its `uat` gate is
-    /// approved too, but its worktree is already merged (a still-open
+    /// Three features carry the three halves of the rule. `pending-feat`
+    /// has no uat approval at all and is the case ctk-8 used to hide: its
+    /// cells are capped, its worktree is open, and the merge is exactly
+    /// what it waits on — it belongs in the column, saying `uat pending`,
+    /// and a `dropped` cell beside its capped ones does not hold it back
+    /// (dropped counts toward nothing). `approved-feat` is the accepted
+    /// half, saying `uat approved`, and it sorts ahead of `pending-feat`
+    /// even though it has been ready far longer — uat approved leads the
+    /// column. `merged-feat` is unchanged from ctk-8: its uat is approved
+    /// too, but its worktree is already merged (a still-open
     /// `worktree-cleanup` entry in `deferred-queue.jsonl`, bee's own
     /// `merged_pending` signal), so merging is NOT its next action and it
     /// stays in the column its phase earns it. Nothing here synthesises a
-    /// merge-readiness verdict -- both halves read only values the store
-    /// already holds (CONTEXT.md D2).
+    /// merge-readiness verdict — every input is a value the store already
+    /// holds (CONTEXT.md D2).
     #[tokio::test]
-    async fn feature_hub_uat_approved_feature_with_an_open_worktree_lands_in_ready_to_merge() {
+    async fn feature_hub_ready_to_merge_holds_capped_open_worktrees_and_says_its_uat_shape() {
         let root = fresh_root("hub-ready-to-merge");
         write(
             &root,
-            ".bee/lanes/ready-feat.json",
+            ".bee/lanes/pending-feat.json",
             &lane_json(
-                "ready-feat",
+                "pending-feat",
+                "swarming",
+                "standard",
+                "merge the worktree",
+                Some(r#""context": true, "shape": true, "execution": true"#),
+                None,
+            ),
+        );
+        // Capped, capped, and one dropped beside them: dropped counts
+        // toward neither `total` nor `done`, so the feature still reads as
+        // "every non-dropped cell capped".
+        write(
+            &root,
+            ".bee/cells/p1.json",
+            &merge_cell_json("p1", "pending-feat", "capped", Some("2026-08-21T10:00:00Z")),
+        );
+        write(
+            &root,
+            ".bee/cells/p2.json",
+            &merge_cell_json("p2", "pending-feat", "capped", Some("2026-08-21T12:00:00Z")),
+        );
+        write(
+            &root,
+            ".bee/cells/p3.json",
+            &merge_cell_json("p3", "pending-feat", "dropped", None),
+        );
+        let pending_sibling = make_worktree_sibling("hub-ready-pending-wt");
+        write(
+            &pending_sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"pending-feat","mode":"standard"}"#,
+        );
+
+        write(
+            &root,
+            ".bee/lanes/approved-feat.json",
+            &lane_json(
+                "approved-feat",
                 "swarming",
                 "standard",
                 "merge the worktree",
@@ -6006,15 +6346,26 @@ mod bee_route_tests {
                 None,
             ),
         );
-        let open_sibling = make_worktree_sibling("hub-ready-open-wt");
         write(
-            &open_sibling,
+            &root,
+            ".bee/cells/a1.json",
+            &merge_cell_json(
+                "a1",
+                "approved-feat",
+                "capped",
+                Some("2026-08-19T09:00:00Z"),
+            ),
+        );
+        let approved_sibling = make_worktree_sibling("hub-ready-approved-wt");
+        write(
+            &approved_sibling,
             ".bee/state.json",
-            r#"{"phase":"swarming","feature":"ready-feat","mode":"standard"}"#,
+            r#"{"phase":"swarming","feature":"approved-feat","mode":"standard"}"#,
         );
 
-        // Same approved `uat` gate, but this grant is already merged and
-        // only awaiting cleanup -- `compounding` is where its phase puts it.
+        // Same approved `uat` gate and capped cell, but this grant is
+        // already merged and only awaiting cleanup -- `compounding` is
+        // where its phase puts it.
         write(
             &root,
             ".bee/lanes/merged-feat.json",
@@ -6029,6 +6380,11 @@ mod bee_route_tests {
                 None,
             ),
         );
+        write(
+            &root,
+            ".bee/cells/m1.json",
+            &merge_cell_json("m1", "merged-feat", "capped", Some("2026-08-20T09:00:00Z")),
+        );
         let merged_sibling = make_worktree_sibling("hub-ready-merged-wt");
         write(
             &merged_sibling,
@@ -6039,15 +6395,29 @@ mod bee_route_tests {
         write(
             &root,
             ".bee/runtime/worktree-grants.json",
-            &grants_json(&["hub-ready-open-wt", "hub-ready-merged-wt"]),
+            &grants_json(&[
+                "hub-ready-pending-wt",
+                "hub-ready-approved-wt",
+                "hub-ready-merged-wt",
+            ]),
         );
         write(
             &root,
-            ".bee/runtime/workspaces/open.json",
+            ".bee/runtime/workspaces/pending.json",
             &workspace_json(
-                "hub-ready-open-wt",
-                &open_sibling.to_string_lossy(),
-                "wt/ready-feat",
+                "hub-ready-pending-wt",
+                &pending_sibling.to_string_lossy(),
+                "wt/pending-feat",
+                &[],
+            ),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/approved.json",
+            &workspace_json(
+                "hub-ready-approved-wt",
+                &approved_sibling.to_string_lossy(),
+                "wt/approved-feat",
                 &[],
             ),
         );
@@ -6077,23 +6447,55 @@ mod bee_route_tests {
         let body = body_string(resp).await;
 
         assert!(
-            body.contains("data-hub-group=\"ready-to-merge\" data-hub-count=\"1\""),
-            "the uat-approved feature with an open unmerged worktree must be the column's one member: {body}"
+            body.contains("data-hub-group=\"ready-to-merge\" data-hub-count=\"2\""),
+            "both capped features with open unmerged worktrees must be the column's members: {body}"
+        );
+        let pending_row = format!(
+            "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/pending-feat\"",
+            project.id
+        );
+        let approved_row = format!(
+            "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/approved-feat\"",
+            project.id
         );
         assert!(
-            body.contains(&format!(
-                "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/ready-feat\"",
-                project.id
-            )),
-            "ready-feat must render as a dense Ready to merge row: {body}"
+            body.contains(&pending_row),
+            "a capped feature with an open worktree is ready to merge whether or not uat is approved: {body}"
         );
+        assert!(
+            body.contains(&approved_row),
+            "the uat-approved feature must still render as a dense Ready to merge row: {body}"
+        );
+        assert!(
+            body.contains(
+                "<span class=\"bee-hub__merge-uat bee-hub__merge-uat--pending\">uat pending</span>"
+            ),
+            "the unaccepted feature must say uat pending, in words: {body}"
+        );
+        assert!(
+            body.contains(
+                "<span class=\"bee-hub__merge-uat bee-hub__merge-uat--approved\">uat approved</span>"
+            ),
+            "the accepted feature must say uat approved, in words: {body}"
+        );
+        assert!(
+            body.contains("<span class=\"bee-hub__merge-since\">ready "),
+            "each row must say how long it has been ready: {body}"
+        );
+        let approved_at = body.find(&approved_row).expect("approved row");
+        let pending_at = body.find(&pending_row).expect("pending row");
+        assert!(
+            approved_at < pending_at,
+            "uat approved sorts ahead of uat pending even when it has been ready longer: {body}"
+        );
+
         assert!(
             body.contains("data-hub-group=\"in-progress\" data-hub-count=\"0\""),
-            "Ready to merge is tested before In Progress, so its member must have left In Progress entirely: {body}"
+            "Ready to merge is tested before In Progress, so its members must have left In Progress entirely: {body}"
         );
         assert!(
             !body.contains(&format!(
-                "bee-hub__detail-link\" href=\"/p/{}/_bee/feature/ready-feat\"",
+                "bee-hub__detail-link\" href=\"/p/{}/_bee/feature/pending-feat\"",
                 project.id
             )),
             "Ready to merge uses the dense row, never the full card anatomy In Progress keeps: {body}"
@@ -6115,12 +6517,170 @@ mod bee_route_tests {
                 "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/merged-feat\"",
                 project.id
             )),
-            "an approved uat gate over an ALREADY merged worktree is not merge-readiness: {body}"
+            "an ALREADY merged worktree is not merge-readiness, approved uat or not: {body}"
         );
 
         std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&open_sibling).ok();
+        std::fs::remove_dir_all(&pending_sibling).ok();
+        std::fs::remove_dir_all(&approved_sibling).ok();
         std::fs::remove_dir_all(&merged_sibling).ok();
+    }
+
+    /// (bee-agent-activity R1) The other side of the widened rule: an open
+    /// worktree alone never makes a feature ready. `claimed-feat` still has
+    /// a cell in flight, `nocells-feat` has no cells at all (R1 names the
+    /// zero-cell grant explicitly — a fresh worktree with nothing done in
+    /// it is not a merge waiting to happen), and `noexec-feat` never got
+    /// its `execution` gate. All three keep the column an open grant used
+    /// to earn them, In Progress, and Ready to merge stays honestly empty.
+    #[tokio::test]
+    async fn feature_hub_ready_to_merge_needs_execution_approved_and_every_cell_capped() {
+        let root = fresh_root("hub-not-ready");
+
+        write(
+            &root,
+            ".bee/lanes/claimed-feat.json",
+            &lane_json(
+                "claimed-feat",
+                "swarming",
+                "standard",
+                "run the wave",
+                Some(r#""context": true, "shape": true, "execution": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/c1.json",
+            &merge_cell_json("c1", "claimed-feat", "capped", Some("2026-08-21T10:00:00Z")),
+        );
+        write(
+            &root,
+            ".bee/cells/c2.json",
+            &merge_cell_json("c2", "claimed-feat", "claimed", None),
+        );
+        let claimed_sibling = make_worktree_sibling("hub-not-ready-claimed-wt");
+        write(
+            &claimed_sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"claimed-feat","mode":"standard"}"#,
+        );
+
+        write(
+            &root,
+            ".bee/lanes/nocells-feat.json",
+            &lane_json(
+                "nocells-feat",
+                "swarming",
+                "standard",
+                "plan the slice",
+                Some(r#""context": true, "shape": true, "execution": true"#),
+                None,
+            ),
+        );
+        let nocells_sibling = make_worktree_sibling("hub-not-ready-nocells-wt");
+        write(
+            &nocells_sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"nocells-feat","mode":"standard"}"#,
+        );
+
+        write(
+            &root,
+            ".bee/lanes/noexec-feat.json",
+            &lane_json(
+                "noexec-feat",
+                "shaping",
+                "standard",
+                "ask for the gate",
+                Some(r#""context": true, "shape": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/n1.json",
+            &merge_cell_json("n1", "noexec-feat", "capped", Some("2026-08-21T11:00:00Z")),
+        );
+        let noexec_sibling = make_worktree_sibling("hub-not-ready-noexec-wt");
+        write(
+            &noexec_sibling,
+            ".bee/state.json",
+            r#"{"phase":"shaping","feature":"noexec-feat","mode":"standard"}"#,
+        );
+
+        write(
+            &root,
+            ".bee/runtime/worktree-grants.json",
+            &grants_json(&[
+                "hub-not-ready-claimed-wt",
+                "hub-not-ready-nocells-wt",
+                "hub-not-ready-noexec-wt",
+            ]),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/claimed.json",
+            &workspace_json(
+                "hub-not-ready-claimed-wt",
+                &claimed_sibling.to_string_lossy(),
+                "wt/claimed-feat",
+                &[],
+            ),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/nocells.json",
+            &workspace_json(
+                "hub-not-ready-nocells-wt",
+                &nocells_sibling.to_string_lossy(),
+                "wt/nocells-feat",
+                &[],
+            ),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/noexec.json",
+            &workspace_json(
+                "hub-not-ready-noexec-wt",
+                &noexec_sibling.to_string_lossy(),
+                "wt/noexec-feat",
+                &[],
+            ),
+        );
+
+        let st = build_state();
+        let project = register(&st, &root, "hub-not-ready");
+        let resp = get(router(st), &format!("/p/{}/_bee", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        assert!(
+            body.contains("data-hub-group=\"ready-to-merge\" data-hub-count=\"0\""),
+            "none of the three qualifies, so the column stays honestly empty: {body}"
+        );
+        assert!(
+            body.contains("Nothing ready to merge."),
+            "an empty Ready to merge column still states its own empty line: {body}"
+        );
+        for feature in ["claimed-feat", "nocells-feat", "noexec-feat"] {
+            assert!(
+                !body.contains(&format!(
+                    "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/{feature}\"",
+                    project.id
+                )),
+                "{feature} must not read as ready to merge: {body}"
+            );
+        }
+        assert!(
+            body.contains("data-hub-group=\"in-progress\" data-hub-count=\"3\""),
+            "all three keep the column their open grant earns them: {body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&claimed_sibling).ok();
+        std::fs::remove_dir_all(&nocells_sibling).ok();
+        std::fs::remove_dir_all(&noexec_sibling).ok();
     }
 
     /// (edge, feature-hub fh-1, grown to five columns by kanban-columns D1
@@ -10257,7 +10817,7 @@ mod bee_route_tests {
     /// `running_workers` as an input, so the open cell stays counted as
     /// live on `state.feature`'s own feature-hub card ("demo", the only
     /// feature this fixture declares), and its own progress must keep
-    /// reading "0/1 cell done" even though a live worker names its one open
+    /// reading "0/1 cells" even though a live worker names its one open
     /// cell. The card lands under In Progress: the fixture's own session
     /// beat a minute ago and carries no lane, so `working-now-default-lane-1`
     /// folds it onto `state.feature` and the unapproved gate stops owing a
@@ -10298,7 +10858,7 @@ mod bee_route_tests {
             "the still-open cell must keep its feature counted as live work: {body}"
         );
         assert!(
-            body.contains("0/1 cell done"),
+            body.contains("0/1 cells"),
             "an open cell must keep reading as not-done even though a live worker names it: {body}"
         );
 
@@ -24645,5 +25205,389 @@ mod bee_route_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── bee agent activity (A2/A3/A6) ─────────────────────────────────────
+    //
+    // The joins and the precedence, proven end to end at the HTTP layer
+    // rather than per function: the whole point of this feature is that ONE
+    // session record reaches five surfaces saying the same thing, and only a
+    // route test can show the card, the badge, the tile, the rail row and
+    // the JSON feed agreeing.
+
+    fn rfc3339_seconds_ago(secs: i64) -> String {
+        let now = time::OffsetDateTime::now_utc();
+        (now - time::Duration::seconds(secs))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    /// A `.bee/sessions/<id>.json` fixture carrying bee 2.20.0's own
+    /// `activity` object (`docs/history/research/bee-agent-activity-contract.md`).
+    /// `pane`, `feature` and `cell` are each omitted entirely when `None` —
+    /// the absent-field shape A1 says must render as a dash, never as an
+    /// error. The heartbeat is always fresh: a dead session is a different
+    /// case, already covered by the reader's own tests.
+    fn activity_session_json(
+        id: &str,
+        state: &str,
+        at: &str,
+        pane: Option<&str>,
+        cwd: &Path,
+        feature: Option<&str>,
+        cell: Option<&str>,
+    ) -> String {
+        let mut activity = serde_json::json!({
+            "state": state,
+            "event": "PermissionRequest",
+            "tool_name": "Bash",
+            "at": at,
+            "cwd": cwd.to_string_lossy().into_owned(),
+        });
+        for (key, value) in [("pane", pane), ("feature", feature), ("cell", cell)] {
+            if let Some(v) = value {
+                activity[key] = serde_json::Value::String(v.to_string());
+            }
+        }
+        serde_json::json!({
+            "id": id,
+            "started_at": "2026-08-22T08:00:00Z",
+            "last_heartbeat": rfc3339_minutes_ago(0),
+            "activity": activity,
+        })
+        .to_string()
+    }
+
+    /// One herdr pane in `root`, backed by an agent whose own screen-derived
+    /// status is `status` — deliberately settable, so a test can hand herdr
+    /// a status bee's own record must override (A3).
+    fn one_agent_snapshot(
+        root: &Path,
+        pane_id: &str,
+        status: herdr::AgentStatus,
+    ) -> herdr::Snapshot {
+        let cwd = root.to_string_lossy().into_owned();
+        herdr::Snapshot {
+            workspaces: vec![herdr::wire::Workspace {
+                workspace_id: "w1".into(),
+                label: "w1".into(),
+                agent_status: herdr::AgentStatus::Idle,
+                active_tab_id: Some("w1:t1".into()),
+            }],
+            tabs: vec![herdr::wire::Tab {
+                tab_id: "w1:t1".into(),
+                label: "main".into(),
+            }],
+            layouts: vec![herdr::wire::PaneLayout {
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+                focused_pane_id: Some(pane_id.to_string()),
+            }],
+            panes: vec![herdr::wire::Pane {
+                pane_id: pane_id.to_string(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+                cwd: Some(cwd.clone()),
+                foreground_cwd: Some(cwd),
+            }],
+            agents: vec![herdr::wire::Agent {
+                pane_id: pane_id.to_string(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+                kind: "claude".into(),
+                name: "agent-1".into(),
+                status,
+                title: "reading views.rs".into(),
+            }],
+            focused_pane_id: Some(pane_id.to_string()),
+            ..herdr::Snapshot::default()
+        }
+    }
+
+    /// A feature lane with every gate approved and no waiting reason of its
+    /// own, so the In Progress card's need-you count can only come from bee's
+    /// agent activity — never from a gate line the fixture smuggled in.
+    fn quiet_in_progress_lane(root: &Path, feature: &str, cell_id: &str) {
+        write(
+            root,
+            &format!(".bee/lanes/{feature}.json"),
+            &lane_json(
+                feature,
+                "execute",
+                "standard",
+                "keep going",
+                Some(r#""context": true, "shape": true, "execution": true, "review": true"#),
+                None,
+            ),
+        );
+        write(
+            root,
+            ".bee/cells/a.json",
+            &feature_cell_json(
+                cell_id,
+                feature,
+                "claimed",
+                Some(&rfc3339_minutes_ago(5)),
+                None,
+            ),
+        );
+    }
+
+    /// The text of one `<span class="{class}">…</span>` in a rendered body,
+    /// so an assertion on a live-computed reading (the quiet age) can check
+    /// its SHAPE without pinning a number the clock decides.
+    fn span_text<'a>(body: &'a str, class: &str) -> &'a str {
+        let open = format!(r#"<span class="{class}">"#);
+        let start = body
+            .find(&open)
+            .unwrap_or_else(|| panic!("no <span class=\"{class}\"> in body: {body}"))
+            + open.len();
+        let rest = &body[start..];
+        &rest[..rest.find("</span>").expect("unterminated span")]
+    }
+
+    async fn get_body(app: &Router, uri: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        body_string(resp).await
+    }
+
+    /// A2/A3/A6, happy path: ONE live bee session — blocked, in pane
+    /// `w1:p1`, `cwd` the project root, bound to the card's own feature and
+    /// holding a cell — reaches every surface this cell is about, and beats
+    /// herdr's own screen-derived `idle` on every one of them: the card's
+    /// agent line names the state, the cell's TITLE and the quiet age; the
+    /// pane's badge carries the blocked tone and says "needs approval" in
+    /// words; the need-you tile and the In Progress waiting chip both count
+    /// it once; the rail's Pinned row carries the state word and the
+    /// feature; and `/api/agents` carries the machine state and the feature
+    /// for the drawer.
+    #[tokio::test]
+    async fn bee_agent_activity_blocked_session_reaches_card_badge_tile_pinned_row_and_agents_feed()
+    {
+        let dir = fresh_root("bee-activity-blocked-data");
+        enable_terminal(&dir);
+        let root = fresh_root("bee-activity-blocked-project");
+        quiet_in_progress_lane(&root, "agent-feat", "af-1");
+        write(
+            &root,
+            ".bee/sessions/live-blocked.json",
+            &activity_session_json(
+                "live-blocked",
+                "blocked",
+                &rfc3339_seconds_ago(12),
+                Some("w1:p1"),
+                &root,
+                Some("agent-feat"),
+                Some("af-1"),
+            ),
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = std::sync::Arc::new(StaticSnapshotHerdr {
+            // herdr says idle; bee says blocked. Every assertion below is
+            // about which of the two the cockpit believes.
+            snap: one_agent_snapshot(&root, "w1:p1", herdr::AgentStatus::Idle),
+        });
+        let project = register(&st, &root, "bee-activity-blocked");
+        let app = router(st);
+
+        let board = get_body(&app, &format!("/p/{}/_bee", project.id)).await;
+        assert!(
+            board.contains(
+                r#"<span class="bee-hub__agent-state bee-hub__agent-state--needs-you">agent: needs approval</span>"#
+            ),
+            "the card must name the agent's state in its own word and tone (A6): {board}"
+        );
+        assert!(
+            board.contains(r#"<span class="bee-hub__agent-cell">Cell af-1</span>"#),
+            "the card must name the held cell by its TITLE, not its bare id, when the store knows it (A6): {board}"
+        );
+        let quiet = span_text(&board, "bee-hub__agent-quiet");
+        assert!(
+            quiet.starts_with("quiet ") && quiet.ends_with('s'),
+            "a record seconds old reads its quiet age in seconds, not minutes: {quiet:?}"
+        );
+        assert!(
+            !board.contains(r#"<span class="bee-hub__agent-signal">no signal</span>"#),
+            "a record 12 s old is still speaking — no no-signal marker belongs on it: {board}"
+        );
+        assert!(
+            board.contains(
+                r#"<span class="fg-status fg-status--blocked"><span class="fg-status__dot"></span>needs approval</span>"#
+            ),
+            "bee's state must colour AND name the pane's own badge, over herdr's idle (A3): {board}"
+        );
+        assert!(
+            board.contains(
+                r#"<span class="bee-hub__stat-num">1</span><span class="bee-hub__stat-label">need you</span>"#
+            ),
+            "need-you = blocked ∪ waiting_input in every count, the tile included (A3): {board}"
+        );
+        assert!(
+            board.contains(
+                r#"data-hub-group="in-progress" data-hub-count="1" data-hub-waiting="1""#
+            ),
+            "the waiting chip reads the same widened predicate the tile does: {board}"
+        );
+
+        let home = get_body(&app, "/").await;
+        assert!(
+            home.contains(r#"<span class="pinned-row__state">needs approval</span>"#),
+            "a Pinned row says the bee state in words (A6): {home}"
+        );
+        assert!(
+            home.contains(r#"<span class="pinned-row__feature">agent-feat</span>"#),
+            "a Pinned row says which feature the session is bound to (A6): {home}"
+        );
+        assert!(
+            home.contains(r#"proj-row__dot--blocked" role="img" aria-label="needs approval""#),
+            "the Pinned row's dot takes bee's tone and its text alternative says the same word: {home}"
+        );
+
+        let agents = get_body(&app, "/api/agents").await;
+        let rows: serde_json::Value = serde_json::from_str(&agents).unwrap();
+        let row = &rows[0];
+        assert_eq!(
+            row["bee_state"], "blocked",
+            "the drawer feed carries the MACHINE state, which is what app.js ranks on: {agents}"
+        );
+        assert_eq!(row["feature"], "agent-feat", "{agents}");
+        assert_eq!(
+            row["status"], "idle",
+            "herdr's own status is still carried verbatim beside it, never overwritten: {agents}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A1/A3, edge: a `waiting_input` record two minutes old has stopped
+    /// speaking. Its state still READS — muted, with the `no signal` marker
+    /// beside it — but it is never counted as need-you, at the tile or at
+    /// the waiting chip, and neither is the pane it names.
+    #[tokio::test]
+    async fn bee_agent_activity_no_signal_record_renders_its_marker_and_is_counted_by_nothing() {
+        let dir = fresh_root("bee-activity-nosignal-data");
+        enable_terminal(&dir);
+        let root = fresh_root("bee-activity-nosignal-project");
+        quiet_in_progress_lane(&root, "quiet-feat", "qf-1");
+        write(
+            &root,
+            ".bee/sessions/live-quiet.json",
+            &activity_session_json(
+                "live-quiet",
+                "waiting_input",
+                &rfc3339_seconds_ago(120),
+                Some("w1:p1"),
+                &root,
+                Some("quiet-feat"),
+                Some("qf-1"),
+            ),
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = std::sync::Arc::new(StaticSnapshotHerdr {
+            snap: one_agent_snapshot(&root, "w1:p1", herdr::AgentStatus::Idle),
+        });
+        let project = register(&st, &root, "bee-activity-nosignal");
+        let app = router(st);
+
+        let board = get_body(&app, &format!("/p/{}/_bee", project.id)).await;
+        assert!(
+            board.contains(
+                r#"<span class="bee-hub__agent-state bee-hub__agent-state--needs-you">agent: needs an answer</span>"#
+            ),
+            "a stale record still says what it last said (A1): {board}"
+        );
+        assert!(
+            board.contains(r#"<span class="bee-hub__agent-signal">no signal</span>"#),
+            "past 90 s the record carries the muted no-signal marker (A1): {board}"
+        );
+        let quiet = span_text(&board, "bee-hub__agent-quiet");
+        assert!(
+            quiet.starts_with("quiet ") && quiet.ends_with('m'),
+            "a record two minutes old reads its quiet age in minutes: {quiet:?}"
+        );
+        assert!(
+            board.contains(
+                r#"<span class="bee-hub__stat-num">0</span><span class="bee-hub__stat-label">need you</span>"#
+            ),
+            "no_signal is a muted marker and never need-you (A3): {board}"
+        );
+        assert!(
+            board.contains(
+                r#"data-hub-group="in-progress" data-hub-count="1" data-hub-waiting="0""#
+            ),
+            "the waiting chip must not count a record that has stopped speaking either: {board}"
+        );
+        assert!(
+            !board.contains("Waiting on you — a terminal is blocked"),
+            "nor may the card's own blocked-terminal line fire on a silent record: {board}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A1, edge: a session holding no claim renders the cell as a dash — the
+    /// absent-field shape, never an error and never an empty gap. It also
+    /// runs in no herdr pane at all, which is what proves the feature join
+    /// (`activity.feature`) stands on its own: the card still names its
+    /// agent with nothing but a session record to go on.
+    #[tokio::test]
+    async fn bee_agent_activity_session_holding_no_cell_renders_a_dash_and_needs_no_pane() {
+        let dir = fresh_root("bee-activity-dash-data");
+        enable_terminal(&dir);
+        let root = fresh_root("bee-activity-dash-project");
+        quiet_in_progress_lane(&root, "dash-feat", "df-1");
+        write(
+            &root,
+            ".bee/sessions/live-unclaimed.json",
+            &activity_session_json(
+                "live-unclaimed",
+                "working",
+                &rfc3339_seconds_ago(3),
+                None,
+                &root,
+                Some("dash-feat"),
+                None,
+            ),
+        );
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "bee-activity-dash");
+        let app = router(st);
+
+        let board = get_body(&app, &format!("/p/{}/_bee", project.id)).await;
+        assert!(
+            board.contains(
+                r#"<span class="bee-hub__agent-state bee-hub__agent-state--working">agent: working</span>"#
+            ),
+            "a session in no herdr pane still names its agent on the card (A2's feature join): {board}"
+        );
+        assert!(
+            board.contains(r#"<span class="bee-hub__agent-cell">—</span>"#),
+            "an absent cell renders as a dash (A1): {board}"
+        );
+        assert!(
+            board.contains(
+                r#"<span class="bee-hub__stat-num">0</span><span class="bee-hub__stat-label">need you</span>"#
+            ),
+            "working is not need-you: {board}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

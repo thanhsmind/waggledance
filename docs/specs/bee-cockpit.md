@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
 updated: 2026-08-22
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout]
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity]
 decisions: []
 coverage: partial
 ---
@@ -77,7 +77,9 @@ now, then what there is to work on:
 - **Pinned**, the live agent terminals. Same inventory and same order as the
   terminals view's own switcher: blocked first, then working, then the rest.
   Each row carries a status dot, the project it belongs to, and its workspace
-  and tab, and leads to that terminal. That address names the pane and nothing
+  and tab, and leads to that terminal. A row whose terminal a live agent
+  session claims also names that agent's own state and the feature it is
+  working; a row no such session claims reads exactly as it did before. That address names the pane and nothing
   else — a terminal's own title, session name and working directory never appear
   on this page. The group's heading is itself a link to the terminals view, and
   the group renders whether or not the terminal supervisor is running, so that
@@ -120,7 +122,9 @@ parts sit, never what they say:
   what is in progress, how much of that is sitting at a gate or a paused note,
   and what is ready to merge. Each figure jumps to the section it counts, and
   a figure of zero is drawn faint rather than hidden. The waiting mark is
-  carried by in-progress work alone, so **need you** lands on In Progress.
+  carried by in-progress work alone, so **need you** lands on In Progress,
+  and it counts an agent that needs approval and one that needs an answer
+  alike (see "The agent at work on a card," below).
 - The groups stack top down in the order the question is asked: whatever
   carries a waiting mark first, then ready to merge, then in progress, then
   the rest, with the archive still a collapsed bar at the bottom. At this
@@ -237,6 +241,13 @@ already shipped — is placed into exactly one of three groups:
   still placed here, which is the case this group exists to catch.
 - **In Progress** — every other feature that still has live work and is not waiting on
   a person.
+- **Ready to merge** — a feature whose work is finished in its own worktree and is
+  waiting only for the human to land it: the worktree is still open, the execution
+  gate was approved, and every cell that was not dropped is capped (a worktree with
+  no cells at all is never ready). The card says whether the acceptance test is
+  already approved or still pending, and how long the feature has been ready
+  (its latest cap); approved cards come first. Once bee records its own
+  merge-readiness fact, that fact outranks this derivation.
 - **Finished** — a feature that has either fully shipped (compounding complete) or been
   archived. A card in this group carries a chip naming the state of its worktree: still
   the main checkout, an open worktree, or one already merged.
@@ -274,6 +285,51 @@ matched to the feature that owes it, so sibling cards of the same project each s
 exactly their own, and a card with nothing owed shows no badge at all. All of these
 signals live on the cards themselves — none of them brings back a board-level panel,
 and none of them moves a card between groups.
+
+### The agent at work on a card
+
+Beside those signals, a card whose feature has a live agent session says what
+that agent is doing right now. The reading comes from bee's own per-session
+record inside the project's store — read, never written, like everything else
+on this surface — and it reaches a card through the feature the session says
+it is working. When several sessions name the same feature, the one that spoke
+last speaks for the card: the line names a single agent, so it names the
+freshest.
+
+The line reads **agent: state · cell · quiet age**:
+
+- **State** is one of five words — *working*, *idle*, *exited*, and the two
+  that call for a person: *needs an answer* and *needs approval*. The word
+  itself is always printed beside its colour, so the state never speaks by
+  colour alone, and a state a newer bee invents is carried through as it was
+  rather than forced into one of the five.
+- **Cell** is the title of the cell the agent holds, falling back to its bare
+  id when the store no longer knows the title. An absent cell — or an absent
+  feature anywhere this reading appears — renders as a dash, never as a blank
+  and never as an error.
+- **Quiet age** is how long ago that record last spoke: seconds under a
+  minute, whole minutes above it.
+
+A record that has not spoken for more than ninety seconds also carries a
+muted **no signal** marker. Its state still reads; what changes is that
+nothing counts it as a call for a person.
+
+Two rules follow this reading wherever else it surfaces:
+
+- **"Need you" means both kinds of call.** A session that needs approval and
+  one that needs an answer each count as needing a person — in the In Progress
+  group's waiting chip, in the phone layout's *need you* figure, in the pinned
+  rows and in the agents listing alike, all from one shared rule, so no two of
+  them can ever disagree. A session that has stopped speaking is counted by
+  none of them.
+- **The agent's own state outranks the screen.** Where the agent's reported
+  state and the terminal supervisor's screen-derived status both describe the
+  same terminal, the reported state decides the dot's colour, the word printed
+  beside it, the order In Progress cards sit in, and the order agents are
+  listed in. A terminal no agent session claims reads exactly as it always did.
+
+Worker nicknames are never rendered anywhere in this: the line says what the
+agent is doing and which cell it holds, never who it is.
 
 ### The terminals running behind a card
 

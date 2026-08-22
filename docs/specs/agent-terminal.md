@@ -1,7 +1,7 @@
 ---
 area: agent-terminal
-updated: 2026-08-13
-sources: [agent-terminal, terminal-open-access, scroll-fab-follow]
+updated: 2026-08-22
+sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity]
 decisions: [D1, D2, D3, D4, D5, D6, D7, D8, D9, D10]
 coverage: partial
 ---
@@ -53,14 +53,14 @@ implementation. Code entry points are listed in `reading-map.md`.
 |---|---|---|---|
 | 1 | Agent | One coding agent herdr is running, addressed by its own id | id, folder (via its pane), status, the program it runs, current screen |
 | 2 | Pane | The addressable session, listed whether or not an agent runs inside it: every agent has exactly one, and a session opened with no agent started in it is listed too, as a shell | id, workspace and tab it sits in, launch folder, live folder, status, an agent when one is attached |
-| 2a | Status | What a listed session is doing, shown as a named dot on its entry | working, blocked, done, idle, unknown, or shell for a session with no agent; the first three each read as their own colour, the rest as the quiet one |
+| 2a | Status | What a listed session is doing, shown as a named dot on its entry | working, blocked, done, idle, unknown, or shell for a session with no agent; the first three each read as their own colour, the rest as the quiet one. A session the bee harness reports on reads that report instead — working, needs an answer, needs approval, idle, exited — and the reported state outranks the screen-derived one wherever both describe the same pane: needs approval and needs an answer both take the blocked colour, the rest the quiet one, and every state prints its own word beside the dot. A session no bee record claims keeps the screen-derived reading, unchanged |
 | 3 | Screen | The agent's recent terminal contents, rendered with colour | a snapshot redrawn on each poll, not a live feed; a bounded tail of up to 200 lines of the pane's own scrollback rather than only the rows currently on screen, so a plain shell shows work that has already scrolled past, while an agent that redraws a full-screen interface has no scrollback to give and shows exactly its current frame; shown at the full height of one pane frame with its lines unwrapped, the box scrolling in both directions rather than re-flowing the frame; rendered in full 24-bit colour rather than a limited palette, since agents' own output overwhelmingly uses colour beyond the basic 16 or 256-colour sets |
 | 4 | Transcript | The agent's own activity log, read directly rather than through herdr | a gap-free running record of the agent's activity, independent of the screen poll; a fresh agent with nothing written yet reports that plainly rather than showing an empty log; if the record is found truncated or rewritten under the reader, the next read shows a visible divider rather than jumping silently; a single poll returns only a bounded number of lines, and when a poll has more than that bound, its oldest lines are marked as lost rather than silently dropped |
 | 5 | Terminal switch | The one switch standing between anyone who can reach the daemon and the terminal, transcript, and agent-creation family — there is no credential behind it | on / off, off by default |
 | 6 | Unassigned agents | Agents whose working directory is outside every registered project's root | listed on their own page, reachable only while both the terminal switch and this group's own switch (below) are on |
 | 7 | Unassigned group switch | The Unassigned group's own switch, separate from the terminal switch above — turning the terminal switch on alone does not open this group | on / off, off by default |
 | 8 | Keep herdr running | Opt-in duty: waggledance keeps the herdr process alive on the operator's behalf | on / off, off by default |
-| 9 | Notify on status change | Opt-in duty: waggledance sends a notification message when a watched agent's status changes | on / off, off by default; needs a destination and a credential configured separately |
+| 9 | Notify on status change | Opt-in duty: waggledance sends a notification message when a watched agent's status changes, and when a bee-reported agent starts needing a person or exits | on / off, off by default; needs a destination and a credential configured separately |
 | 10 | Notify credential | The secret used to send that notification message | write-only: once saved, it is never shown again in full — only a masked hint — and it never appears in any viewed or exported configuration; if a save fails, the operator is told it failed — it is never reported as saved |
 
 ## Behaviors & Operations
@@ -201,6 +201,20 @@ implementation. Code entry points are listed in `reading-map.md`.
   its Enter, immediately — though no current page produces that shape: the
   Approve control submits the literal word "Approve" as its text, so it
   takes the settle wait like any other reply.
+- **Approve is offered only where the agent is actually at a permission
+  prompt.** The one-tap Approve control is live in exactly two cases: when the
+  bee harness reports that this session needs approval, and when no bee session
+  claims the pane at all — nothing is known there, so nothing is withheld and
+  the control behaves as it always has. For every other reported state — needs
+  an answer, working, idle, exited — the control is still shown but refuses,
+  explaining in its own hover text that Approve answers a permission prompt and
+  naming the state the agent is actually in. A refused control also *reads* as
+  refused: dimmed, declining the pointer, and sending nothing at all when
+  clicked, whatever produced the click. Staging and sending text by hand are
+  untouched, so answering an agent is never blocked by this — only the one-tap
+  shortcut is. The gate is as fresh as the page's last load: an agent that
+  leaves its prompt after the page was drawn can still show an enabled Approve
+  until the page is drawn again.
 - **Afterwards:** the agent's next screen poll reflects whatever it did with
   the input.
 
@@ -471,6 +485,17 @@ authentication, and each still holds:
   never shown again in full once saved, and never appears in any viewed or
   exported configuration). Off by default; waggledance makes no outbound call
   until this is turned on.
+- **What a bee-reported agent adds to that duty:** where the bee harness
+  records its own agent activity for a registered project, that record is
+  watched on the same tick and speaks through the same outbox. It says
+  something exactly twice per episode: once when a session starts needing a
+  person — needing approval or needing an answer — and once when that session
+  exits. Rising from needing an answer to needing approval is not a second
+  announcement, and neither is quietly going back to work: a person is told
+  they are needed, not told repeatedly. The same run-ownership suppression that
+  keeps waggledance silent about panes another operator's run owns reaches
+  these messages too, on the session's own pane when it has one. A project
+  registered while the daemon is already running is picked up on the next tick.
 - Both duties, together with the notification destination and credential,
   are switched on and changed from the settings page, the same as every
   other setting on that same page (see Actors & Access) — no separate
@@ -561,6 +586,13 @@ operates waggledance every time the network path to its port changes.
   content, a per-file size ceiling, a per-pane count ceiling with a daily
   sweep — and lives outside every project folder so attaching never
   dirties a repository.
+- **Where a bee-reported state attaches.** A bee session names the pane it
+  occupies, so it is matched to a pane by that pane's own id; the checkout it
+  runs in decides which project it belongs to, through the same containment
+  check panes already use, so a session running in a project's branch worktree
+  belongs to that project; and the feature it names decides which board card
+  it appears on. None of this is ever written back — the record is read only,
+  and a malformed one is dropped without taking its session with it.
 - **An agent is not its pane.** "Agent" is the coding agent herdr is
   running; "pane" is the session it runs inside. Every agent has exactly one
   pane, but the reverse does not hold — a plain shell opened with no agent
@@ -592,6 +624,9 @@ operates waggledance every time the network path to its port changes.
 - A screen poll failing for a reason other than herdr being down: the last
   screen stays on view with a "reconnecting…" indicator, never replaced by
   the down message.
+- A bee record that has stopped speaking for more than ninety seconds: its
+  state still reads, marked as having no signal, and it counts as needing
+  nobody — never as a silent call for a person.
 - A pane's screen diverging while stepped back to older output: the next
   step falls back once to a full restore-and-replay, and what was
   remembered about that pane's position is cleared.
@@ -665,6 +700,17 @@ No settled screenshot captured yet.
   including traversal rejection and symlink resolution).
 - `crates/waggledance-core/src/notify_store.rs` — the notification outbox used
   only when the notify duty is on.
+- `crates/waggledance-core/src/bee.rs` — the session record's `activity` object
+  and the `signal` derived at read (live, else no signal past 90 s), plus the
+  one place the five states map onto their words.
+- `crates/waggledance/src/views.rs` — `pane_tone`, `pane_status_pill` and
+  `pane_needs_you`, the single spelling of the precedence and need-you rules
+  every status surface reads, and `pane_controls`' Approve gate
+  (`data-agent-state` on the reply form, the `disabled` button and its title);
+  `crates/waggledance/assets/app.js` refuses a click on the disabled button in
+  both handlers.
+- `crates/waggledance/src/watcher.rs` with `crates/waggledance/src/notify/` —
+  the second cursor over bee session activity riding the existing 2 s tick.
 - `crates/waggledance-core/src/ansi.rs` — translating a raw screen into safe,
   coloured HTML.
 - `docs/history/agent-terminal/CONTEXT.md` — Outstanding Questions, for the

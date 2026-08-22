@@ -3,10 +3,10 @@
 //! `/highlight.css` (syntect class-based), so themes switch without re-render.
 
 use waggledance_core::bee::{
-    feature_cell_span, list_archived_feature_dirs, BeeApprovedGates, BeeBacklog, BeeBuckets,
-    BeeCell, BeeDecisionSummary, BeeDeferredEntry, BeeFeaturePhase, BeePbi, BeeProjectRollup,
-    BeeReview, BeeReviewStatus, BeeSession, BeeShippedFeature, BeeSnapshot, BeeWorkspace,
-    BeeWorktree,
+    feature_cell_span, list_archived_feature_dirs, BeeActivity, BeeActivityState, BeeApprovedGates,
+    BeeBacklog, BeeBuckets, BeeCell, BeeDecisionSummary, BeeDeferredEntry, BeeFeaturePhase, BeePbi,
+    BeeProjectRollup, BeeReview, BeeReviewStatus, BeeSession, BeeShippedFeature, BeeSignal,
+    BeeSnapshot, BeeWorkspace, BeeWorktree,
 };
 use waggledance_core::code_source::DirListing;
 use waggledance_core::config::Config;
@@ -802,16 +802,30 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
             // working name themselves, everything else (idle, done,
             // unknown) reads quiet rather than borrowing another state's
             // colour.
-            let tone = match pane.view.status.as_str() {
-                "blocked" => "blocked",
-                "working" => "working",
-                _ => "idle",
+            let tone = pane_tone(&pane.view);
+            // A6: a pinned row of a pane a live bee session claims says that
+            // session's own state word and the feature lane it is bound to,
+            // after the workspace/tab meta. Absent either one, nothing is
+            // rendered in its place — the row simply stays as it was.
+            let bee_state_html = match &pane.view.bee_state {
+                Some(state) => format!(
+                    r#"<span class="pinned-row__state">{word}</span>"#,
+                    word = esc(state.word()),
+                ),
+                None => String::new(),
+            };
+            let bee_feature_html = match &pane.view.bee_feature {
+                Some(feature) => format!(
+                    r#"<span class="pinned-row__feature">{feature}</span>"#,
+                    feature = esc(feature),
+                ),
+                None => String::new(),
             };
             rows.push_str(&format!(
                 r#"<li class="pinned-row">
   <a class="pinned-row__link{on_class}" href="{href}"{aria}>
     <span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" role="img" aria-label="{status}"></span><span class="pinned-row__name">{label}</span>
-    <span class="pinned-row__meta">{workspace} · {tab}</span>
+    <span class="pinned-row__meta">{workspace} · {tab}</span>{bee_state_html}{bee_feature_html}
   </a>
 </li>"#,
                 on_class = if on { " pinned-row__link--on" } else { "" },
@@ -824,10 +838,12 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
                 // words to summarise. So the dot carries its own text
                 // alternative rather than being `aria-hidden`: the status
                 // is never spoken by colour alone.
-                status = esc(&pane.view.status),
+                status = esc(pane_status_word(&pane.view)),
                 label = esc(&pane.project_label),
                 workspace = esc(&pane.view.workspace),
                 tab = esc(&pane.view.tab),
+                bee_state_html = bee_state_html,
+                bee_feature_html = bee_feature_html,
             ));
         }
         format!(r#"<ul class="pinned-list">{rows}</ul>"#, rows = rows)
@@ -957,9 +973,13 @@ fn project_row_dot(panes: &[TerminalPaneView]) -> String {
     }
     // Worst news first, the same precedence the board's own In Progress
     // ordering uses: blocked outranks working, which outranks quiet.
-    let tone = if agents.iter().any(|p| p.status == "blocked") {
+    // A3: bee's own state wins over herdr's screen-derived status for any
+    // pane a live bee session claims — [`pane_tone`] is that one precedence,
+    // and the pills on the row's next line say the same words through
+    // [`pane_status_pill`], so dot and words still cannot disagree.
+    let tone = if agents.iter().any(|p| pane_tone(p) == "blocked") {
         "blocked"
-    } else if agents.iter().any(|p| p.status == "working") {
+    } else if agents.iter().any(|p| pane_tone(p) == "working") {
         "working"
     } else {
         "idle"
@@ -1102,7 +1122,7 @@ fn terminal_badges_nav_from_refs(
             r#"<a class="proj-row__badge" href="/p/{pid}/_terminal/pane/{pane_id}">{status_pill}<span class="proj-row__badge-program">{program}</span>{title_span}</a>"#,
             pid = pid,
             pane_id = esc(&p.pane_id),
-            status_pill = status_pill(&p.status),
+            status_pill = pane_status_pill(p),
             program = esc(&p.kind),
         ));
     }
@@ -1145,7 +1165,7 @@ fn bee_hub_terminal_badge_groups(
     let (active, quiet): (Vec<&TerminalPaneView>, Vec<&TerminalPaneView>) = agents
         .iter()
         .copied()
-        .partition(|p| matches!(p.status.as_str(), "working" | "blocked"));
+        .partition(|p| matches!(pane_tone(p), "working" | "blocked"));
     let active_nav = terminal_badges_nav_from_refs(
         project_id,
         &active,
@@ -1382,6 +1402,10 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
 }
 .term-reply__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
 .term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-1) var(--space-3); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; }
+/* A4: Approve is withheld unless bee says this agent is at a permission
+   prompt. It stays in place, same size, so the row never reflows as a state
+   changes — only its weight drops, and its `title` says why. */
+.term-reply__approve:disabled { opacity: .5; cursor: not-allowed; }
 /* Send is the primary of the pair — Stage beside it stays the quiet one. */
 .term-reply__send { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); }
 /* One tight control block under the screen, on a single line: the arrows and
@@ -1516,7 +1540,7 @@ fn pane_tab(link: &str, p: &TerminalPaneView, active: bool, extra: &str) -> Stri
         href = esc(link),
         workspace = esc(&p.workspace),
         tab = esc(&p.tab),
-        status_pill = status_pill(&p.status),
+        status_pill = pane_status_pill(p),
         program = esc(&p.kind),
     )
 }
@@ -1618,6 +1642,105 @@ pub struct TerminalPaneView {
     /// different field carried here for that reason. A shell pane (no
     /// agent) carries the empty string.
     pub title: String,
+    /// A3: what bee's own hook runtime last recorded the agent in this pane
+    /// doing (`activity.state`), joined by `activity.pane == pane_id`
+    /// (A2) in `server.rs::project_bee_activity`. `None` for a pane no live
+    /// bee session claims — a plain shell, an agent bee never saw, or a bee
+    /// older than 2.20.0 — and every surface then keeps herdr's
+    /// screen-derived `status` exactly as before. Where both exist, bee
+    /// wins ([`pane_tone`]).
+    pub bee_state: Option<BeeActivityState>,
+    /// The feature lane that same session is bound to (`activity.feature`).
+    /// `None` for an unbound session, which renders as nothing rather than
+    /// as an error (A1).
+    pub bee_feature: Option<String>,
+    /// A1/A3: that session's activity record has stopped speaking
+    /// (`signal == no_signal`, 90 s on `activity.at`). Carried beside
+    /// `bee_state` rather than folded into it because the state still reads
+    /// — the record simply may no longer be true — and A3 says a
+    /// `no_signal` record is a muted marker that is never counted as
+    /// need-you. `false` whenever `bee_state` is `None`.
+    pub bee_no_signal: bool,
+}
+
+/// A2/A6: one live bee session's `activity`, joined to a project by
+/// `server.rs::project_bee_activity`. The pane join (`activity.pane`) and
+/// the card join (`activity.feature`) hand out this same entry, so a badge,
+/// a Pinned row and a card agent line can never read different records for
+/// the same session.
+///
+/// `signal` rides along because A3's "`no_signal` is a muted marker, never
+/// need-you" cannot be decided from the state alone; `cell_title` is
+/// resolved by the caller (only `server.rs` holds
+/// [`BeeSnapshot::buckets`]), so the card can print a cell's title rather
+/// than its bare id.
+#[derive(Debug, Clone)]
+pub struct BeeActivityEntry {
+    pub activity: BeeActivity,
+    pub signal: BeeSignal,
+    /// The title of `activity.cell` when this project's store still holds
+    /// that cell. `None` when the session holds no claim, or the cell has
+    /// archived out of the live buckets — the card then falls back to the
+    /// bare id (A6).
+    pub cell_title: Option<String>,
+}
+
+impl BeeActivityEntry {
+    /// A3: need-you = `blocked ∪ waiting_input`, minus anything that has
+    /// stopped speaking. A record 2 minutes cold still says what it last
+    /// said, but it is not a live call for the human, so it never reaches a
+    /// count.
+    pub fn needs_you(&self) -> bool {
+        self.activity.state.needs_you() && self.signal != BeeSignal::NoSignal
+    }
+}
+
+/// A2's card join: every live bee session on a feature, keyed by that
+/// session's `activity.feature`.
+pub type BeeFeatureActivity = std::collections::HashMap<String, Vec<BeeActivityEntry>>;
+
+/// A3's precedence, in ONE place: bee's own state wins over herdr's
+/// screen-derived status wherever both exist for a pane. Answers the three
+/// tone keys every status surface here already speaks — the rail dot
+/// ([`project_row_dot`]), the Pinned row, the badge pill ([`status_pill`]),
+/// the In Progress tier ([`bee_hub_in_progress_tier`]) and
+/// `server.rs::terminals_status_rank` — so none of them can drift from
+/// another. Both need-you states read `blocked` (that is the tone the board
+/// exists to surface); `working` reads working; `idle`, `exited` and an
+/// unknown state read quiet. With no bee record the pane keeps today's
+/// herdr mapping, byte for byte.
+pub(crate) fn pane_tone(pane: &TerminalPaneView) -> &'static str {
+    match &pane.bee_state {
+        Some(state) if state.needs_you() => "blocked",
+        Some(BeeActivityState::Working) => "working",
+        Some(_) => "idle",
+        None => match pane.status.as_str() {
+            "blocked" => "blocked",
+            "working" => "working",
+            _ => "idle",
+        },
+    }
+}
+
+/// The one word a pane's status reads as, so status never speaks by colour
+/// alone: bee's own state word ("needs approval", "needs an answer", …)
+/// when the session record has one (A3), else herdr's status verbatim.
+fn pane_status_word(pane: &TerminalPaneView) -> &str {
+    match &pane.bee_state {
+        Some(state) => state.word(),
+        None => pane.status.as_str(),
+    }
+}
+
+/// A3's need-you for one pane, the same rule [`BeeActivityEntry::needs_you`]
+/// applies to a session: bee's state when there is one — never counting a
+/// record that has stopped speaking — and herdr's `blocked` when there is
+/// not.
+fn pane_needs_you(pane: &TerminalPaneView) -> bool {
+    match &pane.bee_state {
+        Some(state) => state.needs_you() && !pane.bee_no_signal,
+        None => pane.status == "blocked",
+    }
 }
 
 /// homepage-terminals: one agent-backed pane the homepage's Terminals tab
@@ -1839,7 +1962,8 @@ fn screen_frame(pane: &TerminalsMenuPane) -> String {
             &pane.view.pane_id,
             &pane.view.name,
             pane.is_project_pane,
-            Some(&pane.base)
+            Some(&pane.base),
+            pane.view.bee_state.as_ref()
         ),
     )
 }
@@ -1853,7 +1977,17 @@ fn screen_frame(pane: &TerminalsMenuPane) -> String {
 /// row does not have is never borrowed from another state's colour. The
 /// pill's own text always names the state, whichever it is.
 fn status_pill(status: &str) -> String {
-    let modifier = match status {
+    status_pill_toned(status, status)
+}
+
+/// [`status_pill`]'s two halves pulled apart, so A3's precedence can keep
+/// the pill's TONE and its WORD from the same reading without either
+/// surface re-deriving the other. `tone` picks the `.fg-status` modifier by
+/// exactly the mapping above; `word` is the text the pill prints. The
+/// plain [`status_pill`] passes one value for both, which is what every
+/// pre-bee caller has always done.
+fn status_pill_toned(tone: &str, word: &str) -> String {
+    let modifier = match tone {
         "done" => " fg-status--ready",
         "working" => " fg-status--warn",
         "blocked" => " fg-status--blocked",
@@ -1862,8 +1996,20 @@ fn status_pill(status: &str) -> String {
     format!(
         r#"<span class="fg-status{modifier}"><span class="fg-status__dot"></span>{status}</span>"#,
         modifier = modifier,
-        status = esc(status),
+        status = esc(word),
     )
+}
+
+/// One pane's status pill under A3's precedence: bee's own state colours
+/// AND names the pill when the session record has one — a `blocked` bee
+/// session reads "needs approval" in the blocked tone even while herdr's
+/// screen scrape still says `idle` — and herdr's status renders exactly as
+/// before when it does not.
+fn pane_status_pill(pane: &TerminalPaneView) -> String {
+    match &pane.bee_state {
+        Some(state) => status_pill_toned(pane_tone(pane), state.word()),
+        None => status_pill(&pane.status),
+    }
 }
 
 /// Shared by [`terminal_page`] and [`unassigned_terminal_page`]: one pane's
@@ -1916,7 +2062,7 @@ fn pane_cards(
 </div>"#,
             pane_id = esc(&p.pane_id),
             name = esc(&p.name),
-            controls = pane_controls(&p.pane_id, &p.name, attach, base),
+            controls = pane_controls(&p.pane_id, &p.name, attach, base, p.bee_state.as_ref()),
         ));
     }
     out
@@ -1936,10 +2082,42 @@ fn pane_cards(
 /// callers ([`terminal_page`], [`unassigned_terminal_page`]) both pass
 /// `None`: their controls already resolve through that project-scoped
 /// fallback and must render byte-identical markup to before this cell.
-fn pane_controls(pane_id: &str, name: &str, attach: bool, base: Option<&str>) -> String {
+///
+/// A4: `bee_state` is the pane's own [`TerminalPaneView::bee_state`], threaded
+/// in by the two callers that hold the view. It rides the form as
+/// `data-agent-state="<word>"` (the same word every other surface prints —
+/// [`BeeActivityState::word`], never a second spelling) and gates the Approve
+/// button: enabled for `blocked` and for a pane with no bee record at all,
+/// `disabled` with the reason in its `title` for every other state. Known
+/// limit: the card is server-rendered and the screen poller only replaces
+/// `.term-screen` text, so this gate is as fresh as the last page load.
+fn pane_controls(
+    pane_id: &str,
+    name: &str,
+    attach: bool,
+    base: Option<&str>,
+    bee_state: Option<&BeeActivityState>,
+) -> String {
     let base_attr = base
         .map(|b| format!(r#" data-term-base="{}""#, esc(b)))
         .unwrap_or_default();
+    let state_attr = bee_state
+        .map(|s| format!(r#" data-agent-state="{}""#, esc(s.word())))
+        .unwrap_or_default();
+    // A4: Approve types a one-tap "Approve" into the pane, which only ever
+    // answers a permission prompt. bee's own state is the only reading that
+    // knows whether one is on screen, so the button is offered for `blocked`
+    // and withheld — visibly, with the reason in its title — for every other
+    // state a live session reports. A pane no bee session claims keeps
+    // today's always-enabled button byte for byte: withholding it there
+    // would take away a working control on the evidence of nothing.
+    let approve_btn = match bee_state {
+        Some(state) if !matches!(state, BeeActivityState::Blocked) => format!(
+            r#"<button type="button" class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is {word}">Approve</button>"#,
+            word = esc(state.word()),
+        ),
+        _ => r#"<button type="button" class="term-reply__approve">Approve</button>"#.to_string(),
+    };
     let attach_block = if attach {
         format!(
             r#"
@@ -1971,10 +2149,10 @@ fn pane_controls(pane_id: &str, name: &str, attach: bool, base: Option<&str>) ->
       <button type="button" data-key="ctrl+c">Ctrl+C</button>
     </div>
   </div>
-  <form class="term-reply" data-pane-id="{pane_id}"{base_attr}>
+  <form class="term-reply" data-pane-id="{pane_id}"{base_attr}{state_attr}>
     <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>{attach_block}
     <div class="term-reply__actions">
-      <button type="button" class="term-reply__approve">Approve</button>
+      {approve_btn}
       <button type="button" class="term-reply__stage">Stage</button>
       <button type="submit" class="term-reply__send">Send</button>
     </div>
@@ -1983,6 +2161,8 @@ fn pane_controls(pane_id: &str, name: &str, attach: bool, base: Option<&str>) ->
         name = esc(name),
         attach_block = attach_block,
         base_attr = base_attr,
+        state_attr = state_attr,
+        approve_btn = approve_btn,
     )
 }
 
@@ -2416,6 +2596,7 @@ pub fn bee_board_page(
     project: &Project,
     snapshot: &BeeSnapshot,
     feature_panes: &std::collections::HashMap<String, Vec<TerminalPaneView>>,
+    feature_activity: &BeeFeatureActivity,
 ) -> String {
     let body = format!(
         r#"{topbar}
@@ -2434,7 +2615,7 @@ pub fn bee_board_page(
         style = bee_hub_style(),
         top = bee_board_top(project),
         live = bee_live_strip_section(snapshot),
-        board = bee_feature_hub_section(project, snapshot, feature_panes),
+        board = bee_feature_hub_section(project, snapshot, feature_panes, feature_activity),
         finished = bee_finished_section(&project.id, &snapshot.shipped),
         panels = bee_panels_section(snapshot),
     );
@@ -2618,7 +2799,7 @@ fn bee_hub_style() -> String {
    have spread the badge away from the title it annotates instead of
    keeping the pair together. Scoped to `.bee-hub__summary` so the archive
    bar's own chevron (ctk-5) keeps sitting after its count chip. */
-.bee-hub__summary { display: flex; align-items: center; gap: 10px; padding: 12px 14px 10px; cursor: pointer; list-style: none; min-width: 0; }
+.bee-hub__summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 14px 10px; cursor: pointer; list-style: none; min-width: 0; }
 .bee-hub__summary .bee-hub__chev { margin-left: auto; }
 .bee-hub__summary::-webkit-details-marker { display: none; }
 .bee-hub__summary:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
@@ -2660,18 +2841,74 @@ fn bee_hub_style() -> String {
    band), truncated with an ellipsis rather than wrapped so a long branch
    never grows the card. Rendered only where a worktree exists; see
    `bee_hub_card`'s `branch_html` for why "Main" renders no row at all. */
+/* A6: the card's own agent line, directly under the card name in the
+   collapsed summary. Mono at the branch row's small size, because every
+   part of it -- the state word, the cell, the quiet age -- is machine
+   vocabulary rather than prose, and the whole line is muted so it reads as
+   an annotation of the title above rather than a second title. The state
+   word carries the only colour on the line, and only for the two states
+   that are actually a call for the human: `--needs-you` takes the same
+   danger tone the blocked status pill uses (A3 -- and the word is always
+   printed beside it, so the state never speaks by colour alone).
+   `no signal` (A1) is the quietest thing on the card: a muted marker that
+   says the record has stopped speaking, never a need-you. */
+/* agent-line-own-row: the agent line is a second ROW of the summary, never a
+   column beside the title — `flex: 1 0 100%` makes it take the whole width
+   after the title, state badge and chevron have filled row one, and
+   `order` keeps it last however those three wrap. It inherits the
+   summary's horizontal padding, so it carries none of its own. */
+.bee-hub__agent { flex: 1 0 100%; order: 10; display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: 0; padding: 0; font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
+.bee-hub__agent-state { color: var(--color-text-muted); }
+.bee-hub__agent-state--working { color: var(--color-warning); }
+.bee-hub__agent-state--needs-you { color: var(--color-danger); }
+.bee-hub__agent-cell { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bee-hub__agent-quiet { color: var(--color-text-subtle); }
+.bee-hub__agent-signal { color: var(--color-text-subtle); font-style: italic; }
+/* (bee-agent-activity R1) The Ready to merge row's own second line — the
+   same muted mono summary row the agent line is, on a dense
+   `.bee-hub__row` instead of a card summary. `.bee-hub__row` is
+   `display: block`, so this needs no `flex: 1 0 100%; order` pair to claim
+   the full width the way `.bee-hub__agent` does inside the flex summary: a
+   block `<p>` already takes the row. `uat approved` and `uat pending` are
+   words first and colours second — the row still reads correctly with no
+   colour at all. */
+.bee-hub__merge { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: var(--space-1) 0 0; padding: 0; font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
+.bee-hub__merge-uat--approved { color: var(--color-success); }
+.bee-hub__merge-uat--pending { color: var(--color-warning); }
+.bee-hub__merge-since { color: var(--color-text-subtle); }
 .bee-hub__branch { display: flex; align-items: center; gap: var(--space-1); min-width: 0; color: var(--color-text-muted); }
 .bee-hub__branch svg { flex: none; }
+/* R2: the same branch row on a Ready to merge dense row, where it sits
+   under the name inside the row's own anchor and so needs stating the gap
+   the card's body flow gives it for free. */
+.bee-hub__row .bee-hub__branch { margin-top: var(--space-1); }
 .bee-hub__branch-name { font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); letter-spacing: var(--type-micro-tracking); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* ctk-6: the console card's footer, set off by a hairline above it -- the
-   activity glyph and its label on the left, the relative time pushed to
-   the right edge by its own auto margin, and the live pulse dot in
-   between where `bee_hub_is_working_now` already put it. The time reads in
-   the mono face, as every timestamp in the digest's own footers does. */
+/* ctk-6: the console card's footer, set off by a hairline above it.
+   bee-agent-activity R2 makes it the card's ONE closing line: the cells
+   ring and its `n/m cells` reading on the left, the relative time pushed
+   to the right edge by its own auto margin. The activity glyph and the
+   "Last activity" label are gone with the progress bar that used to sit
+   above them -- three lines were saying two things, and a time in a card's
+   footer needs no label to be read as one. The time reads in the mono
+   face, as every timestamp in the digest's own footers does. */
 .bee-hub__footer { display: flex; align-items: center; gap: var(--space-1); min-width: 0; margin-top: 2px; padding-top: 8px; border-top: var(--border-width-hairline) solid var(--color-border); color: var(--color-text-subtle); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); }
-.bee-hub__footer svg { flex: none; }
-.bee-hub__activity-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bee-hub__cells { display: inline-flex; align-items: center; gap: var(--space-1); flex: none; min-width: 0; font-family: var(--font-mono); letter-spacing: var(--type-micro-tracking); }
+/* R2: the ring that replaced the 3px bar -- filled in the same success
+   green the bar used when every cell is capped, half-filled while the work
+   is under way, hollow and muted when nothing has closed yet. It is the
+   glance; the fraction printed beside it is what states the actual
+   numbers, so the ring never carries a reading by colour alone. */
+.bee-hub__cells-glyph { flex: none; width: 10px; height: 10px; border-radius: var(--radius-pill); border: var(--border-width-strong) solid var(--color-border-strong); }
+.bee-hub__cells-glyph--done { border-color: var(--color-success); background: var(--color-success); }
+.bee-hub__cells-glyph--partial { background: conic-gradient(var(--color-success) 0 50%, transparent 0 100%); }
+.bee-hub__cells-glyph--none { border-color: var(--color-text-subtle); }
 .bee-hub__activity-time { margin-left: auto; flex: none; font-family: var(--font-mono); letter-spacing: var(--type-micro-tracking); }
+/* kanban-live-signals D1 under R2: the pulse takes the auto margin when it
+   renders, so the dot and the time travel to the right edge as one pair --
+   the dot stays an annotation of the time rather than drifting to the left
+   of the free space now that the cells reading holds that side. */
+.bee-hub__footer .bee-hub__pulse { margin-left: auto; }
+.bee-hub__footer .bee-hub__pulse + .bee-hub__activity-time { margin-left: 0; }
 /* D4: the feature-detail link row -- the one place the card still reaches
    its own detail page now that the `<details>` can no longer be that link
    itself. */
@@ -2709,12 +2946,6 @@ fn bee_hub_style() -> String {
    already drawn them. */
 .bee-hub__quiet-note { border-top: var(--border-width-hairline) solid var(--color-border); margin: 0; padding: var(--space-2) 14px; color: var(--color-text-muted); }
 .bee-hub__badges + .bee-hub__quiet-note { border-top: 0; padding-top: 0; }
-/* ctk-6: the cell-count line is the digest's counts slot -- mono, at the
-   digest's 10-10.5px meta size. `bee_hub_card` renders no markup here at
-   all for a feature with no cells, so this line never states a zeroed
-   division artifact -- a guarantee asserted page-wide against the exact
-   literal, which is why this comment does not spell it either. */
-.bee-hub__progress-label { margin: 0; font-family: var(--font-mono); font-size: var(--type-tag-size); letter-spacing: var(--type-tag-tracking); color: var(--color-text-muted); }
 .bee-hub__reason { font-style: italic; }
 /* kanban-live-signals D2: the run_state badge rides in the collapsed
    `<summary>` beside the title (see `bee_hub_card`'s own doc comment) --
@@ -2885,13 +3116,6 @@ fn bee_hub_style() -> String {
 .bee-panel__list { display: flex; flex-direction: column; gap: var(--space-2); }
 .bee-severity--p1 { font-weight: var(--weight-strong); }
 .bee-asof { color: var(--color-text-subtle); font-size: var(--type-body-sm-size); }
-/* ctk-6: the cell-count bar reads at the console's own hairline register
-   rather than the 8px slab it was -- the digest's board carries no chunky
-   meters, and the counts line beside it is what states the actual
-   numbers. Like the count line, `bee_hub_card` renders it not at all when
-   the feature has no cells. */
-.bee-progress { height: 3px; border-radius: var(--radius-pill); background: var(--color-surface-sunken); overflow: hidden; }
-.bee-progress__bar { height: 100%; background: var(--color-success); }
 .bee-done-summary:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
 /* feature-hub-2: the feature detail page's own header, chip row and
    CSS-only tab pattern — no JS framework, same checkbox/radio-plus-label
@@ -3331,13 +3555,20 @@ fn bee_feature_hub_section(
     project: &Project,
     snapshot: &BeeSnapshot,
     feature_panes: &std::collections::HashMap<String, Vec<TerminalPaneView>>,
+    feature_activity: &BeeFeatureActivity,
 ) -> String {
     let archived_features: std::collections::HashSet<String> =
         list_archived_feature_dirs(&project.root_path)
             .into_iter()
             .collect();
     let placements = bee_classify_features(snapshot, &archived_features);
-    bee_render_hub_section(project, &placements, &snapshot.backlog.pbis, feature_panes)
+    bee_render_hub_section(
+        project,
+        &placements,
+        &snapshot.backlog.pbis,
+        feature_panes,
+        feature_activity,
+    )
 }
 
 /// One feature already sorted into one of the feature hub's columns
@@ -3352,13 +3583,16 @@ fn bee_feature_hub_section(
 /// render through the same dense row (D12) and need nothing beyond a
 /// feature name and its docs -- and so does `ReadyToMerge`
 /// (console-theme-kanban ctk-8), which is a dense-row column like them:
-/// the full card anatomy stays In Progress's alone.
+/// the full card anatomy stays In Progress's alone. bee-agent-activity R1
+/// pairs `ReadyToMerge`'s row data with a second field, [`BeeHubMergeData`],
+/// rather than widening the shared struct: uat state and merge-ready age
+/// exist for this one column and would be dead weight on the other four.
 ///
 /// The variants are listed in [`bee_classify_features`]'s own test order,
 /// so `ReadyToMerge` leads -- see that function for why it must be tested
 /// ahead of `InProgress`.
 enum BeeHubPlacement {
-    ReadyToMerge(BeeHubFinishedData),
+    ReadyToMerge(BeeHubFinishedData, BeeHubMergeData),
     InProgress(BeeHubCardData),
     Finished(BeeHubFinishedData),
     Review(BeeHubFinishedData),
@@ -3413,6 +3647,32 @@ struct BeeHubCardData {
 struct BeeHubFinishedData {
     feature: String,
     docs: Option<waggledance_core::bee::BeeFeatureDocs>,
+}
+
+/// The Ready to merge row's own second half (bee-agent-activity R1): what
+/// the merge line says and what the column sorts by. `uat_approved` is this
+/// feature's own `approved_gates.uat` -- since R1 it no longer decides
+/// membership, so the card has to say which of the two shapes it is
+/// ("uat approved" / "uat pending"), and approved rows sort ahead of
+/// pending ones. `since` is the latest `trace.capped_at` across the
+/// feature's cells ([`bee_hub_latest_cap`]) -- when the work stopped, which
+/// is when the merge became the next action; `None` when no cell carries a
+/// parsable cap, in which case the line drops its age clause rather than
+/// inventing "just now" (the same never-fabricate rule
+/// [`bee_hub_latest_activity`] follows).
+///
+/// `worktree_label` (bee-agent-activity R2) is [`bee_hub_worktree_label`]'s
+/// answer for this feature -- the branch the merge would land, which is the
+/// one fact a reader needs to run it and the one the dense row could not
+/// say before. It rides here rather than on the shared
+/// [`BeeHubFinishedData`] for the same reason the rest of this struct does:
+/// only this column has a merge to name, and only this column renders the
+/// branch ([`bee_hub_branch_line`]), so the other four dense columns stay
+/// byte-identical.
+struct BeeHubMergeData {
+    uat_approved: bool,
+    since: Option<String>,
+    worktree_label: String,
 }
 
 /// The feature hub's own column rules (this function's former home, see
@@ -3532,19 +3792,37 @@ fn bee_classify_features(
             || archived_features.contains(f.feature.as_str());
         let finished_and_idle = is_finished && live == 0;
 
-        // (console-theme-kanban ctk-8) Ready to merge is the state where
-        // `bee worktree merge` is literally the next action, and it is
-        // backed by two values the store already holds -- never a
-        // synthesised merge-readiness verdict (CONTEXT.md D2): the `uat`
-        // gate approved in this feature's own `approved_gates`, and a
-        // worktree still granted to it and not yet merged (`worktree_bound`
-        // above, which already excludes `merged_pending` grants).
+        // (console-theme-kanban ctk-8, widened by bee-agent-activity R1 --
+        // decision `63bffb34`, supersedes `420cec71`) Ready to merge is the
+        // state where `bee worktree merge` is the next action, and every
+        // input is a value the store already holds -- never a synthesised
+        // merge-readiness verdict (CONTEXT.md D2). ctk-8 read the `uat` gate
+        // as the membership rule; R1 moves uat off membership and onto the
+        // card, because a feature whose cells are all capped in an open
+        // worktree is already waiting on the merge whether or not the human
+        // has accepted it yet -- uat pending IS the column's own reason to
+        // exist. So membership is: a worktree still granted and not yet
+        // merged (`worktree_bound` above, which already excludes
+        // `merged_pending` grants), the `execution` gate approved, and at
+        // least one cell with every non-dropped one capped.
+        //
+        // `cell_counts` is exactly that last test already computed: `total`
+        // counts `open`/`claimed`/`blocked`/`capped` and deliberately
+        // excludes `dropped` and any unrecognized status (D8), so
+        // `done == total` means "every non-dropped cell capped" and
+        // `total > 0` rules out the zero-cell grant R1 names as not ready.
         let uat_approved = f
             .approved_gates
             .as_ref()
             .and_then(|g| g.uat)
             .unwrap_or(false);
-        let ready_to_merge = uat_approved && worktree_bound;
+        let execution_gate_approved = f
+            .approved_gates
+            .as_ref()
+            .and_then(|g| g.execution)
+            .unwrap_or(false);
+        let cells_all_capped = f.cell_counts.total > 0 && f.cell_counts.done == f.cell_counts.total;
+        let ready_to_merge = worktree_bound && execution_gate_approved && cells_all_capped;
 
         // (kanban-columns D11, console-theme-kanban ctk-8) Placement is
         // tested in this fixed order: Ready to merge, In Progress,
@@ -3555,7 +3833,9 @@ fn bee_classify_features(
         // `has_live_work`'s pulls (`worktree_bound`), and every Ready to
         // merge feature has one by definition -- so In Progress would
         // swallow every candidate first and this branch would never fire.
-        // Do not reorder it back.
+        // Do not reorder it back. R1's widening only deepens that: a
+        // uat-pending feature with an open grant is exactly the shape In
+        // Progress used to keep, so the order is now what moves it.
         //
         // It keeps In Progress's own `!finished_and_idle` guard so a
         // feature already in the archive still reads as Finished: the
@@ -3563,10 +3843,30 @@ fn bee_classify_features(
         // moves features out of In Progress only, never out of Finished.
         if !finished_and_idle && ready_to_merge {
             let docs = snapshot.feature_docs.get(f.feature.as_str()).cloned();
-            placements.push(BeeHubPlacement::ReadyToMerge(BeeHubFinishedData {
-                feature: f.feature.clone(),
-                docs,
-            }));
+            // R1: how long it has been ready is the latest cap across this
+            // feature's own cells -- the moment the last one closed is the
+            // moment the merge became the next action.
+            let since = bee_hub_latest_cap(bee_hub_feature_cells(&snapshot.buckets, &f.feature));
+            placements.push(BeeHubPlacement::ReadyToMerge(
+                BeeHubFinishedData {
+                    feature: f.feature.clone(),
+                    docs,
+                },
+                BeeHubMergeData {
+                    uat_approved,
+                    since,
+                    // R2: read exactly the way the In Progress card reads
+                    // it below, `finished: false` included -- a feature in
+                    // this column still has its grant open, so the label is
+                    // its live branch and never the `"merged"` spelling.
+                    worktree_label: bee_hub_worktree_label(
+                        &f.feature,
+                        &snapshot.worktrees,
+                        &snapshot.workspaces,
+                        false,
+                    ),
+                },
+            ));
         } else if !finished_and_idle && has_live_work {
             // In Progress absorbs the retired Waiting column (D5, D7): a
             // gate stop or a paused handoff no longer moves the feature to
@@ -3736,10 +4036,14 @@ fn bee_classify_features(
 /// rankings can never quietly drift apart. `"idle"`, `"done"`, `"unknown"`
 /// and `"shell"` all fall into the same "everything else" tier -- only an
 /// exact `"blocked"` or `"working"` status earns a tier of its own.
+/// A3 adds bee's own precedence on top, through the shared [`pane_tone`]:
+/// a pane whose live bee session says `blocked` or `waiting_input` earns
+/// tier 0 whatever herdr's screen scrape says, and a pane with no bee
+/// record ranks exactly as it always has.
 fn bee_hub_in_progress_tier(panes: &[TerminalPaneView]) -> u8 {
-    if panes.iter().any(|p| p.status == "blocked") {
+    if panes.iter().any(|p| pane_tone(p) == "blocked") {
         0
-    } else if panes.iter().any(|p| p.status == "working") {
+    } else if panes.iter().any(|p| pane_tone(p) == "working") {
         1
     } else {
         2
@@ -3792,6 +4096,7 @@ fn bee_render_hub_section(
     placements: &[BeeHubPlacement],
     pbis: &[BeePbi],
     feature_panes: &std::collections::HashMap<String, Vec<TerminalPaneView>>,
+    feature_activity: &BeeFeatureActivity,
 ) -> String {
     let mut todo_rows: Vec<String> = Vec::new();
     // D7: collected as (sort key, rendered html) rather than appended
@@ -3802,7 +4107,10 @@ fn bee_render_hub_section(
     let mut in_progress_entries: Vec<InProgressEntry> = Vec::new();
     let mut review_rows: Vec<String> = Vec::new();
     let mut compound_rows: Vec<String> = Vec::new();
-    let mut ready_to_merge_rows: Vec<String> = Vec::new();
+    // R1: keyed like `in_progress_entries` above, for the same reason --
+    // this column carries its own order (`bee_hub_ready_to_merge_cmp`).
+    type ReadyToMergeEntry = ((u8, Option<time::OffsetDateTime>, String), String);
+    let mut ready_to_merge_entries: Vec<ReadyToMergeEntry> = Vec::new();
     let mut finished_rows: Vec<String> = Vec::new();
     let mut todo_count = 0usize;
     let mut in_progress_count = 0usize;
@@ -3812,19 +4120,28 @@ fn bee_render_hub_section(
     let mut ready_to_merge_count = 0usize;
     let mut finished_count = 0usize;
     let no_panes: Vec<TerminalPaneView> = Vec::new();
+    let no_activity: Vec<BeeActivityEntry> = Vec::new();
 
     for placement in placements {
         match placement {
-            BeeHubPlacement::ReadyToMerge(data) => {
+            BeeHubPlacement::ReadyToMerge(data, merge) => {
                 ready_to_merge_count += 1;
-                ready_to_merge_rows.push(bee_hub_finished_row(
-                    "ready-to-merge",
-                    &bee_hub_feature_href(&project.id, &data.feature),
-                    &data.feature,
-                    data.docs.as_ref(),
-                    None,
-                    None,
-                    None,
+                // R1: collected keyed, like In Progress above, because this
+                // column has an order of its own (uat approved first, then
+                // most recently ready) that placement's name order does not
+                // produce.
+                ready_to_merge_entries.push((
+                    bee_hub_ready_to_merge_key(merge, &data.feature),
+                    bee_hub_finished_row_with_extra(
+                        "ready-to-merge",
+                        &bee_hub_feature_href(&project.id, &data.feature),
+                        &data.feature,
+                        data.docs.as_ref(),
+                        None,
+                        None,
+                        None,
+                        Some(&bee_hub_ready_to_merge_extra(merge)),
+                    ),
                 ));
             }
             BeeHubPlacement::InProgress(data) => {
@@ -3832,11 +4149,25 @@ fn bee_render_hub_section(
                 let panes = feature_panes
                     .get(data.feature.as_str())
                     .unwrap_or(&no_panes);
+                let activity = feature_activity
+                    .get(data.feature.as_str())
+                    .unwrap_or(&no_activity);
+                // A3: need-you is `blocked ∪ waiting_input` in EVERY count,
+                // and this one predicate is what the In Progress waiting
+                // chip and the phone need-you tile both read
+                // (`bee_hub_stat_tiles`/`bee_hub_group` below) — widened
+                // here rather than at either surface, so the chip and the
+                // tile can never disagree. A pane's own bee state wins over
+                // herdr's `blocked` ([`pane_needs_you`]); a session with no
+                // pane at all still counts through its feature; and a
+                // record that has stopped speaking counts for neither.
                 let is_waiting = data.reason.as_deref().is_some_and(|r| !r.is_empty())
-                    || panes.iter().any(|p| p.status == "blocked");
+                    || panes.iter().any(pane_needs_you)
+                    || activity.iter().any(BeeActivityEntry::needs_you);
                 if is_waiting {
                     in_progress_waiting_count += 1;
                 }
+                let agent = bee_card_agent(activity);
                 let key = bee_hub_in_progress_sort_key(
                     &data.feature,
                     data.last_activity.as_deref(),
@@ -3859,6 +4190,7 @@ fn bee_render_hub_section(
                     waiting_on_live: data.waiting_on_live,
                     last_tool_call: data.last_tool_call.as_deref(),
                     deferred: &data.deferred,
+                    agent: agent.as_ref(),
                 });
                 in_progress_entries.push((key, html));
             }
@@ -3941,6 +4273,12 @@ fn bee_render_hub_section(
     let todo_cards = bee_hub_finished_rows(&todo_rows);
     let review_cards = bee_hub_finished_rows(&review_rows);
     let compound_cards = bee_hub_finished_rows(&compound_rows);
+    // R1: uat approved first, then most recently ready.
+    ready_to_merge_entries.sort_by(|a, b| bee_hub_ready_to_merge_cmp(&a.0, &b.0));
+    let ready_to_merge_rows: Vec<String> = ready_to_merge_entries
+        .into_iter()
+        .map(|(_, html)| html)
+        .collect();
     let ready_to_merge_cards = bee_hub_finished_rows(&ready_to_merge_rows);
     let finished_cards = bee_hub_finished_rows(&finished_rows);
 
@@ -4087,6 +4425,7 @@ pub fn bee_cross_project_features_section(
         String,
         std::collections::HashMap<String, Vec<TerminalPaneView>>,
     >,
+    feature_activity: &std::collections::HashMap<String, BeeFeatureActivity>,
 ) -> String {
     let mut todo_rows: Vec<String> = Vec::new();
     let mut todo_pbi_rows: Vec<String> = Vec::new();
@@ -4098,7 +4437,10 @@ pub fn bee_cross_project_features_section(
     let mut in_progress_entries: Vec<InProgressEntry> = Vec::new();
     let mut review_rows: Vec<String> = Vec::new();
     let mut compound_rows: Vec<String> = Vec::new();
-    let mut ready_to_merge_rows: Vec<String> = Vec::new();
+    // R1: keyed and sorted like `in_progress_entries` above, so Ready to
+    // merge merges into one cross-project list in its own order too.
+    type ReadyToMergeEntry = ((u8, Option<time::OffsetDateTime>, String), String);
+    let mut ready_to_merge_entries: Vec<ReadyToMergeEntry> = Vec::new();
     let mut todo_count = 0usize;
     let mut in_progress_count = 0usize;
     let mut in_progress_waiting_count = 0usize;
@@ -4106,6 +4448,7 @@ pub fn bee_cross_project_features_section(
     let mut compound_count = 0usize;
     let mut ready_to_merge_count = 0usize;
     let no_panes: Vec<TerminalPaneView> = Vec::new();
+    let no_activity: Vec<BeeActivityEntry> = Vec::new();
 
     // Classify every project's placements once; reused below both to build
     // the colour map (over only the projects that actually placed
@@ -4144,20 +4487,25 @@ pub fn bee_cross_project_features_section(
             .map(|a| (a.feature.as_str(), a.shipped_at.as_deref()))
             .collect();
         let project_panes = feature_panes.get(project.id.as_str());
+        let project_activity = feature_activity.get(project.id.as_str());
         let project_color = project_colors.get(project.id.as_str()).copied();
 
         for placement in placements {
             match placement {
-                BeeHubPlacement::ReadyToMerge(data) => {
+                BeeHubPlacement::ReadyToMerge(data, merge) => {
                     ready_to_merge_count += 1;
-                    ready_to_merge_rows.push(bee_hub_finished_row(
-                        "ready-to-merge",
-                        &bee_hub_feature_href(&project.id, &data.feature),
-                        &data.feature,
-                        data.docs.as_ref(),
-                        Some(&project.name),
-                        project_color,
-                        None,
+                    ready_to_merge_entries.push((
+                        bee_hub_ready_to_merge_key(merge, &data.feature),
+                        bee_hub_finished_row_with_extra(
+                            "ready-to-merge",
+                            &bee_hub_feature_href(&project.id, &data.feature),
+                            &data.feature,
+                            data.docs.as_ref(),
+                            Some(&project.name),
+                            project_color,
+                            None,
+                            Some(&bee_hub_ready_to_merge_extra(merge)),
+                        ),
                     ));
                 }
                 BeeHubPlacement::InProgress(data) => {
@@ -4165,11 +4513,20 @@ pub fn bee_cross_project_features_section(
                     let panes = project_panes
                         .and_then(|m| m.get(data.feature.as_str()))
                         .unwrap_or(&no_panes);
+                    let activity = project_activity
+                        .and_then(|m| m.get(data.feature.as_str()))
+                        .unwrap_or(&no_activity);
+                    // The per-project board's own widened predicate, the
+                    // same rule in the same shape (A3) — see
+                    // `bee_render_hub_section` for why it lives on this one
+                    // line rather than at the chip and the tile separately.
                     let is_waiting = data.reason.as_deref().is_some_and(|r| !r.is_empty())
-                        || panes.iter().any(|p| p.status == "blocked");
+                        || panes.iter().any(pane_needs_you)
+                        || activity.iter().any(BeeActivityEntry::needs_you);
                     if is_waiting {
                         in_progress_waiting_count += 1;
                     }
+                    let agent = bee_card_agent(activity);
                     let key = bee_hub_in_progress_sort_key(
                         &data.feature,
                         data.last_activity.as_deref(),
@@ -4192,6 +4549,7 @@ pub fn bee_cross_project_features_section(
                         waiting_on_live: data.waiting_on_live,
                         last_tool_call: data.last_tool_call.as_deref(),
                         deferred: &data.deferred,
+                        agent: agent.as_ref(),
                     });
                     in_progress_entries.push((key, html));
                 }
@@ -4302,6 +4660,14 @@ pub fn bee_cross_project_features_section(
     let todo_cards = bee_hub_finished_rows(&todo_rows);
     let review_cards = bee_hub_finished_rows(&review_rows);
     let compound_cards = bee_hub_finished_rows(&compound_rows);
+    // R1: the same comparator the per-project board uses, applied once
+    // across every project's rows -- uat approved first, then most recently
+    // ready -- so the merged column reads as one list.
+    ready_to_merge_entries.sort_by(|a, b| bee_hub_ready_to_merge_cmp(&a.0, &b.0));
+    let ready_to_merge_rows: Vec<String> = ready_to_merge_entries
+        .into_iter()
+        .map(|(_, html)| html)
+        .collect();
     let ready_to_merge_cards = bee_hub_finished_rows(&ready_to_merge_rows);
     let finished_cards = bee_hub_finished_rows(&finished_rows);
     let read_errors_strip = bee_cross_project_read_errors_strip(rollups);
@@ -4597,10 +4963,12 @@ fn bee_cross_project_board_project_colors<'a>(
 /// the former Waiting column into In Progress and moved Todo/Review/Compound
 /// onto that same dense row, so `group_key` in practice now only ever
 /// arrives as `"in-progress"`. Name + link to its
-/// own detail page, its own done/total cell progress (a `bee-progress`
-/// bar, or no markup at all when `total == 0` — hub-finished-compact drops
-/// the old "No cells recorded." filler paragraph) and its own last-activity
-/// age ([`bee_fmt_trace_time`]) — project-color-identity (D3) drops this
+/// own detail page, and one closing footer line carrying both its
+/// done/total cell reading (a ring glyph plus `n/m cells`, or no cells
+/// element at all when `total == 0` — hub-finished-compact drops the old
+/// "No cells recorded." filler paragraph, and bee-agent-activity R2 the
+/// progress bar that stood above it) and its own last-activity age
+/// ([`bee_fmt_trace_time`]) — project-color-identity (D3) drops this
 /// card's own group and worktree chips: the kanban column heading already
 /// names the group, and a cross-project card's own worktree state now
 /// reads on the project line instead (below). `reason` carries the Waiting
@@ -4702,6 +5070,110 @@ fn bee_cross_project_board_project_colors<'a>(
 /// feature-level test verdict is absent for a second reason on top of that
 /// one: `BeeCell.tests` is a PER-CELL value with no feature-level
 /// aggregate, so it belongs on the cell page, not on a board card.
+/// A6's card agent line, already reduced to what the card prints. Derived
+/// from the FRESHEST activity on the feature (by `activity.at`) rather than
+/// folded across every session on it: the line names one agent, so it names
+/// the one that spoke last. Worker nicknames are deliberately absent
+/// (plan.md, "Out of scope") — the line says what the agent is doing and
+/// which cell it holds, never who it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BeeCardAgent {
+    /// The state's own tone modifier: `working`, `needs-you`, `idle` or
+    /// `exited`. An unknown state a newer bee writes reads quiet rather
+    /// than borrowing one of the other three tones.
+    tone: &'static str,
+    /// The state's own word (A3) — the card never says the state by colour
+    /// alone.
+    state_word: String,
+    /// The held cell's title when this project's store still knows it, else
+    /// the bare cell id, else "—" (A1: an absent field renders as a dash,
+    /// never as an error and never as an empty gap).
+    cell_label: String,
+    /// How long the record has been quiet: `"12s"`, `"3m"`, or `"—"` when
+    /// the record carries no age at all.
+    quiet_age: String,
+    /// A1/A3: the record stopped speaking (90 s on `activity.at`). Renders
+    /// as a muted marker beside the state; never a need-you.
+    no_signal: bool,
+}
+
+/// A6/A2: the card agent line for one feature, from every live bee session
+/// joined to it by `activity.feature`. `None` — no session on this feature —
+/// renders no line at all rather than an empty one (D2: cards render only
+/// data-backed elements).
+fn bee_card_agent(entries: &[BeeActivityEntry]) -> Option<BeeCardAgent> {
+    let rfc3339 = time::format_description::well_known::Rfc3339;
+    // Freshest by `activity.at`, parsed the same way every other timestamp
+    // in this module is; a record whose `at` will not parse sorts last
+    // rather than winning by accident, and ties keep the first entry the
+    // server's own session order produced.
+    let freshest = entries
+        .iter()
+        .max_by_key(|e| time::OffsetDateTime::parse(&e.activity.at, &rfc3339).ok())?;
+    let state = &freshest.activity.state;
+    let tone = if state.needs_you() {
+        "needs-you"
+    } else {
+        match state {
+            BeeActivityState::Working => "working",
+            BeeActivityState::Exited => "exited",
+            _ => "idle",
+        }
+    };
+    let cell_label = match (
+        freshest.cell_title.as_deref(),
+        freshest.activity.cell.as_deref(),
+    ) {
+        (Some(title), _) if !title.is_empty() => title.to_string(),
+        (_, Some(id)) if !id.is_empty() => id.to_string(),
+        _ => "—".to_string(),
+    };
+    Some(BeeCardAgent {
+        tone,
+        state_word: state.word().to_string(),
+        cell_label,
+        quiet_age: bee_quiet_age(freshest.activity.age_seconds),
+        no_signal: freshest.signal == BeeSignal::NoSignal,
+    })
+}
+
+/// A6's "quiet <age>" reading: seconds under a minute, whole minutes above
+/// it, and a dash when the record carries no age to state. A negative age
+/// (a record somehow stamped in the future) floors at zero rather than
+/// printing a negative quiet time.
+fn bee_quiet_age(age_seconds: Option<f64>) -> String {
+    match age_seconds {
+        Some(secs) => {
+            let secs = secs.max(0.0).round() as i64;
+            if secs < 60 {
+                format!("{secs}s")
+            } else {
+                format!("{}m", secs / 60)
+            }
+        }
+        None => "—".to_string(),
+    }
+}
+
+/// A6's line itself: state word in its own tone, the held cell, and how long
+/// the record has been quiet — plus the muted `no signal` marker when the
+/// freshest record has stopped speaking (A1).
+fn bee_hub_agent_line(agent: &BeeCardAgent) -> String {
+    let signal_html = if agent.no_signal {
+        r#"<span class="bee-hub__agent-signal">no signal</span>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<p class="bee-hub__agent"><span class="bee-hub__agent-state bee-hub__agent-state--{tone}">agent: {word}</span> · <span class="bee-hub__agent-cell">{cell}</span> · <span class="bee-hub__agent-quiet">quiet {age}</span>{signal_html}</p>"#,
+        tone = agent.tone,
+        word = esc(&agent.state_word),
+        cell = esc(&agent.cell_label),
+        age = esc(&agent.quiet_age),
+        signal_html = signal_html,
+    )
+}
+
 struct BeeHubCardArgs<'a> {
     project_id: &'a str,
     feature: &'a str,
@@ -4722,6 +5194,42 @@ struct BeeHubCardArgs<'a> {
     waiting_on_live: bool,
     last_tool_call: Option<&'a str>,
     deferred: &'a [BeeDeferredEntry],
+    /// A6: the card's own agent line, or `None` when no live bee session is
+    /// bound to this feature — in which case the card renders exactly as it
+    /// did before this feature.
+    agent: Option<&'a BeeCardAgent>,
+}
+
+/// The branch row a card or a Ready to merge row carries under its name
+/// (console-theme-kanban ctk-6 D2, factored out of [`bee_hub_card`] by
+/// bee-agent-activity R2): the fork glyph plus the branch in the mono face
+/// at the digest's small size, truncated rather than wrapped.
+///
+/// D2's "only what the store backs" is what decides whether it renders at
+/// all: [`bee_hub_worktree_label`] answers with a branch name, the bare
+/// word `"worktree"` (a worktree with no branch recorded), or `"merged"` --
+/// all three name a worktree that exists -- and with `"Main"` for the one
+/// case where the feature has NO worktree of its own. `"Main"` is therefore
+/// not a branch this card knows; it is the absence of one, and a row
+/// spelling it would be exactly the placeholder-for-a-missing-source D2
+/// forbids. So `"Main"` (and an empty label) renders no row at all, and
+/// every other spelling renders verbatim.
+///
+/// The glyph is an inline aria-hidden stroke SVG in this file's existing
+/// icon idiom (see `agent_drawer_toggle`), keeping a purely decorative
+/// subtree out of the tab order and the accessible name.
+///
+/// R2 gives the Ready to merge row this same line under its title, and this
+/// function is where both kinds get it: one source of the branch markup, so
+/// a card and a row can never drift into two spellings of the same fact.
+fn bee_hub_branch_line(worktree_label: &str) -> String {
+    if worktree_label.is_empty() || worktree_label == "Main" {
+        return String::new();
+    }
+    format!(
+        r#"<div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">{worktree}</span></div>"#,
+        worktree = esc(worktree_label),
+    )
 }
 
 fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
@@ -4742,6 +5250,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         waiting_on_live,
         last_tool_call,
         deferred,
+        agent,
     } = *args;
     let title = docs
         .and_then(|d| d.title.as_deref())
@@ -4794,34 +5303,23 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
             None => String::new(),
         },
     };
-    // console-theme-kanban ctk-6 (D2): the branch row -- the console card's
-    // own meta-block first line, the fork glyph plus the branch in the mono
-    // face at the digest's small size, truncated rather than wrapped.
-    // D2's "only what the store backs" is what decides whether it renders
-    // at all: [`bee_hub_worktree_label`] answers with a branch name, the
-    // bare word `"worktree"` (a worktree with no branch recorded), or
-    // `"merged"` -- all three name a worktree that exists -- and with
-    // `"Main"` for the one case where the feature has NO worktree of its
-    // own. `"Main"` is therefore not a branch this card knows; it is the
-    // absence of one, and a row spelling it would be exactly the
-    // placeholder-for-a-missing-source D2 forbids. So `"Main"` renders no
-    // row at all, and every other spelling renders verbatim.
-    // The glyph is an inline aria-hidden stroke SVG in this file's existing
-    // icon idiom (see `agent_drawer_toggle`), keeping a purely decorative
-    // subtree out of the tab order and the accessible name.
-    let branch_html = if worktree_label.is_empty() || worktree_label == "Main" {
-        String::new()
-    } else {
-        format!(
-            r#"<div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">{worktree}</span></div>"#,
-            worktree = esc(worktree_label),
-        )
-    };
+    // console-theme-kanban ctk-6 (D2), bee-agent-activity R2: the branch row
+    // is [`bee_hub_branch_line`]'s, the one source of that markup for both
+    // the card and the Ready to merge dense row.
+    let branch_html = bee_hub_branch_line(worktree_label);
     // card-collapse-inprogress D1/D2: the card's own name alone (its
     // CONTEXT title, or the slug fallback) is all the collapsed header
     // shows -- `subtitle_html` above now moves into the expandable body
     // below instead of riding along with the title the way the old
     // `name_html` bundled them.
+    // A6: the agent line rides in the collapsed `<summary>`, directly under
+    // the card's own name and before the badges — the whole point of the
+    // line is to be read without expanding the card, the same reason
+    // `run_state_html` already lives here.
+    let agent_html = match agent {
+        Some(agent) => bee_hub_agent_line(agent),
+        None => String::new(),
+    };
     let title_html = match title {
         Some(t) => format!(
             r#"<div class="fg-card__title">{title}</div>"#,
@@ -4839,54 +5337,59 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         Some(d) => format!(r#"<p class="bee-hub__desc">{}</p>"#, esc(d)),
         None => String::new(),
     };
-    let progress_html = if total == 0 {
-        // hub-finished-compact: an empty card renders no markup at all here
-        // — no fabricated "No cells recorded." paragraph — since a card
-        // with genuinely nothing to report needs no line saying so.
-        String::new()
-    } else {
-        let percent = (done * 100).checked_div(total).unwrap_or(0);
-        format!(
-            r#"<div class="bee-progress"><div class="bee-progress__bar" style="width: {percent}%"></div></div><p class="bee-hub__progress-label">{done}/{total} cell{plural} done</p>"#,
-            percent = percent,
-            done = done,
-            total = total,
-            plural = if total == 1 { "" } else { "s" },
-        )
-    };
-    // kanban-live-signals D1: the pulse dot rides beside this same line,
-    // never its own paragraph -- it is a live annotation of "Last
-    // activity", not a second fact.
+    // kanban-live-signals D1: the pulse dot rides beside the footer's time,
+    // never its own paragraph -- it is a live annotation of when the work
+    // last moved, not a second fact. R2 keeps it there by giving the dot
+    // the footer's auto margin (see `.bee-hub__footer .bee-hub__pulse` in
+    // [`bee_hub_style`]), so the dot and the time travel to the right edge
+    // as one pair now that the cells reading holds the left.
     let pulse_html = if bee_hub_is_working_now(last_tool_call, time::OffsetDateTime::now_utc()) {
         r#" <span class="bee-hub__pulse" role="status" aria-label="Working now" title="Working now"></span>"#
             .to_string()
     } else {
         String::new()
     };
-    // console-theme-kanban ctk-6: the console card's own footer, set off by
-    // a hairline above it -- an activity glyph, its label, the live pulse
-    // dot where [`bee_hub_is_working_now`] already put it, and the relative
-    // time pushed to the right edge. The glyph is the digest's generic
-    // activity mark and deliberately NOT one of its check/warning variants:
-    // those encode a CI or test verdict, and this board has no such value
-    // to read (D2) -- the glyph says "activity", which is precisely what
-    // `last_activity` is. `bee_fmt_trace_time`'s formatting is unchanged,
-    // and an absent timestamp still renders its own honest line with no
-    // time beside it rather than a fabricated one.
-    let activity_glyph = r#"<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>"#;
-    let footer_html = match last_activity {
-        Some(iso) => format!(
-            r#"<div class="bee-hub__footer">{glyph}<span class="bee-hub__activity-label">Last activity</span>{pulse}<span class="bee-hub__activity-time">{when}</span></div>"#,
-            glyph = activity_glyph,
-            when = esc(&bee_fmt_trace_time(iso)),
-            pulse = pulse_html,
-        ),
-        None => format!(
-            r#"<div class="bee-hub__footer">{glyph}<span class="bee-hub__activity-label">No activity recorded.</span>{pulse}</div>"#,
-            glyph = activity_glyph,
-            pulse = pulse_html,
-        ),
+    // bee-agent-activity R2: ONE closing line for every card -- a ring glyph
+    // and `n/m cells` on the left, the last-activity time on the right. It
+    // replaces three elements that were saying two things: the progress
+    // bar, the "n/m cells done" label under it, and the separate "Last
+    // activity" row. The ring is the bar's whole reading at a glance and
+    // the fraction beside it states the numbers, so nothing is read by
+    // colour alone; the time in a card's footer needs no label to be read
+    // as a time, so the label and its activity glyph go with the bar.
+    //
+    // hub-finished-compact still governs the zero-cell card: `total == 0`
+    // renders no cells span at all rather than a `0/0` artifact -- the
+    // footer is then the time by itself. `bee_fmt_trace_time`'s formatting
+    // is unchanged, and an absent timestamp says `no activity` in the
+    // time's own slot rather than inventing a moment (D2).
+    let cells_html = if total == 0 {
+        String::new()
+    } else {
+        let fill = if done == total {
+            "done"
+        } else if done == 0 {
+            "none"
+        } else {
+            "partial"
+        };
+        format!(
+            r#"<span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--{fill}" aria-hidden="true"></span>{done}/{total} cells</span>"#,
+            fill = fill,
+            done = done,
+            total = total,
+        )
     };
+    let when = match last_activity {
+        Some(iso) => esc(&bee_fmt_trace_time(iso)),
+        None => "no activity".to_string(),
+    };
+    let footer_html = format!(
+        r#"<div class="bee-hub__footer">{cells_html}{pulse}<span class="bee-hub__activity-time">{when}</span></div>"#,
+        cells_html = cells_html,
+        pulse = pulse_html,
+        when = when,
+    );
     // kanban-live-signals D2: rendered in the collapsed `<summary>` itself
     // (see this function's own doc comment) so the badge stays visible
     // without expanding the card.
@@ -4909,7 +5412,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // and a blocked terminal are two different things waiting on the user
     // at once. Exact wording, matching the existing gate line's own em-dash
     // punctuation (`server.rs`'s `Waiting on you — {label} gate ...`).
-    let blocked_reason_html = if panes.iter().any(|p| p.status == "blocked") {
+    let blocked_reason_html = if panes.iter().any(pane_needs_you) {
         r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — a terminal is blocked</p>"#
             .to_string()
     } else {
@@ -4950,17 +5453,17 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // the top of the expandable body, since a `<details>`/`<summary>`
     // pair, unlike the old whole-card `<a>`, cannot itself be a link.
     format!(
-        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{title_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{progress_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{terminal_badges_html}{quiet_note_html}</div>"#,
+        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{title_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{terminal_badges_html}{quiet_note_html}</div>"#,
         shell_class = shell_class,
         group_key = group_key,
         title_html = title_html,
+        agent_html = agent_html,
         run_state_html = run_state_html,
         pid = esc(project_id),
         feature_href = esc(feature),
         subtitle_html = subtitle_html,
         desc_html = desc_html,
         branch_html = branch_html,
-        progress_html = progress_html,
         reason_html = reason_html,
         blocked_reason_html = blocked_reason_html,
         deferred_html = deferred_html,
@@ -5049,6 +5552,37 @@ fn bee_hub_finished_row(
     project_color: Option<u8>,
     shipped_at: Option<&str>,
 ) -> String {
+    bee_hub_finished_row_with_extra(
+        group_key,
+        href,
+        feature,
+        docs,
+        project_label,
+        project_color,
+        shipped_at,
+        None,
+    )
+}
+
+/// [`bee_hub_finished_row`] plus one block of extra markup inside the same
+/// anchor, below the name line — today only the Ready to merge column's own
+/// two lines: its branch row ([`bee_hub_branch_line`], bee-agent-activity
+/// R2) and its merge line ([`bee_hub_merge_line`], R1). Every other
+/// column keeps passing through `bee_hub_finished_row` and renders
+/// byte-identically to before R1, which is why the extra rides here as an
+/// optional eighth argument rather than widening the seven-argument
+/// signature every column and its tests already call.
+#[allow(clippy::too_many_arguments)]
+fn bee_hub_finished_row_with_extra(
+    group_key: &str,
+    href: &str,
+    feature: &str,
+    docs: Option<&waggledance_core::bee::BeeFeatureDocs>,
+    project_label: Option<&str>,
+    project_color: Option<u8>,
+    shipped_at: Option<&str>,
+    extra_html: Option<&str>,
+) -> String {
     let title = docs
         .and_then(|d| d.title.as_deref())
         .filter(|t| !t.is_empty());
@@ -5075,14 +5609,100 @@ fn bee_hub_finished_row(
         None => String::new(),
     };
     format!(
-        r#"<a class="bee-hub__row" data-hub-group="{group_key}" href="{href}" title="{full}">{project_html}<span class="bee-hub__row-name">{name}</span>{time_html}</a>"#,
+        r#"<a class="bee-hub__row" data-hub-group="{group_key}" href="{href}" title="{full}">{project_html}<span class="bee-hub__row-name">{name}</span>{time_html}{extra_html}</a>"#,
         group_key = group_key,
         href = href,
         full = esc(name),
         project_html = project_html,
         name = esc(name),
         time_html = time_html,
+        extra_html = extra_html.unwrap_or(""),
     )
+}
+
+/// Everything a Ready to merge row carries under its name, in reading
+/// order: the branch the merge would land ([`bee_hub_branch_line`],
+/// bee-agent-activity R2 -- the same row the In Progress card carries, from
+/// the same helper) and then the merge line below it ([`bee_hub_merge_line`],
+/// R1). Both boards' Ready to merge call sites pass exactly this one string
+/// as [`bee_hub_finished_row_with_extra`]'s extra, so a row can never grow a
+/// second spelling on one board.
+fn bee_hub_ready_to_merge_extra(merge: &BeeHubMergeData) -> String {
+    format!(
+        "{branch}{line}",
+        branch = bee_hub_branch_line(&merge.worktree_label),
+        line = bee_hub_merge_line(merge),
+    )
+}
+
+/// The Ready to merge row's own summary line (bee-agent-activity R1): which
+/// of the two shapes this row is — `uat approved` or `uat pending` — and how
+/// long it has been ready, both as words, never as colour alone (the rail
+/// landmark rule this feature inherits). It renders under the name inside
+/// the same anchor, as a full-width block: `.bee-hub__row` is a dense
+/// `display: block` row, not the In Progress card's flex summary, so the
+/// line takes its own block rather than `.bee-hub__agent`'s
+/// `flex: 1 0 100%; order` pair — the visible result (a second, full-width
+/// muted row under the title) is the same.
+///
+/// The age clause is dropped entirely when no cell carried a parsable cap
+/// ([`BeeHubMergeData::since`]), so the line never reads "ready unknown".
+fn bee_hub_merge_line(merge: &BeeHubMergeData) -> String {
+    let (word, modifier) = if merge.uat_approved {
+        ("uat approved", "approved")
+    } else {
+        ("uat pending", "pending")
+    };
+    let since_html = match merge.since.as_deref() {
+        Some(iso) => format!(
+            r#" · <span class="bee-hub__merge-since">ready {age}</span>"#,
+            age = esc(&bee_fmt_trace_time(iso)),
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"<p class="bee-hub__merge"><span class="bee-hub__merge-uat bee-hub__merge-uat--{modifier}">{word}</span>{since_html}</p>"#,
+    )
+}
+
+/// The Ready to merge column's own order (bee-agent-activity R1): uat
+/// approved first — those rows are one command from landing, the pending
+/// ones are one human decision further out — then most recently ready
+/// first within each half, feature name breaking a tie. A row with no
+/// parsable cap time sorts after every timed row in its own half rather
+/// than jumping the queue with an assumed "now".
+///
+/// The key is `(rank, since, feature)`, built once per row at render time
+/// and sorted once before the column is flattened — the same shape and the
+/// same one-sort-at-the-end discipline `bee_hub_in_progress_cmp` uses, so
+/// the cross-project board can merge several projects' rows into one list.
+fn bee_hub_ready_to_merge_cmp(
+    a: &(u8, Option<time::OffsetDateTime>, String),
+    b: &(u8, Option<time::OffsetDateTime>, String),
+) -> std::cmp::Ordering {
+    a.0.cmp(&b.0)
+        .then_with(|| match (&a.1, &b.1) {
+            (Some(x), Some(y)) => y.cmp(x),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.2.cmp(&b.2))
+}
+
+/// [`bee_hub_ready_to_merge_cmp`]'s key for one row, built from the
+/// classifier's own [`BeeHubMergeData`] — the sort key and the rendered
+/// line read the same two values, so a row can never be ordered by
+/// something its own text does not say.
+fn bee_hub_ready_to_merge_key(
+    merge: &BeeHubMergeData,
+    feature: &str,
+) -> (u8, Option<time::OffsetDateTime>, String) {
+    let rank = if merge.uat_approved { 0 } else { 1 };
+    let since = merge.since.as_deref().and_then(|iso| {
+        time::OffsetDateTime::parse(iso, &time::format_description::well_known::Rfc3339).ok()
+    });
+    (rank, since, feature.to_string())
 }
 
 /// Pages the Finished column's dense rows ([`bee_hub_finished_row`]) ten at
@@ -5239,6 +5859,31 @@ fn bee_hub_latest_activity<'a>(cells: impl Iterator<Item = &'a BeeCell>) -> Opti
                 if newer {
                     latest = Some((t, ts.to_string()));
                 }
+            }
+        }
+    }
+    latest.map(|(_, s)| s)
+}
+
+/// The latest `capped_at` alone across the cells handed to it
+/// (bee-agent-activity R1's "how long it has been ready"), never folding in
+/// `claimed_at` the way [`bee_hub_latest_activity`] does: a Ready to merge
+/// row measures from the moment the LAST cell closed, and a claim is not a
+/// close. A cell with no `capped_at`, or one that does not parse as RFC
+/// 3339, contributes nothing; an empty iterator yields `None` rather than a
+/// fabricated time.
+fn bee_hub_latest_cap<'a>(cells: impl Iterator<Item = &'a BeeCell>) -> Option<String> {
+    let mut latest: Option<(time::OffsetDateTime, String)> = None;
+    for c in cells {
+        let Some(ts) = c.capped_at.as_deref() else {
+            continue;
+        };
+        if let Ok(t) =
+            time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        {
+            let newer = latest.as_ref().map(|(lt, _)| t > *lt).unwrap_or(true);
+            if newer {
+                latest = Some((t, ts.to_string()));
             }
         }
     }
@@ -6475,7 +7120,7 @@ fn bee_feature_terminal_tab(project_id: &str, panes: &[TerminalPaneView]) -> Str
             workspace = esc(&p.workspace),
             tab = esc(&p.tab),
             program = esc(&p.kind),
-            status_pill = status_pill(&p.status),
+            status_pill = pane_status_pill(p),
         ));
     }
     format!(r#"<div class="bee-terminal-panes">{rows}</div>"#)
@@ -7756,6 +8401,9 @@ mod tests {
     /// only the `status` the D7 sort tests below actually vary.
     fn pane_with_status(status: &str) -> TerminalPaneView {
         TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: format!("w1:{status}"),
             kind: "claude".into(),
             name: "agent".into(),
@@ -8364,6 +9012,9 @@ mod tests {
         active.id = "proj-2".into();
         active.name = "Proj Two".into();
         let shell_pane = TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:sh".into(),
             kind: "shell".into(),
             name: "shell".into(),
@@ -8418,7 +9069,13 @@ mod tests {
             vec![pane_with_status("working")],
         );
 
-        let html = bee_render_hub_section(&project, &placements, &[], &feature_panes);
+        let html = bee_render_hub_section(
+            &project,
+            &placements,
+            &[],
+            &feature_panes,
+            &std::collections::HashMap::new(),
+        );
 
         let blocked_at = html
             .find(r#"bee-hub__detail-link" href="/p/proj-1/_bee/feature/feat-blocked""#)
@@ -8459,7 +9116,13 @@ mod tests {
         feature_panes.insert("b-unknown".to_string(), vec![pane_with_status("unknown")]);
         feature_panes.insert("a-shell".to_string(), vec![pane_with_status("shell")]);
 
-        let html = bee_render_hub_section(&project, &placements, &[], &feature_panes);
+        let html = bee_render_hub_section(
+            &project,
+            &placements,
+            &[],
+            &feature_panes,
+            &std::collections::HashMap::new(),
+        );
 
         let at = |feature: &str| {
             html.find(&format!(
@@ -8497,7 +9160,13 @@ mod tests {
             feature_panes.insert(feature.to_string(), vec![pane_with_status("working")]);
         }
 
-        let html = bee_render_hub_section(&project, &placements, &[], &feature_panes);
+        let html = bee_render_hub_section(
+            &project,
+            &placements,
+            &[],
+            &feature_panes,
+            &std::collections::HashMap::new(),
+        );
 
         let at = |feature: &str| {
             html.find(&format!(
@@ -8554,6 +9223,9 @@ mod tests {
     fn terminal_page_renders_the_attach_control_and_unassigned_does_not() {
         let project = sample_project();
         let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p1".into(),
             kind: "claude".into(),
             name: "one".into(),
@@ -8625,6 +9297,9 @@ mod tests {
     fn terminal_page_pane_links_are_unchanged() {
         let project = sample_project();
         let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p1".into(),
             kind: "claude".into(),
             name: "one".into(),
@@ -8647,6 +9322,9 @@ mod tests {
     fn transcript_page_pane_links_are_unchanged() {
         let project = sample_project();
         let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p1".into(),
             kind: "claude".into(),
             name: "one".into(),
@@ -8672,6 +9350,9 @@ mod tests {
     fn terminal_page_controls_carry_no_data_term_base() {
         let project = sample_project();
         let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p1".into(),
             kind: "claude".into(),
             name: "one".into(),
@@ -8708,6 +9389,9 @@ mod tests {
         );
 
         let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p1".into(),
             kind: "claude".into(),
             name: "one".into(),
@@ -8805,6 +9489,9 @@ mod tests {
         let project = sample_project();
         let panes = vec![
             TerminalPaneView {
+                bee_state: None,
+                bee_feature: None,
+                bee_no_signal: false,
                 pane_id: "w1:p1".into(),
                 kind: "claude".into(),
                 name: "one".into(),
@@ -8815,6 +9502,9 @@ mod tests {
                 title: String::new(),
             },
             TerminalPaneView {
+                bee_state: None,
+                bee_feature: None,
+                bee_no_signal: false,
                 pane_id: "w1:p2".into(),
                 kind: "shell".into(),
                 name: String::new(),
@@ -9173,7 +9863,7 @@ mod tests {
     /// Send, and Stage/Send keep their existing relative order.
     #[test]
     fn pane_controls_renders_approve_before_stage_and_send() {
-        let html = pane_controls("pane-1", "Agent One", false, None);
+        let html = pane_controls("pane-1", "Agent One", false, None, None);
         assert!(
             html.contains(r#"<button type="button" class="term-reply__approve">Approve</button>"#),
             "the Approve button must render: {html}"
@@ -9190,6 +9880,101 @@ mod tests {
         assert!(
             approve_at < stage_at && stage_at < send_at,
             "the row must read Approve, Stage, Send: {html}"
+        );
+        assert!(
+            !html.contains("data-agent-state"),
+            "a pane no bee session claims carries no state attribute at all: {html}"
+        );
+    }
+
+    /// A4: Approve types a permission answer, so it is offered only where a
+    /// permission prompt is what is on screen — bee's `blocked` — and
+    /// withheld, with the reason readable in its title, for every other
+    /// state a live session reports. The form carries that state as a data
+    /// attribute either way, in the same words every other surface prints.
+    #[test]
+    fn pane_controls_gates_approve_on_the_panes_bee_state() {
+        let blocked = pane_controls(
+            "pane-1",
+            "Agent One",
+            false,
+            None,
+            Some(&BeeActivityState::Blocked),
+        );
+        assert!(
+            blocked
+                .contains(r#"<button type="button" class="term-reply__approve">Approve</button>"#),
+            "a blocked pane keeps the plain, enabled Approve button: {blocked}"
+        );
+        assert!(
+            blocked.contains(r#"data-agent-state="needs approval""#),
+            "the reply form must carry the blocked pane's state word: {blocked}"
+        );
+
+        let waiting = pane_controls(
+            "pane-1",
+            "Agent One",
+            false,
+            None,
+            Some(&BeeActivityState::WaitingInput),
+        );
+        assert!(
+            waiting.contains(
+                r#"<button type="button" class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is needs an answer">Approve</button>"#
+            ),
+            "a pane waiting on a typed answer must render Approve disabled, with the reason: {waiting}"
+        );
+        assert!(
+            waiting.contains(r#"data-agent-state="needs an answer""#),
+            "the reply form must carry that pane's state word too: {waiting}"
+        );
+        for enabled in [
+            r#"<button type="button" class="term-reply__stage">Stage</button>"#,
+            r#"<button type="submit" class="term-reply__send">Send</button>"#,
+        ] {
+            assert!(
+                waiting.contains(enabled),
+                "Stage and Send are never gated by a bee state: {waiting}"
+            );
+        }
+
+        let working = pane_controls(
+            "pane-1",
+            "Agent One",
+            false,
+            None,
+            Some(&BeeActivityState::Working),
+        );
+        assert!(
+            working.contains(
+                r#"class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is working">Approve</button>"#
+            ),
+            "a working pane must render Approve disabled too: {working}"
+        );
+    }
+
+    /// A4's withheld button still has to READ as withheld — a disabled
+    /// Approve dims and refuses the pointer, and does so by its own rule
+    /// (nothing else in this stylesheet covers `.term-reply__approve`).
+    #[test]
+    fn disabled_approve_reads_as_withheld() {
+        assert!(
+            PROJECT_TAB_STYLE
+                .contains(".term-reply__approve:disabled { opacity: .5; cursor: not-allowed; }"),
+            "the disabled Approve rule must ship: {PROJECT_TAB_STYLE}"
+        );
+    }
+
+    /// A4's JS half: a disabled Approve posts nothing, whatever produced the
+    /// click — the button is server-rendered and only refreshed by a page
+    /// load, so the handler never trusts the DOM to have stopped it.
+    #[test]
+    fn app_js_ignores_a_click_on_a_disabled_approve_button() {
+        let script = include_str!("../assets/app.js");
+        assert_eq!(
+            script.matches("if (approveBtn.disabled) return;").count(),
+            2,
+            "both Approve handlers (shared wiring and the Unassigned page's own) must guard on disabled: {script}"
         );
     }
 
@@ -9395,6 +10180,9 @@ mod tests {
     ) -> TerminalsMenuPane {
         TerminalsMenuPane {
             view: TerminalPaneView {
+                bee_state: None,
+                bee_feature: None,
+                bee_no_signal: false,
                 pane_id: pane_id.into(),
                 kind: "claude".into(),
                 name: "agent".into(),
@@ -10007,7 +10795,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"data-hub-group="in-progress" data-hub-count="0""#),
@@ -10072,7 +10865,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"bee-hub__detail-link" href="/p/proj-1/_bee/feature/session-bound-feat""#),
@@ -10135,7 +10933,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"bee-hub__detail-link" href="/p/proj-1/_bee/feature/wt-bound-feat""#),
@@ -10271,7 +11074,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"bee-hub__detail-link" href="/p/proj-1/_bee/feature/working-feat""#),
@@ -10362,7 +11170,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"bee-hub__detail-link" href="/p/proj-1/_bee/feature/active-feat""#),
@@ -10425,7 +11238,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"bee-hub__detail-link" href="/p/proj-1/_bee/feature/active-feat""#),
@@ -10480,7 +11298,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
         let strip_html = bee_live_strip_section(&snapshot);
 
         assert!(
@@ -10543,7 +11366,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(
@@ -10607,7 +11435,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(
@@ -10895,7 +11728,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             !html.contains("parked-feat"),
@@ -10969,7 +11807,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(
@@ -11024,7 +11867,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"data-hub-group="finished" href="/p/proj-1/_bee/feature/closed-reviewed-feat""#),
@@ -11093,7 +11941,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(
@@ -11165,7 +12018,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(
@@ -11225,7 +12083,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"data-hub-group="finished" href="/p/proj-1/_bee/feature/idle-live-session-feat""#),
@@ -11295,7 +12158,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"bee-hub__detail-link" href="/p/proj-1/_bee/feature/live-reviewed-feat""#),
@@ -11341,7 +12209,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(
@@ -11395,7 +12268,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             !html.contains(r#"data-hub-group="review" href="/p/proj-1/_bee/feature/settled-feat""#),
@@ -11506,8 +12384,13 @@ mod tests {
             r#"<a class="bee-hub__row" data-hub-group="finished" href="/p/proj-1/_bee/feature/shipped-feat" title="shipped-feat"><span class="bee-hub__row-name">shipped-feat</span></a>"#
         );
         assert!(
-            !row.contains("bee-hub__chips") && !row.contains("fg-chip") && !row.contains("bee-progress") && !row.contains("Last activity"),
-            "a Finished row must carry none of the full card's chip/progress/activity markup: {row}"
+            !row.contains("bee-hub__chips")
+                && !row.contains("fg-chip")
+                && !row.contains("bee-hub__footer")
+                && !row.contains("bee-hub__cells")
+                && !row.contains("bee-hub__branch"),
+            "a Finished row must carry none of the full card's chip, cells-reading, \
+             branch or footer markup: {row}"
         );
     }
 
@@ -11849,7 +12732,11 @@ mod tests {
             (&project_b, &rollups[1]),
             (&project_c, &rollups[2]),
         ];
-        let html = bee_cross_project_features_section(&pairs, &std::collections::HashMap::new());
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"bee-hub__detail-link" href="/p/proj-a/_bee/feature/waiting-feat""#),
@@ -11916,7 +12803,11 @@ mod tests {
 
         let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
         let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
-        let html = bee_cross_project_features_section(&pairs, &std::collections::HashMap::new());
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains("fg-banner--warning"),
@@ -11950,7 +12841,11 @@ mod tests {
 
         let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
         let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
-        let html = bee_cross_project_features_section(&pairs, &std::collections::HashMap::new());
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             !html.contains("fg-banner--warning") && !html.contains("could not be read"),
@@ -12105,6 +13000,9 @@ mod tests {
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
 
         let blocked_pane = TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:blocked-pane".into(),
             kind: "codex".into(),
             name: "agent".into(),
@@ -12123,7 +13021,11 @@ mod tests {
         > = std::collections::HashMap::new();
         feature_panes.insert("proj-b".to_string(), proj_b_panes);
 
-        let html = bee_cross_project_features_section(&pairs, &feature_panes);
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &feature_panes,
+            &std::collections::HashMap::new(),
+        );
 
         let blocked_at = html
             .find(r#"bee-hub__detail-link" href="/p/proj-b/_bee/feature/zzz-blocked""#)
@@ -12214,7 +13116,11 @@ mod tests {
         let rollups = waggledance_core::bee::read_rollup(&[root_a.clone(), root_b.clone()]);
         let pairs: Vec<(&Project, &BeeProjectRollup)> =
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
-        let html = bee_cross_project_features_section(&pairs, &std::collections::HashMap::new());
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         let pos_newer = html.find("newer-feat").expect("newer-feat must render");
         let pos_older = html.find("older-feat").expect("older-feat must render");
@@ -12294,7 +13200,11 @@ mod tests {
         let rollups = waggledance_core::bee::read_rollup(&[root_a.clone(), root_b.clone()]);
         let pairs: Vec<(&Project, &BeeProjectRollup)> =
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
-        let html = bee_cross_project_features_section(&pairs, &std::collections::HashMap::new());
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"data-hub-group="finished" data-hub-count="13""#),
@@ -12354,7 +13264,11 @@ mod tests {
         let rollups = waggledance_core::bee::read_rollup(&[root_a.clone(), root_b.clone()]);
         let pairs: Vec<(&Project, &BeeProjectRollup)> =
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
-        let html = bee_cross_project_features_section(&pairs, &std::collections::HashMap::new());
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"href="/p/proj-a/_bee/feature/auth""#),
@@ -12421,10 +13335,16 @@ mod tests {
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
         let without_empty: Vec<(&Project, &BeeProjectRollup)> = vec![(&project_b, &rollups[1])];
 
-        let html_with =
-            bee_cross_project_features_section(&with_empty, &std::collections::HashMap::new());
-        let html_without =
-            bee_cross_project_features_section(&without_empty, &std::collections::HashMap::new());
+        let html_with = bee_cross_project_features_section(
+            &with_empty,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        let html_without = bee_cross_project_features_section(
+            &without_empty,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(
             html_with, html_without,
@@ -12506,7 +13426,11 @@ mod tests {
         let rollups = waggledance_core::bee::read_rollup(&[root_a.clone(), root_b.clone()]);
         let pairs: Vec<(&Project, &BeeProjectRollup)> =
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
-        let html = bee_cross_project_features_section(&pairs, &std::collections::HashMap::new());
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         let card_slot = (1..=10)
             .find(|n| {
@@ -12547,6 +13471,9 @@ mod tests {
     #[test]
     fn bee_hub_card_emits_terminal_badges_matching_project_badges_markup_shape() {
         let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p1".into(),
             kind: "claude".into(),
             name: "agent-name-must-not-appear".into(),
@@ -12557,6 +13484,7 @@ mod tests {
             title: String::new(),
         }];
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -12637,6 +13565,9 @@ mod tests {
     #[test]
     fn board_badges_skip_plain_shell_panes() {
         let shell = |id: &str| TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: id.into(),
             kind: "shell".into(),
             name: String::new(),
@@ -12647,6 +13578,9 @@ mod tests {
             title: String::new(),
         };
         let agent = TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p2".into(),
             kind: "claude".into(),
             name: "n".into(),
@@ -12681,6 +13615,9 @@ mod tests {
     #[test]
     fn badge_title_renders_after_the_program_span_when_it_says_something_new() {
         let pane = TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p1".into(),
             kind: "claude".into(),
             name: "agent-name-must-not-appear".into(),
@@ -12717,6 +13654,9 @@ mod tests {
     #[test]
     fn badge_title_skipped_when_empty_or_redundant_with_the_program() {
         let empty_title = TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p1".into(),
             kind: "claude".into(),
             name: "n".into(),
@@ -12727,6 +13667,9 @@ mod tests {
             title: String::new(),
         };
         let redundant_title = TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: "w1:p2".into(),
             kind: "codex".into(),
             name: "n".into(),
@@ -12753,6 +13696,7 @@ mod tests {
     #[test]
     fn bee_hub_card_with_no_panes_renders_no_badge_container() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -12798,6 +13742,9 @@ mod tests {
     #[test]
     fn bee_hub_card_folds_quiet_panes_into_the_body_and_keeps_active_ones_collapsed() {
         let pane = |id: &str, status: &str| TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: id.into(),
             kind: "claude".into(),
             name: "n".into(),
@@ -12815,6 +13762,7 @@ mod tests {
             pane("w1:blocked", "blocked"),
         ];
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -12878,6 +13826,9 @@ mod tests {
     #[test]
     fn bee_hub_card_badge_groups_never_render_an_empty_frame_or_count_a_shell() {
         let pane = |id: &str, kind: &str, status: &str| TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: id.into(),
             kind: kind.into(),
             name: "n".into(),
@@ -12889,6 +13840,7 @@ mod tests {
         };
         let card = |panes: &[TerminalPaneView]| {
             bee_hub_card(&BeeHubCardArgs {
+                agent: None,
                 project_id: "proj-a",
                 feature: "feat-a",
                 group_key: "in-progress",
@@ -12942,6 +13894,9 @@ mod tests {
     #[test]
     fn project_badges_still_show_every_agent_pane_whatever_its_status() {
         let pane = |id: &str, status: &str| TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
             pane_id: id.into(),
             kind: "claude".into(),
             name: "n".into(),
@@ -12984,6 +13939,7 @@ mod tests {
     fn bee_hub_card_with_a_blocked_pane_carries_its_own_waiting_on_you_line() {
         let panes = vec![pane_with_status("blocked")];
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13015,6 +13971,7 @@ mod tests {
         let panes = vec![pane_with_status("blocked")];
         let gate_reason = "Waiting on you — Shape gate awaiting your decision";
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13052,6 +14009,7 @@ mod tests {
     fn bee_hub_card_with_no_blocked_pane_and_no_gate_reason_carries_neither_line() {
         let panes = vec![pane_with_status("working")];
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13082,6 +14040,7 @@ mod tests {
     #[test]
     fn bee_hub_card_renders_collapsed_with_no_open_attribute() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13120,6 +14079,7 @@ mod tests {
     #[test]
     fn bee_hub_card_body_opens_with_the_feature_detail_link() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13204,6 +14164,7 @@ mod tests {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13235,6 +14196,7 @@ mod tests {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13264,6 +14226,7 @@ mod tests {
     #[test]
     fn bee_hub_card_with_no_tool_call_renders_no_pulse_dot() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13293,6 +14256,7 @@ mod tests {
     #[test]
     fn bee_hub_card_awaiting_approval_run_state_renders_prominent_badge() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13331,6 +14295,7 @@ mod tests {
     #[test]
     fn bee_hub_card_awaiting_approval_without_live_waiting_on_renders_neutral_unreviewed() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13365,6 +14330,7 @@ mod tests {
     #[test]
     fn bee_hub_card_running_run_state_renders_its_own_distinct_tone() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13394,6 +14360,7 @@ mod tests {
     #[test]
     fn bee_hub_card_with_no_run_state_renders_no_badge() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13437,6 +14404,7 @@ mod tests {
             },
         ];
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13473,6 +14441,7 @@ mod tests {
     #[test]
     fn bee_hub_card_with_zero_deferred_debt_renders_nothing() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13554,7 +14523,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         let active_link = "href=\"/p/proj-1/_bee/feature/active-feat\"";
         let other_link = "href=\"/p/proj-1/_bee/feature/other-feat\"";
@@ -13678,6 +14652,7 @@ mod tests {
     #[test]
     fn bee_hub_card_with_project_label_shows_project_worktree_subtitle_and_shell_modifier() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13733,6 +14708,7 @@ mod tests {
     #[test]
     fn bee_hub_card_with_project_label_and_no_title_still_shows_project_subtitle() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13770,7 +14746,10 @@ mod tests {
     /// console-theme-kanban ctk-6 moved that last fact out of the subtitle
     /// and onto the card's own branch row, so this whole-markup assertion
     /// is also the one place the full console card anatomy is pinned end
-    /// to end: header row, subtitle, branch row, counts slot, footer.
+    /// to end: header row, subtitle, branch row, and — since
+    /// bee-agent-activity R2 collapsed the progress bar, its count label and
+    /// the separate "Last activity" row into one closing line — the footer
+    /// that now carries the counts reading and the time together.
     #[test]
     fn bee_hub_card_with_no_project_label_shows_slug_and_worktree_subtitle() {
         let docs = waggledance_core::bee::BeeFeatureDocs {
@@ -13779,6 +14758,7 @@ mod tests {
             docs: vec![],
         };
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13798,7 +14778,7 @@ mod tests {
         });
         assert_eq!(
             card_html,
-            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><div class="fg-card__title">Human Title</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__slug">feat-a</div><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-progress"><div class="bee-progress__bar" style="width: 50%"></div></div><p class="bee-hub__progress-label">1/2 cells done</p><div class="bee-hub__footer"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg><span class="bee-hub__activity-label">No activity recorded.</span></div></div></details></div>"#,
+            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><div class="fg-card__title">Human Title</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__slug">feat-a</div><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
             "a card with no project label must keep the byte-identical shell/colour and now carry its worktree state on its own branch row: {card_html}"
         );
         // console-theme-kanban ctk-6 (D2): the five things the console
@@ -13844,6 +14824,7 @@ mod tests {
     #[test]
     fn bee_hub_card_with_no_project_label_and_no_title_names_its_worktree_alone() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13886,6 +14867,7 @@ mod tests {
     #[test]
     fn bee_hub_card_with_no_worktree_renders_no_branch_row() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13913,13 +14895,15 @@ mod tests {
         );
     }
 
-    /// (console-theme-kanban ctk-6, D2 + must-have) A feature with zero
-    /// cells renders no count element at all -- never `0/0`, and never an
-    /// empty progress bar either. The counts slot states a real reading or
-    /// says nothing.
+    /// (console-theme-kanban ctk-6, D2 + must-have; bee-agent-activity R2)
+    /// A feature with zero cells renders no count element at all -- never
+    /// `0/0`, and since R2 no cells span and no ring either. The footer's
+    /// left half states a real reading or says nothing, and the card is then
+    /// its time alone.
     #[test]
     fn bee_hub_card_with_zero_cells_renders_no_count_element() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13942,28 +14926,34 @@ mod tests {
             "a feature with no cells must never render a 0/0 reading: {card_html}"
         );
         assert!(
-            !card_html.contains("bee-hub__progress-label") && !card_html.contains("bee-progress"),
-            "with no cells there is no count element and no bar at all: {card_html}"
+            !card_html.contains("bee-hub__cells") && !card_html.contains("bee-progress"),
+            "with no cells there is no cells span, no ring and no bar at all: {card_html}"
         );
-        // The rest of the anatomy still renders — omitting the counts slot
-        // is not the card going quiet.
+        // The rest of the anatomy still renders — omitting the cells reading
+        // is not the card going quiet, and the footer still states its time.
         assert!(
             card_html.contains(r#"<span class="bee-hub__branch-name">wt/feat-a</span>"#)
-                && card_html.contains(r#"<div class="bee-hub__footer">"#),
-            "the branch row and footer must still render on a card with no cells: {card_html}"
+                && card_html.contains(
+                    r#"<div class="bee-hub__footer"><span class="bee-hub__activity-time">no activity</span></div>"#
+                ),
+            "the branch row and the time-only footer must still render on a card with no \
+             cells: {card_html}"
         );
     }
 
-    /// (console-theme-kanban ctk-6) The card's footer is the console
-    /// anatomy's own last band: the activity glyph, its label, and the
-    /// relative time `bee_fmt_trace_time` formats, sitting apart from the
-    /// meta block above it.
+    /// (console-theme-kanban ctk-6, bee-agent-activity R2) The card's footer
+    /// is the console anatomy's own last band and, since R2, its only closing
+    /// line: the cells ring and its `n/m cells` reading on the left, the
+    /// relative time `bee_fmt_trace_time` formats on the right, and neither
+    /// the progress bar, the "n/m cells done" label nor the "Last activity"
+    /// row that used to stand above it.
     #[test]
-    fn bee_hub_card_footer_carries_the_activity_glyph_and_its_relative_time() {
+    fn bee_hub_card_footer_puts_the_cells_reading_left_and_the_time_right() {
         let ten_minutes_ago = (time::OffsetDateTime::now_utc() - time::Duration::minutes(10))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
         let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
             project_id: "proj-a",
             feature: "feat-a",
             group_key: "in-progress",
@@ -13984,14 +14974,97 @@ mod tests {
         let expected_time = bee_fmt_trace_time(&ten_minutes_ago);
         assert!(
             card_html.contains(&format!(
-                r#"<span class="bee-hub__activity-label">Last activity</span><span class="bee-hub__activity-time">{expected_time}</span>"#
+                r#"<div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">{expected_time}</span></div>"#
             )),
-            "the footer must carry the activity label and the relative time \
+            "the footer must be one line: the cells ring and reading, then the relative time \
              `bee_fmt_trace_time` formatted: {card_html}"
         );
         assert!(
-            card_html.contains(r#"<div class="bee-hub__footer"><svg"#),
-            "the footer must open with its own aria-hidden activity glyph: {card_html}"
+            !card_html.contains("bee-progress")
+                && !card_html.contains("bee-hub__progress-label")
+                && !card_html.contains("Last activity")
+                && !card_html.contains("cells done"),
+            "no progress bar, count label or separate Last activity row may survive R2: \
+             {card_html}"
+        );
+    }
+
+    /// (bee-agent-activity R2) The ring is the progress bar's whole reading:
+    /// filled when every cell is capped, hollow when none is, half otherwise
+    /// — and the fraction printed beside it always states the numbers, so no
+    /// state is carried by the ring's colour alone.
+    #[test]
+    fn bee_hub_card_footer_ring_reads_done_partial_and_none_from_the_counts() {
+        let card = |done: usize, total: usize| {
+            bee_hub_card(&BeeHubCardArgs {
+                agent: None,
+                project_id: "proj-a",
+                feature: "feat-a",
+                group_key: "in-progress",
+                done,
+                total,
+                last_activity: None,
+                worktree_label: "Main",
+                reason: None,
+                docs: None,
+                project_label: None,
+                project_color: None,
+                panes: &[],
+                run_state: None,
+                waiting_on_live: false,
+                last_tool_call: None,
+                deferred: &[],
+            })
+        };
+        for (done, total, fill) in [(2usize, 2usize, "done"), (1, 2, "partial"), (0, 3, "none")] {
+            let html = card(done, total);
+            assert!(
+                html.contains(&format!(
+                    r#"<span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--{fill}" aria-hidden="true"></span>{done}/{total} cells</span>"#
+                )),
+                "{done}/{total} must ring as --{fill} and print its own fraction: {html}"
+            );
+        }
+    }
+
+    /// (bee-agent-activity R2, kanban-live-signals D1) The pulse dot stays
+    /// inside the one footer line, between the cells reading and the time it
+    /// annotates — never a row of its own.
+    #[test]
+    fn bee_hub_card_footer_keeps_the_pulse_dot_beside_the_time() {
+        let just_now = (time::OffsetDateTime::now_utc() - time::Duration::seconds(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
+            project_id: "proj-a",
+            feature: "feat-a",
+            group_key: "in-progress",
+            done: 1,
+            total: 2,
+            last_activity: Some(&just_now),
+            worktree_label: "Main",
+            reason: None,
+            docs: None,
+            project_label: None,
+            project_color: None,
+            panes: &[],
+            run_state: None,
+            waiting_on_live: false,
+            last_tool_call: Some(just_now.as_str()),
+            deferred: &[],
+        });
+        assert!(
+            card_html.contains(&format!(
+                r#"1/2 cells</span> <span class="bee-hub__pulse" role="status" aria-label="Working now" title="Working now"></span><span class="bee-hub__activity-time">{}</span></div>"#,
+                bee_fmt_trace_time(&just_now)
+            )),
+            "the pulse must ride inside the footer line, right before the time: {card_html}"
+        );
+        assert_eq!(
+            card_html.matches("bee-hub__footer").count(),
+            1,
+            "the card ends in exactly one footer line: {card_html}"
         );
     }
 
@@ -14017,6 +15090,7 @@ mod tests {
             ("Main", false),
         ] {
             let card_html = bee_hub_card(&BeeHubCardArgs {
+                agent: None,
                 project_id: "proj-a",
                 feature: "feat-a",
                 group_key: "in-progress",
@@ -14196,7 +15270,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         // The tiles lead the board: markup order is what a phone reads.
         let stats_at = html
@@ -14272,6 +15351,276 @@ mod tests {
     /// -- while the tiles' wide-screen default (`display: none`) sits outside
     /// it, ahead of the query, so desktop keeps its five-column grid and
     /// draws no tiles at all.
+    /// agent-line-own-row (UAT on bee-agent-activity): the agent line is a
+    /// full-width second row of the summary, never a column beside the title.
+    #[test]
+    fn bee_hub_agent_line_is_a_full_width_row_of_the_summary() {
+        let css = bee_hub_style();
+        assert!(
+            css.contains(".bee-hub__summary { display: flex; flex-wrap: wrap;"),
+            "the summary must wrap so the agent line can drop to its own row: {css}"
+        );
+        assert!(
+            css.contains(".bee-hub__agent { flex: 1 0 100%; order: 10;"),
+            "the agent line must claim the whole width and sit last: {css}"
+        );
+    }
+
+    /// (bee-agent-activity R1) The Ready to merge row's own line says both
+    /// halves in words: which uat shape it is, and how long it has been
+    /// ready. `uat pending` is the half ctk-8's rule used to hide entirely —
+    /// the work is done and the merge is waiting on a human acceptance, and
+    /// the column now shows it instead of parking it in In Progress.
+    #[test]
+    fn bee_hub_merge_line_says_uat_pending_and_how_long_it_has_been_ready() {
+        let since = (time::OffsetDateTime::now_utc() - time::Duration::hours(3))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let html = bee_hub_merge_line(&BeeHubMergeData {
+            uat_approved: false,
+            since: Some(since),
+            worktree_label: String::new(),
+        });
+        assert!(
+            html.contains(r#"<p class="bee-hub__merge">"#),
+            "the merge line must be its own full-width paragraph: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<span class="bee-hub__merge-uat bee-hub__merge-uat--pending">uat pending</span>"#
+            ),
+            "a feature whose uat is not approved must say so in words: {html}"
+        );
+        assert!(
+            html.contains(r#"<span class="bee-hub__merge-since">ready 3 hours ago</span>"#),
+            "the line must say how long it has been ready, relative: {html}"
+        );
+    }
+
+    /// (bee-agent-activity R1) The other half of the same line — an
+    /// accepted feature reads `uat approved`, and it is the same markup
+    /// with a different modifier, so the two never diverge in shape.
+    #[test]
+    fn bee_hub_merge_line_says_uat_approved_when_the_gate_is_stamped() {
+        let since = (time::OffsetDateTime::now_utc() - time::Duration::minutes(2))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let html = bee_hub_merge_line(&BeeHubMergeData {
+            uat_approved: true,
+            since: Some(since),
+            worktree_label: String::new(),
+        });
+        assert!(
+            html.contains(
+                r#"<span class="bee-hub__merge-uat bee-hub__merge-uat--approved">uat approved</span>"#
+            ),
+            "an approved uat gate must read as the word, not a colour alone: {html}"
+        );
+        assert!(
+            html.contains(r#"ready 2 minutes ago</span>"#),
+            "the age is relative language, never a raw timestamp: {html}"
+        );
+    }
+
+    /// (bee-agent-activity R1) No parsable cap time means no age clause —
+    /// the line still names the uat shape rather than inventing a "just
+    /// now" the store never recorded (the same never-fabricate rule
+    /// `bee_hub_latest_activity` follows).
+    #[test]
+    fn bee_hub_merge_line_drops_the_age_clause_when_no_cap_time_parsed() {
+        let html = bee_hub_merge_line(&BeeHubMergeData {
+            uat_approved: false,
+            since: None,
+            worktree_label: String::new(),
+        });
+        assert!(
+            html.contains("uat pending"),
+            "the uat half always renders: {html}"
+        );
+        assert!(
+            !html.contains("ready "),
+            "an unknown cap time must render no age at all: {html}"
+        );
+        assert!(
+            !html.contains("bee-hub__merge-since"),
+            "no age means no age span: {html}"
+        );
+    }
+
+    /// (bee-agent-activity R2) A Ready to merge row says which branch the
+    /// merge would land — the same `.bee-hub__branch` markup the In Progress
+    /// card carries, from the one helper both build it with — and says it
+    /// under the name, above the merge line. The dense rows of the other
+    /// columns have no merge to name and so carry no branch at all: they
+    /// render exactly as they did before this feature.
+    #[test]
+    fn bee_hub_ready_to_merge_row_carries_its_branch_above_the_merge_line() {
+        let merge = BeeHubMergeData {
+            uat_approved: false,
+            since: None,
+            worktree_label: "wt/feat-a".to_string(),
+        };
+        let row = bee_hub_finished_row_with_extra(
+            "ready-to-merge",
+            "/p/proj-1/_bee/feature/feat-a",
+            "feat-a",
+            None,
+            None,
+            None,
+            None,
+            Some(&bee_hub_ready_to_merge_extra(&merge)),
+        );
+        assert!(
+            row.contains(r#"<span class="bee-hub__branch-name">wt/feat-a</span>"#),
+            "the Ready to merge row must name the branch its merge would land: {row}"
+        );
+        let branch_at = row.find("bee-hub__branch").expect("branch row");
+        let name_at = row.find("bee-hub__row-name").expect("name span");
+        let merge_at = row.find("bee-hub__merge").expect("merge line");
+        assert!(
+            name_at < branch_at && branch_at < merge_at,
+            "the branch must sit under the name and above the merge line: {row}"
+        );
+
+        // The three other dense columns take the plain row and so stay
+        // byte-identical to before R2 — no branch, no merge line.
+        for group in ["review", "compound", "todo"] {
+            let plain = bee_hub_finished_row(
+                group,
+                "/p/proj-1/_bee/feature/feat-a",
+                "feat-a",
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                !plain.contains("bee-hub__branch") && !plain.contains("bee-hub__merge"),
+                "a {group} row carries neither a branch nor a merge line: {plain}"
+            );
+        }
+    }
+
+    /// (bee-agent-activity R2) `"Main"` names the absence of a worktree
+    /// ([`bee_hub_worktree_label`]), so it renders no branch row on either
+    /// card kind — the one source of that markup is also the one place that
+    /// rule lives.
+    #[test]
+    fn bee_hub_branch_line_renders_nothing_for_main_or_an_empty_label() {
+        assert_eq!(bee_hub_branch_line("Main"), "");
+        assert_eq!(bee_hub_branch_line(""), "");
+        assert!(
+            bee_hub_branch_line("merged")
+                .contains(r#"<span class="bee-hub__branch-name">merged</span>"#),
+            "every spelling that names a worktree that exists renders verbatim"
+        );
+    }
+
+    /// (bee-agent-activity R1) The column's own order: uat approved first
+    /// (one command from landing), then most recently ready first inside
+    /// each half, with an untimed row after every timed one rather than
+    /// jumping the queue on an assumed "now".
+    #[test]
+    fn bee_hub_ready_to_merge_orders_uat_approved_first_then_newest_ready() {
+        let ago = |h: i64| {
+            (time::OffsetDateTime::now_utc() - time::Duration::hours(h))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        type ReadyRow = ((u8, Option<time::OffsetDateTime>, String), &'static str);
+        let mut rows: Vec<ReadyRow> = vec![
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: false,
+                        since: None,
+                        worktree_label: String::new(),
+                    },
+                    "pending-untimed",
+                ),
+                "pending-untimed",
+            ),
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: false,
+                        since: Some(ago(10)),
+                        worktree_label: String::new(),
+                    },
+                    "pending-old",
+                ),
+                "pending-old",
+            ),
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: true,
+                        since: Some(ago(20)),
+                        worktree_label: String::new(),
+                    },
+                    "approved-old",
+                ),
+                "approved-old",
+            ),
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: false,
+                        since: Some(ago(1)),
+                        worktree_label: String::new(),
+                    },
+                    "pending-new",
+                ),
+                "pending-new",
+            ),
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: true,
+                        since: Some(ago(2)),
+                        worktree_label: String::new(),
+                    },
+                    "approved-new",
+                ),
+                "approved-new",
+            ),
+        ];
+        rows.sort_by(|a, b| bee_hub_ready_to_merge_cmp(&a.0, &b.0));
+        let order: Vec<&str> = rows.into_iter().map(|(_, name)| name).collect();
+        assert_eq!(
+            order,
+            vec![
+                "approved-new",
+                "approved-old",
+                "pending-new",
+                "pending-old",
+                "pending-untimed"
+            ],
+            "uat approved leads, newest ready first inside each half, untimed last"
+        );
+    }
+
+    /// (bee-agent-activity R1) The merge line is styled as the dense row's
+    /// own second line, beside the agent line's rules — muted mono, its own
+    /// block, and each uat shape carrying a colour that only ever seconds
+    /// the word already printed.
+    #[test]
+    fn bee_hub_style_carries_the_ready_to_merge_line_beside_the_agent_line() {
+        let css = bee_hub_style();
+        assert!(
+            css.contains(".bee-hub__merge { display: flex; flex-wrap: wrap;"),
+            "the merge line must lay out like the agent line: {css}"
+        );
+        assert!(
+            css.contains(".bee-hub__merge-uat--approved { color: var(--color-success); }"),
+            "an approved uat gate reads green beside its word: {css}"
+        );
+        assert!(
+            css.contains(".bee-hub__merge-uat--pending { color: var(--color-warning); }"),
+            "a pending uat gate reads warning beside its word: {css}"
+        );
+    }
+
     #[test]
     fn bee_hub_style_keeps_every_phone_board_rule_inside_the_one_narrow_media_query() {
         let css = bee_hub_style();
@@ -14447,7 +15796,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"data-hub-group="finished" data-hub-count="12""#),
@@ -14535,7 +15889,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         let groups_open = html
             .find(r#"<div class="bee-hub__groups">"#)
@@ -14737,7 +16096,12 @@ mod tests {
         let snapshot = waggledance_core::bee::read_snapshot(&root);
         let mut project = sample_project();
         project.root_path = root.clone();
-        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             html.contains(r#"<span class="bee-hub__group-waiting">1 waiting</span>"#),

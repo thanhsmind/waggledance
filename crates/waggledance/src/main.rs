@@ -282,6 +282,19 @@ impl TerminalBackground {
                     }
                     None => Arc::new(notify::NullNotifier),
                 };
+                // The engine is both the run-ownership oracle and the
+                // registry of project roots bee activity is read from (A5)
+                // -- no new plumbing, and the roots are re-asked each tick
+                // so a project registered mid-run is picked up.
+                let bee_roots: Option<Arc<dyn watcher::BeeRoots>> = engine.clone().map(|eng| {
+                    let source: Arc<dyn watcher::BeeRoots> =
+                        Arc::new(move || -> Vec<std::path::PathBuf> {
+                            eng.list_projects()
+                                .map(|ps| ps.into_iter().map(|p| p.root_path).collect())
+                                .unwrap_or_default()
+                        });
+                    source
+                });
                 let service = match engine {
                     Some(eng) => {
                         let ownership: Arc<dyn notify::RunOwnership> =
@@ -294,22 +307,48 @@ impl TerminalBackground {
                     }
                     None => Arc::new(notify::NotifyService::new(store, notifier)),
                 };
-                let poll_watcher = watcher::PollWatcher::new(control, interval);
+                let mut poll_watcher = watcher::PollWatcher::new(control, interval);
+                if let Some(roots) = bee_roots {
+                    poll_watcher = poll_watcher.with_bee_roots(roots);
+                }
                 let ticks = self.notify_ticks.clone();
                 *slot = Some(tokio::spawn(async move {
                     if let Some(prev) = previous {
                         let _ = prev.await;
                     }
                     poll_watcher
-                        .run_async(ticks, move |change| {
+                        .run_async(ticks, move |event| {
                             let service = service.clone();
                             async move {
-                                tracing::info!(
-                                    pane = %change.pane_id,
-                                    status = change.status.as_str(),
-                                    "agent status change"
-                                );
-                                if service.record(&change).await {
+                                // Both cursors land here, on the same tick:
+                                // herdr's screen-derived status and bee's
+                                // own agent activity (A5).
+                                let enqueued = match &event {
+                                    watcher::WatchEvent::Status(change) => {
+                                        tracing::info!(
+                                            pane = %change.pane_id,
+                                            status = change.status.as_str(),
+                                            "agent status change"
+                                        );
+                                        service.record(change).await
+                                    }
+                                    watcher::WatchEvent::Activity(transition) => {
+                                        tracing::info!(
+                                            session = %transition.session_id,
+                                            pane = transition.pane.as_deref().unwrap_or("-"),
+                                            state = transition.to.word(),
+                                            "bee agent activity change"
+                                        );
+                                        service
+                                            .record_activity(
+                                                &transition.session_id,
+                                                transition.pane.as_deref(),
+                                                &transition.to,
+                                            )
+                                            .await
+                                    }
+                                };
+                                if enqueued {
                                     service.drain().await;
                                 }
                             }
