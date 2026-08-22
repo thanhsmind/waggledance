@@ -6235,30 +6235,108 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&sibling).ok();
     }
 
-    /// (console-theme-kanban ctk-8) The Ready to merge column's whole
-    /// membership rule, proven at the HTTP layer over real store files: a
-    /// feature whose `uat` gate is approved AND whose worktree is still
-    /// granted and unmerged is the state where `bee worktree merge` is
-    /// literally the next action, so it lands in Ready to merge -- and it
-    /// must leave In Progress to get there, since an open grant is itself
-    /// one of In Progress's own liveness pulls and would otherwise swallow
-    /// it first.
+    /// One `.bee/cells/<id>.json` for the Ready to merge rule's own tests
+    /// (bee-agent-activity R1): unlike `cell_json` it names its own feature
+    /// and can carry a `trace.capped_at`, which is what the column's
+    /// "ready <age>" reading and its ordering are derived from.
+    fn merge_cell_json(id: &str, feature: &str, status: &str, capped_at: Option<&str>) -> String {
+        let capped_field = capped_at
+            .map(|t| format!(r#", "capped_at": "{t}""#))
+            .unwrap_or_default();
+        format!(
+            r#"{{
+                "id": "{id}",
+                "feature": "{feature}",
+                "lane": "standard",
+                "title": "Cell {id}",
+                "action": "do the thing",
+                "verify": "cargo test",
+                "files": [],
+                "read_first": [],
+                "deps": [],
+                "decisions": [],
+                "must_haves": {{}},
+                "behavior_change": false,
+                "change_class": "behavior",
+                "pbi": null,
+                "status": "{status}",
+                "tier": "generation",
+                "trace": {{"worker": "w1"{capped_field}}}
+            }}"#
+        )
+    }
+
+    /// (console-theme-kanban ctk-8, widened by bee-agent-activity R1 —
+    /// decision `63bffb34`, supersedes `420cec71`) The Ready to merge
+    /// column's whole membership rule, proven at the HTTP layer over real
+    /// store files. ctk-8 read an approved `uat` gate as membership; R1
+    /// moves uat onto the card and makes membership "the work is done and
+    /// the worktree is still open": an unmerged grant, the `execution` gate
+    /// approved, at least one cell and every non-dropped one capped. The
+    /// feature must leave In Progress to get there, since an open grant is
+    /// itself one of In Progress's own liveness pulls and would otherwise
+    /// swallow it first.
     ///
-    /// The second feature is the other half of the rule: its `uat` gate is
-    /// approved too, but its worktree is already merged (a still-open
+    /// Three features carry the three halves of the rule. `pending-feat`
+    /// has no uat approval at all and is the case ctk-8 used to hide: its
+    /// cells are capped, its worktree is open, and the merge is exactly
+    /// what it waits on — it belongs in the column, saying `uat pending`,
+    /// and a `dropped` cell beside its capped ones does not hold it back
+    /// (dropped counts toward nothing). `approved-feat` is the accepted
+    /// half, saying `uat approved`, and it sorts ahead of `pending-feat`
+    /// even though it has been ready far longer — uat approved leads the
+    /// column. `merged-feat` is unchanged from ctk-8: its uat is approved
+    /// too, but its worktree is already merged (a still-open
     /// `worktree-cleanup` entry in `deferred-queue.jsonl`, bee's own
     /// `merged_pending` signal), so merging is NOT its next action and it
     /// stays in the column its phase earns it. Nothing here synthesises a
-    /// merge-readiness verdict -- both halves read only values the store
-    /// already holds (CONTEXT.md D2).
+    /// merge-readiness verdict — every input is a value the store already
+    /// holds (CONTEXT.md D2).
     #[tokio::test]
-    async fn feature_hub_uat_approved_feature_with_an_open_worktree_lands_in_ready_to_merge() {
+    async fn feature_hub_ready_to_merge_holds_capped_open_worktrees_and_says_its_uat_shape() {
         let root = fresh_root("hub-ready-to-merge");
         write(
             &root,
-            ".bee/lanes/ready-feat.json",
+            ".bee/lanes/pending-feat.json",
             &lane_json(
-                "ready-feat",
+                "pending-feat",
+                "swarming",
+                "standard",
+                "merge the worktree",
+                Some(r#""context": true, "shape": true, "execution": true"#),
+                None,
+            ),
+        );
+        // Capped, capped, and one dropped beside them: dropped counts
+        // toward neither `total` nor `done`, so the feature still reads as
+        // "every non-dropped cell capped".
+        write(
+            &root,
+            ".bee/cells/p1.json",
+            &merge_cell_json("p1", "pending-feat", "capped", Some("2026-08-21T10:00:00Z")),
+        );
+        write(
+            &root,
+            ".bee/cells/p2.json",
+            &merge_cell_json("p2", "pending-feat", "capped", Some("2026-08-21T12:00:00Z")),
+        );
+        write(
+            &root,
+            ".bee/cells/p3.json",
+            &merge_cell_json("p3", "pending-feat", "dropped", None),
+        );
+        let pending_sibling = make_worktree_sibling("hub-ready-pending-wt");
+        write(
+            &pending_sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"pending-feat","mode":"standard"}"#,
+        );
+
+        write(
+            &root,
+            ".bee/lanes/approved-feat.json",
+            &lane_json(
+                "approved-feat",
                 "swarming",
                 "standard",
                 "merge the worktree",
@@ -6268,15 +6346,26 @@ mod bee_route_tests {
                 None,
             ),
         );
-        let open_sibling = make_worktree_sibling("hub-ready-open-wt");
         write(
-            &open_sibling,
+            &root,
+            ".bee/cells/a1.json",
+            &merge_cell_json(
+                "a1",
+                "approved-feat",
+                "capped",
+                Some("2026-08-19T09:00:00Z"),
+            ),
+        );
+        let approved_sibling = make_worktree_sibling("hub-ready-approved-wt");
+        write(
+            &approved_sibling,
             ".bee/state.json",
-            r#"{"phase":"swarming","feature":"ready-feat","mode":"standard"}"#,
+            r#"{"phase":"swarming","feature":"approved-feat","mode":"standard"}"#,
         );
 
-        // Same approved `uat` gate, but this grant is already merged and
-        // only awaiting cleanup -- `compounding` is where its phase puts it.
+        // Same approved `uat` gate and capped cell, but this grant is
+        // already merged and only awaiting cleanup -- `compounding` is
+        // where its phase puts it.
         write(
             &root,
             ".bee/lanes/merged-feat.json",
@@ -6291,6 +6380,11 @@ mod bee_route_tests {
                 None,
             ),
         );
+        write(
+            &root,
+            ".bee/cells/m1.json",
+            &merge_cell_json("m1", "merged-feat", "capped", Some("2026-08-20T09:00:00Z")),
+        );
         let merged_sibling = make_worktree_sibling("hub-ready-merged-wt");
         write(
             &merged_sibling,
@@ -6301,15 +6395,29 @@ mod bee_route_tests {
         write(
             &root,
             ".bee/runtime/worktree-grants.json",
-            &grants_json(&["hub-ready-open-wt", "hub-ready-merged-wt"]),
+            &grants_json(&[
+                "hub-ready-pending-wt",
+                "hub-ready-approved-wt",
+                "hub-ready-merged-wt",
+            ]),
         );
         write(
             &root,
-            ".bee/runtime/workspaces/open.json",
+            ".bee/runtime/workspaces/pending.json",
             &workspace_json(
-                "hub-ready-open-wt",
-                &open_sibling.to_string_lossy(),
-                "wt/ready-feat",
+                "hub-ready-pending-wt",
+                &pending_sibling.to_string_lossy(),
+                "wt/pending-feat",
+                &[],
+            ),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/approved.json",
+            &workspace_json(
+                "hub-ready-approved-wt",
+                &approved_sibling.to_string_lossy(),
+                "wt/approved-feat",
                 &[],
             ),
         );
@@ -6339,23 +6447,55 @@ mod bee_route_tests {
         let body = body_string(resp).await;
 
         assert!(
-            body.contains("data-hub-group=\"ready-to-merge\" data-hub-count=\"1\""),
-            "the uat-approved feature with an open unmerged worktree must be the column's one member: {body}"
+            body.contains("data-hub-group=\"ready-to-merge\" data-hub-count=\"2\""),
+            "both capped features with open unmerged worktrees must be the column's members: {body}"
+        );
+        let pending_row = format!(
+            "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/pending-feat\"",
+            project.id
+        );
+        let approved_row = format!(
+            "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/approved-feat\"",
+            project.id
         );
         assert!(
-            body.contains(&format!(
-                "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/ready-feat\"",
-                project.id
-            )),
-            "ready-feat must render as a dense Ready to merge row: {body}"
+            body.contains(&pending_row),
+            "a capped feature with an open worktree is ready to merge whether or not uat is approved: {body}"
         );
+        assert!(
+            body.contains(&approved_row),
+            "the uat-approved feature must still render as a dense Ready to merge row: {body}"
+        );
+        assert!(
+            body.contains(
+                "<span class=\"bee-hub__merge-uat bee-hub__merge-uat--pending\">uat pending</span>"
+            ),
+            "the unaccepted feature must say uat pending, in words: {body}"
+        );
+        assert!(
+            body.contains(
+                "<span class=\"bee-hub__merge-uat bee-hub__merge-uat--approved\">uat approved</span>"
+            ),
+            "the accepted feature must say uat approved, in words: {body}"
+        );
+        assert!(
+            body.contains("<span class=\"bee-hub__merge-since\">ready "),
+            "each row must say how long it has been ready: {body}"
+        );
+        let approved_at = body.find(&approved_row).expect("approved row");
+        let pending_at = body.find(&pending_row).expect("pending row");
+        assert!(
+            approved_at < pending_at,
+            "uat approved sorts ahead of uat pending even when it has been ready longer: {body}"
+        );
+
         assert!(
             body.contains("data-hub-group=\"in-progress\" data-hub-count=\"0\""),
-            "Ready to merge is tested before In Progress, so its member must have left In Progress entirely: {body}"
+            "Ready to merge is tested before In Progress, so its members must have left In Progress entirely: {body}"
         );
         assert!(
             !body.contains(&format!(
-                "bee-hub__detail-link\" href=\"/p/{}/_bee/feature/ready-feat\"",
+                "bee-hub__detail-link\" href=\"/p/{}/_bee/feature/pending-feat\"",
                 project.id
             )),
             "Ready to merge uses the dense row, never the full card anatomy In Progress keeps: {body}"
@@ -6377,12 +6517,170 @@ mod bee_route_tests {
                 "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/merged-feat\"",
                 project.id
             )),
-            "an approved uat gate over an ALREADY merged worktree is not merge-readiness: {body}"
+            "an ALREADY merged worktree is not merge-readiness, approved uat or not: {body}"
         );
 
         std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&open_sibling).ok();
+        std::fs::remove_dir_all(&pending_sibling).ok();
+        std::fs::remove_dir_all(&approved_sibling).ok();
         std::fs::remove_dir_all(&merged_sibling).ok();
+    }
+
+    /// (bee-agent-activity R1) The other side of the widened rule: an open
+    /// worktree alone never makes a feature ready. `claimed-feat` still has
+    /// a cell in flight, `nocells-feat` has no cells at all (R1 names the
+    /// zero-cell grant explicitly — a fresh worktree with nothing done in
+    /// it is not a merge waiting to happen), and `noexec-feat` never got
+    /// its `execution` gate. All three keep the column an open grant used
+    /// to earn them, In Progress, and Ready to merge stays honestly empty.
+    #[tokio::test]
+    async fn feature_hub_ready_to_merge_needs_execution_approved_and_every_cell_capped() {
+        let root = fresh_root("hub-not-ready");
+
+        write(
+            &root,
+            ".bee/lanes/claimed-feat.json",
+            &lane_json(
+                "claimed-feat",
+                "swarming",
+                "standard",
+                "run the wave",
+                Some(r#""context": true, "shape": true, "execution": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/c1.json",
+            &merge_cell_json("c1", "claimed-feat", "capped", Some("2026-08-21T10:00:00Z")),
+        );
+        write(
+            &root,
+            ".bee/cells/c2.json",
+            &merge_cell_json("c2", "claimed-feat", "claimed", None),
+        );
+        let claimed_sibling = make_worktree_sibling("hub-not-ready-claimed-wt");
+        write(
+            &claimed_sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"claimed-feat","mode":"standard"}"#,
+        );
+
+        write(
+            &root,
+            ".bee/lanes/nocells-feat.json",
+            &lane_json(
+                "nocells-feat",
+                "swarming",
+                "standard",
+                "plan the slice",
+                Some(r#""context": true, "shape": true, "execution": true"#),
+                None,
+            ),
+        );
+        let nocells_sibling = make_worktree_sibling("hub-not-ready-nocells-wt");
+        write(
+            &nocells_sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"nocells-feat","mode":"standard"}"#,
+        );
+
+        write(
+            &root,
+            ".bee/lanes/noexec-feat.json",
+            &lane_json(
+                "noexec-feat",
+                "shaping",
+                "standard",
+                "ask for the gate",
+                Some(r#""context": true, "shape": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/n1.json",
+            &merge_cell_json("n1", "noexec-feat", "capped", Some("2026-08-21T11:00:00Z")),
+        );
+        let noexec_sibling = make_worktree_sibling("hub-not-ready-noexec-wt");
+        write(
+            &noexec_sibling,
+            ".bee/state.json",
+            r#"{"phase":"shaping","feature":"noexec-feat","mode":"standard"}"#,
+        );
+
+        write(
+            &root,
+            ".bee/runtime/worktree-grants.json",
+            &grants_json(&[
+                "hub-not-ready-claimed-wt",
+                "hub-not-ready-nocells-wt",
+                "hub-not-ready-noexec-wt",
+            ]),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/claimed.json",
+            &workspace_json(
+                "hub-not-ready-claimed-wt",
+                &claimed_sibling.to_string_lossy(),
+                "wt/claimed-feat",
+                &[],
+            ),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/nocells.json",
+            &workspace_json(
+                "hub-not-ready-nocells-wt",
+                &nocells_sibling.to_string_lossy(),
+                "wt/nocells-feat",
+                &[],
+            ),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/noexec.json",
+            &workspace_json(
+                "hub-not-ready-noexec-wt",
+                &noexec_sibling.to_string_lossy(),
+                "wt/noexec-feat",
+                &[],
+            ),
+        );
+
+        let st = build_state();
+        let project = register(&st, &root, "hub-not-ready");
+        let resp = get(router(st), &format!("/p/{}/_bee", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        assert!(
+            body.contains("data-hub-group=\"ready-to-merge\" data-hub-count=\"0\""),
+            "none of the three qualifies, so the column stays honestly empty: {body}"
+        );
+        assert!(
+            body.contains("Nothing ready to merge."),
+            "an empty Ready to merge column still states its own empty line: {body}"
+        );
+        for feature in ["claimed-feat", "nocells-feat", "noexec-feat"] {
+            assert!(
+                !body.contains(&format!(
+                    "data-hub-group=\"ready-to-merge\" href=\"/p/{}/_bee/feature/{feature}\"",
+                    project.id
+                )),
+                "{feature} must not read as ready to merge: {body}"
+            );
+        }
+        assert!(
+            body.contains("data-hub-group=\"in-progress\" data-hub-count=\"3\""),
+            "all three keep the column their open grant earns them: {body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&claimed_sibling).ok();
+        std::fs::remove_dir_all(&nocells_sibling).ok();
+        std::fs::remove_dir_all(&noexec_sibling).ok();
     }
 
     /// (edge, feature-hub fh-1, grown to five columns by kanban-columns D1

@@ -2820,6 +2820,18 @@ fn bee_hub_style() -> String {
 .bee-hub__agent-cell { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bee-hub__agent-quiet { color: var(--color-text-subtle); }
 .bee-hub__agent-signal { color: var(--color-text-subtle); font-style: italic; }
+/* (bee-agent-activity R1) The Ready to merge row's own second line — the
+   same muted mono summary row the agent line is, on a dense
+   `.bee-hub__row` instead of a card summary. `.bee-hub__row` is
+   `display: block`, so this needs no `flex: 1 0 100%; order` pair to claim
+   the full width the way `.bee-hub__agent` does inside the flex summary: a
+   block `<p>` already takes the row. `uat approved` and `uat pending` are
+   words first and colours second — the row still reads correctly with no
+   colour at all. */
+.bee-hub__merge { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: var(--space-1) 0 0; padding: 0; font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
+.bee-hub__merge-uat--approved { color: var(--color-success); }
+.bee-hub__merge-uat--pending { color: var(--color-warning); }
+.bee-hub__merge-since { color: var(--color-text-subtle); }
 .bee-hub__branch { display: flex; align-items: center; gap: var(--space-1); min-width: 0; color: var(--color-text-muted); }
 .bee-hub__branch svg { flex: none; }
 .bee-hub__branch-name { font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); letter-spacing: var(--type-micro-tracking); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3519,13 +3531,16 @@ fn bee_feature_hub_section(
 /// render through the same dense row (D12) and need nothing beyond a
 /// feature name and its docs -- and so does `ReadyToMerge`
 /// (console-theme-kanban ctk-8), which is a dense-row column like them:
-/// the full card anatomy stays In Progress's alone.
+/// the full card anatomy stays In Progress's alone. bee-agent-activity R1
+/// pairs `ReadyToMerge`'s row data with a second field, [`BeeHubMergeData`],
+/// rather than widening the shared struct: uat state and merge-ready age
+/// exist for this one column and would be dead weight on the other four.
 ///
 /// The variants are listed in [`bee_classify_features`]'s own test order,
 /// so `ReadyToMerge` leads -- see that function for why it must be tested
 /// ahead of `InProgress`.
 enum BeeHubPlacement {
-    ReadyToMerge(BeeHubFinishedData),
+    ReadyToMerge(BeeHubFinishedData, BeeHubMergeData),
     InProgress(BeeHubCardData),
     Finished(BeeHubFinishedData),
     Review(BeeHubFinishedData),
@@ -3580,6 +3595,22 @@ struct BeeHubCardData {
 struct BeeHubFinishedData {
     feature: String,
     docs: Option<waggledance_core::bee::BeeFeatureDocs>,
+}
+
+/// The Ready to merge row's own second half (bee-agent-activity R1): what
+/// the merge line says and what the column sorts by. `uat_approved` is this
+/// feature's own `approved_gates.uat` -- since R1 it no longer decides
+/// membership, so the card has to say which of the two shapes it is
+/// ("uat approved" / "uat pending"), and approved rows sort ahead of
+/// pending ones. `since` is the latest `trace.capped_at` across the
+/// feature's cells ([`bee_hub_latest_cap`]) -- when the work stopped, which
+/// is when the merge became the next action; `None` when no cell carries a
+/// parsable cap, in which case the line drops its age clause rather than
+/// inventing "just now" (the same never-fabricate rule
+/// [`bee_hub_latest_activity`] follows).
+struct BeeHubMergeData {
+    uat_approved: bool,
+    since: Option<String>,
 }
 
 /// The feature hub's own column rules (this function's former home, see
@@ -3699,19 +3730,37 @@ fn bee_classify_features(
             || archived_features.contains(f.feature.as_str());
         let finished_and_idle = is_finished && live == 0;
 
-        // (console-theme-kanban ctk-8) Ready to merge is the state where
-        // `bee worktree merge` is literally the next action, and it is
-        // backed by two values the store already holds -- never a
-        // synthesised merge-readiness verdict (CONTEXT.md D2): the `uat`
-        // gate approved in this feature's own `approved_gates`, and a
-        // worktree still granted to it and not yet merged (`worktree_bound`
-        // above, which already excludes `merged_pending` grants).
+        // (console-theme-kanban ctk-8, widened by bee-agent-activity R1 --
+        // decision `63bffb34`, supersedes `420cec71`) Ready to merge is the
+        // state where `bee worktree merge` is the next action, and every
+        // input is a value the store already holds -- never a synthesised
+        // merge-readiness verdict (CONTEXT.md D2). ctk-8 read the `uat` gate
+        // as the membership rule; R1 moves uat off membership and onto the
+        // card, because a feature whose cells are all capped in an open
+        // worktree is already waiting on the merge whether or not the human
+        // has accepted it yet -- uat pending IS the column's own reason to
+        // exist. So membership is: a worktree still granted and not yet
+        // merged (`worktree_bound` above, which already excludes
+        // `merged_pending` grants), the `execution` gate approved, and at
+        // least one cell with every non-dropped one capped.
+        //
+        // `cell_counts` is exactly that last test already computed: `total`
+        // counts `open`/`claimed`/`blocked`/`capped` and deliberately
+        // excludes `dropped` and any unrecognized status (D8), so
+        // `done == total` means "every non-dropped cell capped" and
+        // `total > 0` rules out the zero-cell grant R1 names as not ready.
         let uat_approved = f
             .approved_gates
             .as_ref()
             .and_then(|g| g.uat)
             .unwrap_or(false);
-        let ready_to_merge = uat_approved && worktree_bound;
+        let execution_gate_approved = f
+            .approved_gates
+            .as_ref()
+            .and_then(|g| g.execution)
+            .unwrap_or(false);
+        let cells_all_capped = f.cell_counts.total > 0 && f.cell_counts.done == f.cell_counts.total;
+        let ready_to_merge = worktree_bound && execution_gate_approved && cells_all_capped;
 
         // (kanban-columns D11, console-theme-kanban ctk-8) Placement is
         // tested in this fixed order: Ready to merge, In Progress,
@@ -3722,7 +3771,9 @@ fn bee_classify_features(
         // `has_live_work`'s pulls (`worktree_bound`), and every Ready to
         // merge feature has one by definition -- so In Progress would
         // swallow every candidate first and this branch would never fire.
-        // Do not reorder it back.
+        // Do not reorder it back. R1's widening only deepens that: a
+        // uat-pending feature with an open grant is exactly the shape In
+        // Progress used to keep, so the order is now what moves it.
         //
         // It keeps In Progress's own `!finished_and_idle` guard so a
         // feature already in the archive still reads as Finished: the
@@ -3730,10 +3781,20 @@ fn bee_classify_features(
         // moves features out of In Progress only, never out of Finished.
         if !finished_and_idle && ready_to_merge {
             let docs = snapshot.feature_docs.get(f.feature.as_str()).cloned();
-            placements.push(BeeHubPlacement::ReadyToMerge(BeeHubFinishedData {
-                feature: f.feature.clone(),
-                docs,
-            }));
+            // R1: how long it has been ready is the latest cap across this
+            // feature's own cells -- the moment the last one closed is the
+            // moment the merge became the next action.
+            let since = bee_hub_latest_cap(bee_hub_feature_cells(&snapshot.buckets, &f.feature));
+            placements.push(BeeHubPlacement::ReadyToMerge(
+                BeeHubFinishedData {
+                    feature: f.feature.clone(),
+                    docs,
+                },
+                BeeHubMergeData {
+                    uat_approved,
+                    since,
+                },
+            ));
         } else if !finished_and_idle && has_live_work {
             // In Progress absorbs the retired Waiting column (D5, D7): a
             // gate stop or a paused handoff no longer moves the feature to
@@ -3974,7 +4035,10 @@ fn bee_render_hub_section(
     let mut in_progress_entries: Vec<InProgressEntry> = Vec::new();
     let mut review_rows: Vec<String> = Vec::new();
     let mut compound_rows: Vec<String> = Vec::new();
-    let mut ready_to_merge_rows: Vec<String> = Vec::new();
+    // R1: keyed like `in_progress_entries` above, for the same reason --
+    // this column carries its own order (`bee_hub_ready_to_merge_cmp`).
+    type ReadyToMergeEntry = ((u8, Option<time::OffsetDateTime>, String), String);
+    let mut ready_to_merge_entries: Vec<ReadyToMergeEntry> = Vec::new();
     let mut finished_rows: Vec<String> = Vec::new();
     let mut todo_count = 0usize;
     let mut in_progress_count = 0usize;
@@ -3988,16 +4052,24 @@ fn bee_render_hub_section(
 
     for placement in placements {
         match placement {
-            BeeHubPlacement::ReadyToMerge(data) => {
+            BeeHubPlacement::ReadyToMerge(data, merge) => {
                 ready_to_merge_count += 1;
-                ready_to_merge_rows.push(bee_hub_finished_row(
-                    "ready-to-merge",
-                    &bee_hub_feature_href(&project.id, &data.feature),
-                    &data.feature,
-                    data.docs.as_ref(),
-                    None,
-                    None,
-                    None,
+                // R1: collected keyed, like In Progress above, because this
+                // column has an order of its own (uat approved first, then
+                // most recently ready) that placement's name order does not
+                // produce.
+                ready_to_merge_entries.push((
+                    bee_hub_ready_to_merge_key(merge, &data.feature),
+                    bee_hub_finished_row_with_extra(
+                        "ready-to-merge",
+                        &bee_hub_feature_href(&project.id, &data.feature),
+                        &data.feature,
+                        data.docs.as_ref(),
+                        None,
+                        None,
+                        None,
+                        Some(&bee_hub_merge_line(merge)),
+                    ),
                 ));
             }
             BeeHubPlacement::InProgress(data) => {
@@ -4129,6 +4201,12 @@ fn bee_render_hub_section(
     let todo_cards = bee_hub_finished_rows(&todo_rows);
     let review_cards = bee_hub_finished_rows(&review_rows);
     let compound_cards = bee_hub_finished_rows(&compound_rows);
+    // R1: uat approved first, then most recently ready.
+    ready_to_merge_entries.sort_by(|a, b| bee_hub_ready_to_merge_cmp(&a.0, &b.0));
+    let ready_to_merge_rows: Vec<String> = ready_to_merge_entries
+        .into_iter()
+        .map(|(_, html)| html)
+        .collect();
     let ready_to_merge_cards = bee_hub_finished_rows(&ready_to_merge_rows);
     let finished_cards = bee_hub_finished_rows(&finished_rows);
 
@@ -4287,7 +4365,10 @@ pub fn bee_cross_project_features_section(
     let mut in_progress_entries: Vec<InProgressEntry> = Vec::new();
     let mut review_rows: Vec<String> = Vec::new();
     let mut compound_rows: Vec<String> = Vec::new();
-    let mut ready_to_merge_rows: Vec<String> = Vec::new();
+    // R1: keyed and sorted like `in_progress_entries` above, so Ready to
+    // merge merges into one cross-project list in its own order too.
+    type ReadyToMergeEntry = ((u8, Option<time::OffsetDateTime>, String), String);
+    let mut ready_to_merge_entries: Vec<ReadyToMergeEntry> = Vec::new();
     let mut todo_count = 0usize;
     let mut in_progress_count = 0usize;
     let mut in_progress_waiting_count = 0usize;
@@ -4339,16 +4420,20 @@ pub fn bee_cross_project_features_section(
 
         for placement in placements {
             match placement {
-                BeeHubPlacement::ReadyToMerge(data) => {
+                BeeHubPlacement::ReadyToMerge(data, merge) => {
                     ready_to_merge_count += 1;
-                    ready_to_merge_rows.push(bee_hub_finished_row(
-                        "ready-to-merge",
-                        &bee_hub_feature_href(&project.id, &data.feature),
-                        &data.feature,
-                        data.docs.as_ref(),
-                        Some(&project.name),
-                        project_color,
-                        None,
+                    ready_to_merge_entries.push((
+                        bee_hub_ready_to_merge_key(merge, &data.feature),
+                        bee_hub_finished_row_with_extra(
+                            "ready-to-merge",
+                            &bee_hub_feature_href(&project.id, &data.feature),
+                            &data.feature,
+                            data.docs.as_ref(),
+                            Some(&project.name),
+                            project_color,
+                            None,
+                            Some(&bee_hub_merge_line(merge)),
+                        ),
                     ));
                 }
                 BeeHubPlacement::InProgress(data) => {
@@ -4503,6 +4588,14 @@ pub fn bee_cross_project_features_section(
     let todo_cards = bee_hub_finished_rows(&todo_rows);
     let review_cards = bee_hub_finished_rows(&review_rows);
     let compound_cards = bee_hub_finished_rows(&compound_rows);
+    // R1: the same comparator the per-project board uses, applied once
+    // across every project's rows -- uat approved first, then most recently
+    // ready -- so the merged column reads as one list.
+    ready_to_merge_entries.sort_by(|a, b| bee_hub_ready_to_merge_cmp(&a.0, &b.0));
+    let ready_to_merge_rows: Vec<String> = ready_to_merge_entries
+        .into_iter()
+        .map(|(_, html)| html)
+        .collect();
     let ready_to_merge_cards = bee_hub_finished_rows(&ready_to_merge_rows);
     let finished_cards = bee_hub_finished_rows(&finished_rows);
     let read_errors_strip = bee_cross_project_read_errors_strip(rollups);
@@ -5368,6 +5461,36 @@ fn bee_hub_finished_row(
     project_color: Option<u8>,
     shipped_at: Option<&str>,
 ) -> String {
+    bee_hub_finished_row_with_extra(
+        group_key,
+        href,
+        feature,
+        docs,
+        project_label,
+        project_color,
+        shipped_at,
+        None,
+    )
+}
+
+/// [`bee_hub_finished_row`] plus one block of extra markup inside the same
+/// anchor, below the name line — today only the Ready to merge column's own
+/// merge line ([`bee_hub_merge_line`], bee-agent-activity R1). Every other
+/// column keeps passing through `bee_hub_finished_row` and renders
+/// byte-identically to before R1, which is why the extra rides here as an
+/// optional eighth argument rather than widening the seven-argument
+/// signature every column and its tests already call.
+#[allow(clippy::too_many_arguments)]
+fn bee_hub_finished_row_with_extra(
+    group_key: &str,
+    href: &str,
+    feature: &str,
+    docs: Option<&waggledance_core::bee::BeeFeatureDocs>,
+    project_label: Option<&str>,
+    project_color: Option<u8>,
+    shipped_at: Option<&str>,
+    extra_html: Option<&str>,
+) -> String {
     let title = docs
         .and_then(|d| d.title.as_deref())
         .filter(|t| !t.is_empty());
@@ -5394,14 +5517,85 @@ fn bee_hub_finished_row(
         None => String::new(),
     };
     format!(
-        r#"<a class="bee-hub__row" data-hub-group="{group_key}" href="{href}" title="{full}">{project_html}<span class="bee-hub__row-name">{name}</span>{time_html}</a>"#,
+        r#"<a class="bee-hub__row" data-hub-group="{group_key}" href="{href}" title="{full}">{project_html}<span class="bee-hub__row-name">{name}</span>{time_html}{extra_html}</a>"#,
         group_key = group_key,
         href = href,
         full = esc(name),
         project_html = project_html,
         name = esc(name),
         time_html = time_html,
+        extra_html = extra_html.unwrap_or(""),
     )
+}
+
+/// The Ready to merge row's own summary line (bee-agent-activity R1): which
+/// of the two shapes this row is — `uat approved` or `uat pending` — and how
+/// long it has been ready, both as words, never as colour alone (the rail
+/// landmark rule this feature inherits). It renders under the name inside
+/// the same anchor, as a full-width block: `.bee-hub__row` is a dense
+/// `display: block` row, not the In Progress card's flex summary, so the
+/// line takes its own block rather than `.bee-hub__agent`'s
+/// `flex: 1 0 100%; order` pair — the visible result (a second, full-width
+/// muted row under the title) is the same.
+///
+/// The age clause is dropped entirely when no cell carried a parsable cap
+/// ([`BeeHubMergeData::since`]), so the line never reads "ready unknown".
+fn bee_hub_merge_line(merge: &BeeHubMergeData) -> String {
+    let (word, modifier) = if merge.uat_approved {
+        ("uat approved", "approved")
+    } else {
+        ("uat pending", "pending")
+    };
+    let since_html = match merge.since.as_deref() {
+        Some(iso) => format!(
+            r#" · <span class="bee-hub__merge-since">ready {age}</span>"#,
+            age = esc(&bee_fmt_trace_time(iso)),
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"<p class="bee-hub__merge"><span class="bee-hub__merge-uat bee-hub__merge-uat--{modifier}">{word}</span>{since_html}</p>"#,
+    )
+}
+
+/// The Ready to merge column's own order (bee-agent-activity R1): uat
+/// approved first — those rows are one command from landing, the pending
+/// ones are one human decision further out — then most recently ready
+/// first within each half, feature name breaking a tie. A row with no
+/// parsable cap time sorts after every timed row in its own half rather
+/// than jumping the queue with an assumed "now".
+///
+/// The key is `(rank, since, feature)`, built once per row at render time
+/// and sorted once before the column is flattened — the same shape and the
+/// same one-sort-at-the-end discipline `bee_hub_in_progress_cmp` uses, so
+/// the cross-project board can merge several projects' rows into one list.
+fn bee_hub_ready_to_merge_cmp(
+    a: &(u8, Option<time::OffsetDateTime>, String),
+    b: &(u8, Option<time::OffsetDateTime>, String),
+) -> std::cmp::Ordering {
+    a.0.cmp(&b.0)
+        .then_with(|| match (&a.1, &b.1) {
+            (Some(x), Some(y)) => y.cmp(x),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.2.cmp(&b.2))
+}
+
+/// [`bee_hub_ready_to_merge_cmp`]'s key for one row, built from the
+/// classifier's own [`BeeHubMergeData`] — the sort key and the rendered
+/// line read the same two values, so a row can never be ordered by
+/// something its own text does not say.
+fn bee_hub_ready_to_merge_key(
+    merge: &BeeHubMergeData,
+    feature: &str,
+) -> (u8, Option<time::OffsetDateTime>, String) {
+    let rank = if merge.uat_approved { 0 } else { 1 };
+    let since = merge.since.as_deref().and_then(|iso| {
+        time::OffsetDateTime::parse(iso, &time::format_description::well_known::Rfc3339).ok()
+    });
+    (rank, since, feature.to_string())
 }
 
 /// Pages the Finished column's dense rows ([`bee_hub_finished_row`]) ten at
@@ -5558,6 +5752,31 @@ fn bee_hub_latest_activity<'a>(cells: impl Iterator<Item = &'a BeeCell>) -> Opti
                 if newer {
                     latest = Some((t, ts.to_string()));
                 }
+            }
+        }
+    }
+    latest.map(|(_, s)| s)
+}
+
+/// The latest `capped_at` alone across the cells handed to it
+/// (bee-agent-activity R1's "how long it has been ready"), never folding in
+/// `claimed_at` the way [`bee_hub_latest_activity`] does: a Ready to merge
+/// row measures from the moment the LAST cell closed, and a claim is not a
+/// close. A cell with no `capped_at`, or one that does not parse as RFC
+/// 3339, contributes nothing; an empty iterator yields `None` rather than a
+/// fabricated time.
+fn bee_hub_latest_cap<'a>(cells: impl Iterator<Item = &'a BeeCell>) -> Option<String> {
+    let mut latest: Option<(time::OffsetDateTime, String)> = None;
+    for c in cells {
+        let Some(ts) = c.capped_at.as_deref() else {
+            continue;
+        };
+        if let Ok(t) =
+            time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        {
+            let newer = latest.as_ref().map(|(lt, _)| t > *lt).unwrap_or(true);
+            if newer {
+                latest = Some((t, ts.to_string()));
             }
         }
     }
@@ -14907,6 +15126,184 @@ mod tests {
         assert!(
             css.contains(".bee-hub__agent { flex: 1 0 100%; order: 10;"),
             "the agent line must claim the whole width and sit last: {css}"
+        );
+    }
+
+    /// (bee-agent-activity R1) The Ready to merge row's own line says both
+    /// halves in words: which uat shape it is, and how long it has been
+    /// ready. `uat pending` is the half ctk-8's rule used to hide entirely —
+    /// the work is done and the merge is waiting on a human acceptance, and
+    /// the column now shows it instead of parking it in In Progress.
+    #[test]
+    fn bee_hub_merge_line_says_uat_pending_and_how_long_it_has_been_ready() {
+        let since = (time::OffsetDateTime::now_utc() - time::Duration::hours(3))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let html = bee_hub_merge_line(&BeeHubMergeData {
+            uat_approved: false,
+            since: Some(since),
+        });
+        assert!(
+            html.contains(r#"<p class="bee-hub__merge">"#),
+            "the merge line must be its own full-width paragraph: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<span class="bee-hub__merge-uat bee-hub__merge-uat--pending">uat pending</span>"#
+            ),
+            "a feature whose uat is not approved must say so in words: {html}"
+        );
+        assert!(
+            html.contains(r#"<span class="bee-hub__merge-since">ready 3 hours ago</span>"#),
+            "the line must say how long it has been ready, relative: {html}"
+        );
+    }
+
+    /// (bee-agent-activity R1) The other half of the same line — an
+    /// accepted feature reads `uat approved`, and it is the same markup
+    /// with a different modifier, so the two never diverge in shape.
+    #[test]
+    fn bee_hub_merge_line_says_uat_approved_when_the_gate_is_stamped() {
+        let since = (time::OffsetDateTime::now_utc() - time::Duration::minutes(2))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let html = bee_hub_merge_line(&BeeHubMergeData {
+            uat_approved: true,
+            since: Some(since),
+        });
+        assert!(
+            html.contains(
+                r#"<span class="bee-hub__merge-uat bee-hub__merge-uat--approved">uat approved</span>"#
+            ),
+            "an approved uat gate must read as the word, not a colour alone: {html}"
+        );
+        assert!(
+            html.contains(r#"ready 2 minutes ago</span>"#),
+            "the age is relative language, never a raw timestamp: {html}"
+        );
+    }
+
+    /// (bee-agent-activity R1) No parsable cap time means no age clause —
+    /// the line still names the uat shape rather than inventing a "just
+    /// now" the store never recorded (the same never-fabricate rule
+    /// `bee_hub_latest_activity` follows).
+    #[test]
+    fn bee_hub_merge_line_drops_the_age_clause_when_no_cap_time_parsed() {
+        let html = bee_hub_merge_line(&BeeHubMergeData {
+            uat_approved: false,
+            since: None,
+        });
+        assert!(
+            html.contains("uat pending"),
+            "the uat half always renders: {html}"
+        );
+        assert!(
+            !html.contains("ready "),
+            "an unknown cap time must render no age at all: {html}"
+        );
+        assert!(
+            !html.contains("bee-hub__merge-since"),
+            "no age means no age span: {html}"
+        );
+    }
+
+    /// (bee-agent-activity R1) The column's own order: uat approved first
+    /// (one command from landing), then most recently ready first inside
+    /// each half, with an untimed row after every timed one rather than
+    /// jumping the queue on an assumed "now".
+    #[test]
+    fn bee_hub_ready_to_merge_orders_uat_approved_first_then_newest_ready() {
+        let ago = |h: i64| {
+            (time::OffsetDateTime::now_utc() - time::Duration::hours(h))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        type ReadyRow = ((u8, Option<time::OffsetDateTime>, String), &'static str);
+        let mut rows: Vec<ReadyRow> = vec![
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: false,
+                        since: None,
+                    },
+                    "pending-untimed",
+                ),
+                "pending-untimed",
+            ),
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: false,
+                        since: Some(ago(10)),
+                    },
+                    "pending-old",
+                ),
+                "pending-old",
+            ),
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: true,
+                        since: Some(ago(20)),
+                    },
+                    "approved-old",
+                ),
+                "approved-old",
+            ),
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: false,
+                        since: Some(ago(1)),
+                    },
+                    "pending-new",
+                ),
+                "pending-new",
+            ),
+            (
+                bee_hub_ready_to_merge_key(
+                    &BeeHubMergeData {
+                        uat_approved: true,
+                        since: Some(ago(2)),
+                    },
+                    "approved-new",
+                ),
+                "approved-new",
+            ),
+        ];
+        rows.sort_by(|a, b| bee_hub_ready_to_merge_cmp(&a.0, &b.0));
+        let order: Vec<&str> = rows.into_iter().map(|(_, name)| name).collect();
+        assert_eq!(
+            order,
+            vec![
+                "approved-new",
+                "approved-old",
+                "pending-new",
+                "pending-old",
+                "pending-untimed"
+            ],
+            "uat approved leads, newest ready first inside each half, untimed last"
+        );
+    }
+
+    /// (bee-agent-activity R1) The merge line is styled as the dense row's
+    /// own second line, beside the agent line's rules — muted mono, its own
+    /// block, and each uat shape carrying a colour that only ever seconds
+    /// the word already printed.
+    #[test]
+    fn bee_hub_style_carries_the_ready_to_merge_line_beside_the_agent_line() {
+        let css = bee_hub_style();
+        assert!(
+            css.contains(".bee-hub__merge { display: flex; flex-wrap: wrap;"),
+            "the merge line must lay out like the agent line: {css}"
+        );
+        assert!(
+            css.contains(".bee-hub__merge-uat--approved { color: var(--color-success); }"),
+            "an approved uat gate reads green beside its word: {css}"
+        );
+        assert!(
+            css.contains(".bee-hub__merge-uat--pending { color: var(--color-warning); }"),
+            "a pending uat gate reads warning beside its word: {css}"
         );
     }
 
