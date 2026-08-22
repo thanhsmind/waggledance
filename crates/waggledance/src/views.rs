@@ -250,12 +250,16 @@ pub fn home_page(
             format!(
                 r#"{style}
 <div class="home-shell">
+{toggle}
 {sidebar}
+{backdrop}
 <main class="fg-page bee-hub-theme">
   {features}
 </main>
 </div>"#,
                 style = bee_hub_style(),
+                toggle = HOME_RAIL_TOGGLE,
+                backdrop = HOME_RAIL_BACKDROP,
                 // console-theme-kanban (ctk-12): the retired Projects tab,
                 // now a left rail sitting as a sibling of the board rather
                 // than inside it, so `<main>` keeps its own scrolling and
@@ -303,12 +307,16 @@ pub fn home_page(
             format!(
                 r#"{style}
 <div class="home-shell">
+{toggle}
 {sidebar}
+{backdrop}
 <main class="fg-page fg-page--tight">
   {body}
 </main>
 </div>"#,
                 style = PROJECT_TAB_STYLE,
+                toggle = HOME_RAIL_TOGGLE,
+                backdrop = HOME_RAIL_BACKDROP,
                 sidebar = project_sidebar(
                     projects,
                     unassigned_visible,
@@ -355,12 +363,107 @@ pub fn home_page(
     );
     let body = format!(
         r#"{topbar}
-{section}"#,
+{section}
+{tabbar}"#,
         topbar = topbar_full("", "", &orchestrator, ""),
         section = section,
+        // console-phone-layout (P2): rendered at every width and revealed
+        // by CSS under the handset breakpoint alone. Markup-at-every-width
+        // rather than a width-conditional render because this page has no
+        // idea how wide the viewport is — the server never sees one — and
+        // the alternative, a script that inserts it after load, would lose
+        // the bar on every one of the full reloads `app.js` performs.
+        tabbar = home_tabbar(tab),
     );
     layout_with_drawer(title, "", &body, true)
 }
+
+/// console-phone-layout (P1): the handset drawer's whole mechanism — a
+/// checkbox whose `:checked` state slides `.home-sidebar` in from the left.
+/// CSS only, by the same reasoning that keeps the Orchestrator button an
+/// anchor: the homepage does a full `location.reload()` on any watched
+/// change (`app.js`), and a script-held open flag would not survive it.
+/// The same pattern the top bar's own menu already ships
+/// (`.topbar-menu__toggle` in app.css), including its `hidden` — the
+/// control a reader touches is the `Projects` tab label below, never this
+/// input.
+///
+/// It renders inside `.home-shell` and *before* the rail so the sibling
+/// combinator can reach both the rail and the backdrop after it; the rail
+/// itself ([`project_sidebar`]) stays a self-contained `<nav>`.
+const HOME_RAIL_TOGGLE: &str =
+    r#"<input type="checkbox" id="rail-toggle" class="home-rail__check" hidden>"#;
+
+/// The open drawer's dimmer, and the way back out of it. A `<label>` rather
+/// than a button so that closing needs no script either — pointing at the
+/// same `#rail-toggle` unchecks it. `aria-hidden` because it is scenery: it
+/// carries no name of its own, and the `Projects` tab that opened the
+/// drawer is still on screen to close it.
+const HOME_RAIL_BACKDROP: &str =
+    r#"<label for="rail-toggle" class="home-rail__backdrop" aria-hidden="true"></label>"#;
+
+/// console-phone-layout (P2): the handset's bottom bar — `Board` · `Agents`
+/// · `Projects` · `Settings`, in that order, hidden above 700px by
+/// `app.css` and never rendered conditionally (see [`home_page`]'s call).
+///
+/// Three of the four are real anchors, for the same reason every other
+/// navigation control on this page is: they have to survive the full page
+/// reload and work with scripting off. `Projects` is the exception, and
+/// cannot be an anchor — there is no separate projects route to point at
+/// any more (console-theme-kanban ctk-12 folded that tab into the rail), so
+/// what it opens is the rail itself, as a `<label>` for
+/// [`HOME_RAIL_TOGGLE`].
+///
+/// Accessibility: the bar is a named `<nav>` landmark, separate from the
+/// topbar's own; exactly one item claims `aria-current="page"` — `Board` on
+/// the board, `Agents` on the terminals view, and neither `Projects` (which
+/// navigates nowhere) nor `Settings` (a different page) ever. The current
+/// item is not marked by colour alone: it also carries a heavier top rule
+/// (`.home-tabbar__item--on` in app.css). Each glyph is decorative and the
+/// visible label beside it is the accessible name.
+fn home_tabbar(tab: HomeTab) -> String {
+    let mark = |on: bool| {
+        if on {
+            (" home-tabbar__item--on", r#" aria-current="page""#)
+        } else {
+            ("", "")
+        }
+    };
+    let (board_on, agents_on) = match tab {
+        HomeTab::Kanban => (mark(true), mark(false)),
+        HomeTab::Terminals => (mark(false), mark(true)),
+    };
+    format!(
+        r#"<nav class="home-tabbar" aria-label="Sections">
+<a class="home-tabbar__item{board_class}" href="/?tab=kanban"{board_aria}>{board_icon}<span class="home-tabbar__label">Board</span></a>
+<a class="home-tabbar__item{agents_class}" href="/?tab=terminals"{agents_aria}>{agents_icon}<span class="home-tabbar__label">Agents</span></a>
+<label class="home-tabbar__item" for="rail-toggle">{projects_icon}<span class="home-tabbar__label">Projects</span></label>
+<a class="home-tabbar__item" href="/settings">{settings_icon}<span class="home-tabbar__label">Settings</span></a>
+</nav>"#,
+        board_class = board_on.0,
+        board_aria = board_on.1,
+        agents_class = agents_on.0,
+        agents_aria = agents_on.1,
+        board_icon = TABBAR_ICON_BOARD,
+        agents_icon = TABBAR_ICON_AGENTS,
+        projects_icon = TABBAR_ICON_PROJECTS,
+        settings_icon = TABBAR_ICON_SETTINGS,
+    )
+}
+
+/// The four tab-bar glyphs, in the app's one icon idiom: a 24-unit box drawn
+/// at 16px, no fill, `currentColor` stroke, round caps — the same drawing as
+/// [`agent_toggle`] and the topbar's Settings gear, one weight lighter
+/// (1.5) because these sit under an 11px label rather than alone in a
+/// button. All decorative: the label beside each one is the name.
+const TABBAR_ICON_BOARD: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"></rect><rect x="10" y="4" width="5" height="10" rx="1"></rect><rect x="17" y="4" width="4" height="14" rx="1"></rect></svg>"#;
+/// The terminal prompt of [`agent_toggle`], redrawn at this bar's weight —
+/// the same mark for the same thing (a live agent screen) in both places.
+const TABBAR_ICON_AGENTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>"#;
+const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>"#;
+/// The topbar gear's own outline, so Settings is the same mark wherever the
+/// reader meets it.
+const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>"#;
 
 /// console-theme-kanban (ctk-12) — was `project_list_main`, the body of
 /// the retired Projects tab. Every element that tab rendered is still here,
@@ -2359,6 +2462,12 @@ fn bee_hub_style() -> String {
    [`bee_hub_archive_bar`]) -- so the fifth track is Ready to merge, not
    the archive. */
 .bee-hub__groups { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(280px, 1.6fr) minmax(200px, 1fr) minmax(200px, 1fr) minmax(200px, 1fr); gap: var(--space-4); }
+/* console-phone-layout P3: the three stat tiles ship in the markup at every
+   width (one board render, no second route -- console-theme-kanban D3) and
+   are simply not drawn above the handset breakpoint, where the five-column
+   grid already shows every count in its own column header. The narrow block
+   below turns them back on; this default is what keeps desktop unchanged. */
+.bee-hub__stats { display: none; }
 /* Column header (console-theme-kanban ctk-5): status dot, label,
    optional waiting chip, right-aligned mono count. 48px tall, 16px side
    padding, 10px gap between items. */
@@ -2800,6 +2909,65 @@ fn bee_hub_style() -> String {
      leaks outside this media query and wide screens render unchanged. */
   .bee-hub__groups > [data-hub-group="in-progress"] {
     order: -1;
+  }
+  /* console-phone-layout P3: on a phone the board opens with the three
+     tiles -- one glance answers "what is running, what wants me, what can
+     ship" before any column is scrolled to. */
+  .bee-hub__stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+  }
+  .bee-hub__stat {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: var(--space-2);
+    background: var(--color-surface);
+    border: var(--border-width-hairline) solid var(--color-border);
+    border-radius: var(--card-radius);
+    text-decoration: none;
+    color: var(--color-text);
+    min-width: 0;
+  }
+  .bee-hub__stat-num {
+    font-family: var(--font-mono);
+    font-size: 24px;
+    font-weight: 800;
+    line-height: 1;
+  }
+  .bee-hub__stat-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--color-text-muted);
+  }
+  /* Faint at zero (P3): a nothing-to-do tile still states its number, it
+     just stops asking for the eye. */
+  .bee-hub__stat--zero .bee-hub__stat-num,
+  .bee-hub__stat--zero .bee-hub__stat-label {
+    color: var(--color-text-subtle);
+  }
+  /* console-phone-layout P4: stacked, the columns read as sections in the
+     order a phone actually needs them -- whoever is waiting on you first
+     (selected through `data-hub-waiting`, the same tally the column header
+     draws as its `N waiting` chip), then what can be merged, then what is
+     running, then the rest in board order. `in-progress` keeps the
+     `order: -1` inprogress-priority-order-2 gave it; the two rules above
+     it only ever move a group further up. */
+  .bee-hub__groups > [data-hub-waiting]:not([data-hub-waiting="0"]) {
+    order: -3;
+  }
+  .bee-hub__groups > [data-hub-group="ready-to-merge"] {
+    order: -2;
+  }
+  /* P4: a zero-card column is a header and an empty line -- worth a track
+     on a wide board, pure scroll cost on a phone. The Finished archive is
+     a `<details>` outside this grid, so it is never what this hides. */
+  .bee-hub__groups > [data-hub-count="0"] {
+    display: none;
   }
 }
 </style>"#
@@ -3725,6 +3893,7 @@ fn bee_render_hub_section(
     format!(
         r#"<section class="fg-card bee-hub" data-feature-hub="1">
   <h3 class="bee-panel__head">Features</h3>
+  {stat_tiles}
   <div class="bee-hub__groups">
     {todo_group}
     {in_progress_group}
@@ -3734,6 +3903,11 @@ fn bee_render_hub_section(
   </div>
   {archive_bar}
 </section>"#,
+        stat_tiles = bee_hub_stat_tiles(
+            in_progress_count,
+            in_progress_waiting_count,
+            ready_to_merge_count
+        ),
         todo_group = bee_hub_group(
             "Todo",
             "todo",
@@ -4082,6 +4256,7 @@ pub fn bee_cross_project_features_section(
         r#"<section class="fg-card bee-hub" data-feature-hub="cross-project">
   <h3 class="bee-panel__head">Features</h3>
   {read_errors_strip}
+  {stat_tiles}
   <div class="bee-hub__groups">
     {todo_group}
     {in_progress_group}
@@ -4092,6 +4267,11 @@ pub fn bee_cross_project_features_section(
   {archive_bar}
 </section>"#,
         read_errors_strip = read_errors_strip,
+        stat_tiles = bee_hub_stat_tiles(
+            in_progress_count,
+            in_progress_waiting_count,
+            ready_to_merge_count
+        ),
         todo_group = bee_hub_group(
             "Todo",
             "todo",
@@ -4207,10 +4387,55 @@ fn bee_gate_current_stop(gates: Option<&BeeApprovedGates>) -> Option<(&'static s
     GATES.into_iter().skip(start).find(|(key, _)| !flag(key))
 }
 
+/// The board's three handset stat tiles (console-phone-layout P3): working /
+/// need you / mergeable, big mono number over a small label, each an in-page
+/// anchor to the group section it counts. Rendered into the markup at every
+/// width and shown only at the handset breakpoint -- `bee_hub_style` hides
+/// `.bee-hub__stats` outright above it, so a desktop board is unchanged.
+///
+/// Every number has a source on the board it leads: `working` and `mergeable`
+/// are the In Progress and Ready to merge groups' own counts, and `need_you`
+/// is the same waiting-on tally the In Progress header already draws as its
+/// `N waiting` chip. That last fact is also why `need you` anchors at
+/// `#hub-in-progress`: In Progress is the only group this board ever hands a
+/// non-zero `waiting_count`, so "the first group in phone order carrying a
+/// waiting mark" and the "nothing is waiting" fallback are the same section.
+fn bee_hub_stat_tiles(working: usize, need_you: usize, mergeable: usize) -> String {
+    let tile = |count: usize, href: &str, label: &str| -> String {
+        // A zero tile still renders -- it is the honest answer to "how many
+        // need you?" -- and reads faint instead of loud.
+        let zero = if count == 0 {
+            " bee-hub__stat--zero"
+        } else {
+            ""
+        };
+        format!(
+            r#"<a class="bee-hub__stat{zero}" href="{href}"><span class="bee-hub__stat-num">{count}</span><span class="bee-hub__stat-label">{label}</span></a>"#,
+            zero = zero,
+            href = href,
+            count = count,
+            label = label,
+        )
+    };
+    format!(
+        r#"<div class="bee-hub__stats">{working_tile}{need_you_tile}{mergeable_tile}</div>"#,
+        working_tile = tile(working, "#hub-in-progress", "working"),
+        need_you_tile = tile(need_you, "#hub-in-progress", "need you"),
+        mergeable_tile = tile(mergeable, "#hub-ready-to-merge", "mergeable"),
+    )
+}
+
 /// One group column of the feature hub (`bee_feature_hub_section`): a
 /// console column header (status dot in locked lane hue, uppercase mono label,
 /// optional waiting chip, right-aligned mono count) and its cards or one
 /// honest empty line (bee-board-pm D5).
+///
+/// console-phone-layout P3/P4 hang two more hooks off this one wrapper, both
+/// inert above the handset breakpoint: `id="hub-{key}"` is what the stat
+/// tiles' in-page anchors land on ([`bee_hub_stat_tiles`]), and
+/// `data-hub-waiting="{waiting_count}"` restates the very number the waiting
+/// chip already draws so the phone stacking order can select "this group has
+/// someone waiting on you" in CSS alone, with no second markup shape.
 fn bee_hub_group(
     label: &str,
     key: &str,
@@ -4226,9 +4451,10 @@ fn bee_hub_group(
         String::new()
     };
     format!(
-        r#"<div class="bee-hub__group" data-hub-group="{key}" data-hub-count="{count}"><h4 class="bee-hub__group-header"><span class="bee-hub__group-dot" aria-hidden="true"></span><span class="bee-hub__group-label">{label}</span>{waiting_chip}<span class="bee-hub__group-count">{count}</span></h4>{body}</div>"#,
+        r#"<div class="bee-hub__group" id="hub-{key}" data-hub-group="{key}" data-hub-count="{count}" data-hub-waiting="{waiting_count}"><h4 class="bee-hub__group-header"><span class="bee-hub__group-dot" aria-hidden="true"></span><span class="bee-hub__group-label">{label}</span>{waiting_chip}<span class="bee-hub__group-count">{count}</span></h4>{body}</div>"#,
         key = key,
         count = count,
+        waiting_count = waiting_count,
         label = esc(label),
         waiting_chip = waiting_chip,
         body = body,
@@ -7735,9 +7961,22 @@ mod tests {
                 ),
             "the rail and its pinned rows must render beside the gone line: {body}"
         );
+        // Scoped to the rail's own slice, the way
+        // `terminals_view_renders_the_selected_pane_beside_the_rail` scopes
+        // its count: `aria-current` is a per-landmark claim, and
+        // console-phone-layout (P2) gave the page a second navigation
+        // landmark — the handset tab bar, whose `Agents` tab is correctly
+        // current on this view whatever the rail has to show.
+        let rail_at = body
+            .find(r#"<nav class="home-sidebar" aria-label="Projects">"#)
+            .expect("the rail must render");
+        let main_at = body
+            .find(r#"<main class="fg-page fg-page--tight">"#)
+            .expect("the terminals main must render");
+        let rail = &body[rail_at..main_at];
         assert!(
-            !body.contains("pinned-row__link--on") && !body.contains(r#"aria-current="page""#),
-            "nothing may read as current when the named pane is gone: {body}"
+            !rail.contains("pinned-row__link--on") && !rail.contains(r#"aria-current="page""#),
+            "no rail row may read as current when the named pane is gone: {body}"
         );
     }
 
@@ -8594,6 +8833,90 @@ mod tests {
             narrow.contains(".pane-menu__panel {\n    display: none;")
                 && narrow.contains(".pane-menu__toggle:checked ~ .pane-menu__panel"),
             "under the breakpoint the pane panel must be closed until the toggle is checked"
+        );
+    }
+
+    /// console-phone-layout (P1/P2): the phone shell is CSS over the same
+    /// markup — `home_page` emits the drawer toggle, the backdrop and the
+    /// bottom bar at every width, and only `app.css` decides that a wide
+    /// screen sees none of it. So the stylesheet is where that promise can
+    /// actually break, in either direction: a missing handset block leaves a
+    /// phone with a 320px rail eating the page, and a rule that escapes the
+    /// block puts a bottom bar across every desktop.
+    ///
+    /// The wide-screen defaults are asserted to come *before* the query, the
+    /// way `the_bar_menu_is_flat_until_the_narrow_breakpoint` asserts it for
+    /// the top bar's menu: same specificity, so source order is the whole of
+    /// what makes the override win.
+    #[test]
+    fn the_home_shell_collapses_into_a_drawer_and_a_tab_bar_only_under_the_handset_breakpoint() {
+        let css = include_str!("../assets/app.css");
+        let bar_hidden = css
+            .find(".home-tabbar {\n  display: none;\n}")
+            .expect("the bottom tab bar must be hidden by default (wide screens)");
+        let backdrop_hidden = css
+            .find(".home-rail__backdrop {\n  display: none;\n}")
+            .expect("the drawer backdrop must be hidden by default (wide screens)");
+        let query = css
+            .find("@media (max-width: 700px) {")
+            .expect("app.css declares no handset block for the home shell");
+        assert!(
+            bar_hidden < query && backdrop_hidden < query,
+            "the wide-screen defaults must come before the handset block, or it never wins"
+        );
+
+        // Bounded at the next `@media`, not at the end of the file: app.css
+        // carries a second `max-width: 700px` block further down for the
+        // file page's own sidebar, and an unbounded slice would happily
+        // accept that one's rules as this one's.
+        let end = css[query + 1..]
+            .find("@media")
+            .map(|i| query + 1 + i)
+            .unwrap_or(css.len());
+        let narrow = &css[query..end];
+        // The rail leaves the flow and comes back on `:checked` alone — no
+        // script anywhere in the mechanism.
+        assert!(
+            narrow.contains(".home-shell {\n    display: block;\n  }"),
+            "the shell must collapse to one column under the breakpoint: {narrow}"
+        );
+        assert!(
+            narrow.contains(".home-sidebar {\n    position: fixed;")
+                && narrow.contains("transform: translateX(-100%);"),
+            "the rail must park off-canvas under the breakpoint: {narrow}"
+        );
+        assert!(
+            narrow.contains(".home-rail__check:checked ~ .home-sidebar {")
+                && narrow.contains(".home-rail__check:checked ~ .home-rail__backdrop {"),
+            "the toggle alone must open the rail and its backdrop: {narrow}"
+        );
+        assert!(
+            narrow.contains(".home-tabbar {\n    display: grid;"),
+            "the bottom tab bar must appear under the breakpoint: {narrow}"
+        );
+        // The current tab never speaks by colour alone — the same rule the
+        // rail's own current row keeps.
+        assert!(
+            narrow.contains(".home-tabbar__item--on {")
+                && narrow.contains("border-top-color: var(--color-action);"),
+            "the current tab must carry a shape cue, not colour alone: {narrow}"
+        );
+        // P2: one destination, one control.
+        assert!(
+            narrow.contains(".topbar__orchestrator {\n    display: none;\n  }"),
+            "the Orchestrator button must give way to the Board tab: {narrow}"
+        );
+        // The bar is fixed over the page; the page has to end above it.
+        assert!(
+            narrow.contains(".home-shell > main {\n    padding-bottom: 72px;\n  }"),
+            "the page must clear the fixed bottom bar: {narrow}"
+        );
+        // The topbar height is a sticky-offset contract this feature inherits
+        // rather than renegotiates: the drawer and the backdrop both hang off
+        // the same 53px the desktop rail already uses.
+        assert!(
+            narrow.contains("top: 53px;") && narrow.contains("inset: 53px 0 0 0;"),
+            "the drawer and its backdrop must both start at the topbar's own 53px: {narrow}"
         );
     }
 
@@ -13710,6 +14033,184 @@ mod tests {
         );
     }
 
+    /// console-phone-layout P3 (must-have): the board leads with three stat
+    /// tiles whose numbers are the groups it just drew -- never a placeholder
+    /// and never a second count of its own -- each anchored at the section it
+    /// counts, faint when that section is empty.
+    #[test]
+    fn bee_hub_renders_stat_tiles_from_the_groups_it_draws() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-hub-stat-tiles-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        // The same fixture the waiting-chip test builds: one In Progress
+        // feature stopped at a gate, so the board draws working = 1,
+        // need you = 1 and nothing at all in Ready to merge.
+        write(
+            ".bee/state.json",
+            r#"{
+                "feature": "active-feat",
+                "phase": "exploring",
+                "approved_gates": {"context": false, "shape": false, "execution": false, "review": false}
+            }"#,
+        );
+        let hb = (time::OffsetDateTime::now_utc() - time::Duration::minutes(20))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        write(
+            ".bee/sessions/default.json",
+            &format!(r#"{{"id": "default", "last_heartbeat": "{hb}", "workspace_id": "main"}}"#),
+        );
+
+        let snapshot = waggledance_core::bee::read_snapshot(&root);
+        let mut project = sample_project();
+        project.root_path = root.clone();
+        let html = bee_feature_hub_section(&project, &snapshot, &std::collections::HashMap::new());
+
+        // The tiles lead the board: markup order is what a phone reads.
+        let stats_at = html
+            .find(r#"<div class="bee-hub__stats">"#)
+            .expect("the board must render the handset stat tiles");
+        let groups_at = html
+            .find(r#"<div class="bee-hub__groups">"#)
+            .expect("the lane-column grid must still render");
+        assert!(
+            stats_at < groups_at,
+            "the tiles must lead the board, ahead of the groups grid: {html}"
+        );
+
+        // The same number the In Progress header draws, twice over: its count
+        // and its `N waiting` chip.
+        assert!(
+            html.contains(r#"<span class="bee-hub__group-waiting">1 waiting</span>"#),
+            "fixture must produce exactly one waiting In Progress feature: {html}"
+        );
+        assert!(
+            html.contains(
+                r##"<a class="bee-hub__stat" href="#hub-in-progress"><span class="bee-hub__stat-num">1</span><span class="bee-hub__stat-label">working</span></a>"##
+            ),
+            "the working tile must carry the In Progress group's own count: {html}"
+        );
+        assert!(
+            html.contains(
+                r##"<a class="bee-hub__stat" href="#hub-in-progress"><span class="bee-hub__stat-num">1</span><span class="bee-hub__stat-label">need you</span></a>"##
+            ),
+            "the need-you tile must carry the waiting-on feature count: {html}"
+        );
+        // Nothing is ready to merge in this fixture, so that tile states its
+        // zero and reads faint.
+        assert!(
+            html.contains(
+                r##"<a class="bee-hub__stat bee-hub__stat--zero" href="#hub-ready-to-merge"><span class="bee-hub__stat-num">0</span><span class="bee-hub__stat-label">mergeable</span></a>"##
+            ),
+            "an empty group's tile must still state its zero, marked faint: {html}"
+        );
+
+        // Every tile href resolves to a section this page actually drew, and
+        // every group carries the waiting hook the phone order selects on.
+        for key in [
+            "todo",
+            "in-progress",
+            "review",
+            "compound",
+            "ready-to-merge",
+        ] {
+            assert!(
+                html.contains(&format!(r#"id="hub-{key}""#)),
+                "group {key} must carry the anchor id its tile jumps to: {html}"
+            );
+        }
+        assert_eq!(
+            html.matches(r#"data-hub-waiting=""#).count(),
+            5,
+            "every one of the five group wrappers must carry data-hub-waiting: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"data-hub-group="in-progress" data-hub-count="1" data-hub-waiting="1""#
+            ),
+            "In Progress must restate its waiting tally as the CSS hook: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// console-phone-layout P3/P4 (must-have + prohibition): every phone-only
+    /// board rule lives inside the ONE existing narrow media block -- the
+    /// tile grid, the need-you-first stacking order and the empty-group hide
+    /// -- while the tiles' wide-screen default (`display: none`) sits outside
+    /// it, ahead of the query, so desktop keeps its five-column grid and
+    /// draws no tiles at all.
+    #[test]
+    fn bee_hub_style_keeps_every_phone_board_rule_inside_the_one_narrow_media_query() {
+        let css = bee_hub_style();
+        assert_eq!(
+            css.matches("@media (max-width: 700px)").count(),
+            1,
+            "the board must still declare exactly one narrow block: {css}"
+        );
+        let media_at = css.find("@media (max-width: 700px)").expect("narrow block");
+        let media_end = css[media_at..]
+            .find("</style>")
+            .map(|i| media_at + i)
+            .unwrap_or(css.len());
+        let media_block = &css[media_at..media_end];
+        let before_media = &css[..media_at];
+
+        // P3: hidden by default, a grid of three only on a handset.
+        assert!(
+            before_media.contains(".bee-hub__stats { display: none; }"),
+            "the tiles must be hidden above the breakpoint, and that default must come \
+             before the query or it never wins: {css}"
+        );
+        assert!(
+            media_block.contains(".bee-hub__stats {\n    display: grid;")
+                && media_block.contains("grid-template-columns: repeat(3, 1fr);"),
+            "the three tiles must become a three-up grid inside the narrow block: {media_block}"
+        );
+        assert!(
+            media_block.contains(".bee-hub__stat--zero"),
+            "the faint-at-zero rule belongs inside the narrow block: {media_block}"
+        );
+
+        // P4: need-you first, then mergeable, then in progress (unchanged).
+        assert!(
+            media_block
+                .contains(r#".bee-hub__groups > [data-hub-waiting]:not([data-hub-waiting="0"]) {"#)
+                && media_block.contains("order: -3;"),
+            "a group someone is waiting on must sort to the top on a phone: {media_block}"
+        );
+        assert!(
+            media_block.contains(r#".bee-hub__groups > [data-hub-group="ready-to-merge"] {"#)
+                && media_block.contains("order: -2;"),
+            "Ready to merge must sort above In Progress on a phone: {media_block}"
+        );
+        assert!(
+            media_block.contains(r#".bee-hub__groups > [data-hub-count="0"] {"#)
+                && media_block.contains("display: none;"),
+            "an empty group must not be drawn on a phone: {media_block}"
+        );
+
+        // None of it may leak onto a wide screen.
+        let after_media = &css[media_end..];
+        for leaked in [
+            "order: -2;",
+            "order: -3;",
+            "grid-template-columns: repeat(3, 1fr);",
+        ] {
+            assert!(
+                !before_media.contains(leaked) && !after_media.contains(leaked),
+                "`{leaked}` must never appear outside the narrow block: {css}"
+            );
+        }
+    }
+
     /// The four worktree-line spellings [`bee_hub_worktree_label`] must
     /// carry: an open worktree with a known branch reads the branch name
     /// alone (no chip's `Open · ` prefix).
@@ -13949,9 +14450,10 @@ mod tests {
         let todo = bee_hub_group("Todo", "todo", 3, 0, "<p>card</p>", "Empty.");
         assert!(
             todo.contains(
-                r#"<div class="bee-hub__group" data-hub-group="todo" data-hub-count="3">"#
+                r#"<div class="bee-hub__group" id="hub-todo" data-hub-group="todo" data-hub-count="3" data-hub-waiting="0">"#
             ),
-            "data-hub-group and data-hub-count must remain on the wrapper div: {todo}"
+            "data-hub-group and data-hub-count must remain on the wrapper div, now beside \
+             console-phone-layout's own anchor id and waiting hook: {todo}"
         );
         assert!(
             todo.contains(r#"<h4 class="bee-hub__group-header">"#),

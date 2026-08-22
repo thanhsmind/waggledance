@@ -726,10 +726,13 @@ html[data-scheme="dark"] .topbar .home {
    in light — and `--color-surface-raised` is the fill the digest gives the
    active row, a step up from the rail in both schemes.
 
-   OWED, the phone phase: this shell declares no narrow-screen behaviour.
-   Supplying one means a second `@media` block, and how a two-column shell
-   collapses on a handset is that phase's decision to make, not this
-   cell's. ───────────────────────────────────────────────── */
+   console-phone-layout (P1/P2) settled the phone phase this block once
+   owed: under 700px the shell is one column, the rail is an off-canvas
+   drawer over it, and a fixed bottom bar carries the four sections. That
+   answer lives in the `@media (max-width: 700px)` block below
+   `.home-sidebar__foot`, together with the two defaults — a hidden tab bar
+   and a hidden backdrop — that keep every wider screen exactly as it was.
+   ───────────────────────────────────────────────── */
 .home-shell {
   display: flex;
   align-items: stretch;
@@ -793,6 +796,115 @@ html[data-scheme="dark"] .topbar .home {
   flex: none;
   padding: var(--space-3);
   border-top: var(--border-width-hairline) solid var(--color-border);
+}
+
+/* ── The handset shell ───────────────────────────────────────────────
+   console-phone-layout (P1/P2). Two wide-screen defaults first, so that
+   everything the phone adds is invisible above the breakpoint: the bottom
+   bar and the drawer's backdrop are both in the markup at every width
+   (the server never sees a viewport, and `app.js` reloads this page whole
+   on any watched change, so a script-inserted bar would keep vanishing)
+   and both are display:none until the media query below asks for them.
+   The toggle input itself needs no rule — it ships `hidden`. */
+.home-tabbar {
+  display: none;
+}
+.home-rail__backdrop {
+  display: none;
+}
+/* 700px is the breakpoint the board's own narrow block already uses
+   (`bee_hub_style`); one number for one phone layout. */
+@media (max-width: 700px) {
+  /* One column. `block` rather than a one-column grid because the rail is
+     about to leave the flow entirely — what is left in it is `<main>`
+     alone. */
+  .home-shell {
+    display: block;
+  }
+  /* The rail becomes a drawer: fixed under the 53px topbar (the same
+     sticky offset it already honoured, and a contract this feature does
+     not touch), parked off the left edge, slid in by the toggle. `height:
+     auto` releases the desktop `calc(100vh - 53px)` — `top`/`bottom` size
+     it here. Above `--z-nav` so it covers the bottom bar it was opened
+     from. */
+  .home-sidebar {
+    position: fixed;
+    top: 53px;
+    left: 0;
+    bottom: 0;
+    width: 82vw;
+    max-width: 320px;
+    height: auto;
+    z-index: var(--z-modal);
+    transform: translateX(-100%);
+    transition: transform 160ms ease;
+  }
+  .home-rail__check:checked ~ .home-sidebar {
+    transform: none;
+  }
+  /* Scenery, and the way back out: a tap anywhere off the drawer unchecks
+     the same toggle. Sits one step under the drawer and one over the page.
+     It starts from 53px so the topbar stays reachable. */
+  .home-rail__backdrop {
+    display: none;
+    position: fixed;
+    inset: 53px 0 0 0;
+    background: rgb(0 0 0 / 0.4);
+    z-index: calc(var(--z-modal) - 1);
+  }
+  .home-rail__check:checked ~ .home-rail__backdrop {
+    display: block;
+  }
+  /* The bar is fixed over the page, so the page has to end above it — the
+     last card in a column would otherwise sit under the bar with no way to
+     scroll it clear. */
+  .home-shell > main {
+    padding-bottom: 72px;
+  }
+  /* The topbar's Orchestrator button is the bottom bar's `Board` tab now;
+     two controls for one destination is one too many on a 390px bar. */
+  .topbar__orchestrator {
+    display: none;
+  }
+  .home-tabbar {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* The safe-area inset is added to the height and paid back as padding,
+       so the four targets keep their full 56px above a home indicator
+       rather than being squeezed by it. */
+    height: calc(56px + env(safe-area-inset-bottom));
+    padding-bottom: env(safe-area-inset-bottom);
+    background: var(--color-surface-sunken);
+    border-top: var(--border-width-hairline) solid var(--color-border);
+    z-index: var(--z-nav);
+  }
+  .home-tabbar__item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    /* The current item is not marked by colour alone: it also carries a
+       rule along the top edge of its own cell. `transparent` here rather
+       than no border, so marking one never shifts the other three. */
+    border-top: 2px solid transparent;
+    color: var(--color-text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .home-tabbar__item--on {
+    border-top-color: var(--color-action);
+    color: var(--color-action);
+  }
+  .home-tabbar__label {
+    line-height: 1;
+  }
 }
 /* console-rail-orchestrator (D2): `.home-sidebar__nav`, `.home-sidebar__row`
    and its hover/current states went out with the rail's `Board` row — that
