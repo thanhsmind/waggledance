@@ -262,7 +262,9 @@ scroll sideways. A card links onward to the feature's own detail page.
 
 ### Live signals on a card
 
-A card's "Last activity" line reports the freshest of two clocks: the feature's own
+Every card ends in one footer line: on the left a small ring that is hollow, half,
+or filled as its cells go from none to some to all capped, beside "n/m cells"; on
+the right the last-activity time. That time reports the freshest of two clocks: the feature's own
 cell claim and cap times, and — only on the card of the checkout's currently active
 feature — the checkout-wide activity stamp that the agent refreshes on every action.
 Work in progress before any cell is claimed therefore moves the active card instead
