@@ -2755,7 +2755,7 @@ fn bee_hub_style() -> String {
    have spread the badge away from the title it annotates instead of
    keeping the pair together. Scoped to `.bee-hub__summary` so the archive
    bar's own chevron (ctk-5) keeps sitting after its count chip. */
-.bee-hub__summary { display: flex; align-items: center; gap: 10px; padding: 12px 14px 10px; cursor: pointer; list-style: none; min-width: 0; }
+.bee-hub__summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 14px 10px; cursor: pointer; list-style: none; min-width: 0; }
 .bee-hub__summary .bee-hub__chev { margin-left: auto; }
 .bee-hub__summary::-webkit-details-marker { display: none; }
 .bee-hub__summary:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
@@ -2808,7 +2808,12 @@ fn bee_hub_style() -> String {
    printed beside it, so the state never speaks by colour alone).
    `no signal` (A1) is the quietest thing on the card: a muted marker that
    says the record has stopped speaking, never a need-you. */
-.bee-hub__agent { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: 0; padding: 0 14px var(--space-1); font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
+/* agent-line-own-row: the agent line is a second ROW of the summary, never a
+   column beside the title — `flex: 1 0 100%` makes it take the whole width
+   after the title, state badge and chevron have filled row one, and
+   `order` keeps it last however those three wrap. It inherits the
+   summary's horizontal padding, so it carries none of its own. */
+.bee-hub__agent { flex: 1 0 100%; order: 10; display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: 0; padding: 0; font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
 .bee-hub__agent-state { color: var(--color-text-muted); }
 .bee-hub__agent-state--working { color: var(--color-warning); }
 .bee-hub__agent-state--needs-you { color: var(--color-danger); }
@@ -14890,6 +14895,21 @@ mod tests {
     /// -- while the tiles' wide-screen default (`display: none`) sits outside
     /// it, ahead of the query, so desktop keeps its five-column grid and
     /// draws no tiles at all.
+    /// agent-line-own-row (UAT on bee-agent-activity): the agent line is a
+    /// full-width second row of the summary, never a column beside the title.
+    #[test]
+    fn bee_hub_agent_line_is_a_full_width_row_of_the_summary() {
+        let css = bee_hub_style();
+        assert!(
+            css.contains(".bee-hub__summary { display: flex; flex-wrap: wrap;"),
+            "the summary must wrap so the agent line can drop to its own row: {css}"
+        );
+        assert!(
+            css.contains(".bee-hub__agent { flex: 1 0 100%; order: 10;"),
+            "the agent line must claim the whole width and sit last: {css}"
+        );
+    }
+
     #[test]
     fn bee_hub_style_keeps_every_phone_board_rule_inside_the_one_narrow_media_query() {
         let css = bee_hub_style();
