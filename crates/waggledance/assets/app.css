@@ -402,6 +402,26 @@ html[data-scheme="dark"] .topbar .home {
 .theme-toggle:hover {
   background: var(--color-surface-hover);
 }
+/* console-rail-orchestrator (D1): the board's entry point, sitting in the
+   topbar's right slot where the retired tab strip's "Kanban" anchor used to
+   sit under the bar. It reuses `.fg-btn.fg-btn--ghost` wholesale and adds
+   only the current state: a filled pill, not a colour swap, so "you are on
+   the board" survives a colour-blind reader and a low-contrast screen — the
+   anchor already carries `aria-current="page"` for the accessibility tree,
+   and this is that same fact rendered as shape. */
+.topbar__orchestrator {
+  white-space: nowrap;
+}
+.topbar__orchestrator--on {
+  background: var(--color-action);
+  color: var(--color-on-action);
+  font-weight: var(--weight-semibold);
+}
+.topbar__orchestrator--on:hover {
+  background: var(--color-action-hover);
+  color: var(--color-on-action);
+}
+
 /* agents-toggle-circle: circular icon button that opens the global agent
    switch drawer, sitting between the topbar menu button and the theme
    toggle at every width — like the theme toggle, it acts on this page
@@ -774,26 +794,14 @@ html[data-scheme="dark"] .topbar .home {
   padding: var(--space-3);
   border-top: var(--border-width-hairline) solid var(--color-border);
 }
-.home-sidebar__nav {
+/* console-rail-orchestrator (D2): `.home-sidebar__nav`, `.home-sidebar__row`
+   and its hover/current states went out with the rail's `Board` row — that
+   row was their only user, and the board's entry point is the topbar's
+   Orchestrator button now. `.pinned-list` is the one list left up here. */
+.pinned-list {
   list-style: none;
   margin: 0;
   padding: 0;
-}
-.home-sidebar__row {
-  display: block;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  text-decoration: none;
-  color: var(--color-text-muted);
-}
-.home-sidebar__row:hover {
-  background: var(--color-surface-hover);
-  color: var(--color-text);
-}
-.home-sidebar__row--on {
-  background: var(--color-surface-raised);
-  color: var(--color-text);
-  font-weight: var(--weight-semibold);
 }
 .home-sidebar__group {
   margin: 0;
@@ -805,8 +813,158 @@ html[data-scheme="dark"] .topbar .home {
   text-transform: uppercase;
   color: var(--color-text-subtle);
 }
+/* console-rail-orchestrator (D2): the Pinned group's heading is itself the
+   way to the Terminals view, so it has to read as a link without stopping
+   reading as the same eyebrow label `Projects` is — the tag type stays,
+   only the colour lifts to body text on hover. */
+.home-sidebar__group-link {
+  color: inherit;
+  text-decoration: none;
+}
+.home-sidebar__group-link:hover {
+  color: var(--color-text);
+  text-decoration: underline;
+}
+/* A pinned terminal's row. Deliberately its own class rather than a
+   `.proj-row` variant: `app.js`'s rail filter sweeps
+   `.home-sidebar .proj-row`, and filtering for a project must not blank
+   out the agents running above the list. The padding matches
+   the project rows below so the two groups share one left edge. */
+.pinned-row__link {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  column-gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  /* The accent bar is always in the box, transparent when the row is not
+     current, and the left padding pays for it — so marking a row current
+     never shifts its text sideways, and every row keeps the same left edge
+     as the project rows below. */
+  padding-left: calc(var(--space-3) - var(--border-width-strong));
+  border-radius: var(--radius-sm);
+  border-left: var(--border-width-strong) solid transparent;
+  text-decoration: none;
+  color: var(--color-text-muted);
+}
+.pinned-row__link:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+/* The current row never says so by colour alone: the markup carries
+   `aria-current="page"`, and the fill is joined by a left accent bar and a
+   heavier weight, so the state survives a colour-blind or forced-colours
+   reading too. */
+.pinned-row__link--on {
+  background: var(--color-surface-raised);
+  border-left-color: var(--color-action);
+  color: var(--color-text);
+  font-weight: var(--weight-semibold);
+}
+.pinned-row__name {
+  overflow-wrap: anywhere;
+}
+/* `workspace · tab` is an identifier, not prose — the mono face keeps a
+   column of them scannable, and the caption size keeps the line
+   subordinate to the project name above it. */
+.pinned-row__meta {
+  grid-column: 2;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-leading);
+  color: var(--color-text-subtle);
+  overflow-wrap: anywhere;
+}
+.pinned-empty {
+  margin: 0;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-subtle);
+}
 .home-sidebar__filter {
   width: 100%;
+}
+/* console-rail-orchestrator (D4): a project group is a native `<details>`
+   inside the `<li>` the rail filter sweeps. The `<li>` keeps `.proj-row`
+   for that filter (and for its bottom rule), but stops being a flex row
+   itself -- the flex layout moves down to the summary, which is the only
+   part of the group that is actually a row of items. `.proj-row[hidden]`
+   still outranks this on specificity, so hiding a filtered-out group
+   still works. */
+.proj-group__row {
+  display: block;
+}
+.proj-group {
+  min-width: 0;
+}
+/* The name line. `position: relative` is what `.proj-row__delete` anchors
+   its absolute top-right corner to now that the remove control lives in
+   the summary rather than in the row box (D4: it has to stay reachable on
+   a collapsed group, and a `<details>` shows nothing but its summary when
+   closed). The link's own `padding-right` is the gutter that control sits
+   in. */
+.proj-group__summary {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  cursor: pointer;
+  /* Two spellings of the same thing: Firefox draws the disclosure triangle
+     with `::marker`, WebKit with its own pseudo-element. The chevron below
+     replaces both, so neither may also render. */
+  list-style: none;
+}
+.proj-group__summary::-webkit-details-marker {
+  display: none;
+}
+.proj-group__summary::marker {
+  content: "";
+}
+/* The disclosure chevron: a CSS triangle rather than a glyph, so it cannot
+   pick up a font the rest of the rail does not have, and it rotates
+   between the two states instead of swapping character. It is decorative
+   -- `<summary>` already announces expanded/collapsed to a screen reader
+   on its own -- so it carries no text. */
+.proj-group__summary::before {
+  content: "";
+  flex: none;
+  align-self: center;
+  width: 0;
+  height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  color: var(--color-text-subtle);
+  transform-origin: 25% 50%;
+  transition: transform 120ms ease;
+}
+.proj-group[open] > .proj-group__summary::before {
+  transform: rotate(90deg);
+}
+.proj-group__summary:hover {
+  background: var(--color-surface-hover);
+}
+.proj-group__summary:hover .proj-row__name {
+  text-decoration: underline;
+}
+/* Everything the group folds away sits under the name line, indented to
+   the chevron's own width so the meta line and the badges read as the
+   project's own block rather than as the next project's. */
+.proj-group__body {
+  padding-left: var(--space-4);
+}
+.proj-group__body > .proj-row__meta {
+  display: block;
+  padding-bottom: var(--space-1);
+}
+.proj-group__branches {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+/* The group's own `<li>` already draws the rule that closes it off; a
+   second one under the last branch would double the line. */
+.proj-group__branches > .proj-row:last-child {
+  border-bottom: 0;
 }
 /* The rail is far narrower than the full-width page these rows were laid
    out for: reclaim the 56px gutter the delete button no longer needs at
@@ -2164,7 +2322,13 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
    the space the board actually has. Deliberately the same rule retargeted
    rather than a second breakpoint: the narrow-screen answer for this shell
    belongs to the phone phase. */
-.home-shell > main.fg-page.bee-hub-theme {
+/* console-rail-orchestrator (D3): the Terminals view moved into this same
+   shell, so its own `<main>` needs the same treatment — a live screen
+   centred inside the leftover room, with the rail already taking 320px off
+   the left, is the worst version of both. One selector list, because the
+   reason is identical for both tabs. */
+.home-shell > main.fg-page.bee-hub-theme,
+.home-shell > main.fg-page.fg-page--tight {
   flex: 1;
   min-width: 0;
   max-width: none;

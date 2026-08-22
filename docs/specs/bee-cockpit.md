@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
-updated: 2026-08-13
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded]
+updated: 2026-08-22
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator]
 decisions: []
 coverage: partial
 ---
@@ -44,7 +44,7 @@ never rendered as an empty dashboard.
 
 A qualifying project gains an entry point on its home page leading to its board.
 
-On a wide desktop screen the board pages — the home Kanban tab and a project's own
+On a wide desktop screen the board pages — the home board and a project's own
 bee board — span the full width of the window instead of stopping at the reading
 column other pages keep; feature and item detail pages keep the narrower column.
 Card titles render in the interface's own sans face rather than the reading face,
@@ -53,12 +53,52 @@ so a wall of cards scans like a control surface, not a document.
 ## The cross-project board
 
 The same surface also exists once for everything at once. The viewer's own front
-page — the page a person lands on before choosing a project — leads with the
-Features board rolled up across **every** qualifying project, and only then shows
-the list of registered projects that page has always shown:
+page — the page a person lands on before choosing a project — is one frame in
+three parts: a top bar, a left rail of what is running and what is registered,
+and, filling the rest, the Features board rolled up across **every** qualifying
+project.
 
-1. **Features**, across all projects.
-2. The project list, unchanged — same rows, same order, same everything below it.
+1. The **top bar**, whose right slot carries a single **Orchestrator** link: the
+   board's entry point, and the only element there that marks itself the current
+   page, which it does while the board is showing. It is a real address
+   (`/?tab=kanban`) and not a script-driven control, so it works with scripting
+   off and survives the page's own reloads. Nothing sits beneath the top bar in
+   place of the retired row of tabs; the `tab=` addresses — `kanban`, `projects`,
+   `terminals` — all keep resolving exactly as they did, and `/?tab=projects`
+   still lands on the board.
+2. The **left rail**, described below. It is the same rail on the board and on
+   the terminals view, so reaching another agent, or another project, never
+   depends on which of the two a reader happens to be looking at.
+3. **Features**, across all projects.
+
+The rail reads top down in the order the question does — who is working right
+now, then what there is to work on:
+
+- **Pinned**, the live agent terminals. Same inventory and same order as the
+  terminals view's own switcher: blocked first, then working, then the rest.
+  Each row carries a status dot, the project it belongs to, and its workspace
+  and tab, and leads to that terminal. That address names the pane and nothing
+  else — a terminal's own title, session name and working directory never appear
+  on this page. The group's heading is itself a link to the terminals view, and
+  the group renders whether or not the terminal supervisor is running, so that
+  view's own account of a stopped supervisor stays reachable; with no agent
+  running the group shows one muted **No agents running** line rather than
+  disappearing. The rail no longer carries a Board row — it pointed at the page
+  it was already on, and the Orchestrator link answers that now.
+- **Projects**, the registered projects, each one a group that collapses. The
+  summary is the project's name line: its dot, its name, and the control that
+  removes it from the registry, which stays reachable while the group is closed.
+  Everything a collapsed group should fold away sits in the body — the markdown
+  count and last-seen line, the badges, and the worktree branches. Groups open
+  by default; the set a reader leaves closed is remembered for that browser
+  alone, keyed by project. Collapsing itself works with scripting off; only the
+  memory of it needs scripting. Typing in the rail's filter forces every still
+  matching group open, because a match hidden inside a closed group reads as no
+  match at all, and clearing the filter restores the reader's own collapsed set.
+
+At most one thing in this frame is marked the current page: the Orchestrator
+link while the board is showing, or, on the terminals view, the pinned row of
+the terminal actually on screen.
 
 There is deliberately no cross-project Live strip. Presence across many projects
 answered nothing the Features columns did not already answer, while taking the
@@ -67,12 +107,12 @@ single project's own board, where it answers who is at work in *this* project.
 
 Qualification is the same rule stated above, and it decides only what feeds the
 Features section: a registered project without a `.bee/` store still appears in
-the list below, exactly as before. When no project qualifies at all, the Features
-section renders its own empty state rather than vanishing — the front page keeps
-its tab strip (Kanban, Projects, Terminals), so the Terminals tab stays reachable
-whether or not any project carries bee metadata; the Kanban tab simply shows it
-has nothing yet, and the project list still reads exactly as before under the
-Projects tab.
+the rail, exactly as before. When no project qualifies at all, the Features
+section renders its own empty state rather than vanishing — the Orchestrator
+link and the rail belong to the frame rather than to the board, so the terminals
+view stays reachable whether or not any project carries bee metadata; the board
+simply shows it has nothing yet, and the project list still reads exactly as
+before in the rail.
 
 If any `.bee` file could not be read while rolling up the board, the front page
 carries one concise warning strip in its header — naming how many files failed and
