@@ -1102,7 +1102,7 @@ html[data-scheme="dark"] .topbar .home {
   text-transform: uppercase;
   color: var(--color-text-subtle);
 }
-/* console-rail-orchestrator (D2): the Pinned group's heading is itself the
+/* console-rail-orchestrator (D2): the Agents group's heading is itself the
    way to the Terminals view, so it has to read as a link without stopping
    reading as the same eyebrow label `Projects` is — the tag type stays,
    only the colour lifts to body text on hover. */
@@ -1114,7 +1114,7 @@ html[data-scheme="dark"] .topbar .home {
   color: var(--color-text);
   text-decoration: underline;
 }
-/* rail-icons: a pin before the Pinned eyebrow, a folder before a project
+/* rail-icons: a pin before the Agents eyebrow, a folder before a project
    name — shape first, word second, on the same baseline as the text. */
 .home-sidebar__group-icon {
   vertical-align: -2px;
@@ -1135,11 +1135,18 @@ html[data-scheme="dark"] .topbar .home {
    `.home-sidebar .proj-row`, and filtering for a project must not blank
    out the agents running above the list. The padding matches
    the project rows below so the two groups share one left edge. */
+/* rail-agents-compact: two rows, never more. Row one is `auto 1fr auto` —
+   the status dot, the name and its `· workspace · tab` address running
+   inline beside it, and the bee state word pushed to the right edge, where
+   a column of rows turns it into a scannable stack. Row two spans the name
+   and state columns for the purpose line: a crosshair and the feature this
+   agent is aimed at, rendered only when a live session names one. */
 .pinned-row__link {
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: auto 1fr auto;
   align-items: baseline;
   column-gap: var(--space-2);
+  row-gap: var(--space-1);
   padding: var(--space-2) var(--space-3);
   /* The accent bar is always in the box, transparent when the row is not
      current, and the left padding pays for it — so marking a row current
@@ -1165,40 +1172,65 @@ html[data-scheme="dark"] .topbar .home {
   color: var(--color-text);
   font-weight: var(--weight-semibold);
 }
+/* The name and its address share one grid cell, so they read as one line
+   rather than as two competing columns. */
+.pinned-row__head {
+  grid-column: 2;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .pinned-row__name {
   overflow-wrap: anywhere;
 }
-/* `workspace · tab` is an identifier, not prose — the mono face keeps a
-   column of them scannable, and the caption size keeps the line
-   subordinate to the project name above it. */
+/* `· workspace · tab` is an identifier, not prose — the mono face keeps a
+   column of them scannable, and the caption size keeps the address
+   subordinate to the project name it trails. */
 .pinned-row__meta {
-  grid-column: 2;
   font-family: var(--font-mono, monospace);
   font-size: var(--type-caption-size);
   line-height: var(--type-caption-leading);
+  font-weight: var(--weight-regular);
   color: var(--color-text-subtle);
-  overflow-wrap: anywhere;
 }
-/* A6: the bee state word and the feature lane a pinned pane's own live
-   session is bound to. Both sit in the meta column under the name, in the
-   same mono caption face the workspace/tab line already uses — they are
-   machine vocabulary, not prose — and the state word carries the blocked
-   tone when it is one of the two need-you states, so the row says the same
-   thing its dot does, in words. */
-.pinned-row__state,
-.pinned-row__feature {
-  grid-column: 2;
-  font-family: var(--font-mono, monospace);
-  font-size: var(--type-caption-size);
-  line-height: var(--type-caption-leading);
-  color: var(--color-text-subtle);
-  overflow-wrap: anywhere;
-}
+/* A6: the bee state word a pinned pane's own live session is in. It ends
+   line one at the right edge — machine vocabulary in the same mono caption
+   face the address uses — and carries the blocked tone when it is one of
+   the two need-you states, so the row says the same thing its dot does, in
+   words. */
 .pinned-row__state {
+  grid-column: 3;
+  justify-self: end;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-leading);
+  font-weight: var(--weight-regular);
   color: var(--color-text-muted);
+  white-space: nowrap;
 }
 .proj-row__dot--blocked ~ .pinned-row__state {
   color: var(--color-danger);
+}
+/* Line two: the feature lane this agent is bound to, led by the crosshair
+   that says the line is a purpose rather than another address. It spans
+   the name and state columns so the feature has the whole width the name
+   had, and it is absent entirely when no live session names a feature. */
+.pinned-row__purpose {
+  grid-column: 2 / -1;
+  min-width: 0;
+}
+.pinned-row__purpose-icon {
+  flex: none;
+  color: var(--color-text-subtle);
+  vertical-align: middle;
+  margin-right: var(--space-1);
+}
+.pinned-row__feature {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-leading);
+  font-weight: var(--weight-regular);
+  color: var(--color-text-subtle);
+  overflow-wrap: anywhere;
 }
 .pinned-empty {
   margin: 0;
