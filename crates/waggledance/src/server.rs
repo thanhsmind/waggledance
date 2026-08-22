@@ -17084,9 +17084,19 @@ mod bee_route_tests {
             at(&parent.id) < at(&branch.id),
             "a worktree must follow the project it branches from: {body}"
         );
-        // Every project appears exactly once — nesting must not duplicate a row.
+        // Every project appears exactly once — nesting must not duplicate a
+        // row. Counted on the ROW LINK, not on the bare `/p/<id>/` href:
+        // rail-collapse-menu (f4999b27) gave every row a `…` menu whose
+        // `Docs` item points at that same project, so a second occurrence
+        // of the href is now the menu doing its job rather than the row
+        // being emitted twice. One `proj-row__link` per project is what
+        // "listed once" actually means.
         assert_eq!(
-            body.matches(&format!("href=\"/p/{}/\"", branch.id)).count(),
+            body.matches(&format!(
+                "<a class=\"proj-row__link\" href=\"/p/{}/\"",
+                branch.id
+            ))
+            .count(),
             1,
             "a nested worktree must be listed once, not twice: {body}"
         );
@@ -17844,6 +17854,39 @@ mod bee_route_tests {
                 "waggledance-rail-collapsed",
                 "<details class=\"proj-group\" open",
                 "the collapsed set's storage key",
+            ),
+            // rail-collapse-menu (2d56ff75): the collapse chevron ships
+            // `hidden` and only the module that wires it unhides it, so a
+            // drift between the two selectors leaves a dead control on the
+            // rail -- the same failure shape the filter field above guards.
+            (
+                ".home-sidebar__collapse",
+                "<button type=\"button\" class=\"home-sidebar__collapse\" hidden",
+                "the rail collapse button's unhide",
+            ),
+            (
+                "home-sidebar--collapsed",
+                "<nav class=\"home-sidebar\" aria-label=\"Projects\">",
+                "the collapsed rail's class and its element",
+            ),
+            (
+                "waggledance-rail-hidden",
+                "<button type=\"button\" class=\"home-sidebar__collapse\"",
+                "the collapsed rail's storage key",
+            ),
+            // rail-collapse-menu (f4999b27): the row menu's manners --
+            // one open at a time, outside click closes -- all hang off
+            // this one selector, and a rename would leave every menu
+            // opening fine and never closing.
+            (
+                "details.proj-menu",
+                "<details class=\"proj-menu\">",
+                "the row menu's one-at-a-time close",
+            ),
+            (
+                ".proj-menu__panel",
+                "<div class=\"proj-menu__panel\">",
+                "the row menu's click containment",
             ),
         ] {
             assert!(

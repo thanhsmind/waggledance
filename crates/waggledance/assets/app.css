@@ -565,12 +565,82 @@ html[data-scheme="dark"] .topbar .home {
    a badge on the three-badge row — where it read as a square adrift rather
    than as the project's own control. `top` is `.proj-row__link`'s own
    `padding-top`, so the control's top edge and the name's line box start on
-   the same line however many badges hang below. */
-.proj-row__delete {
+   the same line however many badges hang below.
+
+   rail-collapse-menu (f4999b27): the same corner, the same geometry — what
+   sits in it is now the row's `…` menu rather than a bare remove button, so
+   this rule moved from `.proj-row__delete` (which is still the remove form,
+   one item down inside the panel) to `.proj-menu` around it. */
+.proj-menu {
   position: absolute;
   top: var(--space-2);
   right: 0;
   margin: 0;
+}
+/* The panel hangs off the button's own corner, over the rows below it —
+   `--z-popover` is the layer the contract reserves for exactly this. It is
+   right-aligned because the button is: a panel growing leftwards from the
+   rail's right gutter can never push itself off the rail. */
+.proj-menu__panel {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 0;
+  z-index: var(--z-popover);
+  min-width: 140px;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+  box-shadow: var(--elevation-md);
+}
+/* The remove form keeps its class (the confirm prompt and its selector test
+   both hold on it) but stops being a positioned corner control: inside the
+   panel it is one full-width item in a column. */
+.proj-menu__panel .proj-row__delete {
+  margin: 0;
+  display: block;
+}
+/* One item shape for both an `<a>` and a `<button>`, so the two read as one
+   list rather than as a link with a button glued under it. */
+.proj-menu__item {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-text);
+  font: inherit;
+  font-size: var(--type-body-sm-size);
+  line-height: 1.6;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.proj-menu__item:hover,
+.proj-menu__item:focus-visible {
+  /* Never `--color-surface-hover`: in dark that token IS the panel's own
+     `--color-surface-raised`, so the wash would be invisible on exactly the
+     surface this item sits on. The sunken step reads against both. */
+  background: var(--color-surface-sunken);
+}
+.proj-menu__item:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: calc(var(--focus-offset) * -1);
+}
+/* Unregistering is destructive and says so in its own colour, at rest and
+   not only on hover — it is a word in a list now, with no icon weight left
+   to carry the warning. */
+.proj-menu__item--danger {
+  color: var(--color-danger);
+}
+.proj-menu__item--danger:hover,
+.proj-menu__item--danger:focus-visible {
+  background: var(--color-danger-tint);
 }
 /* Terminal-pane badges (D1/D1a/D2/D3/D5): sit under the row's meta line, a
    sibling of `.proj-row__link` rather than nested inside it — `flex-wrap`
@@ -675,17 +745,23 @@ html[data-scheme="dark"] .topbar .home {
    project rail this control repeats once per row, so the hairline border on
    a surface fill it used to carry stacked into a column of grey squares
    competing with the project names for the eye. At rest it is the bare
-   glyph; the border and the destructive tone arrive on hover or focus. The
-   border stays declared at `transparent` so gaining it shifts no layout.
+   glyph; the border arrives on hover or focus, and the border stays
+   declared at `transparent` so gaining it shifts no layout.
 
-   Receding is about WEIGHT, never about vanishing — this unregisters a
-   project. It is a real `<button>` in normal flow order, it keeps the
-   `aria-label`/`title` the row markup in `views.rs` gives it, its 24px box
-   is the WCAG 2.5.8 minimum target, and `:focus-visible` below paints the
-   same destructive state as hover PLUS the system's own focus ring (the
+   rail-collapse-menu (f4999b27) inherited this treatment from
+   `.proj-card__del`, which it retires: the control in this corner is the
+   row's `…` menu now, so the DESTRUCTIVE tone moved down to the panel's
+   own Remove item and what is left here is a neutral disclosure. Receding
+   is still about weight, never about vanishing — its 24px box is the WCAG
+   2.5.8 minimum target, it keeps the `aria-label`/`title` `views.rs` gives
+   it, and `:focus-visible` paints the system's own ring (the
    `:where(.fg-btn, …)` list in `atelier/components.css` does not reach a
-   bare button, so the ring is declared here from the same tokens). */
-.proj-card__del {
+   bare `<summary>`, so the ring is declared here from the same tokens).
+
+   Two spellings hide the disclosure triangle, the same pair
+   `.proj-group__summary` below already needs: Firefox draws it with
+   `::marker`, WebKit with its own pseudo-element. */
+.proj-menu__button {
   width: 24px; /* structural: fixed icon-button footprint */
   height: 24px;
   display: inline-flex;
@@ -699,17 +775,25 @@ html[data-scheme="dark"] .topbar .home {
   font-size: var(--type-body-sm-size);
   line-height: 1;
   cursor: pointer;
+  list-style: none;
   transition: color var(--motion-fast) var(--ease-standard),
     border-color var(--motion-fast) var(--ease-standard),
     background var(--motion-fast) var(--ease-standard);
 }
-.proj-card__del:hover,
-.proj-card__del:focus-visible {
-  color: var(--color-danger);
-  border-color: var(--color-danger);
-  background: var(--color-danger-tint);
+.proj-menu__button::-webkit-details-marker {
+  display: none;
 }
-.proj-card__del:focus-visible {
+.proj-menu__button::marker {
+  content: "";
+}
+.proj-menu__button:hover,
+.proj-menu__button:focus-visible,
+.proj-menu[open] > .proj-menu__button {
+  color: var(--color-text);
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-raised);
+}
+.proj-menu__button:focus-visible {
   outline: var(--focus-width) solid var(--focus-color);
   outline-offset: var(--focus-offset);
 }
@@ -797,6 +881,76 @@ html[data-scheme="dark"] .topbar .home {
   padding: var(--space-3);
   border-top: var(--border-width-hairline) solid var(--color-border);
 }
+/* rail-collapse-menu (2d56ff75): the head's collapse chevron. It ships
+   `hidden` from the server and `assets/app.js` unhides it — and `display`
+   declared here outranks the UA sheet's `[hidden] { display: none }`, so
+   the `[hidden]` rule below has to say it again or a no-JS page would show
+   a control that does nothing (the same trap `.proj-row[hidden]` above
+   already documents). `align-self` keeps it in the head's right corner
+   without stretching across a column that is otherwise a banner and a
+   search field. */
+.home-sidebar__collapse {
+  align-self: flex-end;
+  width: 24px; /* structural: fixed icon-button footprint (WCAG 2.5.8) */
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: var(--border-width-hairline) solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-text-subtle);
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
+}
+.home-sidebar__collapse[hidden] {
+  display: none;
+}
+.home-sidebar__collapse:hover,
+.home-sidebar__collapse:focus-visible {
+  color: var(--color-text);
+  border-color: var(--color-border-strong);
+}
+.home-sidebar__collapse:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+/* Both chevrons are in the markup and exactly one shows, so flipping the
+   state is a class on the `<nav>` rather than a script rewriting an icon. */
+.home-sidebar__collapse-icon--out {
+  display: none;
+}
+/* The collapsed strip is a WIDE-SCREEN state only: under 700px the rail is
+   an off-canvas drawer that is already fully out of the way, and a second
+   way to hide it would only be a control the drawer has no room for. Every
+   rule the collapse adds is scoped here, so the handset block below sees
+   none of them however `waggledance-rail-hidden` was left. */
+@media (min-width: 701px) {
+  .home-sidebar--collapsed {
+    /* Structural: the head's two `--space-2` paddings plus the button's own
+       24px box — the strip is exactly the expand control and nothing else. */
+    width: 44px;
+  }
+  .home-sidebar--collapsed .home-sidebar__body,
+  .home-sidebar--collapsed .home-sidebar__foot,
+  .home-sidebar--collapsed .home-sidebar__head > *:not(.home-sidebar__collapse) {
+    display: none;
+  }
+  .home-sidebar--collapsed .home-sidebar__head {
+    padding: var(--space-2);
+  }
+  .home-sidebar--collapsed .home-sidebar__collapse {
+    align-self: center;
+  }
+  .home-sidebar--collapsed .home-sidebar__collapse-icon--in {
+    display: none;
+  }
+  .home-sidebar--collapsed .home-sidebar__collapse-icon--out {
+    display: block;
+  }
+}
 
 /* ── The handset shell ───────────────────────────────────────────────
    console-phone-layout (P1/P2). Two wide-screen defaults first, so that
@@ -841,6 +995,13 @@ html[data-scheme="dark"] .topbar .home {
   }
   .home-rail__check:checked ~ .home-sidebar {
     transform: none;
+  }
+  /* The drawer is already off-canvas; collapsing it to a 44px strip would
+     be a second way to hide something that is hidden by default, on the
+     one layout with no width to spend on the control. (2d56ff75: the phone
+     drawer is untouched by the rail collapse.) */
+  .home-sidebar__collapse {
+    display: none;
   }
   /* Scenery, and the way back out: a tap anywhere off the drawer unchecks
      the same toggle. Sits one step under the drawer and one over the page.

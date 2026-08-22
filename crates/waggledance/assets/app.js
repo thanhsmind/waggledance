@@ -452,6 +452,103 @@
     });
   })();
 
+  // Rail collapse (home page, rail-collapse-menu 2d56ff75): on a wide
+  // screen the 320px project rail folds to a 44px strip carrying nothing
+  // but the button that brings it back, and the choice is remembered per
+  // browser in `localStorage["waggledance-rail-hidden"]` ("1" when
+  // collapsed, absent otherwise) — which is what makes it survive the
+  // whole-page reload this script performs on every watched change.
+  //
+  // The button ships `hidden` from the server and is unhidden here, and
+  // only here: with scripting off there is no server route behind it, so a
+  // visible chevron would be a control that lies (the rail filter below
+  // ships the same way for the same reason). The stored state is painted
+  // BEFORE the unhide, so the strip never renders wide for a frame and
+  // then jumps.
+  //
+  // Which chevron shows is CSS's job — both are in the markup and the
+  // class on the `<nav>` picks one — so this only ever writes the class
+  // and the state the button announces.
+  (function () {
+    var rail = document.querySelector(".home-sidebar");
+    var btn = rail && rail.querySelector(".home-sidebar__collapse");
+    if (!rail || !btn) return;
+    var KEY = "waggledance-rail-hidden";
+    var CLASS = "home-sidebar--collapsed";
+
+    function paint(collapsed) {
+      rail.classList.toggle(CLASS, collapsed);
+      btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      var label = collapsed ? "Expand projects rail" : "Collapse projects rail";
+      btn.setAttribute("aria-label", label);
+      btn.title = label;
+    }
+
+    // Storage is a hostile input like any other: a disabled or
+    // quota-blocked `localStorage` throws on read, and anything but the
+    // literal "1" reads as "not collapsed" rather than taking the rail
+    // down with it.
+    var stored = false;
+    try { stored = localStorage.getItem(KEY) === "1"; } catch (e) {}
+    paint(stored);
+    btn.hidden = false;
+
+    btn.addEventListener("click", function () {
+      var next = !rail.classList.contains(CLASS);
+      paint(next);
+      try {
+        if (next) localStorage.setItem(KEY, "1");
+        else localStorage.removeItem(KEY);
+      } catch (e) {}
+    });
+  })();
+
+  // Project row menus (home page rail, rail-collapse-menu f4999b27): each
+  // row's actions live in a native `<details class="proj-menu">`, so the
+  // menu opens, closes and reaches Docs or Remove with this script absent.
+  // What is added here is only the manners a native `<details>` has none
+  // of: one menu open at a time, an outside click or Escape closes them,
+  // and — the load-bearing one — a click on a menu never reaches the
+  // project group's own `<summary>` around it.
+  //
+  // A nested `<summary>` is an activatable element, so the browser should
+  // not toggle the outer group for it; `stopPropagation` makes that a
+  // guarantee rather than a reading of the spec, and covers the panel too,
+  // whose plain `<a>`/`<button>` sit inside the same summary.
+  (function () {
+    var menus = document.querySelectorAll("details.proj-menu");
+    if (!menus.length) return;
+
+    function closeAll(except) {
+      menus.forEach(function (m) {
+        if (m !== except && m.open) m.open = false;
+      });
+    }
+
+    menus.forEach(function (m) {
+      // `toggle` does not bubble, so this never reaches the group's own
+      // collapse module and can never be mistaken for the reader closing a
+      // project group.
+      m.addEventListener("toggle", function () {
+        if (m.open) closeAll(m);
+      });
+      var stop = function (e) { e.stopPropagation(); };
+      var button = m.querySelector(".proj-menu__button");
+      if (button) button.addEventListener("click", stop);
+      var panel = m.querySelector(".proj-menu__panel");
+      if (panel) panel.addEventListener("click", stop);
+    });
+
+    document.addEventListener("click", function () {
+      // Clicks inside a menu stopped propagating above, so anything that
+      // arrives here happened somewhere else on the page.
+      closeAll(null);
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") closeAll(null);
+    });
+  })();
+
   // Project group collapse (home page rail, console-rail-orchestrator D4):
   // each project group in the rail is a native `<details class="proj-group"
   // open data-project-id="...">`, so collapsing one already works with this
@@ -554,11 +651,25 @@
     var rows = document.querySelectorAll(".home-sidebar .proj-row");
     if (!input || !rows.length) return;
     box.hidden = false;
+    // rail-collapse-menu (f4999b27): every row now carries a `…` menu whose
+    // panel spells out "Docs" and "Remove", and those words are part of
+    // `row.textContent` — so a raw match on it would report a hit for
+    // "doc", "re" or "move" on EVERY project in the rail. The menus all
+    // render the same text, so removing that one string removes it
+    // everywhere, leaving the name, meta line and badges the filter was
+    // always searching.
+    function rowText(row) {
+      var text = row.textContent || "";
+      var menu = row.querySelector(".proj-menu");
+      var noise = menu && menu.textContent;
+      if (noise) text = text.split(noise).join("");
+      return text.toLowerCase();
+    }
     function apply() {
       var q = input.value.trim().toLowerCase();
       var groupShown = false;
       rows.forEach(function (row) {
-        var hit = !q || (row.textContent || "").toLowerCase().indexOf(q) !== -1;
+        var hit = !q || rowText(row).indexOf(q) !== -1;
         if (row.classList.contains("proj-row--branch")) {
           if (groupShown) hit = true;
         } else {
