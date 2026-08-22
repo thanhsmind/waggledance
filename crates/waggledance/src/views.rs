@@ -477,12 +477,58 @@ const HUB_KIND_ICON_IN_PROGRESS: &str =
 const HUB_KIND_ICON_REVIEW: &str = r#"<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"></path><circle cx="12" cy="12" r="3"></circle>"#;
 const HUB_KIND_ICON_COMPOUND: &str = r#"<polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline>"#;
 const HUB_KIND_ICON_READY: &str = r#"<circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M6 21V9a9 9 0 0 0 9 9"></path>"#;
+const AGENT_LOGO_CLAUDE: &str = r#"<path d="M12 3.5v17M3.5 12h17M6 6l12 12M18 6L6 18"></path>"#;
+const AGENT_LOGO_OPENAI: &str = r#"<path d="M12 2.8l8 4.6v9.2l-8 4.6-8-4.6V7.4z"></path><path d="M12 7.6l3.9 2.2v4.4L12 16.4l-3.9-2.2V9.8z"></path><path d="M4 7.4l4.1 2.4M20 7.4l-4.1 2.4M12 21.2v-4.8"></path>"#;
+const AGENT_LOGO_GEMINI: &str = r#"<path d="M12 2.5c0 5.3 4.2 9.5 9.5 9.5-5.3 0-9.5 4.2-9.5 9.5 0-5.3-4.2-9.5-9.5-9.5 5.3 0 9.5-4.2 9.5-9.5z" fill="currentColor" stroke="none"></path>"#;
+const AGENT_LOGO_GENERIC: &str =
+    r#"<polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line>"#;
 const HUB_KIND_ICON_FINISHED: &str = r#"<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline>"#;
+
+/// The mark drawn for an agent `kind` (herdr's free-form `agent` field):
+/// a class slug plus the SVG body. Matched by substring so `claude-code`,
+/// `codex-cli` or `openai` still land on their vendor's mark; anything
+/// unrecognised draws the generic prompt.
+fn bee_hub_agent_logo(kind: &str) -> (&'static str, &'static str) {
+    let k = kind.to_ascii_lowercase();
+    if k.contains("claude") || k.contains("anthropic") {
+        ("anthropic", AGENT_LOGO_CLAUDE)
+    } else if k.contains("codex")
+        || k.contains("openai")
+        || k.contains("chatgpt")
+        || k.contains("gpt")
+    {
+        ("openai", AGENT_LOGO_OPENAI)
+    } else if k.contains("gemini") || k.contains("google") {
+        ("gemini", AGENT_LOGO_GEMINI)
+    } else {
+        ("generic", AGENT_LOGO_GENERIC)
+    }
+}
 
 /// The state glyph a hub card's title leads with, keyed by the column the
 /// card sits in. Decorative: the column header already names the state,
 /// so the glyph is `aria-hidden` and carries no text alternative.
-fn bee_hub_kind_icon(group_key: &str) -> String {
+fn bee_hub_kind_icon(group_key: &str, panes: &[TerminalPaneView]) -> String {
+    // card-agent-logos: when an agent session is attached to the card, the
+    // glyph is that agent's own mark (Claude, OpenAI/Codex, Gemini, or a
+    // generic prompt for a kind without a drawn logo) rather than the
+    // column's state glyph -- the column header already names the state,
+    // while WHO is working on the card is the thing no other element says
+    // at a glance. An active session (working/blocked) wins over a quiet
+    // one; with no agent pane at all the column glyph stays.
+    let agent = panes
+        .iter()
+        .filter(|p| p.kind != "shell")
+        .max_by_key(|p| matches!(pane_tone(p), "working" | "blocked"));
+    if let Some(pane) = agent {
+        let (slug, body) = bee_hub_agent_logo(&pane.kind);
+        return format!(
+            r#"<span class="bee-hub__kind bee-hub__kind--agent bee-hub__kind--{slug}" title="{kind}" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{body}</svg></span>"#,
+            slug = slug,
+            kind = esc(&pane.kind),
+            body = body,
+        );
+    }
     let body = match group_key {
         "in-progress" => HUB_KIND_ICON_IN_PROGRESS,
         "review" => HUB_KIND_ICON_REVIEW,
@@ -2846,6 +2892,11 @@ fn bee_hub_style() -> String {
 .bee-hub__kind--compound { color: var(--color-accent-alt-5); }
 .bee-hub__kind--ready-to-merge { color: var(--color-accent-alt-4); }
 .bee-hub__kind--todo { color: var(--color-accent-alt-1); }
+.bee-hub__kind--agent { background: color-mix(in srgb, currentColor 14%, transparent); }
+.bee-hub__kind--anthropic { color: #d97757; }
+.bee-hub__kind--openai { color: #10a37f; }
+.bee-hub__kind--gemini { color: #4e8df5; }
+.bee-hub__kind--generic { color: var(--color-text-muted); }
 .bee-hub__summary .fg-card__title { flex: 1 1 0; min-width: 0; }
 .bee-hub__summary::-webkit-details-marker { display: none; }
 .bee-hub__summary:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
@@ -5366,7 +5417,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         Some(agent) => bee_hub_agent_line(agent),
         None => String::new(),
     };
-    let kind_html = bee_hub_kind_icon(group_key);
+    let kind_html = bee_hub_kind_icon(group_key, panes);
     let title_html = match title {
         Some(t) => format!(
             r#"<div class="fg-card__title">{title}</div>"#,
