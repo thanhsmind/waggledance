@@ -1043,6 +1043,13 @@ html[data-scheme="dark"] .topbar .home {
   .topbar__orchestrator {
     display: none;
   }
+  /* board-new-task (N1): "+ New task" leaves with it. The bar has room for
+     the menu, the agent drawer and the theme toggle and nothing else at
+     390px, and unlike Orchestrator this one has no bottom-bar tab standing
+     in for it — filing a task is a desk-width act. */
+  .topbar__new-task {
+    display: none;
+  }
   .home-tabbar {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -1866,6 +1873,73 @@ html[data-scheme="dark"] .topbar .home {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ── "+ New task" dialog (board-new-task N1) ─────────────────── */
+/* The same overlay mechanism the jump palette above uses — one fixed
+   scrim at `--z-modal`, one raised box inside it — so the board's two
+   in-page dialogs stack and dim identically. It centres rather than
+   sitting at 12vh: this box is a form the reader is composing in, not
+   a list they are scanning down. */
+.task-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--color-scrim);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: var(--space-4);
+  z-index: var(--z-modal);
+}
+.task-overlay[hidden] {
+  display: none;
+}
+.task-box {
+  width: min(560px, 92vw); /* structural: dialog footprint, same as .jump-box */
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--color-surface-raised);
+  border: var(--border-width-hairline) solid var(--color-border-strong);
+  border-radius: var(--card-radius);
+  box-shadow: var(--elevation-lg);
+}
+.task-box__title {
+  margin: 0;
+  font-family: var(--type-heading-sm-font);
+  font-size: var(--type-heading-sm-size);
+}
+.task-box__sub {
+  margin: 0;
+  color: var(--color-text-subtle);
+  font-size: var(--type-caption-size);
+}
+.task-box__input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
+.task-box__hint {
+  margin: 0;
+  color: var(--color-text-subtle);
+  font-size: var(--type-caption-size);
+}
+/* The refusal lands here, in the dialog, beside the text the reader still
+   has — never in an alert that takes the typing away with it. */
+.task-box__error {
+  margin: 0;
+  color: var(--color-danger);
+  font-size: var(--type-caption-size);
+}
+.task-box__error[hidden] {
+  display: none;
+}
+.task-box__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
 }
 
 /* ── Mermaid pan/zoom + fullscreen toolbar ───────────────────── */

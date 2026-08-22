@@ -691,6 +691,151 @@
     apply();
   })();
 
+  // board-new-task (N1/N3): the home topbar's "+ New task" dialog. The
+  // overlay itself is server-rendered and ships `hidden` (views.rs
+  // `new_task_overlay`) — this only reveals it, keys it, and posts it.
+  // Scoped to the one `[data-new-task]` the homepage renders, so it binds
+  // nothing on a project page, which has no such element.
+  //
+  // The submit is `fetch` + `location.reload()` rather than a plain form
+  // POST because a refusal has to land back *in* the dialog with the typed
+  // text still there (N3) — a redirect would take the typing with it.
+  (function () {
+    var overlay = document.querySelector("[data-new-task]");
+    var opener = document.querySelector("[data-new-task-open]");
+    if (!overlay || !opener) return;
+    var form = overlay.querySelector("[data-new-task-form]");
+    var text = overlay.querySelector('textarea[name="task"]');
+    var picker = overlay.querySelector('select[name="project"]');
+    var errBox = overlay.querySelector("[data-new-task-error]");
+    var submitBtn = overlay.querySelector("[data-new-task-submit]");
+    var cancelBtn = overlay.querySelector("[data-new-task-cancel]");
+    if (!form || !text || !picker || !errBox || !submitBtn) return;
+
+    function clearError() {
+      errBox.textContent = "";
+      errBox.hidden = true;
+    }
+    function showError(msg) {
+      errBox.textContent = msg;
+      errBox.hidden = false;
+    }
+    function isOpen() {
+      return !overlay.hidden;
+    }
+
+    // The rail's filter is client-side state the server never saw. When it
+    // has narrowed the list down to a single top-level project, that is the
+    // project the reader is looking at, so the dialog opens on it; with the
+    // filter empty or matching several, the server's own first-project
+    // preselection stands.
+    function filteredProjectId() {
+      var rows = document.querySelectorAll(
+        ".home-sidebar .proj-row:not(.proj-row--branch)"
+      );
+      var hit = null;
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].hidden) continue;
+        if (hit) return null; // more than one still showing — no single pick
+        hit = rows[i];
+      }
+      if (!hit) return null;
+      var link = hit.querySelector(".proj-row__link");
+      var href = link && link.getAttribute("href");
+      var m = href && href.match(/^\/p\/([^/]+)\//);
+      return m ? decodeURIComponent(m[1]) : null;
+    }
+
+    function open() {
+      clearError();
+      var pid = filteredProjectId();
+      if (pid) {
+        for (var i = 0; i < picker.options.length; i++) {
+          if (picker.options[i].value === pid) {
+            picker.selectedIndex = i;
+            break;
+          }
+        }
+      }
+      overlay.hidden = false;
+      text.focus();
+    }
+    function close() {
+      overlay.hidden = true;
+      clearError();
+    }
+
+    opener.addEventListener("click", open);
+    if (cancelBtn) cancelBtn.addEventListener("click", close);
+    // The scrim itself, never a click that merely started inside the box and
+    // drifted out while selecting text — hence `mousedown` on the overlay
+    // with an identity check, the same guard the jump palette uses.
+    overlay.addEventListener("mousedown", function (e) {
+      if (e.target === overlay) close();
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && isOpen()) close();
+    });
+    // Enter files the task; Shift+Enter is the newline a textarea would
+    // otherwise own outright. `requestSubmit` and not `submit()`, so the
+    // handler below actually runs and the navigation never happens.
+    text.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter" || e.shiftKey) return;
+      e.preventDefault();
+      if (typeof form.requestSubmit === "function") form.requestSubmit();
+      else form.dispatchEvent(new Event("submit", { cancelable: true }));
+    });
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      if (submitBtn.disabled) return; // one in-flight post at a time
+      var task = text.value;
+      if (!task.trim()) {
+        showError("A task needs some text.");
+        return;
+      }
+      var project = picker.value;
+      if (!project) {
+        showError("Pick a project to add this task to.");
+        return;
+      }
+      clearError();
+      submitBtn.disabled = true;
+      fetch("/api/projects/" + encodeURIComponent(project) + "/pbi", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: task }),
+      })
+        .then(function (res) {
+          if (res.ok) {
+            // The watcher ignores `.jsonl`, so no live-reload will notice
+            // the new item — this reload is what puts it on the board.
+            location.reload();
+            return null;
+          }
+          return res
+            .json()
+            .catch(function () {
+              return null;
+            })
+            .then(function (b) {
+              // The typed text is deliberately left alone: it is the only
+              // copy, and the fix may be nothing more than picking a
+              // different project and sending the very same words.
+              showError(
+                (b && b.error) || res.statusText || "Could not add this task."
+              );
+              submitBtn.disabled = false;
+            });
+        })
+        .catch(function () {
+          showError("Could not reach the server.");
+          submitBtn.disabled = false;
+        });
+    });
+  })();
+
   // Terminal settings (Settings page, `/api/terminal-config`): D10 requires
   // a JSON body — a plain form POST is a CORS *simple* request (no
   // preflight, no CORS layer on this server), so a page the owner happens
