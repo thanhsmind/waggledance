@@ -241,6 +241,13 @@ already shipped — is placed into exactly one of three groups:
   still placed here, which is the case this group exists to catch.
 - **In Progress** — every other feature that still has live work and is not waiting on
   a person.
+- **Ready to merge** — a feature whose work is finished in its own worktree and is
+  waiting only for the human to land it: the worktree is still open, the execution
+  gate was approved, and every cell that was not dropped is capped (a worktree with
+  no cells at all is never ready). The card says whether the acceptance test is
+  already approved or still pending, and how long the feature has been ready
+  (its latest cap); approved cards come first. Once bee records its own
+  merge-readiness fact, that fact outranks this derivation.
 - **Finished** — a feature that has either fully shipped (compounding complete) or been
   archived. A card in this group carries a chip naming the state of its worktree: still
   the main checkout, an open worktree, or one already merged.
