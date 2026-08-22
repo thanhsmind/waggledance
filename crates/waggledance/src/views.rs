@@ -15433,9 +15433,8 @@ mod tests {
         assert_eq!(bee_hub_branch_line("Main"), "");
         assert_eq!(bee_hub_branch_line(""), "");
         assert!(
-            bee_hub_branch_line("merged").contains(
-                r#"<span class="bee-hub__branch-name">merged</span>"#
-            ),
+            bee_hub_branch_line("merged")
+                .contains(r#"<span class="bee-hub__branch-name">merged</span>"#),
             "every spelling that names a worktree that exists renders verbatim"
         );
     }
