@@ -57,3 +57,13 @@ rows add the state word and feature; worker nicknames stay unrendered.
 - Status never speaks by colour alone (rail landmark test).
 - Existing literal tests on badges, dots, waiting chip, stat tiles, Approve
   button, `/api/agents`, notify obligations move in lockstep, never deleted.
+
+## Added during UAT
+
+**R1 — Ready to merge widens.** (decision `63bffb34`, supersedes `420cec71`)
+A feature enters the column when its worktree grant is open, its execution
+gate is approved, it has ≥1 cell and every non-dropped cell is capped —
+uat approved or not; the card says `uat approved` / `uat pending` and how
+long it has been ready (latest cap). uat-approved first. Zero-cell grants
+are not ready. A stored `merge_ready` fact from bee, once written, is
+preferred; this derivation is the fallback.
