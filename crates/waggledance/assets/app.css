@@ -1114,6 +1114,22 @@ html[data-scheme="dark"] .topbar .home {
   color: var(--color-text);
   text-decoration: underline;
 }
+/* rail-icons: a pin before the Pinned eyebrow, a folder before a project
+   name — shape first, word second, on the same baseline as the text. */
+.home-sidebar__group-icon {
+  vertical-align: -2px;
+  margin-right: var(--space-1);
+  opacity: 0.8;
+}
+.proj-row__icon {
+  flex: none;
+  align-self: center;
+  color: var(--color-text-subtle);
+}
+.proj-row__link:hover .proj-row__icon,
+.proj-group__summary:hover .proj-row__icon {
+  color: var(--color-text);
+}
 /* A pinned terminal's row. Deliberately its own class rather than a
    `.proj-row` variant: `app.js`'s rail filter sweeps
    `.home-sidebar .proj-row`, and filtering for a project must not blank

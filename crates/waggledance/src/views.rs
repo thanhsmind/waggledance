@@ -465,6 +465,39 @@ const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 
 /// reader meets it.
 const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>"#;
 
+/// Rail-icons: the leading glyphs the rail and the board cards carry so a
+/// row reads by shape before by word — a pin on the Pinned eyebrow, a
+/// folder on a project row, and one state glyph per hub column on every
+/// card title. Same feather-style stroke set as the tab bar icons above.
+const RAIL_ICON_PIN: &str = r#"<svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>"#;
+const RAIL_ICON_FOLDER: &str = r#"<svg class="proj-row__icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>"#;
+const HUB_KIND_ICON_TODO: &str = r#"<circle cx="12" cy="12" r="8"></circle>"#;
+const HUB_KIND_ICON_IN_PROGRESS: &str =
+    r#"<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>"#;
+const HUB_KIND_ICON_REVIEW: &str = r#"<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"></path><circle cx="12" cy="12" r="3"></circle>"#;
+const HUB_KIND_ICON_COMPOUND: &str = r#"<polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline>"#;
+const HUB_KIND_ICON_READY: &str = r#"<circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M6 21V9a9 9 0 0 0 9 9"></path>"#;
+const HUB_KIND_ICON_FINISHED: &str = r#"<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline>"#;
+
+/// The state glyph a hub card's title leads with, keyed by the column the
+/// card sits in. Decorative: the column header already names the state,
+/// so the glyph is `aria-hidden` and carries no text alternative.
+fn bee_hub_kind_icon(group_key: &str) -> String {
+    let body = match group_key {
+        "in-progress" => HUB_KIND_ICON_IN_PROGRESS,
+        "review" => HUB_KIND_ICON_REVIEW,
+        "compound" => HUB_KIND_ICON_COMPOUND,
+        "ready-to-merge" => HUB_KIND_ICON_READY,
+        "finished" => HUB_KIND_ICON_FINISHED,
+        _ => HUB_KIND_ICON_TODO,
+    };
+    format!(
+        r#"<span class="bee-hub__kind bee-hub__kind--{group_key}" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{body}</svg></span>"#,
+        group_key = group_key,
+        body = body,
+    )
+}
+
 /// console-theme-kanban (ctk-12) — was `project_list_main`, the body of
 /// the retired Projects tab. Every element that tab rendered is still here,
 /// moved rather than rebuilt: the project rows with their nested worktree
@@ -641,7 +674,7 @@ fn project_sidebar(
                 r#"<li class="proj-row proj-group__row">
   <details class="proj-group" open data-project-id="{id}">
     <summary class="proj-group__summary">
-      <a class="proj-row__link" href="/p/{id}/">{dot}<span class="proj-row__name">{label}</span></a>
+      <a class="proj-row__link" href="/p/{id}/">{folder}{dot}<span class="proj-row__name">{label}</span></a>
       {row_menu}
     </summary>
     <div class="proj-group__body">
@@ -653,6 +686,7 @@ fn project_sidebar(
 </li>"#,
                 id = esc(&p.id),
                 label = esc(&p.name),
+                folder = RAIL_ICON_FOLDER,
                 dot = project_row_dot(panes),
                 row_menu = proj_row_menu(&p.id, &p.name),
                 meta = proj_row_meta(*count, &p.last_seen_at),
@@ -849,8 +883,9 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
         format!(r#"<ul class="pinned-list">{rows}</ul>"#, rows = rows)
     };
     format!(
-        r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">Pinned</a></h2>
+        r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">{pin}Pinned</a></h2>
     {body}"#,
+        pin = RAIL_ICON_PIN,
         body = body,
     )
 }
@@ -2801,6 +2836,17 @@ fn bee_hub_style() -> String {
    bar's own chevron (ctk-5) keeps sitting after its count chip. */
 .bee-hub__summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 14px 10px; cursor: pointer; list-style: none; min-width: 0; }
 .bee-hub__summary .bee-hub__chev { margin-left: auto; }
+/* rail-icons: the state glyph leads the title, sized to the title's cap
+   height and tinted with its column's own lane hue so card and column
+   header agree. */
+.bee-hub__kind { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: var(--radius-sm, 6px); background: var(--color-surface-raised); color: var(--color-text-muted); }
+.bee-hub__kind svg { display: block; }
+.bee-hub__kind--in-progress { color: var(--color-accent-alt-2); }
+.bee-hub__kind--review { color: var(--color-accent-alt-3); }
+.bee-hub__kind--compound { color: var(--color-accent-alt-5); }
+.bee-hub__kind--ready-to-merge { color: var(--color-accent-alt-4); }
+.bee-hub__kind--todo { color: var(--color-accent-alt-1); }
+.bee-hub__summary .fg-card__title { flex: 1 1 0; min-width: 0; }
 .bee-hub__summary::-webkit-details-marker { display: none; }
 .bee-hub__summary:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
 /* Card titles are list entries under a column header, not headings of
@@ -5320,6 +5366,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         Some(agent) => bee_hub_agent_line(agent),
         None => String::new(),
     };
+    let kind_html = bee_hub_kind_icon(group_key);
     let title_html = match title {
         Some(t) => format!(
             r#"<div class="fg-card__title">{title}</div>"#,
@@ -5453,7 +5500,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // the top of the expandable body, since a `<details>`/`<summary>`
     // pair, unlike the old whole-card `<a>`, cannot itself be a link.
     format!(
-        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{title_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{terminal_badges_html}{quiet_note_html}</div>"#,
+        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{terminal_badges_html}{quiet_note_html}</div>"#,
         shell_class = shell_class,
         group_key = group_key,
         title_html = title_html,
@@ -8496,7 +8543,7 @@ mod tests {
             // rail above Projects — the live agent terminals, and the way
             // to the terminals view now that the tab strip is gone.
             (
-                r#"<a class="home-sidebar__group-link" href="/?tab=terminals">Pinned</a>"#,
+                r#"<a class="home-sidebar__group-link" href="/?tab=terminals">"#,
                 "the Pinned group's heading anchor",
             ),
             (
@@ -8618,7 +8665,7 @@ mod tests {
         let rail = project_sidebar(&[], false, &[], None, &[], None);
         assert!(
             rail.contains(
-                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">Pinned</a></h2>"#
+                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals"><svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>Pinned</a></h2>"#
             ),
             "the Pinned heading anchor must render with nothing pinned: {rail}"
         );
@@ -8730,7 +8777,7 @@ mod tests {
         // it renders whether or not there is anything pinned under it.
         assert!(
             rail.contains(
-                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">Pinned</a></h2>"#
+                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals"><svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>Pinned</a></h2>"#
             ),
             "the Pinned group's heading must anchor the terminals view: {rail}"
         );
@@ -14778,7 +14825,7 @@ mod tests {
         });
         assert_eq!(
             card_html,
-            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><div class="fg-card__title">Human Title</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__slug">feat-a</div><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
+            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><span class="bee-hub__kind bee-hub__kind--in-progress" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span><div class="fg-card__title">Human Title</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__slug">feat-a</div><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
             "a card with no project label must keep the byte-identical shell/colour and now carry its worktree state on its own branch row: {card_html}"
         );
         // console-theme-kanban ctk-6 (D2): the five things the console
