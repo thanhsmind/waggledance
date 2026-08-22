@@ -17857,6 +17857,131 @@ mod bee_route_tests {
         }
     }
 
+    /// console-phone-layout (P1/P2): the handset's bottom bar and the rail
+    /// drawer are plain markup on every response — the server has no idea
+    /// how wide the viewport is, and `app.js` reloads this page whole on any
+    /// watched change, so anything a script inserted would keep disappearing.
+    /// `app.css` is what hides both above 700px (asserted in `views.rs`);
+    /// what this test pins is the half that CSS cannot fix — the four items,
+    /// their order, the one that is current, and the single toggle the
+    /// `Projects` tab and the backdrop both point at.
+    ///
+    /// The `aria-current` count is scoped to the tab bar's own `<nav>` slice
+    /// rather than the document: the topbar's Orchestrator button and the
+    /// rail's pinned row are separate landmarks with their own correct
+    /// current markers, not duplicates of this one.
+    #[tokio::test]
+    async fn home_page_renders_the_handset_tab_bar_with_the_current_section_marked() {
+        let dir = fresh_root("home-tabbar");
+        let st = build_state_with_dir(&dir);
+        let root = dir.join("proj-a");
+        std::fs::create_dir_all(&root).unwrap();
+        write_bee_project_fixture(&root, "feat-a");
+        register(&st, &root, "Project A");
+        let app = router(st);
+
+        fn tabbar_of(body: &str) -> &str {
+            let open = body
+                .find(r#"<nav class="home-tabbar" aria-label="Sections">"#)
+                .expect("the handset tab bar must render");
+            let close = body[open..]
+                .find("</nav>")
+                .map(|i| open + i)
+                .expect("the tab bar must be closed");
+            &body[open..close]
+        }
+
+        for (path, current_label, other_label) in [
+            ("/", "Board", "Agents"),
+            ("/?tab=terminals", "Agents", "Board"),
+        ] {
+            let body = body_string(get(app.clone(), path).await).await;
+            let bar = tabbar_of(&body);
+
+            // Four items, in the order the decision fixes them.
+            let order: Vec<usize> = ["Board", "Agents", "Projects", "Settings"]
+                .iter()
+                .map(|label| {
+                    bar.find(&format!(
+                        r#"<span class="home-tabbar__label">{label}</span>"#
+                    ))
+                    .unwrap_or_else(|| panic!("{path} must offer the {label} tab: {bar}"))
+                })
+                .collect();
+            assert!(
+                order.windows(2).all(|w| w[0] < w[1]),
+                "the tabs must read Board, Agents, Projects, Settings: {bar}"
+            );
+
+            // Three real anchors and one label — `Projects` opens the rail
+            // rather than navigating, because there is no projects route to
+            // navigate to.
+            assert!(
+                bar.contains(r#"href="/?tab=kanban""#)
+                    && bar.contains(r#"href="/?tab=terminals""#)
+                    && bar.contains(r#"href="/settings""#),
+                "Board, Agents and Settings must be real anchors: {bar}"
+            );
+            assert!(
+                bar.contains(r#"<label class="home-tabbar__item" for="rail-toggle">"#),
+                "the Projects tab must be the rail drawer's own toggle: {bar}"
+            );
+
+            // Exactly one current tab, and it is the section being rendered.
+            assert_eq!(
+                bar.matches(r#"aria-current="page""#).count(),
+                1,
+                "exactly one tab may claim to be current: {bar}"
+            );
+            assert_eq!(
+                bar.matches("home-tabbar__item--on").count(),
+                1,
+                "exactly one tab may carry the current styling: {bar}"
+            );
+            let on_at = bar
+                .find("home-tabbar__item--on")
+                .expect("a tab must be marked current");
+            let current_at = bar
+                .find(&format!(
+                    r#"<span class="home-tabbar__label">{current_label}</span>"#
+                ))
+                .expect("the current tab must render");
+            // The marker belongs to the current tab and to no other: no
+            // second label may sit between the two.
+            assert!(
+                on_at < current_at && !bar[on_at..current_at].contains("home-tabbar__label"),
+                "{path} must mark {current_label} current, not {other_label}: {bar}"
+            );
+
+            // One toggle on the page, and two controls pointing at it: the
+            // backdrop that closes the drawer and the Projects tab that opens
+            // it. A second `id="rail-toggle"` would leave one of them dead.
+            assert_eq!(
+                body.matches(r#"id="rail-toggle""#).count(),
+                1,
+                "{path} must carry exactly one rail toggle: {body}"
+            );
+            assert_eq!(
+                body.matches(r#"for="rail-toggle""#).count(),
+                2,
+                "the backdrop and the Projects tab must both target the toggle: {body}"
+            );
+            assert!(
+                body.contains(
+                    r#"<label for="rail-toggle" class="home-rail__backdrop" aria-hidden="true"></label>"#
+                ),
+                "{path} must render the drawer's backdrop: {body}"
+            );
+
+            // No script in the mechanism: the drawer is a checkbox and two
+            // labels, nothing that a full page reload could forget.
+            assert!(
+                !bar.contains("onclick") && !bar.contains("<script"),
+                "the tab bar must need no script: {bar}"
+            );
+        }
+    }
+
     // --- cross-board-3: the home page's cross-project sections ---
 
     /// Writes the same live-session/lane fixture shape

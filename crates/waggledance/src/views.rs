@@ -250,12 +250,16 @@ pub fn home_page(
             format!(
                 r#"{style}
 <div class="home-shell">
+{toggle}
 {sidebar}
+{backdrop}
 <main class="fg-page bee-hub-theme">
   {features}
 </main>
 </div>"#,
                 style = bee_hub_style(),
+                toggle = HOME_RAIL_TOGGLE,
+                backdrop = HOME_RAIL_BACKDROP,
                 // console-theme-kanban (ctk-12): the retired Projects tab,
                 // now a left rail sitting as a sibling of the board rather
                 // than inside it, so `<main>` keeps its own scrolling and
@@ -303,12 +307,16 @@ pub fn home_page(
             format!(
                 r#"{style}
 <div class="home-shell">
+{toggle}
 {sidebar}
+{backdrop}
 <main class="fg-page fg-page--tight">
   {body}
 </main>
 </div>"#,
                 style = PROJECT_TAB_STYLE,
+                toggle = HOME_RAIL_TOGGLE,
+                backdrop = HOME_RAIL_BACKDROP,
                 sidebar = project_sidebar(
                     projects,
                     unassigned_visible,
@@ -355,12 +363,107 @@ pub fn home_page(
     );
     let body = format!(
         r#"{topbar}
-{section}"#,
+{section}
+{tabbar}"#,
         topbar = topbar_full("", "", &orchestrator, ""),
         section = section,
+        // console-phone-layout (P2): rendered at every width and revealed
+        // by CSS under the handset breakpoint alone. Markup-at-every-width
+        // rather than a width-conditional render because this page has no
+        // idea how wide the viewport is — the server never sees one — and
+        // the alternative, a script that inserts it after load, would lose
+        // the bar on every one of the full reloads `app.js` performs.
+        tabbar = home_tabbar(tab),
     );
     layout_with_drawer(title, "", &body, true)
 }
+
+/// console-phone-layout (P1): the handset drawer's whole mechanism — a
+/// checkbox whose `:checked` state slides `.home-sidebar` in from the left.
+/// CSS only, by the same reasoning that keeps the Orchestrator button an
+/// anchor: the homepage does a full `location.reload()` on any watched
+/// change (`app.js`), and a script-held open flag would not survive it.
+/// The same pattern the top bar's own menu already ships
+/// (`.topbar-menu__toggle` in app.css), including its `hidden` — the
+/// control a reader touches is the `Projects` tab label below, never this
+/// input.
+///
+/// It renders inside `.home-shell` and *before* the rail so the sibling
+/// combinator can reach both the rail and the backdrop after it; the rail
+/// itself ([`project_sidebar`]) stays a self-contained `<nav>`.
+const HOME_RAIL_TOGGLE: &str =
+    r#"<input type="checkbox" id="rail-toggle" class="home-rail__check" hidden>"#;
+
+/// The open drawer's dimmer, and the way back out of it. A `<label>` rather
+/// than a button so that closing needs no script either — pointing at the
+/// same `#rail-toggle` unchecks it. `aria-hidden` because it is scenery: it
+/// carries no name of its own, and the `Projects` tab that opened the
+/// drawer is still on screen to close it.
+const HOME_RAIL_BACKDROP: &str =
+    r#"<label for="rail-toggle" class="home-rail__backdrop" aria-hidden="true"></label>"#;
+
+/// console-phone-layout (P2): the handset's bottom bar — `Board` · `Agents`
+/// · `Projects` · `Settings`, in that order, hidden above 700px by
+/// `app.css` and never rendered conditionally (see [`home_page`]'s call).
+///
+/// Three of the four are real anchors, for the same reason every other
+/// navigation control on this page is: they have to survive the full page
+/// reload and work with scripting off. `Projects` is the exception, and
+/// cannot be an anchor — there is no separate projects route to point at
+/// any more (console-theme-kanban ctk-12 folded that tab into the rail), so
+/// what it opens is the rail itself, as a `<label>` for
+/// [`HOME_RAIL_TOGGLE`].
+///
+/// Accessibility: the bar is a named `<nav>` landmark, separate from the
+/// topbar's own; exactly one item claims `aria-current="page"` — `Board` on
+/// the board, `Agents` on the terminals view, and neither `Projects` (which
+/// navigates nowhere) nor `Settings` (a different page) ever. The current
+/// item is not marked by colour alone: it also carries a heavier top rule
+/// (`.home-tabbar__item--on` in app.css). Each glyph is decorative and the
+/// visible label beside it is the accessible name.
+fn home_tabbar(tab: HomeTab) -> String {
+    let mark = |on: bool| {
+        if on {
+            (" home-tabbar__item--on", r#" aria-current="page""#)
+        } else {
+            ("", "")
+        }
+    };
+    let (board_on, agents_on) = match tab {
+        HomeTab::Kanban => (mark(true), mark(false)),
+        HomeTab::Terminals => (mark(false), mark(true)),
+    };
+    format!(
+        r#"<nav class="home-tabbar" aria-label="Sections">
+<a class="home-tabbar__item{board_class}" href="/?tab=kanban"{board_aria}>{board_icon}<span class="home-tabbar__label">Board</span></a>
+<a class="home-tabbar__item{agents_class}" href="/?tab=terminals"{agents_aria}>{agents_icon}<span class="home-tabbar__label">Agents</span></a>
+<label class="home-tabbar__item" for="rail-toggle">{projects_icon}<span class="home-tabbar__label">Projects</span></label>
+<a class="home-tabbar__item" href="/settings">{settings_icon}<span class="home-tabbar__label">Settings</span></a>
+</nav>"#,
+        board_class = board_on.0,
+        board_aria = board_on.1,
+        agents_class = agents_on.0,
+        agents_aria = agents_on.1,
+        board_icon = TABBAR_ICON_BOARD,
+        agents_icon = TABBAR_ICON_AGENTS,
+        projects_icon = TABBAR_ICON_PROJECTS,
+        settings_icon = TABBAR_ICON_SETTINGS,
+    )
+}
+
+/// The four tab-bar glyphs, in the app's one icon idiom: a 24-unit box drawn
+/// at 16px, no fill, `currentColor` stroke, round caps — the same drawing as
+/// [`agent_toggle`] and the topbar's Settings gear, one weight lighter
+/// (1.5) because these sit under an 11px label rather than alone in a
+/// button. All decorative: the label beside each one is the name.
+const TABBAR_ICON_BOARD: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"></rect><rect x="10" y="4" width="5" height="10" rx="1"></rect><rect x="17" y="4" width="4" height="14" rx="1"></rect></svg>"#;
+/// The terminal prompt of [`agent_toggle`], redrawn at this bar's weight —
+/// the same mark for the same thing (a live agent screen) in both places.
+const TABBAR_ICON_AGENTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>"#;
+const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>"#;
+/// The topbar gear's own outline, so Settings is the same mark wherever the
+/// reader meets it.
+const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>"#;
 
 /// console-theme-kanban (ctk-12) — was `project_list_main`, the body of
 /// the retired Projects tab. Every element that tab rendered is still here,
@@ -7735,9 +7838,22 @@ mod tests {
                 ),
             "the rail and its pinned rows must render beside the gone line: {body}"
         );
+        // Scoped to the rail's own slice, the way
+        // `terminals_view_renders_the_selected_pane_beside_the_rail` scopes
+        // its count: `aria-current` is a per-landmark claim, and
+        // console-phone-layout (P2) gave the page a second navigation
+        // landmark — the handset tab bar, whose `Agents` tab is correctly
+        // current on this view whatever the rail has to show.
+        let rail_at = body
+            .find(r#"<nav class="home-sidebar" aria-label="Projects">"#)
+            .expect("the rail must render");
+        let main_at = body
+            .find(r#"<main class="fg-page fg-page--tight">"#)
+            .expect("the terminals main must render");
+        let rail = &body[rail_at..main_at];
         assert!(
-            !body.contains("pinned-row__link--on") && !body.contains(r#"aria-current="page""#),
-            "nothing may read as current when the named pane is gone: {body}"
+            !rail.contains("pinned-row__link--on") && !rail.contains(r#"aria-current="page""#),
+            "no rail row may read as current when the named pane is gone: {body}"
         );
     }
 
@@ -8594,6 +8710,90 @@ mod tests {
             narrow.contains(".pane-menu__panel {\n    display: none;")
                 && narrow.contains(".pane-menu__toggle:checked ~ .pane-menu__panel"),
             "under the breakpoint the pane panel must be closed until the toggle is checked"
+        );
+    }
+
+    /// console-phone-layout (P1/P2): the phone shell is CSS over the same
+    /// markup — `home_page` emits the drawer toggle, the backdrop and the
+    /// bottom bar at every width, and only `app.css` decides that a wide
+    /// screen sees none of it. So the stylesheet is where that promise can
+    /// actually break, in either direction: a missing handset block leaves a
+    /// phone with a 320px rail eating the page, and a rule that escapes the
+    /// block puts a bottom bar across every desktop.
+    ///
+    /// The wide-screen defaults are asserted to come *before* the query, the
+    /// way `the_bar_menu_is_flat_until_the_narrow_breakpoint` asserts it for
+    /// the top bar's menu: same specificity, so source order is the whole of
+    /// what makes the override win.
+    #[test]
+    fn the_home_shell_collapses_into_a_drawer_and_a_tab_bar_only_under_the_handset_breakpoint() {
+        let css = include_str!("../assets/app.css");
+        let bar_hidden = css
+            .find(".home-tabbar {\n  display: none;\n}")
+            .expect("the bottom tab bar must be hidden by default (wide screens)");
+        let backdrop_hidden = css
+            .find(".home-rail__backdrop {\n  display: none;\n}")
+            .expect("the drawer backdrop must be hidden by default (wide screens)");
+        let query = css
+            .find("@media (max-width: 700px) {")
+            .expect("app.css declares no handset block for the home shell");
+        assert!(
+            bar_hidden < query && backdrop_hidden < query,
+            "the wide-screen defaults must come before the handset block, or it never wins"
+        );
+
+        // Bounded at the next `@media`, not at the end of the file: app.css
+        // carries a second `max-width: 700px` block further down for the
+        // file page's own sidebar, and an unbounded slice would happily
+        // accept that one's rules as this one's.
+        let end = css[query + 1..]
+            .find("@media")
+            .map(|i| query + 1 + i)
+            .unwrap_or(css.len());
+        let narrow = &css[query..end];
+        // The rail leaves the flow and comes back on `:checked` alone — no
+        // script anywhere in the mechanism.
+        assert!(
+            narrow.contains(".home-shell {\n    display: block;\n  }"),
+            "the shell must collapse to one column under the breakpoint: {narrow}"
+        );
+        assert!(
+            narrow.contains(".home-sidebar {\n    position: fixed;")
+                && narrow.contains("transform: translateX(-100%);"),
+            "the rail must park off-canvas under the breakpoint: {narrow}"
+        );
+        assert!(
+            narrow.contains(".home-rail__check:checked ~ .home-sidebar {")
+                && narrow.contains(".home-rail__check:checked ~ .home-rail__backdrop {"),
+            "the toggle alone must open the rail and its backdrop: {narrow}"
+        );
+        assert!(
+            narrow.contains(".home-tabbar {\n    display: grid;"),
+            "the bottom tab bar must appear under the breakpoint: {narrow}"
+        );
+        // The current tab never speaks by colour alone — the same rule the
+        // rail's own current row keeps.
+        assert!(
+            narrow.contains(".home-tabbar__item--on {")
+                && narrow.contains("border-top-color: var(--color-action);"),
+            "the current tab must carry a shape cue, not colour alone: {narrow}"
+        );
+        // P2: one destination, one control.
+        assert!(
+            narrow.contains(".topbar__orchestrator {\n    display: none;\n  }"),
+            "the Orchestrator button must give way to the Board tab: {narrow}"
+        );
+        // The bar is fixed over the page; the page has to end above it.
+        assert!(
+            narrow.contains(".home-shell > main {\n    padding-bottom: 72px;\n  }"),
+            "the page must clear the fixed bottom bar: {narrow}"
+        );
+        // The topbar height is a sticky-offset contract this feature inherits
+        // rather than renegotiates: the drawer and the backdrop both hang off
+        // the same 53px the desktop rail already uses.
+        assert!(
+            narrow.contains("top: 53px;") && narrow.contains("inset: 53px 0 0 0;"),
+            "the drawer and its backdrop must both start at the topbar's own 53px: {narrow}"
         );
     }
 
