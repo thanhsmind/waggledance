@@ -198,6 +198,14 @@ html[data-scheme="dark"] .topbar .home {
 .agent-drawer__item { flex-direction: column; align-items: flex-start; gap: 2px; min-height: 44px; }
 .agent-drawer__head { display: flex; align-items: center; gap: var(--space-2); }
 .agent-drawer__suffix { color: var(--color-text-muted); font-size: var(--type-caption-size); }
+/* A3/A6: bee's own reading of the row — the state word, and the feature
+   lane the session is bound to. Muted mono beside herdr's own status pill,
+   so the row reads "what bee knows" without competing with it; the
+   need-you modifier takes the same blocked tone `.fg-status--blocked`
+   already uses, since these two states are exactly what the drawer sorts
+   to the top. */
+.agent-drawer__state, .agent-drawer__feature { font-family: var(--font-mono, monospace); font-size: var(--type-caption-size); color: var(--color-text-muted); }
+.agent-drawer__state--needs-you { color: var(--color-danger); }
 /* ── Pane bar menu ───────────────────────────────────────────────────
    Same shape as the bar menu above, applied to the row over a terminal
    pane: wide, the strip and the creation controls lay out as they always
@@ -993,6 +1001,27 @@ html[data-scheme="dark"] .topbar .home {
   line-height: var(--type-caption-leading);
   color: var(--color-text-subtle);
   overflow-wrap: anywhere;
+}
+/* A6: the bee state word and the feature lane a pinned pane's own live
+   session is bound to. Both sit in the meta column under the name, in the
+   same mono caption face the workspace/tab line already uses — they are
+   machine vocabulary, not prose — and the state word carries the blocked
+   tone when it is one of the two need-you states, so the row says the same
+   thing its dot does, in words. */
+.pinned-row__state,
+.pinned-row__feature {
+  grid-column: 2;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-leading);
+  color: var(--color-text-subtle);
+  overflow-wrap: anywhere;
+}
+.pinned-row__state {
+  color: var(--color-text-muted);
+}
+.proj-row__dot--blocked ~ .pinned-row__state {
+  color: var(--color-danger);
 }
 .pinned-empty {
   margin: 0;

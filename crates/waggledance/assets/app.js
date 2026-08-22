@@ -2281,6 +2281,32 @@
       return 2;
     }
 
+    // A3: bee's own state wins over herdr's screen-derived status wherever
+    // both exist for a pane — the same precedence `views::pane_tone` applies
+    // server-side to the rail dot, the badge pill and the board tier. Both
+    // need-you states (`blocked`, `waiting_input`) rank first: they are
+    // exactly what the drawer exists to surface.
+    function agentRank(agent) {
+      if (agent.bee_state === "blocked" || agent.bee_state === "waiting_input") return 0;
+      if (agent.bee_state === "working") return 1;
+      if (agent.bee_state) return 2;
+      return statusRank(agent.status);
+    }
+
+    // A3's five-state vocabulary, the client half of
+    // `BeeActivityState::word()` — every state reads as a word beside its
+    // colour, so a state bee spells `waiting_input` never reaches a reader
+    // as an identifier. An state this build does not know renders verbatim
+    // rather than being coerced into one it never claimed.
+    function beeStateWord(state) {
+      if (state === "working") return "working";
+      if (state === "waiting_input") return "needs an answer";
+      if (state === "blocked") return "needs approval";
+      if (state === "idle") return "idle";
+      if (state === "exited") return "exited";
+      return state;
+    }
+
     function agentRow(agent) {
       var item = document.createElement("a");
       item.className = "fg-menu__item agent-drawer__item";
@@ -2312,6 +2338,25 @@
       suffix.className = "agent-drawer__suffix";
       suffix.textContent = agent.workspace + ":" + agent.tab;
       head.appendChild(suffix);
+
+      // A6: bee's own reading of this pane, beside herdr's status pill —
+      // the state word (in the blocked tone for the two need-you states)
+      // and the feature lane the session is bound to. Absent for a pane no
+      // live bee session claims, in which case the row renders exactly as
+      // it did before.
+      if (agent.bee_state) {
+        var beeState = document.createElement("span");
+        var needsYou = agent.bee_state === "blocked" || agent.bee_state === "waiting_input";
+        beeState.className = "agent-drawer__state" + (needsYou ? " agent-drawer__state--needs-you" : "");
+        beeState.textContent = beeStateWord(agent.bee_state);
+        head.appendChild(beeState);
+      }
+      if (agent.feature) {
+        var beeFeature = document.createElement("span");
+        beeFeature.className = "agent-drawer__feature";
+        beeFeature.textContent = agent.feature;
+        head.appendChild(beeFeature);
+      }
 
       item.appendChild(head);
 
@@ -2353,7 +2398,7 @@
       });
       order.forEach(function (project_name) {
         var rows = groups[project_name].slice().sort(function (a, b) {
-          return statusRank(a.status) - statusRank(b.status);
+          return agentRank(a) - agentRank(b);
         });
         var heading = document.createElement("div");
         heading.className = "agent-drawer__section";
