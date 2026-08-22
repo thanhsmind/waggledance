@@ -2834,16 +2834,37 @@ fn bee_hub_style() -> String {
 .bee-hub__merge-since { color: var(--color-text-subtle); }
 .bee-hub__branch { display: flex; align-items: center; gap: var(--space-1); min-width: 0; color: var(--color-text-muted); }
 .bee-hub__branch svg { flex: none; }
+/* R2: the same branch row on a Ready to merge dense row, where it sits
+   under the name inside the row's own anchor and so needs stating the gap
+   the card's body flow gives it for free. */
+.bee-hub__row .bee-hub__branch { margin-top: var(--space-1); }
 .bee-hub__branch-name { font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); letter-spacing: var(--type-micro-tracking); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* ctk-6: the console card's footer, set off by a hairline above it -- the
-   activity glyph and its label on the left, the relative time pushed to
-   the right edge by its own auto margin, and the live pulse dot in
-   between where `bee_hub_is_working_now` already put it. The time reads in
-   the mono face, as every timestamp in the digest's own footers does. */
+/* ctk-6: the console card's footer, set off by a hairline above it.
+   bee-agent-activity R2 makes it the card's ONE closing line: the cells
+   ring and its `n/m cells` reading on the left, the relative time pushed
+   to the right edge by its own auto margin. The activity glyph and the
+   "Last activity" label are gone with the progress bar that used to sit
+   above them -- three lines were saying two things, and a time in a card's
+   footer needs no label to be read as one. The time reads in the mono
+   face, as every timestamp in the digest's own footers does. */
 .bee-hub__footer { display: flex; align-items: center; gap: var(--space-1); min-width: 0; margin-top: 2px; padding-top: 8px; border-top: var(--border-width-hairline) solid var(--color-border); color: var(--color-text-subtle); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); }
-.bee-hub__footer svg { flex: none; }
-.bee-hub__activity-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bee-hub__cells { display: inline-flex; align-items: center; gap: var(--space-1); flex: none; min-width: 0; font-family: var(--font-mono); letter-spacing: var(--type-micro-tracking); }
+/* R2: the ring that replaced the 3px bar -- filled in the same success
+   green the bar used when every cell is capped, half-filled while the work
+   is under way, hollow and muted when nothing has closed yet. It is the
+   glance; the fraction printed beside it is what states the actual
+   numbers, so the ring never carries a reading by colour alone. */
+.bee-hub__cells-glyph { flex: none; width: 10px; height: 10px; border-radius: var(--radius-pill); border: var(--border-width-strong) solid var(--color-border-strong); }
+.bee-hub__cells-glyph--done { border-color: var(--color-success); background: var(--color-success); }
+.bee-hub__cells-glyph--partial { background: conic-gradient(var(--color-success) 0 50%, transparent 0 100%); }
+.bee-hub__cells-glyph--none { border-color: var(--color-text-subtle); }
 .bee-hub__activity-time { margin-left: auto; flex: none; font-family: var(--font-mono); letter-spacing: var(--type-micro-tracking); }
+/* kanban-live-signals D1 under R2: the pulse takes the auto margin when it
+   renders, so the dot and the time travel to the right edge as one pair --
+   the dot stays an annotation of the time rather than drifting to the left
+   of the free space now that the cells reading holds that side. */
+.bee-hub__footer .bee-hub__pulse { margin-left: auto; }
+.bee-hub__footer .bee-hub__pulse + .bee-hub__activity-time { margin-left: 0; }
 /* D4: the feature-detail link row -- the one place the card still reaches
    its own detail page now that the `<details>` can no longer be that link
    itself. */
@@ -2881,12 +2902,6 @@ fn bee_hub_style() -> String {
    already drawn them. */
 .bee-hub__quiet-note { border-top: var(--border-width-hairline) solid var(--color-border); margin: 0; padding: var(--space-2) 14px; color: var(--color-text-muted); }
 .bee-hub__badges + .bee-hub__quiet-note { border-top: 0; padding-top: 0; }
-/* ctk-6: the cell-count line is the digest's counts slot -- mono, at the
-   digest's 10-10.5px meta size. `bee_hub_card` renders no markup here at
-   all for a feature with no cells, so this line never states a zeroed
-   division artifact -- a guarantee asserted page-wide against the exact
-   literal, which is why this comment does not spell it either. */
-.bee-hub__progress-label { margin: 0; font-family: var(--font-mono); font-size: var(--type-tag-size); letter-spacing: var(--type-tag-tracking); color: var(--color-text-muted); }
 .bee-hub__reason { font-style: italic; }
 /* kanban-live-signals D2: the run_state badge rides in the collapsed
    `<summary>` beside the title (see `bee_hub_card`'s own doc comment) --
@@ -3057,13 +3072,6 @@ fn bee_hub_style() -> String {
 .bee-panel__list { display: flex; flex-direction: column; gap: var(--space-2); }
 .bee-severity--p1 { font-weight: var(--weight-strong); }
 .bee-asof { color: var(--color-text-subtle); font-size: var(--type-body-sm-size); }
-/* ctk-6: the cell-count bar reads at the console's own hairline register
-   rather than the 8px slab it was -- the digest's board carries no chunky
-   meters, and the counts line beside it is what states the actual
-   numbers. Like the count line, `bee_hub_card` renders it not at all when
-   the feature has no cells. */
-.bee-progress { height: 3px; border-radius: var(--radius-pill); background: var(--color-surface-sunken); overflow: hidden; }
-.bee-progress__bar { height: 100%; background: var(--color-success); }
 .bee-done-summary:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
 /* feature-hub-2: the feature detail page's own header, chip row and
    CSS-only tab pattern — no JS framework, same checkbox/radio-plus-label
@@ -3608,9 +3616,19 @@ struct BeeHubFinishedData {
 /// parsable cap, in which case the line drops its age clause rather than
 /// inventing "just now" (the same never-fabricate rule
 /// [`bee_hub_latest_activity`] follows).
+///
+/// `worktree_label` (bee-agent-activity R2) is [`bee_hub_worktree_label`]'s
+/// answer for this feature -- the branch the merge would land, which is the
+/// one fact a reader needs to run it and the one the dense row could not
+/// say before. It rides here rather than on the shared
+/// [`BeeHubFinishedData`] for the same reason the rest of this struct does:
+/// only this column has a merge to name, and only this column renders the
+/// branch ([`bee_hub_branch_line`]), so the other four dense columns stay
+/// byte-identical.
 struct BeeHubMergeData {
     uat_approved: bool,
     since: Option<String>,
+    worktree_label: String,
 }
 
 /// The feature hub's own column rules (this function's former home, see
@@ -3793,6 +3811,16 @@ fn bee_classify_features(
                 BeeHubMergeData {
                     uat_approved,
                     since,
+                    // R2: read exactly the way the In Progress card reads
+                    // it below, `finished: false` included -- a feature in
+                    // this column still has its grant open, so the label is
+                    // its live branch and never the `"merged"` spelling.
+                    worktree_label: bee_hub_worktree_label(
+                        &f.feature,
+                        &snapshot.worktrees,
+                        &snapshot.workspaces,
+                        false,
+                    ),
                 },
             ));
         } else if !finished_and_idle && has_live_work {
@@ -4068,7 +4096,7 @@ fn bee_render_hub_section(
                         None,
                         None,
                         None,
-                        Some(&bee_hub_merge_line(merge)),
+                        Some(&bee_hub_ready_to_merge_extra(merge)),
                     ),
                 ));
             }
@@ -4432,7 +4460,7 @@ pub fn bee_cross_project_features_section(
                             Some(&project.name),
                             project_color,
                             None,
-                            Some(&bee_hub_merge_line(merge)),
+                            Some(&bee_hub_ready_to_merge_extra(merge)),
                         ),
                     ));
                 }
@@ -4891,10 +4919,12 @@ fn bee_cross_project_board_project_colors<'a>(
 /// the former Waiting column into In Progress and moved Todo/Review/Compound
 /// onto that same dense row, so `group_key` in practice now only ever
 /// arrives as `"in-progress"`. Name + link to its
-/// own detail page, its own done/total cell progress (a `bee-progress`
-/// bar, or no markup at all when `total == 0` — hub-finished-compact drops
-/// the old "No cells recorded." filler paragraph) and its own last-activity
-/// age ([`bee_fmt_trace_time`]) — project-color-identity (D3) drops this
+/// own detail page, and one closing footer line carrying both its
+/// done/total cell reading (a ring glyph plus `n/m cells`, or no cells
+/// element at all when `total == 0` — hub-finished-compact drops the old
+/// "No cells recorded." filler paragraph, and bee-agent-activity R2 the
+/// progress bar that stood above it) and its own last-activity age
+/// ([`bee_fmt_trace_time`]) — project-color-identity (D3) drops this
 /// card's own group and worktree chips: the kanban column heading already
 /// names the group, and a cross-project card's own worktree state now
 /// reads on the project line instead (below). `reason` carries the Waiting
@@ -5126,6 +5156,38 @@ struct BeeHubCardArgs<'a> {
     agent: Option<&'a BeeCardAgent>,
 }
 
+/// The branch row a card or a Ready to merge row carries under its name
+/// (console-theme-kanban ctk-6 D2, factored out of [`bee_hub_card`] by
+/// bee-agent-activity R2): the fork glyph plus the branch in the mono face
+/// at the digest's small size, truncated rather than wrapped.
+///
+/// D2's "only what the store backs" is what decides whether it renders at
+/// all: [`bee_hub_worktree_label`] answers with a branch name, the bare
+/// word `"worktree"` (a worktree with no branch recorded), or `"merged"` --
+/// all three name a worktree that exists -- and with `"Main"` for the one
+/// case where the feature has NO worktree of its own. `"Main"` is therefore
+/// not a branch this card knows; it is the absence of one, and a row
+/// spelling it would be exactly the placeholder-for-a-missing-source D2
+/// forbids. So `"Main"` (and an empty label) renders no row at all, and
+/// every other spelling renders verbatim.
+///
+/// The glyph is an inline aria-hidden stroke SVG in this file's existing
+/// icon idiom (see `agent_drawer_toggle`), keeping a purely decorative
+/// subtree out of the tab order and the accessible name.
+///
+/// R2 gives the Ready to merge row this same line under its title, and this
+/// function is where both kinds get it: one source of the branch markup, so
+/// a card and a row can never drift into two spellings of the same fact.
+fn bee_hub_branch_line(worktree_label: &str) -> String {
+    if worktree_label.is_empty() || worktree_label == "Main" {
+        return String::new();
+    }
+    format!(
+        r#"<div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">{worktree}</span></div>"#,
+        worktree = esc(worktree_label),
+    )
+}
+
 fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     let BeeHubCardArgs {
         project_id,
@@ -5197,29 +5259,10 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
             None => String::new(),
         },
     };
-    // console-theme-kanban ctk-6 (D2): the branch row -- the console card's
-    // own meta-block first line, the fork glyph plus the branch in the mono
-    // face at the digest's small size, truncated rather than wrapped.
-    // D2's "only what the store backs" is what decides whether it renders
-    // at all: [`bee_hub_worktree_label`] answers with a branch name, the
-    // bare word `"worktree"` (a worktree with no branch recorded), or
-    // `"merged"` -- all three name a worktree that exists -- and with
-    // `"Main"` for the one case where the feature has NO worktree of its
-    // own. `"Main"` is therefore not a branch this card knows; it is the
-    // absence of one, and a row spelling it would be exactly the
-    // placeholder-for-a-missing-source D2 forbids. So `"Main"` renders no
-    // row at all, and every other spelling renders verbatim.
-    // The glyph is an inline aria-hidden stroke SVG in this file's existing
-    // icon idiom (see `agent_drawer_toggle`), keeping a purely decorative
-    // subtree out of the tab order and the accessible name.
-    let branch_html = if worktree_label.is_empty() || worktree_label == "Main" {
-        String::new()
-    } else {
-        format!(
-            r#"<div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">{worktree}</span></div>"#,
-            worktree = esc(worktree_label),
-        )
-    };
+    // console-theme-kanban ctk-6 (D2), bee-agent-activity R2: the branch row
+    // is [`bee_hub_branch_line`]'s, the one source of that markup for both
+    // the card and the Ready to merge dense row.
+    let branch_html = bee_hub_branch_line(worktree_label);
     // card-collapse-inprogress D1/D2: the card's own name alone (its
     // CONTEXT title, or the slug fallback) is all the collapsed header
     // shows -- `subtitle_html` above now moves into the expandable body
@@ -5250,54 +5293,59 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         Some(d) => format!(r#"<p class="bee-hub__desc">{}</p>"#, esc(d)),
         None => String::new(),
     };
-    let progress_html = if total == 0 {
-        // hub-finished-compact: an empty card renders no markup at all here
-        // — no fabricated "No cells recorded." paragraph — since a card
-        // with genuinely nothing to report needs no line saying so.
-        String::new()
-    } else {
-        let percent = (done * 100).checked_div(total).unwrap_or(0);
-        format!(
-            r#"<div class="bee-progress"><div class="bee-progress__bar" style="width: {percent}%"></div></div><p class="bee-hub__progress-label">{done}/{total} cell{plural} done</p>"#,
-            percent = percent,
-            done = done,
-            total = total,
-            plural = if total == 1 { "" } else { "s" },
-        )
-    };
-    // kanban-live-signals D1: the pulse dot rides beside this same line,
-    // never its own paragraph -- it is a live annotation of "Last
-    // activity", not a second fact.
+    // kanban-live-signals D1: the pulse dot rides beside the footer's time,
+    // never its own paragraph -- it is a live annotation of when the work
+    // last moved, not a second fact. R2 keeps it there by giving the dot
+    // the footer's auto margin (see `.bee-hub__footer .bee-hub__pulse` in
+    // [`bee_hub_style`]), so the dot and the time travel to the right edge
+    // as one pair now that the cells reading holds the left.
     let pulse_html = if bee_hub_is_working_now(last_tool_call, time::OffsetDateTime::now_utc()) {
         r#" <span class="bee-hub__pulse" role="status" aria-label="Working now" title="Working now"></span>"#
             .to_string()
     } else {
         String::new()
     };
-    // console-theme-kanban ctk-6: the console card's own footer, set off by
-    // a hairline above it -- an activity glyph, its label, the live pulse
-    // dot where [`bee_hub_is_working_now`] already put it, and the relative
-    // time pushed to the right edge. The glyph is the digest's generic
-    // activity mark and deliberately NOT one of its check/warning variants:
-    // those encode a CI or test verdict, and this board has no such value
-    // to read (D2) -- the glyph says "activity", which is precisely what
-    // `last_activity` is. `bee_fmt_trace_time`'s formatting is unchanged,
-    // and an absent timestamp still renders its own honest line with no
-    // time beside it rather than a fabricated one.
-    let activity_glyph = r#"<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>"#;
-    let footer_html = match last_activity {
-        Some(iso) => format!(
-            r#"<div class="bee-hub__footer">{glyph}<span class="bee-hub__activity-label">Last activity</span>{pulse}<span class="bee-hub__activity-time">{when}</span></div>"#,
-            glyph = activity_glyph,
-            when = esc(&bee_fmt_trace_time(iso)),
-            pulse = pulse_html,
-        ),
-        None => format!(
-            r#"<div class="bee-hub__footer">{glyph}<span class="bee-hub__activity-label">No activity recorded.</span>{pulse}</div>"#,
-            glyph = activity_glyph,
-            pulse = pulse_html,
-        ),
+    // bee-agent-activity R2: ONE closing line for every card -- a ring glyph
+    // and `n/m cells` on the left, the last-activity time on the right. It
+    // replaces three elements that were saying two things: the progress
+    // bar, the "n/m cells done" label under it, and the separate "Last
+    // activity" row. The ring is the bar's whole reading at a glance and
+    // the fraction beside it states the numbers, so nothing is read by
+    // colour alone; the time in a card's footer needs no label to be read
+    // as a time, so the label and its activity glyph go with the bar.
+    //
+    // hub-finished-compact still governs the zero-cell card: `total == 0`
+    // renders no cells span at all rather than a `0/0` artifact -- the
+    // footer is then the time by itself. `bee_fmt_trace_time`'s formatting
+    // is unchanged, and an absent timestamp says `no activity` in the
+    // time's own slot rather than inventing a moment (D2).
+    let cells_html = if total == 0 {
+        String::new()
+    } else {
+        let fill = if done == total {
+            "done"
+        } else if done == 0 {
+            "none"
+        } else {
+            "partial"
+        };
+        format!(
+            r#"<span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--{fill}" aria-hidden="true"></span>{done}/{total} cells</span>"#,
+            fill = fill,
+            done = done,
+            total = total,
+        )
     };
+    let when = match last_activity {
+        Some(iso) => esc(&bee_fmt_trace_time(iso)),
+        None => "no activity".to_string(),
+    };
+    let footer_html = format!(
+        r#"<div class="bee-hub__footer">{cells_html}{pulse}<span class="bee-hub__activity-time">{when}</span></div>"#,
+        cells_html = cells_html,
+        pulse = pulse_html,
+        when = when,
+    );
     // kanban-live-signals D2: rendered in the collapsed `<summary>` itself
     // (see this function's own doc comment) so the badge stays visible
     // without expanding the card.
@@ -5361,7 +5409,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // the top of the expandable body, since a `<details>`/`<summary>`
     // pair, unlike the old whole-card `<a>`, cannot itself be a link.
     format!(
-        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{title_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{progress_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{terminal_badges_html}{quiet_note_html}</div>"#,
+        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{title_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{terminal_badges_html}{quiet_note_html}</div>"#,
         shell_class = shell_class,
         group_key = group_key,
         title_html = title_html,
@@ -5372,7 +5420,6 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         subtitle_html = subtitle_html,
         desc_html = desc_html,
         branch_html = branch_html,
-        progress_html = progress_html,
         reason_html = reason_html,
         blocked_reason_html = blocked_reason_html,
         deferred_html = deferred_html,
@@ -5475,7 +5522,8 @@ fn bee_hub_finished_row(
 
 /// [`bee_hub_finished_row`] plus one block of extra markup inside the same
 /// anchor, below the name line — today only the Ready to merge column's own
-/// merge line ([`bee_hub_merge_line`], bee-agent-activity R1). Every other
+/// two lines: its branch row ([`bee_hub_branch_line`], bee-agent-activity
+/// R2) and its merge line ([`bee_hub_merge_line`], R1). Every other
 /// column keeps passing through `bee_hub_finished_row` and renders
 /// byte-identically to before R1, which is why the extra rides here as an
 /// optional eighth argument rather than widening the seven-argument
@@ -5525,6 +5573,21 @@ fn bee_hub_finished_row_with_extra(
         name = esc(name),
         time_html = time_html,
         extra_html = extra_html.unwrap_or(""),
+    )
+}
+
+/// Everything a Ready to merge row carries under its name, in reading
+/// order: the branch the merge would land ([`bee_hub_branch_line`],
+/// bee-agent-activity R2 -- the same row the In Progress card carries, from
+/// the same helper) and then the merge line below it ([`bee_hub_merge_line`],
+/// R1). Both boards' Ready to merge call sites pass exactly this one string
+/// as [`bee_hub_finished_row_with_extra`]'s extra, so a row can never grow a
+/// second spelling on one board.
+fn bee_hub_ready_to_merge_extra(merge: &BeeHubMergeData) -> String {
+    format!(
+        "{branch}{line}",
+        branch = bee_hub_branch_line(&merge.worktree_label),
+        line = bee_hub_merge_line(merge),
     )
 }
 
@@ -12244,8 +12307,13 @@ mod tests {
             r#"<a class="bee-hub__row" data-hub-group="finished" href="/p/proj-1/_bee/feature/shipped-feat" title="shipped-feat"><span class="bee-hub__row-name">shipped-feat</span></a>"#
         );
         assert!(
-            !row.contains("bee-hub__chips") && !row.contains("fg-chip") && !row.contains("bee-progress") && !row.contains("Last activity"),
-            "a Finished row must carry none of the full card's chip/progress/activity markup: {row}"
+            !row.contains("bee-hub__chips")
+                && !row.contains("fg-chip")
+                && !row.contains("bee-hub__footer")
+                && !row.contains("bee-hub__cells")
+                && !row.contains("bee-hub__branch"),
+            "a Finished row must carry none of the full card's chip, cells-reading, \
+             branch or footer markup: {row}"
         );
     }
 
@@ -14601,7 +14669,10 @@ mod tests {
     /// console-theme-kanban ctk-6 moved that last fact out of the subtitle
     /// and onto the card's own branch row, so this whole-markup assertion
     /// is also the one place the full console card anatomy is pinned end
-    /// to end: header row, subtitle, branch row, counts slot, footer.
+    /// to end: header row, subtitle, branch row, and — since
+    /// bee-agent-activity R2 collapsed the progress bar, its count label and
+    /// the separate "Last activity" row into one closing line — the footer
+    /// that now carries the counts reading and the time together.
     #[test]
     fn bee_hub_card_with_no_project_label_shows_slug_and_worktree_subtitle() {
         let docs = waggledance_core::bee::BeeFeatureDocs {
@@ -14630,7 +14701,7 @@ mod tests {
         });
         assert_eq!(
             card_html,
-            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><div class="fg-card__title">Human Title</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__slug">feat-a</div><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-progress"><div class="bee-progress__bar" style="width: 50%"></div></div><p class="bee-hub__progress-label">1/2 cells done</p><div class="bee-hub__footer"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg><span class="bee-hub__activity-label">No activity recorded.</span></div></div></details></div>"#,
+            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><div class="fg-card__title">Human Title</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__slug">feat-a</div><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
             "a card with no project label must keep the byte-identical shell/colour and now carry its worktree state on its own branch row: {card_html}"
         );
         // console-theme-kanban ctk-6 (D2): the five things the console
@@ -14747,10 +14818,11 @@ mod tests {
         );
     }
 
-    /// (console-theme-kanban ctk-6, D2 + must-have) A feature with zero
-    /// cells renders no count element at all -- never `0/0`, and never an
-    /// empty progress bar either. The counts slot states a real reading or
-    /// says nothing.
+    /// (console-theme-kanban ctk-6, D2 + must-have; bee-agent-activity R2)
+    /// A feature with zero cells renders no count element at all -- never
+    /// `0/0`, and since R2 no cells span and no ring either. The footer's
+    /// left half states a real reading or says nothing, and the card is then
+    /// its time alone.
     #[test]
     fn bee_hub_card_with_zero_cells_renders_no_count_element() {
         let card_html = bee_hub_card(&BeeHubCardArgs {
@@ -14777,24 +14849,29 @@ mod tests {
             "a feature with no cells must never render a 0/0 reading: {card_html}"
         );
         assert!(
-            !card_html.contains("bee-hub__progress-label") && !card_html.contains("bee-progress"),
-            "with no cells there is no count element and no bar at all: {card_html}"
+            !card_html.contains("bee-hub__cells") && !card_html.contains("bee-progress"),
+            "with no cells there is no cells span, no ring and no bar at all: {card_html}"
         );
-        // The rest of the anatomy still renders — omitting the counts slot
-        // is not the card going quiet.
+        // The rest of the anatomy still renders — omitting the cells reading
+        // is not the card going quiet, and the footer still states its time.
         assert!(
             card_html.contains(r#"<span class="bee-hub__branch-name">wt/feat-a</span>"#)
-                && card_html.contains(r#"<div class="bee-hub__footer">"#),
-            "the branch row and footer must still render on a card with no cells: {card_html}"
+                && card_html.contains(
+                    r#"<div class="bee-hub__footer"><span class="bee-hub__activity-time">no activity</span></div>"#
+                ),
+            "the branch row and the time-only footer must still render on a card with no \
+             cells: {card_html}"
         );
     }
 
-    /// (console-theme-kanban ctk-6) The card's footer is the console
-    /// anatomy's own last band: the activity glyph, its label, and the
-    /// relative time `bee_fmt_trace_time` formats, sitting apart from the
-    /// meta block above it.
+    /// (console-theme-kanban ctk-6, bee-agent-activity R2) The card's footer
+    /// is the console anatomy's own last band and, since R2, its only closing
+    /// line: the cells ring and its `n/m cells` reading on the left, the
+    /// relative time `bee_fmt_trace_time` formats on the right, and neither
+    /// the progress bar, the "n/m cells done" label nor the "Last activity"
+    /// row that used to stand above it.
     #[test]
-    fn bee_hub_card_footer_carries_the_activity_glyph_and_its_relative_time() {
+    fn bee_hub_card_footer_puts_the_cells_reading_left_and_the_time_right() {
         let ten_minutes_ago = (time::OffsetDateTime::now_utc() - time::Duration::minutes(10))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
@@ -14820,14 +14897,97 @@ mod tests {
         let expected_time = bee_fmt_trace_time(&ten_minutes_ago);
         assert!(
             card_html.contains(&format!(
-                r#"<span class="bee-hub__activity-label">Last activity</span><span class="bee-hub__activity-time">{expected_time}</span>"#
+                r#"<div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">{expected_time}</span></div>"#
             )),
-            "the footer must carry the activity label and the relative time \
+            "the footer must be one line: the cells ring and reading, then the relative time \
              `bee_fmt_trace_time` formatted: {card_html}"
         );
         assert!(
-            card_html.contains(r#"<div class="bee-hub__footer"><svg"#),
-            "the footer must open with its own aria-hidden activity glyph: {card_html}"
+            !card_html.contains("bee-progress")
+                && !card_html.contains("bee-hub__progress-label")
+                && !card_html.contains("Last activity")
+                && !card_html.contains("cells done"),
+            "no progress bar, count label or separate Last activity row may survive R2: \
+             {card_html}"
+        );
+    }
+
+    /// (bee-agent-activity R2) The ring is the progress bar's whole reading:
+    /// filled when every cell is capped, hollow when none is, half otherwise
+    /// — and the fraction printed beside it always states the numbers, so no
+    /// state is carried by the ring's colour alone.
+    #[test]
+    fn bee_hub_card_footer_ring_reads_done_partial_and_none_from_the_counts() {
+        let card = |done: usize, total: usize| {
+            bee_hub_card(&BeeHubCardArgs {
+                agent: None,
+                project_id: "proj-a",
+                feature: "feat-a",
+                group_key: "in-progress",
+                done,
+                total,
+                last_activity: None,
+                worktree_label: "Main",
+                reason: None,
+                docs: None,
+                project_label: None,
+                project_color: None,
+                panes: &[],
+                run_state: None,
+                waiting_on_live: false,
+                last_tool_call: None,
+                deferred: &[],
+            })
+        };
+        for (done, total, fill) in [(2usize, 2usize, "done"), (1, 2, "partial"), (0, 3, "none")] {
+            let html = card(done, total);
+            assert!(
+                html.contains(&format!(
+                    r#"<span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--{fill}" aria-hidden="true"></span>{done}/{total} cells</span>"#
+                )),
+                "{done}/{total} must ring as --{fill} and print its own fraction: {html}"
+            );
+        }
+    }
+
+    /// (bee-agent-activity R2, kanban-live-signals D1) The pulse dot stays
+    /// inside the one footer line, between the cells reading and the time it
+    /// annotates — never a row of its own.
+    #[test]
+    fn bee_hub_card_footer_keeps_the_pulse_dot_beside_the_time() {
+        let just_now = (time::OffsetDateTime::now_utc() - time::Duration::seconds(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
+            project_id: "proj-a",
+            feature: "feat-a",
+            group_key: "in-progress",
+            done: 1,
+            total: 2,
+            last_activity: Some(&just_now),
+            worktree_label: "Main",
+            reason: None,
+            docs: None,
+            project_label: None,
+            project_color: None,
+            panes: &[],
+            run_state: None,
+            waiting_on_live: false,
+            last_tool_call: Some(just_now.as_str()),
+            deferred: &[],
+        });
+        assert!(
+            card_html.contains(&format!(
+                r#"1/2 cells</span> <span class="bee-hub__pulse" role="status" aria-label="Working now" title="Working now"></span><span class="bee-hub__activity-time">{}</span></div>"#,
+                bee_fmt_trace_time(&just_now)
+            )),
+            "the pulse must ride inside the footer line, right before the time: {card_html}"
+        );
+        assert_eq!(
+            card_html.matches("bee-hub__footer").count(),
+            1,
+            "the card ends in exactly one footer line: {card_html}"
         );
     }
 
@@ -15142,6 +15302,7 @@ mod tests {
         let html = bee_hub_merge_line(&BeeHubMergeData {
             uat_approved: false,
             since: Some(since),
+            worktree_label: String::new(),
         });
         assert!(
             html.contains(r#"<p class="bee-hub__merge">"#),
@@ -15170,6 +15331,7 @@ mod tests {
         let html = bee_hub_merge_line(&BeeHubMergeData {
             uat_approved: true,
             since: Some(since),
+            worktree_label: String::new(),
         });
         assert!(
             html.contains(
@@ -15192,6 +15354,7 @@ mod tests {
         let html = bee_hub_merge_line(&BeeHubMergeData {
             uat_approved: false,
             since: None,
+            worktree_label: String::new(),
         });
         assert!(
             html.contains("uat pending"),
@@ -15204,6 +15367,76 @@ mod tests {
         assert!(
             !html.contains("bee-hub__merge-since"),
             "no age means no age span: {html}"
+        );
+    }
+
+    /// (bee-agent-activity R2) A Ready to merge row says which branch the
+    /// merge would land — the same `.bee-hub__branch` markup the In Progress
+    /// card carries, from the one helper both build it with — and says it
+    /// under the name, above the merge line. The dense rows of the other
+    /// columns have no merge to name and so carry no branch at all: they
+    /// render exactly as they did before this feature.
+    #[test]
+    fn bee_hub_ready_to_merge_row_carries_its_branch_above_the_merge_line() {
+        let merge = BeeHubMergeData {
+            uat_approved: false,
+            since: None,
+            worktree_label: "wt/feat-a".to_string(),
+        };
+        let row = bee_hub_finished_row_with_extra(
+            "ready-to-merge",
+            "/p/proj-1/_bee/feature/feat-a",
+            "feat-a",
+            None,
+            None,
+            None,
+            None,
+            Some(&bee_hub_ready_to_merge_extra(&merge)),
+        );
+        assert!(
+            row.contains(r#"<span class="bee-hub__branch-name">wt/feat-a</span>"#),
+            "the Ready to merge row must name the branch its merge would land: {row}"
+        );
+        let branch_at = row.find("bee-hub__branch").expect("branch row");
+        let name_at = row.find("bee-hub__row-name").expect("name span");
+        let merge_at = row.find("bee-hub__merge").expect("merge line");
+        assert!(
+            name_at < branch_at && branch_at < merge_at,
+            "the branch must sit under the name and above the merge line: {row}"
+        );
+
+        // The three other dense columns take the plain row and so stay
+        // byte-identical to before R2 — no branch, no merge line.
+        for group in ["review", "compound", "todo"] {
+            let plain = bee_hub_finished_row(
+                group,
+                "/p/proj-1/_bee/feature/feat-a",
+                "feat-a",
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                !plain.contains("bee-hub__branch") && !plain.contains("bee-hub__merge"),
+                "a {group} row carries neither a branch nor a merge line: {plain}"
+            );
+        }
+    }
+
+    /// (bee-agent-activity R2) `"Main"` names the absence of a worktree
+    /// ([`bee_hub_worktree_label`]), so it renders no branch row on either
+    /// card kind — the one source of that markup is also the one place that
+    /// rule lives.
+    #[test]
+    fn bee_hub_branch_line_renders_nothing_for_main_or_an_empty_label() {
+        assert_eq!(bee_hub_branch_line("Main"), "");
+        assert_eq!(bee_hub_branch_line(""), "");
+        assert!(
+            bee_hub_branch_line("merged").contains(
+                r#"<span class="bee-hub__branch-name">merged</span>"#
+            ),
+            "every spelling that names a worktree that exists renders verbatim"
         );
     }
 
@@ -15225,6 +15458,7 @@ mod tests {
                     &BeeHubMergeData {
                         uat_approved: false,
                         since: None,
+                        worktree_label: String::new(),
                     },
                     "pending-untimed",
                 ),
@@ -15235,6 +15469,7 @@ mod tests {
                     &BeeHubMergeData {
                         uat_approved: false,
                         since: Some(ago(10)),
+                        worktree_label: String::new(),
                     },
                     "pending-old",
                 ),
@@ -15245,6 +15480,7 @@ mod tests {
                     &BeeHubMergeData {
                         uat_approved: true,
                         since: Some(ago(20)),
+                        worktree_label: String::new(),
                     },
                     "approved-old",
                 ),
@@ -15255,6 +15491,7 @@ mod tests {
                     &BeeHubMergeData {
                         uat_approved: false,
                         since: Some(ago(1)),
+                        worktree_label: String::new(),
                     },
                     "pending-new",
                 ),
@@ -15265,6 +15502,7 @@ mod tests {
                     &BeeHubMergeData {
                         uat_approved: true,
                         since: Some(ago(2)),
+                        worktree_label: String::new(),
                     },
                     "approved-new",
                 ),
