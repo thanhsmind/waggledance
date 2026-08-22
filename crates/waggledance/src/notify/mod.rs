@@ -20,6 +20,7 @@ pub mod telegram;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use waggledance_core::bee::BeeActivityState;
 use waggledance_core::notify_store::NotifyStore;
 
 use crate::herdr::AgentStatus;
@@ -141,6 +142,49 @@ impl NotifyService {
             .is_ok()
     }
 
+    /// The machine token a bee activity state is filed under in the outbox
+    /// -- the record's own `state` string, not the human word. Local to the
+    /// notifier because the outbox's `kind` column is its vocabulary, the
+    /// same way `record` files a herdr change under `status.as_str()`.
+    fn activity_kind(state: &BeeActivityState) -> &str {
+        match state {
+            BeeActivityState::Working => "working",
+            BeeActivityState::WaitingInput => "waiting_input",
+            BeeActivityState::Blocked => "blocked",
+            BeeActivityState::Idle => "idle",
+            BeeActivityState::Exited => "exited",
+            BeeActivityState::Unknown(raw) => raw,
+        }
+    }
+
+    /// Record a bee agent-activity transition as a pending obligation (A5).
+    /// The caller (`watcher::ActivityCursor`) has already decided the
+    /// transition is worth saying -- entry into the need-you family, or
+    /// `exited` -- so there is no second notifiability test here; what this
+    /// adds is the same run-ownership suppression `record` applies, on the
+    /// session's pane when one is known. A session with no pane cannot be
+    /// owned by a dispatched run, so it is never suppressed. Returns true
+    /// if it was enqueued.
+    pub async fn record_activity(
+        &self,
+        session_id: &str,
+        pane: Option<&str>,
+        to: &BeeActivityState,
+    ) -> bool {
+        if let (Some(ownership), Some(pane)) = (&self.ownership, pane) {
+            if ownership.is_pane_owned(pane) {
+                return false;
+            }
+        }
+        // The pane is what a human recognizes; the session id is the
+        // fallback for an agent running outside herdr.
+        let subject = pane.unwrap_or(session_id);
+        let body = format!("agent {} {}", subject, to.word());
+        self.store
+            .enqueue_notification(subject, Self::activity_kind(to), &body)
+            .is_ok()
+    }
+
     /// Drain the outbox: send each pending notification, marking it
     /// delivered only on success. A send failure leaves it pending for the
     /// next drain (at-least-once). Returns how many were delivered this
@@ -248,6 +292,66 @@ mod tests {
         assert!(svc.record(&change("p1", AgentStatus::Blocked)).await);
         assert!(svc.record(&change("p1", AgentStatus::Done)).await);
         assert_eq!(store.undelivered().unwrap().len(), 2);
+    }
+
+    /// Run-ownership suppression reaches activity notifications exactly as
+    /// it reaches herdr ones (A5): a pane a dispatched run already owns
+    /// stays silent.
+    #[tokio::test]
+    async fn activity_entry_on_an_owned_pane_enqueues_nothing() {
+        let store = store();
+        let ownership = Arc::new(|pane: &str| pane == "w1:p1");
+        let svc = NotifyService::with_ownership(store.clone(), Arc::new(NullNotifier), ownership);
+        assert!(
+            !svc.record_activity("sess-1", Some("w1:p1"), &BeeActivityState::Blocked)
+                .await
+        );
+        assert!(store.undelivered().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn activity_entry_on_an_unowned_pane_enqueues_one_row() {
+        let store = store();
+        let ownership = Arc::new(|pane: &str| pane == "other");
+        let svc = NotifyService::with_ownership(store.clone(), Arc::new(NullNotifier), ownership);
+        assert!(
+            svc.record_activity("sess-1", Some("w1:p1"), &BeeActivityState::Blocked)
+                .await
+        );
+        let pending = store.undelivered().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].body, "agent w1:p1 needs approval");
+        assert_eq!(pending[0].kind, "blocked");
+    }
+
+    /// No pane -- an agent outside herdr -- names the session and can never
+    /// be suppressed by ownership, which only speaks panes.
+    #[tokio::test]
+    async fn activity_without_a_pane_names_the_session() {
+        let store = store();
+        let ownership = Arc::new(|_pane: &str| true);
+        let svc = NotifyService::with_ownership(store.clone(), Arc::new(NullNotifier), ownership);
+        assert!(
+            svc.record_activity("sess-1", None, &BeeActivityState::WaitingInput)
+                .await
+        );
+        let pending = store.undelivered().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].body, "agent sess-1 needs an answer");
+        assert_eq!(pending[0].kind, "waiting_input");
+    }
+
+    #[tokio::test]
+    async fn exited_activity_is_enqueued_with_its_word() {
+        let store = store();
+        let svc = NotifyService::new(store.clone(), Arc::new(NullNotifier));
+        assert!(
+            svc.record_activity("sess-1", Some("w2:p3"), &BeeActivityState::Exited)
+                .await
+        );
+        let pending = store.undelivered().unwrap();
+        assert_eq!(pending[0].body, "agent w2:p3 exited");
+        assert_eq!(pending[0].kind, "exited");
     }
 
     #[tokio::test]
