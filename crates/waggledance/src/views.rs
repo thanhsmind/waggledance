@@ -8895,6 +8895,14 @@ mod tests {
                 && narrow.contains("transform: translateX(-100%);"),
             "the rail must park off-canvas under the breakpoint: {narrow}"
         );
+        // scroll-fab-clears-tabbar: the terminal's sticky scroll column
+        // parks above the fixed bar, home only, at the bar's own height.
+        assert!(
+            narrow.contains(
+                ".home-shell .term-scroll__stack {\n    bottom: calc(var(--space-3) + 56px + env(safe-area-inset-bottom));\n  }"
+            ),
+            "the scroll column must clear the bottom tab bar on a handset: {narrow}"
+        );
         assert!(
             narrow.contains(".home-rail__check:checked ~ .home-sidebar {")
                 && narrow.contains(".home-rail__check:checked ~ .home-rail__backdrop {"),

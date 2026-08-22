@@ -861,6 +861,14 @@ html[data-scheme="dark"] .topbar .home {
   .home-shell > main {
     padding-bottom: 72px;
   }
+  /* scroll-fab-clears-tabbar: the terminal's sticky scroll column pins
+     itself to the viewport's lower edge, and on the homepage that edge is
+     now the fixed tab bar — the Live button sat under it. The bar's own
+     height rides on the sticky offset here, so the column parks just above
+     the bar instead. Home only: the project pages draw no bar. */
+  .home-shell .term-scroll__stack {
+    bottom: calc(var(--space-3) + 56px + env(safe-area-inset-bottom));
+  }
   /* The topbar's Orchestrator button is the bottom bar's `Board` tab now;
      two controls for one destination is one too many on a 390px bar. */
   .topbar__orchestrator {
