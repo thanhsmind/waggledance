@@ -296,7 +296,7 @@ pub fn home_page(
         ),
         // console-rail-orchestrator (D3): the Terminals view sits in the
         // same two-column `home-shell` the board does, beside the same
-        // rail — reached from the rail's own Pinned group (D2), and the
+        // rail — reached from the rail's own Agents group (D2), and the
         // way back to another agent without a round trip through the
         // board. `terminals_tab` supplies the `<main>`'s contents only;
         // the shell, the rail and the `<main>` itself are composed here,
@@ -466,10 +466,14 @@ const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 
 const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>"#;
 
 /// Rail-icons: the leading glyphs the rail and the board cards carry so a
-/// row reads by shape before by word — a pin on the Pinned eyebrow, a
+/// row reads by shape before by word — a pin on the Agents eyebrow, a
 /// folder on a project row, and one state glyph per hub column on every
 /// card title. Same feather-style stroke set as the tab bar icons above.
 const RAIL_ICON_PIN: &str = r#"<svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>"#;
+/// rail-agents-compact: the crosshair an agent's second line leads with —
+/// what that agent is aimed at. Sized a notch under the folder so the
+/// feature lane reads as the row's caption, never as a second title.
+const RAIL_ICON_PURPOSE: &str = r#"<svg class="pinned-row__purpose-icon" viewBox="0 0 24 24" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2.5"></circle><line x1="12" y1="2" x2="12" y2="5"></line><line x1="12" y1="19" x2="12" y2="22"></line><line x1="2" y1="12" x2="5" y2="12"></line><line x1="19" y1="12" x2="22" y2="12"></line></svg>"#;
 const RAIL_ICON_FOLDER: &str = r#"<svg class="proj-row__icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>"#;
 const HUB_KIND_ICON_TODO: &str = r#"<circle cx="12" cy="12" r="8"></circle>"#;
 const HUB_KIND_ICON_IN_PROGRESS: &str =
@@ -594,7 +598,7 @@ fn project_sidebar(
     // console-rail-orchestrator (D2): the Terminals switcher's own
     // inventory, already D3-filtered and D4-ordered by
     // `server.rs::terminals_menu_panes` and already threaded into
-    // [`home_page`] — the rail's Pinned group renders it verbatim rather
+    // [`home_page`] — the rail's Agents group renders it verbatim rather
     // than re-deriving a second, possibly-disagreeing list of live agents.
     terminals_panes: &[TerminalsMenuPane],
     // console-rail-orchestrator (D3): the pane the *rendered* page is
@@ -838,7 +842,7 @@ fn project_sidebar(
     )
 }
 
-/// console-rail-orchestrator (D2): the rail's `Pinned` group — the live
+/// console-rail-orchestrator (D2): the rail's `Agents` group — the live
 /// agent terminals, sitting above `Projects`.
 ///
 /// The inventory is the Terminals switcher's own `panes` slice, rendered in
@@ -853,6 +857,14 @@ fn project_sidebar(
 /// vanished with the last pane would take the only way back to that view's
 /// own "herdr is not running" explanation with it. With no panes the group
 /// carries one muted line instead of a list.
+///
+/// rail-agents-compact: the heading says `Agents` — what the rows are, not
+/// how they got there — and a row is at most two lines. Line one is the
+/// agent: dot, project name, the `· workspace · tab` address (the
+/// workspace drops out when it only repeats the project label), and the
+/// bee state word pushed to the right edge, where a column of rows makes
+/// it scannable. Line two, only when a live session names a feature, is a
+/// crosshair and that feature — what this agent is aimed at.
 ///
 /// This group replaced the rail's old `Board` row. That row pointed at the
 /// page it was already on; the board's entry point is now the topbar's
@@ -883,10 +895,11 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
             // unknown) reads quiet rather than borrowing another state's
             // colour.
             let tone = pane_tone(&pane.view);
-            // A6: a pinned row of a pane a live bee session claims says that
-            // session's own state word and the feature lane it is bound to,
-            // after the workspace/tab meta. Absent either one, nothing is
-            // rendered in its place — the row simply stays as it was.
+            // A6: a row of a pane a live bee session claims says that
+            // session's own state word (at the right end of line one) and
+            // the feature lane it is bound to (all of line two). Absent
+            // either one, nothing is rendered in its place — the row simply
+            // stays as it was.
             let bee_state_html = match &pane.view.bee_state {
                 Some(state) => format!(
                     r#"<span class="pinned-row__state">{word}</span>"#,
@@ -896,16 +909,29 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
             };
             let bee_feature_html = match &pane.view.bee_feature {
                 Some(feature) => format!(
-                    r#"<span class="pinned-row__feature">{feature}</span>"#,
+                    r#"<span class="pinned-row__purpose">{icon}<span class="pinned-row__feature">{feature}</span></span>"#,
+                    icon = RAIL_ICON_PURPOSE,
                     feature = esc(feature),
                 ),
                 None => String::new(),
             };
+            // The address rides line one behind the project name, so the
+            // workspace is only worth its width when it says something the
+            // name did not — one agent per project is the common case, and
+            // `Proj One · Proj One · w1:p1` is noise.
+            let meta = if pane.view.workspace == pane.project_label {
+                format!("· {tab}", tab = esc(&pane.view.tab))
+            } else {
+                format!(
+                    "· {workspace} · {tab}",
+                    workspace = esc(&pane.view.workspace),
+                    tab = esc(&pane.view.tab),
+                )
+            };
             rows.push_str(&format!(
                 r#"<li class="pinned-row">
   <a class="pinned-row__link{on_class}" href="{href}"{aria}>
-    <span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" role="img" aria-label="{status}"></span><span class="pinned-row__name">{label}</span>
-    <span class="pinned-row__meta">{workspace} · {tab}</span>{bee_state_html}{bee_feature_html}
+    <span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" role="img" aria-label="{status}"></span><span class="pinned-row__head"><span class="pinned-row__name">{label}</span> <span class="pinned-row__meta">{meta}</span></span>{bee_state_html}{bee_feature_html}
   </a>
 </li>"#,
                 on_class = if on { " pinned-row__link--on" } else { "" },
@@ -914,14 +940,13 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
                 tone = tone,
                 // Unlike a project row — which prints its statuses as
                 // `status_pill` words on its own next line, letting its dot
-                // be purely decorative — a pinned row has no second line of
-                // words to summarise. So the dot carries its own text
+                // be purely decorative — an agent row prints no status
+                // words of its own anywhere. So the dot carries its text
                 // alternative rather than being `aria-hidden`: the status
                 // is never spoken by colour alone.
                 status = esc(pane_status_word(&pane.view)),
                 label = esc(&pane.project_label),
-                workspace = esc(&pane.view.workspace),
-                tab = esc(&pane.view.tab),
+                meta = meta,
                 bee_state_html = bee_state_html,
                 bee_feature_html = bee_feature_html,
             ));
@@ -929,7 +954,7 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
         format!(r#"<ul class="pinned-list">{rows}</ul>"#, rows = rows)
     };
     format!(
-        r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">{pin}Pinned</a></h2>
+        r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">{pin}Agents</a></h2>
     {body}"#,
         pin = RAIL_ICON_PIN,
         body = body,
@@ -1747,7 +1772,7 @@ pub struct TerminalPaneView {
 /// A2/A6: one live bee session's `activity`, joined to a project by
 /// `server.rs::project_bee_activity`. The pane join (`activity.pane`) and
 /// the card join (`activity.feature`) hand out this same entry, so a badge,
-/// a Pinned row and a card agent line can never read different records for
+/// a rail agent row and a card agent line can never read different records for
 /// the same session.
 ///
 /// `signal` rides along because A3's "`no_signal` is a muted marker, never
@@ -1783,7 +1808,7 @@ pub type BeeFeatureActivity = std::collections::HashMap<String, Vec<BeeActivityE
 /// A3's precedence, in ONE place: bee's own state wins over herdr's
 /// screen-derived status wherever both exist for a pane. Answers the three
 /// tone keys every status surface here already speaks — the rail dot
-/// ([`project_row_dot`]), the Pinned row, the badge pill ([`status_pill`]),
+/// ([`project_row_dot`]), the rail agent row, the badge pill ([`status_pill`]),
 /// the In Progress tier ([`bee_hub_in_progress_tier`]) and
 /// `server.rs::terminals_status_rank` — so none of them can drift from
 /// another. Both need-you states read `blocked` (that is the tone the board
@@ -8590,12 +8615,12 @@ mod tests {
                 r#"href="/_terminal/unassigned""#,
                 "the Unassigned group's link",
             ),
-            // console-rail-orchestrator (D2): the Pinned group joined the
+            // console-rail-orchestrator (D2): the Agents group joined the
             // rail above Projects — the live agent terminals, and the way
             // to the terminals view now that the tab strip is gone.
             (
                 r#"<a class="home-sidebar__group-link" href="/?tab=terminals">"#,
-                "the Pinned group's heading anchor",
+                "the Agents group's heading anchor",
             ),
             (
                 r#"<a class="pinned-row__link" href="/?tab=terminals&amp;pane=w1:p1">"#,
@@ -8626,13 +8651,13 @@ mod tests {
         // row is current on the board — the Orchestrator button is.
         let pinned_at = body
             .find(r#"<h2 class="home-sidebar__group home-sidebar__group--pinned">"#)
-            .expect("the Pinned heading");
+            .expect("the Agents heading");
         let projects_at = body
             .find(r#"<h2 class="home-sidebar__group">Projects</h2>"#)
             .expect("the Projects heading");
         assert!(
             pinned_at < projects_at,
-            "the Pinned group must sit above Projects: {body}"
+            "the Agents group must sit above Projects: {body}"
         );
         assert!(
             !body.contains("pinned-row__link--on"),
@@ -8706,7 +8731,7 @@ mod tests {
         );
     }
 
-    /// console-rail-orchestrator (D2), the empty case: the Pinned group's
+    /// console-rail-orchestrator (D2), the empty case: the Agents group's
     /// heading anchor renders whatever herdr has to say — homepage-terminals
     /// D8 made the terminals view reachable when herdr is off, and a heading
     /// that vanished with the last pane would take the only way to that
@@ -8716,17 +8741,71 @@ mod tests {
         let rail = project_sidebar(&[], false, &[], None, &[], None);
         assert!(
             rail.contains(
-                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals"><svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>Pinned</a></h2>"#
+                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals"><svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>Agents</a></h2>"#
             ),
-            "the Pinned heading anchor must render with nothing pinned: {rail}"
+            "the Agents heading anchor must render with nothing pinned: {rail}"
         );
         assert!(
             rail.contains(r#"<p class="pinned-empty fg-empty">No agents running</p>"#),
-            "an empty Pinned group must say so in one muted line: {rail}"
+            "an empty Agents group must say so in one muted line: {rail}"
         );
         assert!(
             !rail.contains(r#"<ul class="pinned-list">"#),
-            "an empty Pinned group must render no list at all: {rail}"
+            "an empty Agents group must render no list at all: {rail}"
+        );
+    }
+
+    /// rail-agents-compact: a live agent's row is at most two lines. Line
+    /// one is the agent itself — dot, project name, the `· workspace · tab`
+    /// address inline beside it, and the bee state word ending the line —
+    /// and the workspace drops out of that address when it only repeats the
+    /// project name. Line two exists only when a session names a feature,
+    /// and it leads with the crosshair that says the line is a purpose
+    /// rather than a second address.
+    #[test]
+    fn an_agent_row_reads_as_two_lines_and_leads_its_feature_with_a_purpose_icon() {
+        let mut pane = menu_pane("w1:p1", Some("proj-1"), "Proj One");
+        pane.view.bee_state = Some(BeeActivityState::Blocked);
+        pane.view.bee_feature = Some("rail-agents-compact".into());
+        let rail = project_sidebar(&[], false, &[], None, &[pane], None);
+
+        assert!(
+            rail.contains(
+                r#"<span class="pinned-row__head"><span class="pinned-row__name">Proj One</span> <span class="pinned-row__meta">· w1 · w1:p1</span></span><span class="pinned-row__state">needs approval</span>"#
+            ),
+            "the name, the address and the state word must share line one: {rail}"
+        );
+        let purpose_at = rail
+            .find(r#"<span class="pinned-row__purpose">"#)
+            .expect("the purpose line must render for a feature-bound session");
+        let icon_at = rail
+            .find(r#"<svg class="pinned-row__purpose-icon""#)
+            .expect("the purpose line must lead with its icon");
+        let feature_at = rail
+            .find(r#"<span class="pinned-row__feature">rail-agents-compact</span>"#)
+            .expect("the feature lane must render");
+        assert!(
+            purpose_at < icon_at && icon_at < feature_at,
+            "the purpose icon must lead the feature name inside the purpose line: {rail}"
+        );
+        // Two lines, and only two: a row's own grid rows are the head and
+        // the purpose line, and nothing else.
+        assert_eq!(rail.matches(r#"class="pinned-row__head""#).count(), 1);
+        assert_eq!(rail.matches(r#"class="pinned-row__purpose""#).count(), 1);
+
+        // A session that names no feature has no second line at all, and a
+        // workspace that only repeats the project name is not worth its
+        // width on the first one.
+        let mut plain = menu_pane("w1:p2", Some("proj-1"), "w1");
+        plain.view.tab = "agent".into();
+        let quiet = project_sidebar(&[], false, &[], None, &[plain], None);
+        assert!(
+            quiet.contains(r#"<span class="pinned-row__meta">· agent</span>"#),
+            "a workspace that repeats the project name must drop out: {quiet}"
+        );
+        assert!(
+            !quiet.contains("pinned-row__purpose"),
+            "a row with no feature must render no second line: {quiet}"
         );
     }
 
@@ -8793,7 +8872,7 @@ mod tests {
     /// console-rail-orchestrator (D2/D3): the `Board` row this used to pin
     /// is gone — it pointed at the page it was already on, and the board's
     /// entry point is the topbar's Orchestrator button now. What sits above
-    /// `Projects` in its place is the `Pinned` group, and the rail's single
+    /// `Projects` in its place is the `Agents` group, and the rail's single
     /// `aria-current` moved with it: none on the board, exactly one on the
     /// terminals view — the row of the pane actually being shown.
     #[test]
@@ -8828,9 +8907,9 @@ mod tests {
         // it renders whether or not there is anything pinned under it.
         assert!(
             rail.contains(
-                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals"><svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>Pinned</a></h2>"#
+                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals"><svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>Agents</a></h2>"#
             ),
-            "the Pinned group's heading must anchor the terminals view: {rail}"
+            "the Agents group's heading must anchor the terminals view: {rail}"
         );
         assert_eq!(
             rail.matches(r#"aria-current="page""#).count(),
