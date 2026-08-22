@@ -603,13 +603,13 @@ fn project_sidebar(
     {meta}
   </a>
   {badges}
-  {delete_form}
+  {row_menu}
 </li>"#,
                     id = esc(&bp.id),
                     label = esc(label),
                     meta = proj_row_meta(*bcount, &bp.last_seen_at),
                     badges = project_badges(&bp.id, bpanes),
-                    delete_form = proj_row_delete_form(&bp.id, &bp.name),
+                    row_menu = proj_row_menu(&bp.id, &bp.name),
                     dot = project_row_dot(bpanes),
                 ));
             }
@@ -626,23 +626,23 @@ fn project_sidebar(
                 )
             };
             // The summary is the name line and nothing else: the dot, the
-            // name, and the remove control. Everything a collapsed group is
+            // name, and the actions menu. Everything a collapsed group is
             // meant to fold away -- the meta line, the badges, the branches
-            // -- sits in the body under it. The remove form has to be INSIDE
-            // the summary: `<details>` hides every child but its summary
-            // when closed, and a control that vanished with the group would
-            // be gone exactly when a reader wants to clear it away.
+            // -- sits in the body under it. The menu has to be INSIDE the
+            // summary: `<details>` hides every child but its summary when
+            // closed, and a control that vanished with the group would be
+            // gone exactly when a reader wants to act on it.
             //
-            // Both the name anchor and the remove button are activatable
-            // elements, so a click on either is their own activation, not
-            // the summary's -- following the link or pressing the button
-            // does not also toggle the group.
+            // Both the name anchor and the menu's own `<summary>` are
+            // activatable elements, so a click on either is their own
+            // activation, not the outer summary's -- following the link or
+            // opening the menu does not also toggle the group.
             rows.push_str(&format!(
                 r#"<li class="proj-row proj-group__row">
   <details class="proj-group" open data-project-id="{id}">
     <summary class="proj-group__summary">
       <a class="proj-row__link" href="/p/{id}/">{dot}<span class="proj-row__name">{label}</span></a>
-      {delete_form}
+      {row_menu}
     </summary>
     <div class="proj-group__body">
       {meta}
@@ -654,7 +654,7 @@ fn project_sidebar(
                 id = esc(&p.id),
                 label = esc(&p.name),
                 dot = project_row_dot(panes),
-                delete_form = proj_row_delete_form(&p.id, &p.name),
+                row_menu = proj_row_menu(&p.id, &p.name),
                 meta = proj_row_meta(*count, &p.last_seen_at),
                 badges = project_badges(&p.id, panes),
                 branch_list = branch_list,
@@ -737,7 +737,7 @@ fn project_sidebar(
     };
     format!(
         r#"<nav class="home-sidebar" aria-label="Projects">
-  <div class="home-sidebar__head">{register_banner}{filter}</div>
+  <div class="home-sidebar__head">{collapse}{register_banner}{filter}</div>
   <div class="home-sidebar__body">
     {pinned}
     <h2 class="home-sidebar__group">Projects</h2>
@@ -747,6 +747,7 @@ fn project_sidebar(
   </div>
   <div class="home-sidebar__foot">{add_form}</div>
 </nav>"#,
+        collapse = rail_collapse_button(),
         register_banner = register_banner,
         filter = project_filter_field(),
         add_form = project_add_form(),
@@ -838,6 +839,33 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
     )
 }
 
+/// rail-collapse-menu (2d56ff75): the rail head's collapse chevron.
+///
+/// On a wide screen the 320px rail is permanent furniture, and a reader
+/// working in one document wants the width back without losing the way
+/// back to the project list. Pressing this folds `.home-sidebar` to a
+/// narrow strip carrying nothing but this same button, and the choice is
+/// remembered per browser in `localStorage["waggledance-rail-hidden"]` --
+/// which is what makes it survive the whole-page reload `assets/app.js`
+/// performs on every watched change. The handset drawer (<=700px) is
+/// untouched: the CSS scopes every collapsed rule to `min-width: 701px`.
+///
+/// Like the filter field above it, the button ships `hidden` and
+/// `assets/app.js` unhides it -- collapsing is a client-side act with no
+/// server route behind it, so with scripting off there is no control here
+/// promising something that would never happen, and the head's
+/// `:not(:has(> *:not([hidden])))` rule still zeroes its padding on a page
+/// whose only other child is the still-hidden filter.
+///
+/// Both chevrons are in the markup and CSS shows exactly one, so the state
+/// flip is a class on the `<nav>` rather than a script rewriting an icon.
+fn rail_collapse_button() -> &'static str {
+    r#"<button type="button" class="home-sidebar__collapse" hidden data-rail-collapse aria-label="Collapse projects rail" aria-expanded="true" title="Collapse projects rail">
+    <svg class="home-sidebar__collapse-icon home-sidebar__collapse-icon--in" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
+    <svg class="home-sidebar__collapse-icon home-sidebar__collapse-icon--out" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+  </button>"#
+}
+
 /// console-theme-kanban (ctk-12): the digest's sidebar search field, and
 /// the one control on this rail that cannot work without JavaScript --
 /// filtering a list is a client-side act and this page has no server route
@@ -871,22 +899,38 @@ fn proj_row_meta(count: usize, last_seen_at: &str) -> String {
     )
 }
 
-/// A rail row's remove control -- a real POST form, so it still works with
-/// scripting off (`assets/app.js` only adds the confirm prompt on top).
+/// A rail row's actions menu -- a native `<details>`, so it opens and
+/// closes with scripting off (`assets/app.js` only adds one-menu-at-a-time
+/// and outside-click on top).
+///
+/// rail-collapse-menu (f4999b27) replaced the bare ✕ with this menu. The
+/// remove form was the row's only control, one stray tap from unregistering
+/// a project, while the row's other obvious destination -- the project's
+/// own docs -- had no entry here at all. The panel lists `Docs` first and
+/// `Remove` last, and `Remove` keeps its own `proj-row__delete` form, so
+/// the confirm prompt in `assets/app.js` and the selector test guarding it
+/// hold unchanged.
 ///
 /// console-theme-kanban (ctk-13) anchors it to the row's NAME LINE rather
 /// than the row box, and console-rail-orchestrator (D4) is why it is
 /// emitted into a project group's `<summary>`: `<details>` hides every
-/// child but its summary when the group is closed, so a remove control
-/// anywhere else would disappear exactly when a reader has folded the
-/// project away and wants it gone. A `<button>` is an activatable element,
-/// so pressing it is its own activation, not the summary's -- it never
-/// toggles the group on the way.
-fn proj_row_delete_form(id: &str, name: &str) -> String {
+/// child but its summary when the group is closed, so a control anywhere
+/// else would disappear exactly when a reader has folded the project away
+/// and wants to act on it. A nested `<summary>` is itself an activatable
+/// element, so opening this menu is its own activation, not the outer
+/// group's -- and `assets/app.js` stops that click propagating anyway, so
+/// the group can never toggle underneath an opening menu.
+fn proj_row_menu(id: &str, name: &str) -> String {
     format!(
-        r#"<form class="proj-row__delete" method="post" action="/api/projects/{id}/unregister" data-project="{name}">
-    <button type="submit" class="proj-card__del" aria-label="Remove {name} from Waggle Dance" title="Remove from Waggle Dance">✕</button>
-  </form>"#,
+        r#"<details class="proj-menu">
+    <summary class="proj-menu__button" aria-label="Actions for {name}" title="Actions">…</summary>
+    <div class="proj-menu__panel">
+      <a class="proj-menu__item" href="/p/{id}/">Docs</a>
+      <form class="proj-row__delete" method="post" action="/api/projects/{id}/unregister" data-project="{name}">
+        <button type="submit" class="proj-menu__item proj-menu__item--danger" aria-label="Remove {name} from Waggle Dance" title="Remove from Waggle Dance">Remove</button>
+      </form>
+    </div>
+  </details>"#,
         id = esc(id),
         name = esc(name),
     )
@@ -8190,14 +8234,46 @@ mod tests {
             "a branch is not a group of its own, so it gets no collapse key: {rail}"
         );
 
+        // rail-collapse-menu (f4999b27): the rail nests `<details>` now --
+        // every row carries its own `…` menu, and a group's body carries
+        // its branches' menus too -- so "the first `</details>`" stopped
+        // meaning "this group's end" and "the first `</summary>`" stopped
+        // meaning "this group's name line". Match the tags by depth.
+        fn details_slice(html: &str) -> &str {
+            let mut depth = 0usize;
+            let mut i = 0usize;
+            loop {
+                let open = html[i..].find("<details").map(|o| i + o);
+                let close = html[i..].find("</details>").map(|c| i + c);
+                match (open, close) {
+                    (Some(o), Some(c)) if o < c => {
+                        depth += 1;
+                        i = o + "<details".len();
+                    }
+                    (_, Some(c)) if depth > 0 => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &html[..c];
+                        }
+                        i = c + "</details>".len();
+                    }
+                    _ => panic!("unbalanced <details> in: {html}"),
+                }
+            }
+        }
+
         let group_start = rail
             .find(r#"<details class="proj-group" open data-project-id="demo">"#)
             .expect("the demo group must render");
-        let group = &rail[group_start..];
-        let group = &group[..group.find("</details>").expect("the group must close")];
-        let summary_end = group
-            .find("</summary>")
-            .expect("the group must have a summary");
+        let group = details_slice(&rail[group_start..]);
+        // The group's own `</summary>` is the one after the row menu it
+        // holds -- the menu's own summary closes first.
+        let menu_close =
+            group.find("</details>").expect("the row menu must close") + "</details>".len();
+        let summary_end = menu_close
+            + group[menu_close..]
+                .find("</summary>")
+                .expect("the group must have a summary");
         let (summary, body) = group.split_at(summary_end);
 
         // The summary is the name line: the project's own link and the one
@@ -8209,8 +8285,10 @@ mod tests {
             "the group's summary must carry the project's own name line: {group}"
         );
         assert!(
-            summary.contains(r#"<form class="proj-row__delete""#),
-            "the remove control must stay in the summary so a collapsed group keeps it: {group}"
+            summary.contains(r#"<details class="proj-menu">"#)
+                && summary.contains(r#"<form class="proj-row__delete""#),
+            "the row's actions menu -- Remove included -- must stay in the summary so a collapsed \
+             group keeps it: {group}"
         );
         assert!(
             !summary.contains("proj-row__meta") && !summary.contains("proj-row__badges"),
@@ -8234,8 +8312,7 @@ mod tests {
         let solo_start = rail
             .find(r#"<details class="proj-group" open data-project-id="solo">"#)
             .expect("the solo group must render");
-        let solo = &rail[solo_start..];
-        let solo = &solo[..solo.find("</details>").expect("the group must close")];
+        let solo = details_slice(&rail[solo_start..]);
         assert!(
             solo.contains(r#"<span class="proj-row__name">Solo</span>"#)
                 && solo.contains(r#"<span class="proj-row__meta">0 markdown files"#),
