@@ -883,6 +883,89 @@ html[data-scheme="dark"] .topbar .home {
 .home-sidebar__filter {
   width: 100%;
 }
+/* console-rail-orchestrator (D4): a project group is a native `<details>`
+   inside the `<li>` the rail filter sweeps. The `<li>` keeps `.proj-row`
+   for that filter (and for its bottom rule), but stops being a flex row
+   itself -- the flex layout moves down to the summary, which is the only
+   part of the group that is actually a row of items. `.proj-row[hidden]`
+   still outranks this on specificity, so hiding a filtered-out group
+   still works. */
+.proj-group__row {
+  display: block;
+}
+.proj-group {
+  min-width: 0;
+}
+/* The name line. `position: relative` is what `.proj-row__delete` anchors
+   its absolute top-right corner to now that the remove control lives in
+   the summary rather than in the row box (D4: it has to stay reachable on
+   a collapsed group, and a `<details>` shows nothing but its summary when
+   closed). The link's own `padding-right` is the gutter that control sits
+   in. */
+.proj-group__summary {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  cursor: pointer;
+  /* Two spellings of the same thing: Firefox draws the disclosure triangle
+     with `::marker`, WebKit with its own pseudo-element. The chevron below
+     replaces both, so neither may also render. */
+  list-style: none;
+}
+.proj-group__summary::-webkit-details-marker {
+  display: none;
+}
+.proj-group__summary::marker {
+  content: "";
+}
+/* The disclosure chevron: a CSS triangle rather than a glyph, so it cannot
+   pick up a font the rest of the rail does not have, and it rotates
+   between the two states instead of swapping character. It is decorative
+   -- `<summary>` already announces expanded/collapsed to a screen reader
+   on its own -- so it carries no text. */
+.proj-group__summary::before {
+  content: "";
+  flex: none;
+  align-self: center;
+  width: 0;
+  height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  color: var(--color-text-subtle);
+  transform-origin: 25% 50%;
+  transition: transform 120ms ease;
+}
+.proj-group[open] > .proj-group__summary::before {
+  transform: rotate(90deg);
+}
+.proj-group__summary:hover {
+  background: var(--color-surface-hover);
+}
+.proj-group__summary:hover .proj-row__name {
+  text-decoration: underline;
+}
+/* Everything the group folds away sits under the name line, indented to
+   the chevron's own width so the meta line and the badges read as the
+   project's own block rather than as the next project's. */
+.proj-group__body {
+  padding-left: var(--space-4);
+}
+.proj-group__body > .proj-row__meta {
+  display: block;
+  padding-bottom: var(--space-1);
+}
+.proj-group__branches {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+/* The group's own `<li>` already draws the rule that closes it off; a
+   second one under the last branch would double the line. */
+.proj-group__branches > .proj-row:last-child {
+  border-bottom: 0;
+}
 /* The rail is far narrower than the full-width page these rows were laid
    out for: reclaim the 56px gutter the delete button no longer needs at
    this width, and let a long name or path wrap instead of pushing the row

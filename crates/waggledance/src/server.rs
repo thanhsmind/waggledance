@@ -17111,7 +17111,8 @@ mod bee_route_tests {
             .rfind("<li class=\"")
             .expect("every row opens an <li>");
         assert!(
-            body[orphan_row_open..at(&orphan.id)].contains("<li class=\"proj-row\">"),
+            body[orphan_row_open..at(&orphan.id)]
+                .contains("<li class=\"proj-row proj-group__row\">"),
             "an orphan worktree must not be rendered as someone's branch: {body}"
         );
 
@@ -17823,6 +17824,26 @@ mod bee_route_tests {
                 ".home-sidebar .proj-row",
                 "<nav class=\"home-sidebar\" aria-label=\"Projects\">",
                 "the project-rail filter's row set",
+            ),
+            // console-rail-orchestrator (D4): the collapse module reads
+            // the group elements and stores their `data-project-id`s. A
+            // rename on either side would leave the rail collapsing fine
+            // and forgetting every time -- a failure nothing else notices,
+            // because the markup would still be valid.
+            (
+                "details.proj-group",
+                "<details class=\"proj-group\" open data-project-id=",
+                "the rail collapse module's group set",
+            ),
+            (
+                "data-project-id",
+                " data-project-id=\"",
+                "the collapsed set's per-project key",
+            ),
+            (
+                "waggledance-rail-collapsed",
+                "<details class=\"proj-group\" open",
+                "the collapsed set's storage key",
             ),
         ] {
             assert!(

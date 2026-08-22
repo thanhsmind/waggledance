@@ -467,40 +467,94 @@ fn project_sidebar(
                 .iter()
                 .any(|((_, _, panes), _)| panes.iter().any(|p| p.kind != "shell"))
         });
-        let ordered: Vec<OrderedProjectRow> = groups.into_iter().flatten().collect();
         let mut rows = String::new();
-        for ((p, count, panes), branch) in ordered {
-            // A worktree whose parent is not registered has nothing to nest
-            // under, so it stands on its own and keeps its full name — never
-            // hidden, and never indented under a row that is not there.
-            let (row_class, label) = match branch {
-                Some(branch) => ("proj-row proj-row--branch", branch.to_string()),
-                None => ("proj-row", p.name.clone()),
-            };
-            // D1/D1a/D2/D3/D5: a sibling of `proj-row__link`, never nested
-            // inside it — an anchor inside an anchor is invalid HTML and
-            // browsers unnest it, which would break the row link itself.
-            let badges = project_badges(&p.id, panes);
-            rows.push_str(&format!(
-                r#"<li class="{row_class}">
+        for group in groups {
+            // console-rail-orchestrator (D4): a project and every worktree
+            // branch under it are one native `<details>`, so collapsing the
+            // group is the browser's own behaviour rather than a script's --
+            // it still collapses with JavaScript off, and the state a reader
+            // sets is a real element property `assets/app.js` only has to
+            // remember, never to invent.
+            //
+            // The `<li>` around the group keeps the `proj-row` class the
+            // rail filter sweeps (`.home-sidebar .proj-row` in app.js), so a
+            // filter miss hides the project and its branches as one unit
+            // instead of stranding a branch under a hidden parent.
+            let ((p, count, panes), _) = group[0];
+            let mut branches = String::new();
+            for entry in group.iter().skip(1) {
+                let ((bp, bcount, bpanes), branch) = *entry;
+                // A worktree whose parent is not registered never reaches
+                // here -- it leads a group of its own and keeps its full
+                // name (see the grouping above), so it is never indented
+                // under a row that is not there.
+                let label = branch.unwrap_or(bp.name.as_str());
+                // D1/D1a/D2/D3/D5: a sibling of `proj-row__link`, never
+                // nested inside it -- an anchor inside an anchor is invalid
+                // HTML and browsers unnest it, which would break the row
+                // link itself.
+                branches.push_str(&format!(
+                    r#"<li class="proj-row proj-row--branch">
   <a class="proj-row__link" href="/p/{id}/">
     {dot}<span class="proj-row__name">{label}</span>
-    <span class="proj-row__meta">{count} markdown files · <time class="proj-row__time" datetime="{seen}">{seen_short}</time></span>
+    {meta}
   </a>
   {badges}
-  <form class="proj-row__delete" method="post" action="/api/projects/{id}/unregister" data-project="{name}">
-    <button type="submit" class="proj-card__del" aria-label="Remove {name} from Waggle Dance" title="Remove from Waggle Dance">✕</button>
-  </form>
+  {delete_form}
 </li>"#,
-                row_class = row_class,
+                    id = esc(&bp.id),
+                    label = esc(label),
+                    meta = proj_row_meta(*bcount, &bp.last_seen_at),
+                    badges = project_badges(&bp.id, bpanes),
+                    delete_form = proj_row_delete_form(&bp.id, &bp.name),
+                    dot = project_row_dot(bpanes),
+                ));
+            }
+            // A project with nothing branching off it emits no branch list
+            // at all rather than an empty `<ul>` -- the group is still a
+            // `<details>`, because what collapses is the project's own info
+            // block (meta line and terminal badges), not just its children.
+            let branch_list = if branches.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<ul class="proj-group__branches">{branches}</ul>"#,
+                    branches = branches,
+                )
+            };
+            // The summary is the name line and nothing else: the dot, the
+            // name, and the remove control. Everything a collapsed group is
+            // meant to fold away -- the meta line, the badges, the branches
+            // -- sits in the body under it. The remove form has to be INSIDE
+            // the summary: `<details>` hides every child but its summary
+            // when closed, and a control that vanished with the group would
+            // be gone exactly when a reader wants to clear it away.
+            //
+            // Both the name anchor and the remove button are activatable
+            // elements, so a click on either is their own activation, not
+            // the summary's -- following the link or pressing the button
+            // does not also toggle the group.
+            rows.push_str(&format!(
+                r#"<li class="proj-row proj-group__row">
+  <details class="proj-group" open data-project-id="{id}">
+    <summary class="proj-group__summary">
+      <a class="proj-row__link" href="/p/{id}/">{dot}<span class="proj-row__name">{label}</span></a>
+      {delete_form}
+    </summary>
+    <div class="proj-group__body">
+      {meta}
+      {badges}
+      {branch_list}
+    </div>
+  </details>
+</li>"#,
                 id = esc(&p.id),
-                label = esc(&label),
-                name = esc(&p.name),
-                count = count,
-                seen = esc(&p.last_seen_at),
-                seen_short = esc(&short_instant(&p.last_seen_at)),
-                badges = badges,
+                label = esc(&p.name),
                 dot = project_row_dot(panes),
+                delete_form = proj_row_delete_form(&p.id, &p.name),
+                meta = proj_row_meta(*count, &p.last_seen_at),
+                badges = project_badges(&p.id, panes),
+                branch_list = branch_list,
             ));
         }
         format!(r#"<ul class="proj-list">{rows}</ul>"#, rows = rows)
@@ -695,6 +749,44 @@ fn project_filter_field() -> &'static str {
     r#"<div class="home-sidebar__search" hidden data-proj-filter>
   <input class="fg-input home-sidebar__filter" type="search" id="proj-filter" name="q" placeholder="Filter projects" aria-label="Filter projects" autocomplete="off">
 </div>"#
+}
+
+/// A rail row's "N markdown files - <last seen>" line.
+///
+/// Its own function because it is emitted from two shapes now: inside a
+/// worktree branch row's link, and -- since console-rail-orchestrator
+/// (D4) -- in a project group's `<details>` body, under the summary
+/// rather than in it. `<time class="proj-row__time" datetime=...>` is the
+/// hook `assets/app.js` upgrades to the viewer's own locale, so the two
+/// call sites must never drift apart on that literal.
+fn proj_row_meta(count: usize, last_seen_at: &str) -> String {
+    format!(
+        r#"<span class="proj-row__meta">{count} markdown files · <time class="proj-row__time" datetime="{seen}">{seen_short}</time></span>"#,
+        count = count,
+        seen = esc(last_seen_at),
+        seen_short = esc(&short_instant(last_seen_at)),
+    )
+}
+
+/// A rail row's remove control -- a real POST form, so it still works with
+/// scripting off (`assets/app.js` only adds the confirm prompt on top).
+///
+/// console-theme-kanban (ctk-13) anchors it to the row's NAME LINE rather
+/// than the row box, and console-rail-orchestrator (D4) is why it is
+/// emitted into a project group's `<summary>`: `<details>` hides every
+/// child but its summary when the group is closed, so a remove control
+/// anywhere else would disappear exactly when a reader has folded the
+/// project away and wants it gone. A `<button>` is an activatable element,
+/// so pressing it is its own activation, not the summary's -- it never
+/// toggles the group on the way.
+fn proj_row_delete_form(id: &str, name: &str) -> String {
+    format!(
+        r#"<form class="proj-row__delete" method="post" action="/api/projects/{id}/unregister" data-project="{name}">
+    <button type="submit" class="proj-card__del" aria-label="Remove {name} from Waggle Dance" title="Remove from Waggle Dance">✕</button>
+  </form>"#,
+        id = esc(id),
+        name = esc(name),
+    )
 }
 
 /// console-theme-kanban (ctk-12): the digest's status dot on a rail row.
@@ -7796,6 +7888,135 @@ mod tests {
         assert!(
             !rail.contains("onclick=") && !rail.contains(r##"href="#""##),
             "the rail must carry no script-only or dead controls: {rail}"
+        );
+    }
+
+    /// console-rail-orchestrator (D4): every project in the rail is a
+    /// collapsible `<details>` group -- the name line is the summary, and
+    /// the project's own info block (meta line, terminal badges) plus every
+    /// worktree branch under it are the body that folds away.
+    ///
+    /// Three claims at once, because the failure this guards is a group
+    /// that only half-forms: a project WITH branches wraps them in its own
+    /// group (not in the next project's), a project with NO branches is
+    /// still a group (its info block is what collapses), and the `.proj-row`
+    /// class the rail filter sweeps survives on both the group wrapper and
+    /// the branch rows. The `data-project-id` is the key `assets/app.js`
+    /// stores the collapsed set under, so it is asserted as a literal.
+    #[test]
+    fn each_project_in_the_rail_is_a_collapsible_details_group_keyed_by_project_id() {
+        let mut parent = sample_project();
+        parent.id = "demo".into();
+        parent.name = "Demo".into();
+        let mut branch = sample_project();
+        branch.id = "demo--wt--feature-x".into();
+        branch.name = "demo--wt--feature-x".into();
+        let mut lone = sample_project();
+        lone.id = "solo".into();
+        lone.name = "Solo".into();
+        let projects = vec![
+            (parent, 3, vec![pane_with_status("working")]),
+            (branch, 1, Vec::new()),
+            (lone, 0, Vec::new()),
+        ];
+        let rail = project_sidebar(&projects, false, &[], None, &[], None);
+
+        // One group per PROJECT, never per row: the branch is inside its
+        // parent's group, so two groups is the whole rail here.
+        assert_eq!(
+            rail.matches(r#"<details class="proj-group" open"#).count(),
+            2,
+            "a worktree branch must live inside its parent's group, not lead one of its own: {rail}"
+        );
+        for id in ["demo", "solo"] {
+            assert!(
+                rail.contains(&format!(
+                    r#"<details class="proj-group" open data-project-id="{id}">"#
+                )),
+                "the {id} group must open by default and carry its project id: {rail}"
+            );
+        }
+        assert!(
+            !rail.contains(r#"data-project-id="demo--wt--feature-x""#),
+            "a branch is not a group of its own, so it gets no collapse key: {rail}"
+        );
+
+        let group_start = rail
+            .find(r#"<details class="proj-group" open data-project-id="demo">"#)
+            .expect("the demo group must render");
+        let group = &rail[group_start..];
+        let group = &group[..group.find("</details>").expect("the group must close")];
+        let summary_end = group
+            .find("</summary>")
+            .expect("the group must have a summary");
+        let (summary, body) = group.split_at(summary_end);
+
+        // The summary is the name line: the project's own link and the one
+        // control that has to survive a collapse (a `<details>` renders
+        // nothing but its summary when closed).
+        assert!(
+            summary.contains(r#"<a class="proj-row__link" href="/p/demo/">"#)
+                && summary.contains(r#"<span class="proj-row__name">Demo</span>"#),
+            "the group's summary must carry the project's own name line: {group}"
+        );
+        assert!(
+            summary.contains(r#"<form class="proj-row__delete""#),
+            "the remove control must stay in the summary so a collapsed group keeps it: {group}"
+        );
+        assert!(
+            !summary.contains("proj-row__meta") && !summary.contains("proj-row__badges"),
+            "the meta line and the badges are what collapses, so neither belongs in the summary: {group}"
+        );
+
+        // The body is everything the group folds away.
+        assert!(
+            body.contains(r#"<span class="proj-row__meta">3 markdown files"#)
+                && body.contains(r#"class="proj-row__badges"#),
+            "the group's body must hold the project's own info block: {group}"
+        );
+        assert!(
+            body.contains(r#"<li class="proj-row proj-row--branch">"#)
+                && body.contains(r#"<span class="proj-row__name">feature-x</span>"#),
+            "the branch row must sit inside its parent's group body: {group}"
+        );
+
+        // A project with nothing branching off it is still a group -- and it
+        // emits no empty branch list to get there.
+        let solo_start = rail
+            .find(r#"<details class="proj-group" open data-project-id="solo">"#)
+            .expect("the solo group must render");
+        let solo = &rail[solo_start..];
+        let solo = &solo[..solo.find("</details>").expect("the group must close")];
+        assert!(
+            solo.contains(r#"<span class="proj-row__name">Solo</span>"#)
+                && solo.contains(r#"<span class="proj-row__meta">0 markdown files"#),
+            "a branchless project must still fold its own info block: {solo}"
+        );
+        assert!(
+            !solo.contains("proj-group__branches"),
+            "a project with no branches must emit no branch list at all: {solo}"
+        );
+
+        // The rail filter sweeps `.home-sidebar .proj-row`; hiding a group
+        // wrapper has to take its branches with it, so the class stays on
+        // the wrapper as well as on the branch rows.
+        assert_eq!(
+            rail.matches(r#"<li class="proj-row proj-group__row">"#)
+                .count(),
+            2,
+            "every group wrapper must keep the class the rail filter sweeps: {rail}"
+        );
+
+        // D1/D1a: still no anchor inside an anchor, summary or not.
+        let open_tag = r#"<a class="proj-row__link" href="/p/demo/">"#;
+        let inner_start = rail.find(open_tag).expect("the demo link must render") + open_tag.len();
+        let inner_end = inner_start
+            + rail[inner_start..]
+                .find("</a>")
+                .expect("the link must close");
+        assert!(
+            !rail[inner_start..inner_end].contains("<a "),
+            "no anchor may be nested inside the row link: {rail}"
         );
     }
 

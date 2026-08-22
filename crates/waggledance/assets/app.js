@@ -452,6 +452,93 @@
     });
   })();
 
+  // Project group collapse (home page rail, console-rail-orchestrator D4):
+  // each project group in the rail is a native `<details class="proj-group"
+  // open data-project-id="...">`, so collapsing one already works with this
+  // script absent. All this adds is memory — the ids of the groups the
+  // reader left CLOSED, in `localStorage["waggledance-rail-collapsed"]` —
+  // and the one override the filter needs.
+  //
+  // The closed set is stored rather than the open one on purpose: the
+  // server ships every group `open`, so an unknown project (registered
+  // since the last visit, or a browser with nothing stored) reads as open
+  // by default, which is what the markup already said.
+  //
+  // Returns the handle the rail filter below reaches for; it is defined
+  // ahead of the filter so `apply()` can call `sync` on its first run.
+  var railGroups = (function () {
+    var KEY = "waggledance-rail-collapsed";
+    var groups = document.querySelectorAll("details.proj-group");
+    var noop = { sync: function () {} };
+    if (!groups.length) return noop;
+
+    // Storage is a hostile input like any other: a quota-blocked or
+    // disabled `localStorage` throws on read, and the value itself is
+    // whatever some other page or an older build left behind. Anything that
+    // is not an array of strings reads as "nothing collapsed" rather than
+    // taking the rail down with it.
+    var closed = {};
+    try {
+      var raw = localStorage.getItem(KEY);
+      var saved = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(saved)) {
+        saved.forEach(function (id) {
+          if (typeof id === "string" && id !== "") closed[id] = true;
+        });
+      }
+    } catch (e) {}
+
+    function idOf(g) {
+      return g.getAttribute("data-project-id") || "";
+    }
+    groups.forEach(function (g) {
+      if (closed[idOf(g)]) g.open = false;
+    });
+
+    // `forcing` guards the filter's own opening: a group the filter pried
+    // open to show a match must not be written back as the reader's choice,
+    // or one keystroke would silently forget every collapse they made.
+    var forcing = false;
+    function persist() {
+      closed = {};
+      var out = [];
+      groups.forEach(function (g) {
+        var id = idOf(g);
+        if (id && !g.open) {
+          closed[id] = true;
+          out.push(id);
+        }
+      });
+      try { localStorage.setItem(KEY, JSON.stringify(out)); } catch (e) {}
+    }
+    groups.forEach(function (g) {
+      g.addEventListener("toggle", function () {
+        if (!forcing) persist();
+      });
+    });
+
+    return {
+      // Called by the filter on every keystroke. With a query typed, every
+      // group still visible is one holding a match, so it is forced open —
+      // a match hidden inside a collapsed group would read as no match at
+      // all. With the query cleared, the reader's own remembered state
+      // comes straight back.
+      sync: function (query) {
+        forcing = true;
+        groups.forEach(function (g) {
+          var row = g.parentNode;
+          var visible = !(row && row.hidden);
+          if (query) {
+            if (visible) g.open = true;
+          } else {
+            g.open = !closed[idOf(g)];
+          }
+        });
+        forcing = false;
+      },
+    };
+  })();
+
   // Project rail filter (home page, console-theme-kanban ctk-12): the
   // rail's search field ships `hidden` from the server. Filtering a list is
   // a client-side act and this page has no server route for it, so a field
@@ -479,6 +566,8 @@
         }
         row.hidden = !hit;
       });
+      // D4: a group holding a match has to be open to show it.
+      railGroups.sync(q);
     }
     input.addEventListener("input", apply);
     // Escape clears the field even where the browser draws no clear button.
