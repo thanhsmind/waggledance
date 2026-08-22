@@ -263,8 +263,18 @@ pub fn home_page(
                 // tab alone — Terminals is a live screen, and a project
                 // list beside it would only steal width from the thing the
                 // reader opened that tab for.
-                sidebar =
-                    project_sidebar(projects, unassigned_visible, suggestions, register_error),
+                sidebar = project_sidebar(
+                    projects,
+                    unassigned_visible,
+                    suggestions,
+                    register_error,
+                    terminals_panes,
+                    // console-rail-orchestrator (D3): no pinned row is
+                    // current on the board, whatever `?pane` happens to
+                    // still be in the query — the topbar's Orchestrator
+                    // button is what is current here.
+                    None,
+                ),
                 // D1 (backlog-groom-2): an empty `cross_features_html`
                 // (D9 — no registered project carries a `.bee` board) used
                 // to make the whole page early-return the tabless plain
@@ -280,13 +290,45 @@ pub fn home_page(
                 },
             ),
         ),
+        // console-rail-orchestrator (D3): the Terminals view sits in the
+        // same two-column `home-shell` the board does, beside the same
+        // rail — reached from the rail's own Pinned group (D2), and the
+        // way back to another agent without a round trip through the
+        // board. `terminals_tab` supplies the `<main>`'s contents only;
+        // the shell, the rail and the `<main>` itself are composed here,
+        // exactly as they are for Kanban, so there is one place that
+        // decides what a home tab's frame looks like.
         HomeTab::Terminals => (
             "Terminals",
-            terminals_tab(
-                terminals_panes,
-                terminals_selected_pane,
-                terminals_herdr_ok,
-                terminals_presets,
+            format!(
+                r#"{style}
+<div class="home-shell">
+{sidebar}
+<main class="fg-page fg-page--tight">
+  {body}
+</main>
+</div>"#,
+                style = PROJECT_TAB_STYLE,
+                sidebar = project_sidebar(
+                    projects,
+                    unassigned_visible,
+                    suggestions,
+                    register_error,
+                    terminals_panes,
+                    // The pane the `<main>` beside this rail is actually
+                    // showing — D4's first-pane fallback included, and
+                    // `None` when D7's named-but-gone pane leaves nothing
+                    // selected. A current row always names a terminal the
+                    // reader is actually looking at.
+                    effective_pane(terminals_panes, terminals_selected_pane)
+                        .map(|p| p.view.pane_id.as_str()),
+                ),
+                body = terminals_tab(
+                    terminals_panes,
+                    terminals_selected_pane,
+                    terminals_herdr_ok,
+                    terminals_presets,
+                ),
             ),
         ),
     };
@@ -367,6 +409,17 @@ fn project_sidebar(
     unassigned_visible: bool,
     suggestions: &[ProjectSuggestion],
     register_error: Option<&str>,
+    // console-rail-orchestrator (D2): the Terminals switcher's own
+    // inventory, already D3-filtered and D4-ordered by
+    // `server.rs::terminals_menu_panes` and already threaded into
+    // [`home_page`] — the rail's Pinned group renders it verbatim rather
+    // than re-deriving a second, possibly-disagreeing list of live agents.
+    terminals_panes: &[TerminalsMenuPane],
+    // console-rail-orchestrator (D3): the pane the *rendered* page is
+    // actually showing, or `None`. `None` on the board — the Orchestrator
+    // button in the topbar is what is current there — so the rail never
+    // carries more than one `aria-current="page"` across the two views.
+    terminals_selected_pane: Option<&str>,
 ) -> String {
     let listing = if projects.is_empty() {
         "<p class=\"fg-empty\">Chưa có project nào trong Waggle Dance. Đăng ký: <code>waggledance register &lt;dir&gt;</code> hoặc gọi MCP <code>waggledance_view_file</code>.</p>".to_string()
@@ -529,9 +582,7 @@ fn project_sidebar(
         r#"<nav class="home-sidebar" aria-label="Projects">
   <div class="home-sidebar__head">{register_banner}{filter}</div>
   <div class="home-sidebar__body">
-    <ul class="home-sidebar__nav">
-      <li><a class="home-sidebar__row home-sidebar__row--on" href="/?tab=kanban" aria-current="page">Board</a></li>
-    </ul>
+    {pinned}
     <h2 class="home-sidebar__group">Projects</h2>
     {listing}
     {suggestions_block}
@@ -542,9 +593,91 @@ fn project_sidebar(
         register_banner = register_banner,
         filter = project_filter_field(),
         add_form = project_add_form(),
+        pinned = pinned_group(terminals_panes, terminals_selected_pane),
         listing = listing,
         suggestions_block = suggestions_block,
         unassigned_card = unassigned_card,
+    )
+}
+
+/// console-rail-orchestrator (D2): the rail's `Pinned` group — the live
+/// agent terminals, sitting above `Projects`.
+///
+/// The inventory is the Terminals switcher's own `panes` slice, rendered in
+/// the order `server.rs::terminals_menu_panes` already put it in (blocked,
+/// then working, then the rest) — never re-filtered and never re-sorted
+/// here, so the rail and the switcher can never disagree about which agents
+/// are running or which one matters most.
+///
+/// The heading is itself an anchor to `/?tab=terminals`, and it renders in
+/// every case, including the empty one: homepage-terminals D8 made the
+/// Terminals view reachable regardless of herdr's state, and a heading that
+/// vanished with the last pane would take the only way back to that view's
+/// own "herdr is not running" explanation with it. With no panes the group
+/// carries one muted line instead of a list.
+///
+/// This group replaced the rail's old `Board` row. That row pointed at the
+/// page it was already on; the board's entry point is now the topbar's
+/// `Orchestrator` button (D1), which is where a reader on the Terminals
+/// view looks for it.
+///
+/// D3: at most one row is `aria-current="page"` — the selected pane's, and
+/// only on the Terminals view (`selected` is `None` on the board). The
+/// current row is not marked by its accent fill alone: `aria-current` says
+/// it in words a screen reader reads, and the CSS adds a left accent bar
+/// beside the fill so the state survives a colour-blind or high-contrast
+/// reading too.
+///
+/// Rows deliberately do NOT carry the `proj-row` class: `assets/app.js`'s
+/// rail filter sweeps `.home-sidebar .proj-row`, and a pinned terminal is
+/// not a project — typing a project name must not blank out the agents
+/// running above the list.
+fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
+    let body = if panes.is_empty() {
+        r#"<p class="pinned-empty fg-empty">No agents running</p>"#.to_string()
+    } else {
+        let mut rows = String::new();
+        for pane in panes {
+            let on = selected == Some(pane.view.pane_id.as_str());
+            // The same three tones [`project_row_dot`] maps a project's
+            // whole pane set onto, applied to this one pane: blocked and
+            // working name themselves, everything else (idle, done,
+            // unknown) reads quiet rather than borrowing another state's
+            // colour.
+            let tone = match pane.view.status.as_str() {
+                "blocked" => "blocked",
+                "working" => "working",
+                _ => "idle",
+            };
+            rows.push_str(&format!(
+                r#"<li class="pinned-row">
+  <a class="pinned-row__link{on_class}" href="{href}"{aria}>
+    <span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" role="img" aria-label="{status}"></span><span class="pinned-row__name">{label}</span>
+    <span class="pinned-row__meta">{workspace} · {tab}</span>
+  </a>
+</li>"#,
+                on_class = if on { " pinned-row__link--on" } else { "" },
+                href = esc(&format!("/?tab=terminals&pane={}", pane.view.pane_id)),
+                aria = if on { r#" aria-current="page""# } else { "" },
+                tone = tone,
+                // Unlike a project row — which prints its statuses as
+                // `status_pill` words on its own next line, letting its dot
+                // be purely decorative — a pinned row has no second line of
+                // words to summarise. So the dot carries its own text
+                // alternative rather than being `aria-hidden`: the status
+                // is never spoken by colour alone.
+                status = esc(&pane.view.status),
+                label = esc(&pane.project_label),
+                workspace = esc(&pane.view.workspace),
+                tab = esc(&pane.view.tab),
+            ));
+        }
+        format!(r#"<ul class="pinned-list">{rows}</ul>"#, rows = rows)
+    };
+    format!(
+        r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">Pinned</a></h2>
+    {body}"#,
+        body = body,
     )
 }
 
@@ -1305,6 +1438,14 @@ pub struct TerminalsMenuPane {
 /// D8 preset label list [`terminal_page`] already threads through —
 /// `server.rs::index_page` obtains it the same way
 /// `terminal_page_inner` does.
+///
+/// console-rail-orchestrator (D3): this returns the `<main>`'s *contents*,
+/// not the `<main>`. The tab now renders inside the same `home-shell` as
+/// the board, beside the same rail, and [`home_page`] composes that frame —
+/// shell, rail, `<main class="fg-page fg-page--tight">` and
+/// `PROJECT_TAB_STYLE` — for both tabs in one place. Every string this
+/// function does own, the two empty-state lines and the vanished-pane line
+/// included, is unchanged.
 fn terminals_tab(
     panes: &[TerminalsMenuPane],
     selected_pane: Option<&str>,
@@ -1317,24 +1458,10 @@ fn terminals_tab(
         } else {
             "herdr is not running."
         };
-        return format!(
-            r#"{tab_style}
-<main class="fg-page fg-page--tight">
-  <p class="fg-empty">{msg}</p>
-</main>"#,
-            tab_style = PROJECT_TAB_STYLE,
-            msg = esc(msg),
-        );
+        return format!(r#"<p class="fg-empty">{msg}</p>"#, msg = esc(msg));
     }
 
-    // D7: an explicit `?pane` naming nothing in `panes` leaves the
-    // selection empty rather than silently falling back to another pane —
-    // `effective` stays `None`. An absent `?pane` takes D4's own first
-    // entry (`panes` is non-empty here).
-    let effective: Option<&TerminalsMenuPane> = match selected_pane {
-        Some(pid) => panes.iter().find(|p| p.view.pane_id == pid),
-        None => Some(&panes[0]),
-    };
+    let effective = effective_pane(panes, selected_pane);
 
     let body = match effective {
         Some(pane) => screen_frame(pane),
@@ -1398,15 +1525,32 @@ fn terminals_tab(
     // `layout_with_drawer`, wrapping every home tab alike. A second drawer
     // here would duplicate `#agent-drawer-toggle`.
     format!(
-        r#"{tab_style}
-<main class="fg-page fg-page--tight">
-  {bar}
-  {body}
-</main>"#,
-        tab_style = PROJECT_TAB_STYLE,
+        r#"{bar}
+  {body}"#,
         bar = bar,
         body = body,
     )
+}
+
+/// homepage-terminal-full D4/D7's selection rule, in the one place both
+/// readers of it can share: an explicit `?pane` naming nothing in `panes`
+/// leaves the selection empty rather than silently falling back to another
+/// pane (`None` — the "this terminal is gone" case); an absent `?pane`
+/// takes D4's own first entry; an empty inventory selects nothing at all.
+///
+/// console-rail-orchestrator (D3) is why this is a free function rather
+/// than a local in [`terminals_tab`]: the rail beside that tab marks the
+/// row of the pane the tab is *actually showing*, so both have to resolve
+/// the query value the same way or the highlighted rail row and the
+/// rendered screen would name different terminals.
+fn effective_pane<'a>(
+    panes: &'a [TerminalsMenuPane],
+    selected_pane: Option<&str>,
+) -> Option<&'a TerminalsMenuPane> {
+    match selected_pane {
+        Some(pid) => panes.iter().find(|p| p.view.pane_id == pid),
+        None => panes.first(),
+    }
 }
 
 /// homepage-terminals D6: the selected pane's live screen viewport plus
@@ -7274,6 +7418,7 @@ mod tests {
             path: "/tmp/unregistered-folder".into(),
             pane_count: 2,
         }];
+        let pinned = vec![menu_pane("w1:p1", Some("proj-1"), "Proj One")];
         let body = home_page(
             &projects,
             true,
@@ -7281,7 +7426,7 @@ mod tests {
             None,
             r#"<div data-feature-hub="cross-project">BOARD</div>"#,
             HomeTab::Kanban,
-            &[],
+            &pinned,
             None,
             true,
             &[],
@@ -7327,6 +7472,17 @@ mod tests {
                 r#"href="/_terminal/unassigned""#,
                 "the Unassigned group's link",
             ),
+            // console-rail-orchestrator (D2): the Pinned group joined the
+            // rail above Projects — the live agent terminals, and the way
+            // to the terminals view now that the tab strip is gone.
+            (
+                r#"<a class="home-sidebar__group-link" href="/?tab=terminals">Pinned</a>"#,
+                "the Pinned group's heading anchor",
+            ),
+            (
+                r#"<a class="pinned-row__link" href="/?tab=terminals&amp;pane=w1:p1">"#,
+                "a pinned terminal's own row link",
+            ),
         ] {
             assert!(
                 body.contains(needle),
@@ -7347,15 +7503,168 @@ mod tests {
             foot_at < form_at,
             "the registration form must be pinned in the rail's foot: {body}"
         );
+
+        // D2: the pinned terminals sit above the projects, and D3: no rail
+        // row is current on the board — the Orchestrator button is.
+        let pinned_at = body
+            .find(r#"<h2 class="home-sidebar__group home-sidebar__group--pinned">"#)
+            .expect("the Pinned heading");
+        let projects_at = body
+            .find(r#"<h2 class="home-sidebar__group">Projects</h2>"#)
+            .expect("the Projects heading");
+        assert!(
+            pinned_at < projects_at,
+            "the Pinned group must sit above Projects: {body}"
+        );
+        assert!(
+            !body.contains("pinned-row__link--on"),
+            "no pinned row may read as current on the board: {body}"
+        );
+        assert!(
+            !body.contains("Board</a>"),
+            "the retired Board row must be gone from the rail: {body}"
+        );
+    }
+
+    /// console-rail-orchestrator (D3): the terminals view renders inside the
+    /// same two-column shell the board does — the rail on the left, the live
+    /// screen beside it — and the pinned row of the pane actually being
+    /// shown is the rail's one current row.
+    #[test]
+    fn terminals_view_renders_the_selected_pane_beside_the_rail() {
+        let panes = vec![
+            menu_pane("w1:p1", Some("proj-1"), "Proj One"),
+            menu_pane("w1:p2", Some("proj-1"), "Proj One"),
+        ];
+        let body = home_page(
+            &[(sample_project(), 3, Vec::new())],
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Terminals,
+            &panes,
+            Some("w1:p2"),
+            true,
+            &[],
+        );
+
+        let shell_at = body
+            .find(r#"<div class="home-shell">"#)
+            .expect("the terminals view must render inside the home shell");
+        let rail_at = body
+            .find(r#"<nav class="home-sidebar" aria-label="Projects">"#)
+            .expect("the rail must render on the terminals view");
+        let main_at = body
+            .find(r#"<main class="fg-page fg-page--tight">"#)
+            .expect("the terminals main must render");
+        assert!(
+            shell_at < rail_at && rail_at < main_at,
+            "the rail must sit inside the shell, before the terminals main: {body}"
+        );
+        assert!(
+            body.contains(
+                r#"<a class="pinned-row__link pinned-row__link--on" href="/?tab=terminals&amp;pane=w1:p2" aria-current="page">"#
+            ),
+            "the selected pane's rail row must be marked current: {body}"
+        );
+        assert_eq!(
+            body[rail_at..main_at]
+                .matches(r#"aria-current="page""#)
+                .count(),
+            1,
+            "the rail must never carry more than one current row: {body}"
+        );
+        assert!(
+            body.contains(r#"data-pane-id="w1:p2""#) && body.contains("term-screen"),
+            "the selected pane's own screen must render beside the rail: {body}"
+        );
+        // agents-drawer-global: still exactly one drawer on the page —
+        // moving the tab into the shell must not have spawned a second.
+        assert_eq!(
+            body.matches(r#"id="agent-drawer-toggle""#).count(),
+            1,
+            "the page must carry exactly one agent drawer: {body}"
+        );
+    }
+
+    /// console-rail-orchestrator (D2), the empty case: the Pinned group's
+    /// heading anchor renders whatever herdr has to say — homepage-terminals
+    /// D8 made the terminals view reachable when herdr is off, and a heading
+    /// that vanished with the last pane would take the only way to that
+    /// view's own explanation with it.
+    #[test]
+    fn rail_with_no_live_panes_still_offers_the_way_to_the_terminals_view() {
+        let rail = project_sidebar(&[], false, &[], None, &[], None);
+        assert!(
+            rail.contains(
+                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">Pinned</a></h2>"#
+            ),
+            "the Pinned heading anchor must render with nothing pinned: {rail}"
+        );
+        assert!(
+            rail.contains(r#"<p class="pinned-empty fg-empty">No agents running</p>"#),
+            "an empty Pinned group must say so in one muted line: {rail}"
+        );
+        assert!(
+            !rail.contains(r#"<ul class="pinned-list">"#),
+            "an empty Pinned group must render no list at all: {rail}"
+        );
+    }
+
+    /// console-rail-orchestrator (D3) x homepage-terminal-full D7: a `?pane`
+    /// naming a pane that has since vanished still renders the rail beside
+    /// its own "this terminal is gone" line — the way to every other running
+    /// agent is exactly where it was, and nothing in the rail claims to be
+    /// current.
+    #[test]
+    fn terminals_view_with_a_vanished_pane_keeps_the_rail_beside_the_gone_line() {
+        let panes = vec![menu_pane("w1:p1", Some("proj-1"), "Proj One")];
+        let body = home_page(
+            &[],
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Terminals,
+            &panes,
+            Some("does-not-exist"),
+            true,
+            &[],
+        );
+        assert!(
+            body.contains(r#"<p class="fg-empty">This terminal is gone.</p>"#),
+            "a vanished pane must still render its own gone line: {body}"
+        );
+        assert!(
+            body.contains(r#"<nav class="home-sidebar" aria-label="Projects">"#)
+                && body.contains(
+                    r#"<a class="pinned-row__link" href="/?tab=terminals&amp;pane=w1:p1">"#
+                ),
+            "the rail and its pinned rows must render beside the gone line: {body}"
+        );
+        assert!(
+            !body.contains("pinned-row__link--on") && !body.contains(r#"aria-current="page""#),
+            "nothing may read as current when the named pane is gone: {body}"
+        );
     }
 
     /// console-theme-kanban (ctk-12): the rail is navigation, and has to
     /// behave like it. A named landmark, a real list under a real heading,
-    /// one row that says it is the current page, and no piece of meaning
-    /// carried by colour alone — the status dot is decorative by
-    /// construction and the words it summarises are the badge pills on the
-    /// row's own next line. Every control is an anchor, an input or a
-    /// button, so keyboard order is document order with nothing to trap it.
+    /// at most one row that says it is the current page, and no piece of
+    /// meaning carried by colour alone — a project row's status dot is
+    /// decorative by construction, because the words it summarises are the
+    /// badge pills on that row's own next line, while a pinned row (which
+    /// has no such second line) carries its own text alternative instead.
+    /// Every control is an anchor, an input or a button, so keyboard order
+    /// is document order with nothing to trap it.
+    ///
+    /// console-rail-orchestrator (D2/D3): the `Board` row this used to pin
+    /// is gone — it pointed at the page it was already on, and the board's
+    /// entry point is the topbar's Orchestrator button now. What sits above
+    /// `Projects` in its place is the `Pinned` group, and the rail's single
+    /// `aria-current` moved with it: none on the board, exactly one on the
+    /// terminals view — the row of the pane actually being shown.
     #[test]
     fn project_rail_is_a_named_landmark_whose_current_row_and_dots_never_speak_by_colour_alone() {
         let mut working = sample_project();
@@ -7369,7 +7678,7 @@ mod tests {
             (blocked, 1, vec![pane_with_status("blocked")]),
             (quiet, 1, Vec::new()),
         ];
-        let rail = project_sidebar(&projects, false, &[], None);
+        let rail = project_sidebar(&projects, false, &[], None, &[], None);
 
         assert!(
             rail.starts_with(r#"<nav class="home-sidebar" aria-label="Projects">"#),
@@ -7380,20 +7689,79 @@ mod tests {
                 && rail.contains(r#"<ul class="proj-list">"#),
             "the projects must stay a real list under a real heading: {rail}"
         );
-        assert_eq!(
-            rail.matches(r#"aria-current="page""#).count(),
-            1,
-            "exactly one row in the rail may claim to be the current page: {rail}"
+        assert!(
+            !rail.contains("Board</a>") && !rail.contains("home-sidebar__row"),
+            "the retired Board row must be gone from the rail: {rail}"
         );
+        // D2: the group heading is itself the way to the terminals view, and
+        // it renders whether or not there is anything pinned under it.
         assert!(
             rail.contains(
-                r#"<a class="home-sidebar__row home-sidebar__row--on" href="/?tab=kanban" aria-current="page">Board</a>"#
+                r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals">Pinned</a></h2>"#
             ),
-            "the current row must announce itself, not merely be filled with the accent: {rail}"
+            "the Pinned group's heading must anchor the terminals view: {rail}"
+        );
+        assert_eq!(
+            rail.matches(r#"aria-current="page""#).count(),
+            0,
+            "no rail row may claim to be current on the board: {rail}"
         );
 
-        // Colour-only meaning: every dot is aria-hidden, and a dot only
-        // ever appears on a row that also prints its status as words.
+        // D3: the same rail on the terminals view, with a pane selected —
+        // one current row, and it announces itself rather than relying on
+        // the accent fill alone.
+        let pinned = vec![
+            menu_pane("w1:p1", Some("proj-working"), "Proj Working"),
+            menu_pane("w1:p2", Some("proj-blocked"), "Proj Blocked"),
+        ];
+        let on_terminals = project_sidebar(&projects, false, &[], None, &pinned, Some("w1:p2"));
+        assert_eq!(
+            on_terminals.matches(r#"aria-current="page""#).count(),
+            1,
+            "exactly one row in the rail may claim to be the current page: {on_terminals}"
+        );
+        assert!(
+            on_terminals.contains(
+                r#"<a class="pinned-row__link pinned-row__link--on" href="/?tab=terminals&amp;pane=w1:p2" aria-current="page">"#
+            ),
+            "the current row must announce itself, not merely be filled with the accent: {on_terminals}"
+        );
+        // The rail filter sweeps `.home-sidebar .proj-row`; a pinned
+        // terminal is not a project, so typing a project name must not
+        // blank out the agents running above the list.
+        let list_start = on_terminals
+            .find(r#"<ul class="pinned-list">"#)
+            .expect("the pinned list must render");
+        let list_end = on_terminals
+            .find(r#"<h2 class="home-sidebar__group">Projects</h2>"#)
+            .expect("the Projects heading must follow the pinned group");
+        let pinned_block = &on_terminals[list_start..list_end];
+        assert_eq!(
+            pinned_block.matches(r#"class="proj-row"#).count(),
+            0,
+            "no pinned row may carry the proj-row class the filter sweeps: {pinned_block}"
+        );
+        assert_eq!(
+            pinned_block.matches(r#"<li class="pinned-row">"#).count(),
+            2,
+            "one pinned row per live pane, in the switcher's own order: {pinned_block}"
+        );
+        assert!(
+            pinned_block.find("w1:p1").unwrap() < pinned_block.find("w1:p2").unwrap(),
+            "the pinned rows must keep the order server.rs handed them in: {pinned_block}"
+        );
+        // Colour-only meaning on a pinned row: the dot names its own status,
+        // since a pinned row has no badge pills to carry the words for it.
+        assert!(
+            on_terminals.contains(
+                r#"<span class="fg-status__dot proj-row__dot proj-row__dot--working" role="img" aria-label="working"></span>"#
+            ),
+            "a pinned row's dot must carry its status as text, not as colour alone: {on_terminals}"
+        );
+
+        // Colour-only meaning on a project row: every dot is aria-hidden,
+        // and a dot only ever appears on a row that also prints its status
+        // as words.
         assert_eq!(
             rail.matches(r#"class="fg-status__dot proj-row__dot"#)
                 .count(),
@@ -7462,7 +7830,7 @@ mod tests {
             (idle, 3, vec![shell_pane]),
             (active, 5, vec![pane_with_status("working")]),
         ];
-        let html = project_sidebar(&projects, false, &[], None);
+        let html = project_sidebar(&projects, false, &[], None, &[], None);
         assert!(
             !html.contains("fg-pagehead__title"),
             "the project rail must render no page heading: {html}"
@@ -8313,10 +8681,31 @@ mod tests {
             is_project_pane: true,
             project_id: Some(project.id.clone()),
         };
+        // console-rail-orchestrator (D3): the tab's `<main>` is composed by
+        // `home_page` now (inside the `home-shell`, beside the rail), so the
+        // claim is checked where that element actually lives — still the
+        // same claim: no `data-project-id` on the home page's own `<main>`,
+        // because its panes can belong to any project or none.
+        let page_html = home_page(
+            &[],
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Terminals,
+            std::slice::from_ref(&menu_pane),
+            None,
+            true,
+            &[],
+        );
+        assert!(
+            page_html.contains(r#"<main class="fg-page fg-page--tight">"#),
+            "the homepage Terminals tab's own <main> must render with no data-project-id: {page_html}"
+        );
         let tab_html = terminals_tab(std::slice::from_ref(&menu_pane), None, true, &[]);
         assert!(
-            tab_html.contains(r#"<main class="fg-page fg-page--tight">"#),
-            "the homepage Terminals tab's own <main> must render with no data-project-id: {tab_html}"
+            !tab_html.contains("<main"),
+            "the tab itself must own no <main> — `home_page` composes it: {tab_html}"
         );
         assert!(
             tab_html.contains(&format!(r#"data-term-base="{}""#, menu_pane.base)),
@@ -8457,10 +8846,13 @@ mod tests {
         let bar_start = with_project
             .find(r#"class="pane-bar js-menu""#)
             .expect("no pane bar");
+        // console-rail-orchestrator (D3): the tab no longer closes its own
+        // `<main>` — `home_page` does — so the switcher's extent is bounded
+        // by the thing that follows it, the selected pane's own screen card.
         let bar_end = with_project[bar_start..]
-            .find("</main>")
+            .find(r#"<div class="fg-card term-pane""#)
             .map(|i| bar_start + i)
-            .expect("no </main> after the pane bar");
+            .expect("no screen card after the pane bar");
         assert!(
             with_project[bar_start..bar_end].contains(r#"data-preset="Claude""#),
             "the creation controls must live inside the pane_bar switcher: {with_project}"

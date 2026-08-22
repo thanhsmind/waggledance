@@ -17944,14 +17944,35 @@ mod bee_route_tests {
             "/?tab=projects must resolve to the Kanban page that now carries the project rail"
         );
 
-        // homepage-terminals: the third tab renders neither of the other
-        // two sections — its own body is a switch menu plus a screen, not
-        // Features and not the project list.
+        // homepage-terminals: the third tab renders none of the board's own
+        // Features section — its own `<main>` is a switch menu plus a
+        // screen.
+        //
+        // console-rail-orchestrator (D3): the project list is no longer part
+        // of that claim. The rail moved out of the board's `<main>` and into
+        // the shell that now wraps both tabs alike, so the terminals view
+        // renders it too — beside the screen, not inside it. What still has
+        // to hold is the separation the original assertion was protecting:
+        // the rail is a sibling of the terminals `<main>`, never content
+        // inside it.
         let terminals_body = body_string(get(app, "/?tab=terminals").await).await;
         assert!(
-            !terminals_body.contains(r#"data-feature-hub="cross-project""#)
-                && !terminals_body.contains("<ul class=\"proj-list\">"),
-            "the Terminals tab must render neither the Features section nor the project list: {terminals_body}"
+            !terminals_body.contains(r#"data-feature-hub="cross-project""#),
+            "the Terminals tab must render no Features section: {terminals_body}"
+        );
+        let rail_at = terminals_body
+            .find(r#"<nav class="home-sidebar" aria-label="Projects">"#)
+            .expect("D3: the rail must render on the terminals view");
+        let list_at = terminals_body
+            .find("<ul class=\"proj-list\">")
+            .expect("D3: the rail's project list comes with it");
+        let main_at = terminals_body
+            .find(r#"<main class="fg-page fg-page--tight">"#)
+            .expect("the terminals main must render");
+        assert!(
+            rail_at < main_at && list_at < main_at,
+            "the project list may only reach the terminals view as the rail beside its <main>, \
+             never as content inside it: {terminals_body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -19998,8 +20019,33 @@ mod bee_route_tests {
             "the group's presence marker is missing once both switches are on: {body_on}"
         );
         assert!(
-            !body_on.contains(&stray.name) && !body_on.contains(&stray.pane_id),
-            "an unauthenticated home page leaked an unassigned agent's name or pane id: {body_on}"
+            !body_on.contains(&stray.name),
+            "an unauthenticated home page leaked an unassigned agent's name: {body_on}"
+        );
+        // console-rail-orchestrator (D2): the pane id is no longer absent
+        // from this page — the rail's Pinned group links each live terminal
+        // by it. That is a move, not a widening: the identical anonymous
+        // visitor could already read this exact pane id off
+        // `/?tab=terminals` on this same build (the Terminals inventory is
+        // gated on `terminal.enabled` alone), so what changed is which URL
+        // shows it, not who can see it.
+        //
+        // The boundary that still has teeth, and is what this asserts: the
+        // id appears ONLY as the address of that pinned link. It reaches no
+        // other element, and it brings nothing with it — the agent's name
+        // and its cwd stay off this page entirely, and the Unassigned
+        // group's own card is still presence and nothing more.
+        let pinned_href = format!(r#"href="/?tab=terminals&amp;pane={}""#, stray.pane_id);
+        assert_eq!(
+            body_on.matches(&stray.pane_id).count(),
+            body_on.matches(&pinned_href).count(),
+            "an unassigned agent's pane id may appear only as its pinned row's own address: \
+             {body_on}"
+        );
+        assert_eq!(
+            body_on.matches(&pinned_href).count(),
+            1,
+            "D2: the stray pane must have exactly one pinned row in the rail: {body_on}"
         );
         // D2 inverted: the page as a whole now legitimately shows the
         // stray pane's cwd, via the separate suggestion block — that
@@ -20036,11 +20082,25 @@ mod bee_route_tests {
         // second suggestion row here too — its identity fields must still
         // never appear.
         assert!(
-            !body_on.contains("Building the parser")
-                && !body_on.contains("claude-main")
-                && !body_on.contains("w1:p1"),
-            "an unauthenticated home page leaked a suggested folder's agent title, name, or \
-             pane id: {body_on}"
+            !body_on.contains("Building the parser") && !body_on.contains("claude-main"),
+            "an unauthenticated home page leaked a suggested folder's agent title or name: \
+             {body_on}"
+        );
+        // console-rail-orchestrator (D2), the same move the `stray` pin
+        // above records: this pane's id now addresses its own pinned row in
+        // the rail — the one place it may appear, and it still carries none
+        // of the identity above with it.
+        let seeded_href = r#"href="/?tab=terminals&amp;pane=w1:p1""#;
+        assert_eq!(
+            body_on.matches("w1:p1").count(),
+            body_on.matches(seeded_href).count(),
+            "a suggested folder's agent pane id may appear only as its pinned row's own \
+             address: {body_on}"
+        );
+        assert_eq!(
+            body_on.matches(seeded_href).count(),
+            1,
+            "D2: the seeded pane must have exactly one pinned row in the rail: {body_on}"
         );
         // Workspace and tab labels are deliberately not checked here: this
         // fixture's own seeded labels ("frontend-app"/"main") are
