@@ -18107,27 +18107,26 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// homepage-tabs: the tab strip itself — exactly one `fg-tab--on` and
-    /// one `aria-current="page"`, both on the tab actually selected, and
-    /// real anchors so the page works with JavaScript off and survives the
-    /// homepage's own `location.reload()`.
+    /// homepage-tabs, retargeted by console-rail-orchestrator (D1): the
+    /// board's entry point is a single `Orchestrator` anchor in the
+    /// topbar's right slot, and it is the ONE thing in that bar marking
+    /// itself current. A real anchor, not a button or `href="#"` plus JS,
+    /// so the page works with JavaScript off and survives the homepage's
+    /// own `location.reload()` — the same guarantee the retired strip's
+    /// anchors carried.
     ///
-    /// console-theme-kanban (ctk-12): repaired for a two-tab strip. The
-    /// Projects anchor is retired with its tab — its body is now the Kanban
-    /// tab's left rail — so what this pins is Kanban and Terminals, that
-    /// the strip carries no third anchor at all, and that the retired tab's
-    /// own URL still selects Kanban rather than leaving the strip with
-    /// nothing marked current.
+    /// What this pins: the button renders exactly once; it is marked
+    /// current on the board and plain on the terminals view; the strip's
+    /// own `<nav class="fg-tabs">` is gone from the page entirely; and the
+    /// retired `/?tab=projects` URL still lands on the board, rail and all.
     ///
-    /// The `aria-current` count is now scoped to the strip's own `<nav>`
-    /// rather than counted across the whole document. That is what the
-    /// assertion always meant — its own message says "exactly one TAB" —
-    /// and the page legitimately carries a second one now: the rail is a
-    /// separate navigation landmark, and the row marking where the reader
-    /// is inside it is correct, not a duplicate of the strip's.
+    /// The `aria-current` count is scoped to the topbar's own `<header>`
+    /// rather than counted across the whole document: `aria-current` is a
+    /// per-landmark claim, and the rail is a separate navigation landmark
+    /// whose own current-row is correct, not a duplicate of this one.
     #[tokio::test]
-    async fn home_page_tab_strip_marks_exactly_one_tab_selected() {
-        let dir = fresh_root("home-tab-strip");
+    async fn home_page_orchestrator_button_is_the_only_current_marker_in_the_topbar() {
+        let dir = fresh_root("home-orchestrator-button");
         let st = build_state_with_dir(&dir);
         let root = dir.join("proj-a");
         std::fs::create_dir_all(&root).unwrap();
@@ -18135,62 +18134,42 @@ mod bee_route_tests {
         register(&st, &root, "Project A");
         let app = router(st);
 
-        // The strip's own markup, cut out of the page: `aria-current` is a
-        // per-landmark claim, so counting it document-wide would fold the
-        // rail's own current-row into the strip's count.
-        fn strip_of(body: &str) -> &str {
+        fn topbar_of(body: &str) -> &str {
             let open = body
-                .find(r#"<nav class="fg-tabs" aria-label="Home sections">"#)
-                .expect("the tab strip must render");
+                .find(r#"<header class="topbar">"#)
+                .expect("the topbar must render");
             let close = body[open..]
-                .find("</nav>")
+                .find("</header>")
                 .map(|i| open + i)
-                .expect("the tab strip must be closed");
+                .expect("the topbar must be closed");
             &body[open..close]
         }
 
         let kanban_body = body_string(get(app.clone(), "/").await).await;
         assert!(
-            kanban_body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
-            "the tab strip must render on the Kanban tab: {kanban_body}"
+            !kanban_body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
+            "the retired tab strip must not render on the board: {kanban_body}"
         );
         assert_eq!(
-            kanban_body.matches("fg-tab--on").count(),
+            kanban_body.matches(">Orchestrator</a>").count(),
             1,
-            "exactly one tab must be marked selected: {kanban_body}"
+            "exactly one Orchestrator button must render: {kanban_body}"
+        );
+        assert!(
+            topbar_of(&kanban_body).contains(
+                r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#
+            ),
+            "the Orchestrator button must sit in the topbar, marked current on the board: {kanban_body}"
         );
         assert_eq!(
-            strip_of(&kanban_body)
+            topbar_of(&kanban_body)
                 .matches(r#"aria-current="page""#)
                 .count(),
             1,
-            "exactly one tab must carry aria-current: {kanban_body}"
-        );
-        assert!(
-            kanban_body.contains(
-                r#"<a class="fg-tab fg-tab--on" href="/?tab=kanban" aria-current="page">Kanban</a>"#
-            ),
-            "Kanban must be the selected tab by default: {kanban_body}"
-        );
-        assert!(
-            !kanban_body.contains("/?tab=projects"),
-            "the retired Projects tab must not appear on the strip: {kanban_body}"
-        );
-        assert_eq!(
-            strip_of(&kanban_body)
-                .matches(r#"<a class="fg-tab"#)
-                .count(),
-            2,
-            "the strip must offer exactly two tabs: {kanban_body}"
-        );
-        // homepage-terminals D1/D8: the third tab is always on the strip,
-        // plain and unselected here, whatever herdr's own state is.
-        assert!(
-            kanban_body.contains(r#"<a class="fg-tab" href="/?tab=terminals">Terminals</a>"#),
-            "Terminals must always be offered, plain and unselected on Kanban: {kanban_body}"
+            "the Orchestrator button must be the only current marker in the topbar: {kanban_body}"
         );
 
-        // The retired tab's own URL still resolves, and selects Kanban —
+        // The retired tab's own URL still resolves, and lands on the board —
         // the section that now carries what that URL was pointing at.
         let legacy_resp = get(app.clone(), "/?tab=projects").await;
         assert_eq!(
@@ -18199,34 +18178,36 @@ mod bee_route_tests {
             "an old /?tab=projects bookmark must still resolve"
         );
         let legacy_body = body_string(legacy_resp).await;
-        assert_eq!(
-            legacy_body.matches("fg-tab--on").count(),
-            1,
-            "exactly one tab must be marked selected for the retired tab's URL too: {legacy_body}"
-        );
         assert!(
             legacy_body.contains(
-                r#"<a class="fg-tab fg-tab--on" href="/?tab=kanban" aria-current="page">Kanban</a>"#
+                r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#
             ),
-            "/?tab=projects must select Kanban, where the project rail lives: {legacy_body}"
+            "/?tab=projects must land on the board, with its button marked current: {legacy_body}"
         );
         assert!(
             legacy_body.contains(r#"<nav class="home-sidebar" aria-label="Projects">"#),
             "/?tab=projects must land on the page carrying the project rail: {legacy_body}"
         );
 
-        // homepage-terminals: Terminals itself, selected — the strip still
-        // marks exactly one of the now-three tabs current.
+        // homepage-terminals: the terminals view offers the same button,
+        // plain — it is the way back to the board from here.
         let terminals_body = body_string(get(app, "/?tab=terminals").await).await;
-        assert_eq!(
-            terminals_body.matches("fg-tab--on").count(),
-            1,
-            "exactly one tab must be marked selected on the Terminals tab too: {terminals_body}"
+        assert!(
+            !terminals_body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
+            "the retired tab strip must not render on the terminals view either: {terminals_body}"
         );
         assert!(
-            terminals_body
-                .contains(r#"<a class="fg-tab fg-tab--on" href="/?tab=terminals" aria-current="page">Terminals</a>"#),
-            "Terminals must be the selected tab when asked for: {terminals_body}"
+            terminals_body.contains(
+                r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator" href="/?tab=kanban">Orchestrator</a>"#
+            ),
+            "the terminals view must offer the same button, plain: {terminals_body}"
+        );
+        assert_eq!(
+            topbar_of(&terminals_body)
+                .matches(r#"aria-current="page""#)
+                .count(),
+            0,
+            "nothing in the topbar is current while the terminals view is showing: {terminals_body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -18235,10 +18216,15 @@ mod bee_route_tests {
     /// homepage-tabs: an unknown, empty, or repeated `tab` value all resolve
     /// to Kanban rather than erroring or leaving the query unresolved.
     ///
-    /// homepage-terminals: `"terminals"` is a THIRD recognized value now,
-    /// not one of the unknowns this loop still exercises — proven
-    /// separately below so this loop's own claim ("everything else falls
-    /// back to Kanban") stays accurate.
+    /// homepage-terminals: `"terminals"` is a second recognized value, not
+    /// one of the unknowns this loop still exercises — proven separately
+    /// below so this loop's own claim ("everything else falls back to
+    /// Kanban") stays accurate.
+    ///
+    /// console-rail-orchestrator (D1): the parsing is untouched; only the
+    /// evidence moved. "This URL landed on the board" now reads off the
+    /// topbar's Orchestrator button being marked current instead of off a
+    /// strip anchor that no longer exists.
     #[tokio::test]
     async fn home_page_unrecognized_tab_value_resolves_to_kanban() {
         let dir = fresh_root("home-tab-unknown");
@@ -18254,16 +18240,23 @@ mod bee_route_tests {
             assert_eq!(resp.status(), StatusCode::OK, "{uri} must still render");
             let body = body_string(resp).await;
             assert!(
-                body.contains(r#"<a class="fg-tab fg-tab--on" href="/?tab=kanban" aria-current="page">Kanban</a>"#),
+                body.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#),
                 "{uri} must resolve to the Kanban tab: {body}"
+            );
+            assert!(
+                !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
+                "{uri} must not resurrect the retired tab strip: {body}"
             );
         }
 
         let terminals_body = body_string(get(app, "/?tab=terminals").await).await;
         assert!(
-            terminals_body
-                .contains(r#"<a class="fg-tab fg-tab--on" href="/?tab=terminals" aria-current="page">Terminals</a>"#),
-            "\"terminals\" itself must resolve to the Terminals tab, not fall back to Kanban: {terminals_body}"
+            terminals_body.contains("herdr is not running."),
+            "\"terminals\" itself must resolve to the Terminals section's own body, not fall back to Kanban: {terminals_body}"
+        );
+        assert!(
+            terminals_body.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator" href="/?tab=kanban">Orchestrator</a>"#),
+            "\"terminals\" must leave the Orchestrator button plain — it is the way back, not where you are: {terminals_body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -18284,12 +18277,15 @@ mod bee_route_tests {
     /// screen reader is told about it on arrival too.
     ///
     /// homepage-terminals: proven a second time with `tab=terminals`, since
-    /// D8 means the Terminals tab is otherwise always reachable — this
-    /// shows `register_error` still overrides it, and that Terminals stays
-    /// on the strip (plain, unselected) even while forced off.
+    /// D8 means the terminals view is otherwise always reachable — this
+    /// shows `register_error` still overrides it.
+    ///
+    /// console-rail-orchestrator (D1): the force is untouched; the strip it
+    /// used to be read off is retired, so the destination is now read off
+    /// the topbar's Orchestrator button being marked current.
     #[tokio::test]
-    async fn home_page_register_error_forces_the_tab_carrying_the_banner_over_an_explicit_request()
-    {
+    async fn home_page_register_error_forces_the_board_carrying_the_banner_over_an_explicit_request(
+    ) {
         let dir = fresh_root("home-tab-register-error");
         let st = build_state_with_dir(&dir);
         let root = dir.join("proj-a");
@@ -18302,10 +18298,8 @@ mod bee_route_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         assert!(
-            body.contains(
-                r#"<a class="fg-tab fg-tab--on" href="/?tab=kanban" aria-current="page">Kanban</a>"#
-            ),
-            "a register_error must land on the tab whose rail carries the banner: {body}"
+            body.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#),
+            "a register_error must land on the board whose rail carries the banner: {body}"
         );
         assert!(
             body.contains(
@@ -18330,17 +18324,15 @@ mod bee_route_tests {
             "the register_error banner must sit in the rail's non-scrolling head: {body}"
         );
         assert!(
-            body.contains(r#"<a class="fg-tab" href="/?tab=terminals">Terminals</a>"#),
-            "Terminals must stay on the strip, plain, even while register_error forces Kanban: {body}"
+            !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
+            "the retired tab strip must not come back with the banner: {body}"
         );
 
         let terminals_forced_body =
             body_string(get(app, "/?tab=terminals&register_error=denied").await).await;
         assert!(
-            terminals_forced_body.contains(
-                r#"<a class="fg-tab fg-tab--on" href="/?tab=kanban" aria-current="page">Kanban</a>"#
-            ),
-            "a register_error must force the banner's tab even when tab=terminals was asked for: {terminals_forced_body}"
+            terminals_forced_body.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#),
+            "a register_error must force the banner's section even when tab=terminals was asked for: {terminals_forced_body}"
         );
         assert!(
             terminals_forced_body.contains("fg-banner--danger"),
@@ -18350,22 +18342,21 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// homepage-tabs edge (a), backlog-groom-2 D1 (supersedes the earlier
-    /// "no tab strip at all" rule): with no qualifying project at all, `/`
-    /// still renders the full tab strip — Kanban, Projects, Terminals — so
-    /// the Terminals tab stays reachable regardless of whether any project
-    /// carries a bee board. The Kanban tab itself falls back to its own
-    /// `fg-empty` state instead of the cross-project section; the Projects
-    /// tab still carries the plain project list.
+    /// homepage-tabs edge (a), backlog-groom-2 D1, retargeted by
+    /// console-rail-orchestrator (D1): with no qualifying project at all,
+    /// `/` still renders the chrome that reaches both sections — the
+    /// topbar's Orchestrator button — so neither section is stranded by
+    /// whether any project carries a bee board. The board itself falls back
+    /// to its own `fg-empty` state instead of the cross-project section;
+    /// the rail still carries the plain project list.
     ///
-    /// homepage-terminals: this axis (whether the strip itself renders at
-    /// all) is orthogonal to D8 (whether Terminals shows up ON the strip
-    /// once it does render) — D8 talks about herdr's own state, never about
-    /// `.bee/` project qualification; proven again with `tab=terminals`
-    /// below so a reader sees the strip (and the Terminals anchor on it)
-    /// survives the third tab's own request too.
+    /// homepage-terminals: this axis (whether that chrome renders at all)
+    /// is orthogonal to D8 (whether herdr is up) — D8 talks about herdr's
+    /// own state, never about `.bee/` project qualification; proven again
+    /// with `tab=terminals` below so a reader sees the button survives the
+    /// terminals view's own request too.
     #[tokio::test]
-    async fn home_page_with_no_qualifying_project_still_renders_the_tab_strip() {
+    async fn home_page_with_no_qualifying_project_still_renders_the_orchestrator_button() {
         let dir = fresh_root("home-tab-none-qualify");
         let st = build_state_with_dir(&dir);
         let root = dir.join("no-bee-project");
@@ -18377,24 +18368,24 @@ mod bee_route_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         assert!(
-            body.contains("fg-tabs"),
-            "an empty bee board must still carry the tab strip: {body}"
+            body.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#),
+            "an empty bee board must still carry the Orchestrator button, marked current: {body}"
         );
         assert!(
-            body.contains(r#"href="/?tab=terminals""#),
-            "the Terminals tab anchor must stay reachable even with no qualifying project: {body}"
+            !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
+            "the retired tab strip must not render with no qualifying project either: {body}"
         );
         assert!(
             body.contains("<ul class=\"proj-list\">") || body.contains("fg-empty"),
-            "the plain project list must still render, now as the Projects tab body: {body}"
+            "the plain project list must still render, now in the board's own rail: {body}"
         );
 
         let kanban_resp = get(app.clone(), "/?tab=kanban").await;
         assert_eq!(kanban_resp.status(), StatusCode::OK);
         let kanban_body = body_string(kanban_resp).await;
         assert!(
-            kanban_body.contains("fg-tabs") && kanban_body.contains(r#"href="/?tab=terminals""#),
-            "the Kanban tab's own empty state must still carry the tab strip and Terminals anchor: {kanban_body}"
+            kanban_body.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#),
+            "the board's own empty state must still carry the Orchestrator button: {kanban_body}"
         );
         assert!(
             kanban_body.contains("fg-empty"),
@@ -18405,8 +18396,8 @@ mod bee_route_tests {
         assert_eq!(terminals_resp.status(), StatusCode::OK);
         let terminals_body = body_string(terminals_resp).await;
         assert!(
-            terminals_body.contains("fg-tabs"),
-            "the tab strip must survive a direct Terminals request too, even with no qualifying project: {terminals_body}"
+            terminals_body.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator" href="/?tab=kanban">Orchestrator</a>"#),
+            "the Orchestrator button must survive a direct Terminals request too, plain, even with no qualifying project: {terminals_body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -18790,8 +18781,8 @@ mod bee_route_tests {
             "the family switch being off must read as herdr not running: {body_off}"
         );
         assert!(
-            body_off.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
-            "the tab strip must still render while herdr is off: {body_off}"
+            body_off.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator" href="/?tab=kanban">Orchestrator</a>"#),
+            "the way back to the board must still render while herdr is off: {body_off}"
         );
         std::fs::remove_dir_all(&dir_off).ok();
 
@@ -18812,8 +18803,8 @@ mod bee_route_tests {
             "a reachable herdr with nothing running must read as no agents, not herdr down: {body_empty}"
         );
         assert!(
-            body_empty.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
-            "the tab strip must still render with zero agents: {body_empty}"
+            body_empty.contains(r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator" href="/?tab=kanban">Orchestrator</a>"#),
+            "the way back to the board must still render with zero agents: {body_empty}"
         );
 
         std::fs::remove_dir_all(&dir_empty).ok();

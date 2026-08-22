@@ -147,6 +147,13 @@ pub struct ProjectSuggestion {
 /// unparseable `tab` query value (`server.rs`'s `RegisterFlag` visitor)
 /// always resolves here rather than needing its own fallback branch.
 ///
+/// console-rail-orchestrator (D1): the strip that used to sit under the
+/// topbar and name these sections is retired. The variants and every `tab=`
+/// query value they parse from are untouched — what changed is the chrome
+/// that offers them: the board is reached by the topbar's own `Orchestrator`
+/// anchor ([`home_page`]) and the terminals view by the rail's pinned group,
+/// so no element on the page renders one anchor per variant any more.
+///
 /// console-theme-kanban (ctk-12): the `Projects` variant is retired. Its
 /// whole body -- the project rows, their nested worktree children, the
 /// folder suggestions, the registration form and its error, and the
@@ -159,42 +166,12 @@ pub struct ProjectSuggestion {
 pub enum HomeTab {
     #[default]
     Kanban,
-    /// homepage-terminals D1/D8: the third tab, opening one live agent
-    /// terminal. Always offered on the strip regardless of herdr's own
-    /// state — [`home_tab_strip`] never gates this variant's anchor on
-    /// anything; [`terminals_tab`] is what tells the herdr-off and
-    /// no-agent empty causes apart once this tab is actually selected.
+    /// homepage-terminals D1/D8: the second section, opening one live agent
+    /// terminal. Always reachable regardless of herdr's own state — nothing
+    /// gates the anchors that point here on herdr being up;
+    /// [`terminals_tab`] is what tells the herdr-off and no-agent empty
+    /// causes apart once this section is actually selected.
     Terminals,
-}
-
-/// homepage-tabs: the tab strip above the selected section, reusing the
-/// design system's existing `.fg-tabs`/`.fg-tab`/`.fg-tab--on` component
-/// (`components.css:188-198`) rather than declaring a second one. Real
-/// anchors, not buttons or `<a href="#">` plus JS: the homepage does a full
-/// `location.reload()` on any watched change (`app.js:810-840`), and the tab
-/// choice has to survive that reload and work with JavaScript off.
-fn home_tab_strip(selected: HomeTab) -> String {
-    let tab_link = |tab: HomeTab, href: &str, label: &str| {
-        let on = tab == selected;
-        format!(
-            r#"<a class="fg-tab{on_class}" href="{href}"{aria}>{label}</a>"#,
-            on_class = if on { " fg-tab--on" } else { "" },
-            href = href,
-            aria = if on { r#" aria-current="page""# } else { "" },
-            label = label,
-        )
-    };
-    // console-theme-kanban (ctk-12): two anchors, not three. The Projects
-    // tab is retired — its body is now the Kanban tab's own left rail
-    // ([`project_sidebar`]) — so the strip offers the two sections that
-    // still exist. Terminals is untouched and stays reachable.
-    format!(
-        r#"<nav class="fg-tabs" aria-label="Home sections">{kanban}{terminals}</nav>"#,
-        kanban = tab_link(HomeTab::Kanban, "/?tab=kanban", "Kanban"),
-        // homepage-terminals D8: no gate here — the anchor renders
-        // whatever herdr's own state is; only the tab's own body reads it.
-        terminals = tab_link(HomeTab::Terminals, "/?tab=terminals", "Terminals"),
-    )
 }
 
 /// cross-board (D1, superseded) / homepage-tabs: the home page `/` used to
@@ -205,9 +182,15 @@ fn home_tab_strip(selected: HomeTab) -> String {
 /// decision of what to show (`server.rs::index_page` applies D8's
 /// qualification and D9's empty rule before calling this); empty is treated
 /// as "nothing qualified" and the Kanban tab renders its own `fg-empty`
-/// state instead of `cross_features_html` (backlog-groom-2 D1) -- the tab
-/// strip, and the Terminals tab riding on it, always render regardless of
-/// whether any project carries a bee board.
+/// state instead of `cross_features_html` (backlog-groom-2 D1) -- the
+/// chrome that reaches the two sections renders regardless of whether any
+/// project carries a bee board.
+///
+/// console-rail-orchestrator (D1): that chrome is now the topbar's own
+/// right slot. The strip under the topbar is gone; this function renders
+/// [`topbar_full`] with a single `Orchestrator` anchor to `/?tab=kanban` in
+/// its actions slot, marked current on the board and plain on Terminals.
+/// Nothing about which section a `tab=` value resolves to changed.
 ///
 /// console-theme-kanban (ctk-12): there are two tabs now, not three. The
 /// project list, the folder suggestions, the registration form and its
@@ -307,12 +290,31 @@ pub fn home_page(
             ),
         ),
     };
+    // console-rail-orchestrator (D1): the board's entry point is a real
+    // anchor in the topbar's own right slot, not a strip under it. An
+    // anchor and not a button: the homepage does a full `location.reload()`
+    // on any watched change (`app.js`), so the choice has to survive that
+    // reload and work with JavaScript off, exactly as the retired strip's
+    // anchors did. It is the only element in the topbar that marks itself
+    // current, so `aria-current="page"` here is unambiguous.
+    let on_board = tab == HomeTab::Kanban;
+    let orchestrator = format!(
+        r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator{on_class}" href="/?tab=kanban"{aria}>Orchestrator</a>"#,
+        on_class = if on_board {
+            " topbar__orchestrator--on"
+        } else {
+            ""
+        },
+        aria = if on_board {
+            r#" aria-current="page""#
+        } else {
+            ""
+        },
+    );
     let body = format!(
         r#"{topbar}
-{tabs}
 {section}"#,
-        topbar = topbar(""),
-        tabs = home_tab_strip(tab),
+        topbar = topbar_full("", "", &orchestrator, ""),
         section = section,
     );
     layout_with_drawer(title, "", &body, true)
@@ -7009,12 +7011,14 @@ mod tests {
         );
     }
 
-    /// backlog-groom-2 D1 (#26): an empty cross-project board must not
-    /// swallow the tab strip — Terminals has nothing to do with whether any
-    /// project carries a bee board, so it must stay reachable even when
-    /// Kanban itself has nothing of its own to show.
+    /// backlog-groom-2 D1 (#26), retargeted by console-rail-orchestrator
+    /// (D1): an empty cross-project board must not swallow the chrome that
+    /// reaches the two sections. That chrome is the topbar's `Orchestrator`
+    /// anchor now, not the retired strip, so what this pins is the anchor
+    /// rendering — current, since the board is what is showing — beside the
+    /// board's own honest empty state.
     #[test]
-    fn home_page_with_empty_board_still_renders_tab_strip_and_terminals_tab() {
+    fn home_page_with_empty_board_still_renders_the_orchestrator_button() {
         let body = home_page(
             &[],
             false,
@@ -7028,16 +7032,43 @@ mod tests {
             &[],
         );
         assert!(
-            body.contains("fg-tabs"),
-            "an empty bee board must still carry the tab strip: {body}"
+            !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
+            "the retired tab strip must not render at all: {body}"
         );
         assert!(
-            body.contains(r#"href="/?tab=terminals""#),
-            "the Terminals tab anchor must stay reachable: {body}"
+            body.contains(
+                r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#
+            ),
+            "an empty bee board must still carry the Orchestrator button, marked current: {body}"
         );
         assert!(
             body.contains("fg-empty"),
             "the Kanban tab must show its own empty state instead of nothing: {body}"
+        );
+
+        // The same button on the terminals view: present, plain, and the
+        // only place `aria-current` could have come from in the topbar.
+        let terminals = home_page(
+            &[],
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Terminals,
+            &[],
+            None,
+            true,
+            &[],
+        );
+        assert!(
+            terminals.contains(
+                r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator" href="/?tab=kanban">Orchestrator</a>"#
+            ),
+            "the Orchestrator button must render plain on the terminals view: {terminals}"
+        );
+        assert!(
+            !terminals.contains("topbar__orchestrator--on"),
+            "the Orchestrator button must not read as current off the board: {terminals}"
         );
     }
 
@@ -7078,8 +7109,12 @@ mod tests {
     }
 
     /// backlog-groom-2 D1: a populated board renders exactly as before — the
-    /// tab strip plus the cross-project section verbatim, never the empty
-    /// state.
+    /// Orchestrator button plus the cross-project section verbatim, never
+    /// the empty state.
+    ///
+    /// console-rail-orchestrator (D1): the strip literal this used to probe
+    /// for is retired; the button that replaced it is what pins "the chrome
+    /// still renders beside a populated board".
     ///
     /// console-theme-kanban (ctk-12): repaired, not weakened. The probe was
     /// the bare class `fg-empty`, which stopped identifying the board's own
@@ -7089,7 +7124,7 @@ mod tests {
     /// now names the board's empty-state sentence, which is what it always
     /// meant.
     #[test]
-    fn home_page_with_populated_board_renders_kanban_section_unchanged() {
+    fn home_page_with_populated_board_renders_kanban_section_under_the_orchestrator_button() {
         let marker = r#"<div data-feature-hub="cross-project">MARKER-CONTENT</div>"#;
         let body = home_page(
             &[],
@@ -7103,7 +7138,16 @@ mod tests {
             true,
             &[],
         );
-        assert!(body.contains("fg-tabs"), "{body}");
+        assert!(
+            body.contains(
+                r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator topbar__orchestrator--on" href="/?tab=kanban" aria-current="page">Orchestrator</a>"#
+            ),
+            "a populated board must still carry the Orchestrator button, marked current: {body}"
+        );
+        assert!(
+            !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
+            "the retired tab strip must not render beside a populated board either: {body}"
+        );
         assert!(
             body.contains("MARKER-CONTENT"),
             "a populated cross-project section must render verbatim: {body}"

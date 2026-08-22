@@ -402,6 +402,26 @@ html[data-scheme="dark"] .topbar .home {
 .theme-toggle:hover {
   background: var(--color-surface-hover);
 }
+/* console-rail-orchestrator (D1): the board's entry point, sitting in the
+   topbar's right slot where the retired tab strip's "Kanban" anchor used to
+   sit under the bar. It reuses `.fg-btn.fg-btn--ghost` wholesale and adds
+   only the current state: a filled pill, not a colour swap, so "you are on
+   the board" survives a colour-blind reader and a low-contrast screen — the
+   anchor already carries `aria-current="page"` for the accessibility tree,
+   and this is that same fact rendered as shape. */
+.topbar__orchestrator {
+  white-space: nowrap;
+}
+.topbar__orchestrator--on {
+  background: var(--color-action);
+  color: var(--color-on-action);
+  font-weight: var(--weight-semibold);
+}
+.topbar__orchestrator--on:hover {
+  background: var(--color-action-hover);
+  color: var(--color-on-action);
+}
+
 /* agents-toggle-circle: circular icon button that opens the global agent
    switch drawer, sitting between the topbar menu button and the theme
    toggle at every width — like the theme toggle, it acts on this page
