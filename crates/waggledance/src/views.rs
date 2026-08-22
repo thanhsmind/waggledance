@@ -1304,6 +1304,16 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
   .term-keys button, .term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-2) var(--space-3); }
   .term-reply__actions { justify-content: stretch; }
   .term-reply__actions button { flex: 1; }
+  /* term-keys-one-row: on a handset all eight keys share ONE line — the two
+     groups stop wrapping and every key takes an equal share of the width,
+     so the arrows and the named keys read as one band instead of two rows
+     with a gap. The 44px minimum the arrows keep at desktop width would
+     push the row past a 390px screen, so it yields to the equal share here;
+     the 44px height stays. */
+  .term-controls { flex-wrap: nowrap; gap: var(--space-1); }
+  .term-keys { flex: 1 1 0; flex-wrap: nowrap; min-width: 0; }
+  .term-keys button { flex: 1 1 0; min-width: 0; padding-inline: var(--space-1); }
+  .term-controls .term-keys--move button { min-width: 0; }
 }
 /* The controls read top to bottom in the order they are reached: the screen,
    then the two controls that move the screen, then the keys that drive the
@@ -9114,6 +9124,36 @@ mod tests {
                 ".term-keys button, .term-reply__send, .term-reply__stage, .term-reply__approve {"
             ),
             "the mobile sizing tweak must include term-reply__approve: {html}"
+        );
+    }
+
+    /// term-keys-one-row: on a handset the arrows and the named keys share
+    /// one line — both groups stop wrapping and every key takes an equal
+    /// share, inside the tab's own narrow block and nowhere else.
+    #[test]
+    fn term_keys_share_one_row_only_inside_the_narrow_media_query() {
+        let html = PROJECT_TAB_STYLE;
+        let start = html
+            .find("@media (max-width: 720px) {")
+            .expect("the narrow block must exist");
+        let tail = &html[start..];
+        let end = tail.find("\n}\n").expect("the narrow block must close");
+        let narrow = &tail[..end];
+        for rule in [
+            ".term-controls { flex-wrap: nowrap;",
+            ".term-keys { flex: 1 1 0; flex-wrap: nowrap; min-width: 0; }",
+            ".term-keys button { flex: 1 1 0; min-width: 0;",
+            ".term-controls .term-keys--move button { min-width: 0; }",
+        ] {
+            assert!(
+                narrow.contains(rule),
+                "narrow block must carry `{rule}`: {narrow}"
+            );
+        }
+        let outside = format!("{}{}", &html[..start], &tail[end..]);
+        assert!(
+            !outside.contains("flex-wrap: nowrap"),
+            "the one-row rule is a handset rule only: {outside}"
         );
     }
 
