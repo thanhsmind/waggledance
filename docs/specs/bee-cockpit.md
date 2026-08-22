@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
 updated: 2026-08-22
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator]
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout]
 decisions: []
 coverage: partial
 ---
@@ -99,6 +99,39 @@ now, then what there is to work on:
 At most one thing in this frame is marked the current page: the Orchestrator
 link while the board is showing, or, on the terminals view, the pinned row of
 the terminal actually on screen.
+
+On a handset the same frame answers, narrowed rather than replaced: one page,
+one address, one reading, laid out in a single column below the narrow-screen
+width the rest of this surface already uses. What changes is where the frame's
+parts sit, never what they say:
+
+- The rail leaves the flow and becomes a drawer over the page, opened from a
+  **Projects** item and dismissed by tapping the page behind it. It needs no
+  scripting, so it survives the reload the page performs on its own, and a
+  reader's collapsed project groups are still collapsed when the drawer opens.
+- A **bottom bar** carries four items — **Board**, **Agents**, **Projects**,
+  **Settings** — and marks the section on screen by more than colour alone.
+  Board and Agents are the frame's two existing addresses, Projects is the
+  drawer, Settings the settings page. The Orchestrator link stands down at
+  this width because the Board item already answers it, which keeps the rule
+  above intact: exactly one thing still marks itself the current page.
+- The board opens with three figures — **working**, **need you** and
+  **mergeable** — each read straight off the groups the board has just drawn:
+  what is in progress, how much of that is sitting at a gate or a paused note,
+  and what is ready to merge. Each figure jumps to the section it counts, and
+  a figure of zero is drawn faint rather than hidden. The waiting mark is
+  carried by in-progress work alone, so **need you** lands on In Progress.
+- The groups stack top down in the order the question is asked: whatever
+  carries a waiting mark first, then ready to merge, then in progress, then
+  the rest, with the archive still a collapsed bar at the bottom. At this
+  width only, a group holding no cards is not drawn at all — screen height is
+  the scarce thing on a phone, and an empty header spends it saying nothing.
+  At full width every group keeps its place and its honest empty line.
+
+None of this adds a way to act. There is no floating compose button and no
+notification bell on the phone layout, because the surface still only reads a
+project's store. Above the narrow width the page is exactly what it was: no
+bottom bar, no figures, and the rail back in the frame.
 
 There is deliberately no cross-project Live strip. Presence across many projects
 answered nothing the Features columns did not already answer, while taking the
