@@ -25032,7 +25032,8 @@ mod bee_route_tests {
     /// feature; and `/api/agents` carries the machine state and the feature
     /// for the drawer.
     #[tokio::test]
-    async fn bee_agent_activity_blocked_session_reaches_card_badge_tile_pinned_row_and_agents_feed() {
+    async fn bee_agent_activity_blocked_session_reaches_card_badge_tile_pinned_row_and_agents_feed()
+    {
         let dir = fresh_root("bee-activity-blocked-data");
         enable_terminal(&dir);
         let root = fresh_root("bee-activity-blocked-project");

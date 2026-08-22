@@ -1925,6 +1925,12 @@
 
       if (approveBtn) {
         approveBtn.addEventListener("click", function () {
+          // A4: the server renders this button `disabled` whenever bee says
+          // the agent is at anything other than a permission prompt. A
+          // disabled button fires no click in any browser we ship to, but the
+          // guard is here so a stale card, a keyboard path or a script click
+          // can never one-tap "Approve" into a pane that never asked.
+          if (approveBtn.disabled) return;
           postJson(inputUrl(paneId, base), { text: "Approve", submit: true }).catch(function () {});
         });
       }
@@ -2101,6 +2107,9 @@
         }
         if (approveBtn) {
           approveBtn.addEventListener("click", function () {
+            // A4, same guard as the shared wiring above: a disabled Approve
+            // never posts, whatever produced the click.
+            if (approveBtn.disabled) return;
             postJson(inputUrl(paneId), { text: "Approve", submit: true }).catch(function () {});
           });
         }

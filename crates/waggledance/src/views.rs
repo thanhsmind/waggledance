@@ -1358,6 +1358,10 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
 }
 .term-reply__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
 .term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-1) var(--space-3); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; }
+/* A4: Approve is withheld unless bee says this agent is at a permission
+   prompt. It stays in place, same size, so the row never reflows as a state
+   changes — only its weight drops, and its `title` says why. */
+.term-reply__approve:disabled { opacity: .5; cursor: not-allowed; }
 /* Send is the primary of the pair — Stage beside it stays the quiet one. */
 .term-reply__send { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); }
 /* One tight control block under the screen, on a single line: the arrows and
@@ -1914,7 +1918,8 @@ fn screen_frame(pane: &TerminalsMenuPane) -> String {
             &pane.view.pane_id,
             &pane.view.name,
             pane.is_project_pane,
-            Some(&pane.base)
+            Some(&pane.base),
+            pane.view.bee_state.as_ref()
         ),
     )
 }
@@ -2013,7 +2018,7 @@ fn pane_cards(
 </div>"#,
             pane_id = esc(&p.pane_id),
             name = esc(&p.name),
-            controls = pane_controls(&p.pane_id, &p.name, attach, base),
+            controls = pane_controls(&p.pane_id, &p.name, attach, base, p.bee_state.as_ref()),
         ));
     }
     out
@@ -2033,10 +2038,42 @@ fn pane_cards(
 /// callers ([`terminal_page`], [`unassigned_terminal_page`]) both pass
 /// `None`: their controls already resolve through that project-scoped
 /// fallback and must render byte-identical markup to before this cell.
-fn pane_controls(pane_id: &str, name: &str, attach: bool, base: Option<&str>) -> String {
+///
+/// A4: `bee_state` is the pane's own [`TerminalPaneView::bee_state`], threaded
+/// in by the two callers that hold the view. It rides the form as
+/// `data-agent-state="<word>"` (the same word every other surface prints —
+/// [`BeeActivityState::word`], never a second spelling) and gates the Approve
+/// button: enabled for `blocked` and for a pane with no bee record at all,
+/// `disabled` with the reason in its `title` for every other state. Known
+/// limit: the card is server-rendered and the screen poller only replaces
+/// `.term-screen` text, so this gate is as fresh as the last page load.
+fn pane_controls(
+    pane_id: &str,
+    name: &str,
+    attach: bool,
+    base: Option<&str>,
+    bee_state: Option<&BeeActivityState>,
+) -> String {
     let base_attr = base
         .map(|b| format!(r#" data-term-base="{}""#, esc(b)))
         .unwrap_or_default();
+    let state_attr = bee_state
+        .map(|s| format!(r#" data-agent-state="{}""#, esc(s.word())))
+        .unwrap_or_default();
+    // A4: Approve types a one-tap "Approve" into the pane, which only ever
+    // answers a permission prompt. bee's own state is the only reading that
+    // knows whether one is on screen, so the button is offered for `blocked`
+    // and withheld — visibly, with the reason in its title — for every other
+    // state a live session reports. A pane no bee session claims keeps
+    // today's always-enabled button byte for byte: withholding it there
+    // would take away a working control on the evidence of nothing.
+    let approve_btn = match bee_state {
+        Some(state) if !matches!(state, BeeActivityState::Blocked) => format!(
+            r#"<button type="button" class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is {word}">Approve</button>"#,
+            word = esc(state.word()),
+        ),
+        _ => r#"<button type="button" class="term-reply__approve">Approve</button>"#.to_string(),
+    };
     let attach_block = if attach {
         format!(
             r#"
@@ -2068,10 +2105,10 @@ fn pane_controls(pane_id: &str, name: &str, attach: bool, base: Option<&str>) ->
       <button type="button" data-key="ctrl+c">Ctrl+C</button>
     </div>
   </div>
-  <form class="term-reply" data-pane-id="{pane_id}"{base_attr}>
+  <form class="term-reply" data-pane-id="{pane_id}"{base_attr}{state_attr}>
     <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>{attach_block}
     <div class="term-reply__actions">
-      <button type="button" class="term-reply__approve">Approve</button>
+      {approve_btn}
       <button type="button" class="term-reply__stage">Stage</button>
       <button type="submit" class="term-reply__send">Send</button>
     </div>
@@ -2080,6 +2117,8 @@ fn pane_controls(pane_id: &str, name: &str, attach: bool, base: Option<&str>) ->
         name = esc(name),
         attach_block = attach_block,
         base_attr = base_attr,
+        state_attr = state_attr,
+        approve_btn = approve_btn,
     )
 }
 
@@ -9460,7 +9499,7 @@ mod tests {
     /// Send, and Stage/Send keep their existing relative order.
     #[test]
     fn pane_controls_renders_approve_before_stage_and_send() {
-        let html = pane_controls("pane-1", "Agent One", false, None);
+        let html = pane_controls("pane-1", "Agent One", false, None, None);
         assert!(
             html.contains(r#"<button type="button" class="term-reply__approve">Approve</button>"#),
             "the Approve button must render: {html}"
@@ -9477,6 +9516,101 @@ mod tests {
         assert!(
             approve_at < stage_at && stage_at < send_at,
             "the row must read Approve, Stage, Send: {html}"
+        );
+        assert!(
+            !html.contains("data-agent-state"),
+            "a pane no bee session claims carries no state attribute at all: {html}"
+        );
+    }
+
+    /// A4: Approve types a permission answer, so it is offered only where a
+    /// permission prompt is what is on screen — bee's `blocked` — and
+    /// withheld, with the reason readable in its title, for every other
+    /// state a live session reports. The form carries that state as a data
+    /// attribute either way, in the same words every other surface prints.
+    #[test]
+    fn pane_controls_gates_approve_on_the_panes_bee_state() {
+        let blocked = pane_controls(
+            "pane-1",
+            "Agent One",
+            false,
+            None,
+            Some(&BeeActivityState::Blocked),
+        );
+        assert!(
+            blocked
+                .contains(r#"<button type="button" class="term-reply__approve">Approve</button>"#),
+            "a blocked pane keeps the plain, enabled Approve button: {blocked}"
+        );
+        assert!(
+            blocked.contains(r#"data-agent-state="needs approval""#),
+            "the reply form must carry the blocked pane's state word: {blocked}"
+        );
+
+        let waiting = pane_controls(
+            "pane-1",
+            "Agent One",
+            false,
+            None,
+            Some(&BeeActivityState::WaitingInput),
+        );
+        assert!(
+            waiting.contains(
+                r#"<button type="button" class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is needs an answer">Approve</button>"#
+            ),
+            "a pane waiting on a typed answer must render Approve disabled, with the reason: {waiting}"
+        );
+        assert!(
+            waiting.contains(r#"data-agent-state="needs an answer""#),
+            "the reply form must carry that pane's state word too: {waiting}"
+        );
+        for enabled in [
+            r#"<button type="button" class="term-reply__stage">Stage</button>"#,
+            r#"<button type="submit" class="term-reply__send">Send</button>"#,
+        ] {
+            assert!(
+                waiting.contains(enabled),
+                "Stage and Send are never gated by a bee state: {waiting}"
+            );
+        }
+
+        let working = pane_controls(
+            "pane-1",
+            "Agent One",
+            false,
+            None,
+            Some(&BeeActivityState::Working),
+        );
+        assert!(
+            working.contains(
+                r#"class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is working">Approve</button>"#
+            ),
+            "a working pane must render Approve disabled too: {working}"
+        );
+    }
+
+    /// A4's withheld button still has to READ as withheld — a disabled
+    /// Approve dims and refuses the pointer, and does so by its own rule
+    /// (nothing else in this stylesheet covers `.term-reply__approve`).
+    #[test]
+    fn disabled_approve_reads_as_withheld() {
+        assert!(
+            PROJECT_TAB_STYLE
+                .contains(".term-reply__approve:disabled { opacity: .5; cursor: not-allowed; }"),
+            "the disabled Approve rule must ship: {PROJECT_TAB_STYLE}"
+        );
+    }
+
+    /// A4's JS half: a disabled Approve posts nothing, whatever produced the
+    /// click — the button is server-rendered and only refreshed by a page
+    /// load, so the handler never trusts the DOM to have stopped it.
+    #[test]
+    fn app_js_ignores_a_click_on_a_disabled_approve_button() {
+        let script = include_str!("../assets/app.js");
+        assert_eq!(
+            script.matches("if (approveBtn.disabled) return;").count(),
+            2,
+            "both Approve handlers (shared wiring and the Unassigned page's own) must guard on disabled: {script}"
         );
     }
 
