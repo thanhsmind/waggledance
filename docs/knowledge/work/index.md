@@ -17,6 +17,7 @@ never a generation timestamp or any other wall-clock value.
 - [backlog-groom-1/](backlog-groom-1/index.md) — 1 concept(s)
 - [backlog-groom-2/](backlog-groom-2/index.md) — 1 concept(s)
 - [badge-title/](badge-title/index.md) — 1 concept(s)
+- [board-new-task/](board-new-task/index.md) — 1 concept(s)
 - [card-badge-inside/](card-badge-inside/index.md) — 1 concept(s)
 - [card-collapse-inprogress/](card-collapse-inprogress/index.md) — 1 concept(s)
 - [card-terminals/](card-terminals/index.md) — 1 concept(s)
