@@ -459,6 +459,13 @@ fn router(state: AppState) -> Router {
         .route("/p/:id/_search", get(search_page))
         .route("/p/:id/_jump", get(jump_search))
         .route("/p/:id/_bee", get(bee_board))
+        // board-approve-actions (D1/D3/D4): the board's one write path —
+        // a card's Approve/Reject relayed into the project's own bee CLI
+        // (a gate) or into the agent's waiting pane (a permission prompt).
+        // Mounted here, inside the same Host-allowlist layer as every other
+        // route, and gated by nothing else but D3's per-project opt-in —
+        // see `bee_action`'s own doc comment.
+        .route("/p/:id/_bee/actions", post(bee_action))
         .route("/p/:id/_bee/cell/:cell_id", get(bee_cell_detail))
         .route("/p/:id/_bee/feature/:feature", get(bee_feature_detail))
         .route("/p/:id/_bee/pbi/:pbi_id", get(bee_pbi_detail))
@@ -1501,6 +1508,325 @@ async fn create_project_pbi(
         Json(json!({ "id": pbi_id, "project_id": project.id })),
     )
         .into_response()
+}
+
+/// `POST /p/:id/_bee/actions` body (board-approve-actions D1/D3/D4) — the
+/// only write a feature card can make: which stop is being answered
+/// (`kind`) and for which feature. Deliberately the only two fields — the
+/// board is a relay (D5), so a request has nowhere to put a lane path, an
+/// actor, a bee verb or a pane id even if a client tries.
+#[derive(serde::Deserialize)]
+struct BeeActionBody {
+    kind: String,
+    feature: String,
+}
+
+/// The six answers a card's one Approve+Reject pair can send (D1): the UAT
+/// gate, the merged shape+execution gate, and the agent's own permission
+/// prompt, each with its refusal half. Any other string is a `400` — this
+/// route never grows into a generic "run any bee verb" door, which is
+/// exactly what plan.md rejected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BeeActionKind {
+    UatApprove,
+    UatReject,
+    GateApprove,
+    GateReject,
+    PermissionApprove,
+    PermissionReject,
+}
+
+/// Which gate a gate kind answers — the `bee gate` selector and the word the
+/// wake-up line names it by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BeeGate {
+    /// `bee gate --name uat` — the UAT stop (`--actor auto` is refused for
+    /// it; this is a human's click, so the CLI's default actor is right).
+    Uat,
+    /// `bee gate --merge` — the merged shape+execution gate.
+    Merged,
+}
+
+impl BeeGate {
+    /// What follows `gate` in the argv, before `--approved`.
+    fn selector(self) -> &'static [&'static str] {
+        match self {
+            Self::Uat => &["--name", "uat"],
+            Self::Merged => &["--merge"],
+        }
+    }
+
+    /// The word D4's one line into the pane names this gate by — the same
+    /// word the button the human pressed carries.
+    fn word(self) -> &'static str {
+        match self {
+            Self::Uat => "uat",
+            Self::Merged => "gate",
+        }
+    }
+}
+
+impl BeeActionKind {
+    fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "uat-approve" => Self::UatApprove,
+            "uat-reject" => Self::UatReject,
+            "gate-approve" => Self::GateApprove,
+            "gate-reject" => Self::GateReject,
+            "permission-approve" => Self::PermissionApprove,
+            "permission-reject" => Self::PermissionReject,
+            _ => return None,
+        })
+    }
+
+    /// `Some((which gate, approved))` for the four gate kinds; `None` for
+    /// the two permission kinds, which never run bee at all — they are a
+    /// keystroke into a waiting pane, nothing more.
+    fn gate(self) -> Option<(BeeGate, bool)> {
+        match self {
+            Self::UatApprove => Some((BeeGate::Uat, true)),
+            Self::UatReject => Some((BeeGate::Uat, false)),
+            Self::GateApprove => Some((BeeGate::Merged, true)),
+            Self::GateReject => Some((BeeGate::Merged, false)),
+            Self::PermissionApprove | Self::PermissionReject => None,
+        }
+    }
+}
+
+/// Every refusal this route makes, in the one shape the card reads back
+/// inline: a JSON `{error}`, never an HTML error page — this route's only
+/// caller is `fetch`. Deliberately its own function rather than a shared one
+/// with `pbi_error`: the two surfaces answer different dialogs and are free
+/// to diverge.
+fn action_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(json!({ "error": message.into() }))).into_response()
+}
+
+/// D4's one line into the feature's bound pane after a gate write, so the
+/// waiting session wakes and its own waiting-on mark clears. A board click
+/// is not a user message — this line stands in for one, and says where it
+/// came from so the session's transcript records the provenance bee's own
+/// gate record cannot.
+fn gate_wake_line(gate: BeeGate, approved: bool) -> String {
+    format!(
+        "{} {} from the board",
+        gate.word(),
+        if approved { "approved" } else { "unapproved" }
+    )
+}
+
+/// The panes bound to `feature` in `project`, through the exact join
+/// `bee_board` renders its badges from ([`project_bee_activity`] +
+/// [`project_feature_panes`]) — so the pane a card badges is the pane a
+/// click on that card writes to, never a second, differently-derived
+/// answer. A herdr that is down, an absent `.bee/`, or a feature with no
+/// checkout of its own all yield an empty list, which every caller here
+/// reads as "no live pane" rather than as an error.
+async fn feature_bound_panes(
+    st: &AppState,
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+) -> Vec<views::TerminalPaneView> {
+    let herdr_snapshot = st.herdr.snapshot().await.ok();
+    let root = project.root_path.clone();
+    let cache = st.bee_cache.clone();
+    let Ok(rollup) = tokio::task::spawn_blocking(move || cached_read_rollup(&cache, &root)).await
+    else {
+        return Vec::new();
+    };
+    let bee = project_bee_activity(project, &rollup);
+    let mut panes = project_feature_panes(herdr_snapshot.as_ref(), project, &rollup, &bee);
+    panes.remove(feature).unwrap_or_default()
+}
+
+/// D4's second, best-effort half: one line into the feature's own live agent
+/// pane. `false` means there was nobody to wake (no live pane, herdr down, a
+/// pane that has since gone) — never that the gate failed, which is why the
+/// caller reports it as `woke` beside `ok: true` rather than as an error.
+///
+/// Never a shell pane: this line is a message to an agent, and a shell would
+/// execute it as a command.
+async fn wake_feature_pane(
+    st: &AppState,
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+    line: &str,
+) -> bool {
+    let panes = feature_bound_panes(st, project, feature).await;
+    let Some(pane) = panes.iter().find(|p| p.kind != "shell") else {
+        return false;
+    };
+    st.herdr.send_input(&pane.pane_id, line, true).await.is_ok()
+}
+
+/// The gate half of [`bee_action`] (D4): write the answer through the
+/// project's OWN `.bee/bin/bee`, then wake the session waiting on it.
+///
+/// The spawn is `create_project_pbi`'s shape verbatim — the project's own
+/// vendored binary (never a PATH `bee`, which would move a gate in a
+/// repository that never opted in), `current_dir` the project root (which is
+/// what decides *whose* gate this is, and is the one cwd bee's control-plane
+/// verbs accept — they refuse inside a granted worktree), null stdin, and
+/// `--json`. Its refusal mapping is the same too, and for the same reason:
+/// bee is the only party that knows why it said no — an advisor
+/// precondition, a plan conflict, `WORKTREE_MERGE_UAT_PENDING` — so its own
+/// stderr tail is what reaches the card, not a generic failure.
+///
+/// `--lane <feature>` versus `--no-lane` is decided by the lane file on
+/// disk, never guessed: bee refuses a `--lane` naming no lane, and refuses a
+/// lane-less run that did not say `--no-lane`.
+async fn bee_action_gate(
+    st: &AppState,
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+    gate: BeeGate,
+    approved: bool,
+) -> Response {
+    let Some(bee) = project_bee_binary(&project.root_path) else {
+        return action_error(
+            StatusCode::CONFLICT,
+            "this project is not set up with bee, so it has no gate to write",
+        );
+    };
+
+    let mut cmd = tokio::process::Command::new(&bee);
+    cmd.arg("gate");
+    for arg in gate.selector() {
+        cmd.arg(arg);
+    }
+    cmd.arg("--approved")
+        .arg(if approved { "true" } else { "false" });
+    let lane_file = project
+        .root_path
+        .join(".bee")
+        .join("lanes")
+        .join(format!("{feature}.json"));
+    if lane_file.is_file() {
+        cmd.arg("--lane").arg(feature);
+    } else {
+        cmd.arg("--no-lane");
+    }
+    cmd.arg("--json")
+        .current_dir(&project.root_path)
+        .stdin(std::process::Stdio::null());
+
+    let out = match cmd.output().await {
+        Ok(out) => out,
+        Err(e) => {
+            return action_error(
+                StatusCode::BAD_GATEWAY,
+                format!("could not run this project's bee: {e}"),
+            )
+        }
+    };
+    if !out.status.success() {
+        return action_error(StatusCode::BAD_GATEWAY, stderr_tail(&out.stderr));
+    }
+
+    // The gate is written and nothing below can take it back (D4): a pane
+    // failure never undoes it, so every way the wake can miss answers
+    // `ok: true, woke: false`.
+    let woke = wake_feature_pane(st, project, feature, &gate_wake_line(gate, approved)).await;
+    Json(json!({ "ok": true, "woke": woke })).into_response()
+}
+
+/// The permission half of [`bee_action`] (D1): the card's one-click answer
+/// to the prompt an agent is sitting on right now. No bee run at all — the
+/// prompt lives in the agent's own terminal, so the answer is the same
+/// keystroke the terminal's own Approve button sends.
+///
+/// The target is the feature's bound pane whose bee state is
+/// [`waggledance_core::bee::BeeActivityState::Blocked`] — the one state an
+/// approve is valid for (the terminal button's own rule, decision
+/// `110d9120`). No such pane is a `409`: the human is answering a prompt
+/// that is no longer there, and guessing a pane would type `Approve` into
+/// whatever happens to be running.
+///
+/// Approve sends the literal text `Approve` with `submit: true`, byte for
+/// byte what `assets/app.js`'s terminal Approve button posts. Reject sends
+/// the herdr key `escape` — the dismissal a human presses at the prompt —
+/// through the same channel `/keys` uses.
+async fn bee_action_permission(
+    st: &AppState,
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+    approve: bool,
+) -> Response {
+    let panes = feature_bound_panes(st, project, feature).await;
+    let Some(pane) = panes.iter().find(|p| {
+        p.kind != "shell"
+            && p.bee_state.as_ref() == Some(&waggledance_core::bee::BeeActivityState::Blocked)
+    }) else {
+        return action_error(
+            StatusCode::CONFLICT,
+            "no agent is waiting on a permission prompt for this feature",
+        );
+    };
+    let sent = if approve {
+        st.herdr.send_input(&pane.pane_id, "Approve", true).await
+    } else {
+        st.herdr
+            .send_keys(&pane.pane_id, &["escape".to_string()])
+            .await
+    };
+    match sent {
+        Ok(()) => Json(json!({ "ok": true, "woke": true })).into_response(),
+        Err(herdr::HerdrError::NoSuchPane(_)) => action_error(
+            StatusCode::NOT_FOUND,
+            "that agent's pane is gone — nothing was sent",
+        ),
+        Err(_) => herdr_down_response(),
+    }
+}
+
+/// `POST /p/:id/_bee/actions` (board-approve-actions D1/D3/D4) — the board's
+/// one write path: a human's click on a feature card's Approve or Reject,
+/// relayed into bee or into the waiting pane.
+///
+/// The board decides nothing here. It carries the click to the party that
+/// owns the answer — the project's own `bee` CLI for a gate (never this
+/// process: `.bee/` is the CLI's to write, the same rule
+/// `create_project_pbi` follows for the backlog), or the agent's own pane
+/// for a permission prompt — and mirrors what came back (D5).
+///
+/// Guarded by exactly two things: the Host allowlist every route in this
+/// router sits behind, and D3's per-project `orchestration.enabled` opt-in.
+/// A project that never opted in is a `403` naming its remedy, and nothing
+/// runs — no bee spawn, no keystroke, not even a rollup read.
+async fn bee_action(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<BeeActionBody>,
+) -> Response {
+    let Some(kind) = BeeActionKind::parse(&body.kind) else {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            format!("unknown board action {:?}", body.kind),
+        );
+    };
+    let Ok(Some(project)) = st.engine.get_project(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "project not found");
+    };
+    if !project.orchestration_enabled {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "this project does not take board actions — enable orchestration for this project on the settings page",
+        );
+    }
+    match kind.gate() {
+        Some((gate, approved)) => {
+            bee_action_gate(&st, &project, &body.feature, gate, approved).await
+        }
+        None => {
+            bee_action_permission(
+                &st,
+                &project,
+                &body.feature,
+                kind == BeeActionKind::PermissionApprove,
+            )
+            .await
+        }
+    }
 }
 
 /// The Telegram credential state `settings_page` renders — masked to the
@@ -26179,6 +26505,500 @@ mod bee_route_tests {
                 r#"<span class="bee-hub__stat-num">0</span><span class="bee-hub__stat-label">need you</span>"#
             ),
             "working is not need-you: {board}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── board-approve-actions: `POST /p/:id/_bee/actions` ────────────────
+    //
+    // The route's whole job is to relay one human click: into the
+    // *project's own* `.bee/bin/bee` for a gate, or into the feature's own
+    // waiting pane for a permission prompt. So these tests use the same two
+    // seams the surfaces they mirror already use — the `fake_bee` argv
+    // recorder from the board-new-task block above (the only way to prove
+    // the argv and the cwd without a bee-shaped repository per test), and
+    // `FakeHerdr`, whose screen echo is what a sent line or key shows up in.
+    //
+    // The gate tests are Unix-only for `fake_bee`'s own reason (it is a
+    // `#!/bin/sh` script); the opt-in and unknown-kind refusals never reach
+    // a spawn at all, so they run everywhere.
+
+    fn action_req(id: &str, kind: &str, feature: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .uri(format!("/p/{id}/_bee/actions"))
+            .method("POST")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "kind": kind, "feature": feature }).to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn action_json(resp: Response) -> serde_json::Value {
+        let body = body_string(resp).await;
+        serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("every action response is JSON ({e}): {body}"))
+    }
+
+    /// What one pane's screen shows right now — the FakeHerdr echo that
+    /// makes a `send_input`/`send_keys` observable without a live terminal.
+    async fn pane_screen(st: &AppState, pane_id: &str) -> String {
+        st.herdr
+            .read_pane(pane_id, herdr::ReadSource::Visible, 200)
+            .await
+            .unwrap()
+            .text
+    }
+
+    /// D3/D4, the happy path and the flag this route must never guess: an
+    /// opted-in project's uat-approve runs the project's OWN bee, in the
+    /// project's OWN directory (which is what decides whose gate moves),
+    /// with `--lane <feature>` when that feature has a lane file and
+    /// `--no-lane` when it does not — bee refuses each of those two the
+    /// other way round. With no live pane in the checkout the gate is still
+    /// written and the answer says so: `ok: true, woke: false` (must-have).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_uat_approve_runs_the_projects_own_bee_with_the_lane_it_finds() {
+        let dir = fresh_root("action-uat-cfg");
+        let root = fresh_root("action-uat-root");
+        let log = fresh_root("action-uat-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-uat", "live-uat");
+        fake_bee(&root, &log, "{\"ok\":true}\n[bee] gate 1ms\n", "", 0);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "action-uat");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "uat-approve", "feat-uat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = action_json(resp).await;
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(
+            json["woke"], false,
+            "no live pane in this checkout: the gate is written and nobody was woken: {json}"
+        );
+
+        let (cwd, argv) = recorded(&log);
+        assert_eq!(
+            std::fs::canonicalize(&cwd).unwrap(),
+            std::fs::canonicalize(&project.root_path).unwrap(),
+            "bee must run in the project's own root, or it moves another project's gate"
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "gate",
+                "--name",
+                "uat",
+                "--approved",
+                "true",
+                "--lane",
+                "feat-uat",
+                "--json",
+            ],
+            "a feature with a lane file must be approved on its own lane"
+        );
+
+        // The same click for a feature this project has no lane file for:
+        // `--no-lane`, never a `--lane` bee would refuse.
+        let resp = router(st)
+            .oneshot(action_req(&project.id, "uat-approve", "feat-laneless"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, argv) = recorded(&log);
+        assert_eq!(
+            argv,
+            vec![
+                "gate",
+                "--name",
+                "uat",
+                "--approved",
+                "true",
+                "--no-lane",
+                "--json",
+            ],
+            "a feature with no lane file on disk must say --no-lane"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D1/D4: the merged shape+execution gate is a different selector
+    /// (`--merge`, not `--name`), and Reject is the same verb with
+    /// `--approved false` — that is what makes a wrong click on the board
+    /// reversible rather than a dead end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_gate_reject_unapproves_the_merged_gate() {
+        let dir = fresh_root("action-merge-cfg");
+        let root = fresh_root("action-merge-root");
+        let log = fresh_root("action-merge-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-merge", "live-merge");
+        fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "action-merge");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st)
+            .oneshot(action_req(&project.id, "gate-reject", "feat-merge"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, argv) = recorded(&log);
+        assert_eq!(
+            argv,
+            vec![
+                "gate",
+                "--merge",
+                "--approved",
+                "false",
+                "--lane",
+                "feat-merge",
+                "--json",
+            ],
+            "the merged gate takes --merge, and Reject is --approved false"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D4's second half: after the gate is written, ONE line goes into the
+    /// feature's own live agent pane so the waiting session wakes — the same
+    /// pane join the board already badges that card with, so the pane a
+    /// reader sees is the pane the click reaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_gate_wakes_the_features_own_agent_pane() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("action-wake-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-wake-root");
+        let log = fresh_root("action-wake-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-wake", "live-wake");
+        fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        let pane = fake
+            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .await
+            .unwrap();
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "action-wake");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "uat-approve", "feat-wake"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = action_json(resp).await;
+        assert_eq!(
+            json["woke"], true,
+            "a live agent pane in the feature's checkout must be woken: {json}"
+        );
+
+        let screen = pane_screen(&st, &pane.pane_id).await;
+        assert!(
+            screen.contains("uat approved from the board"),
+            "the pane must receive one line saying what was answered and by whom: {screen:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D3, the must-have: a project that never opted in answers 403 with the
+    /// remedy in words, and NOTHING runs — the stub bee is right there on
+    /// disk and is never reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_refuses_a_project_that_never_opted_in() {
+        let dir = fresh_root("action-optout-cfg");
+        let root = fresh_root("action-optout-root");
+        let log = fresh_root("action-optout-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-out", "live-out");
+        fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "action-optout");
+        assert!(
+            !project.orchestration_enabled,
+            "a freshly registered project must default to opted-out (D3/D6)"
+        );
+
+        let resp = router(st)
+            .oneshot(action_req(&project.id, "uat-approve", "feat-out"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let msg = error_of(resp).await;
+        assert!(
+            msg.contains("enable orchestration for this project on the settings page"),
+            "the 403 must name the one thing that fixes it: {msg}"
+        );
+        assert!(
+            !log.exists(),
+            "an opted-out project must never reach its own bee at all"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The refusals a card has to be able to show inline. An unknown kind is
+    /// a 400 before anything is looked up — this route answers six named
+    /// actions and is never a door onto arbitrary bee verbs; an unknown
+    /// project id is a 404; and an opted-in project that vendored no bee is
+    /// a 409 in words, never a fallback to whatever `bee` is on the daemon's
+    /// PATH.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_names_its_refusals_without_ever_running_a_foreign_bee() {
+        let dir = fresh_root("action-refusals-cfg");
+        let root = fresh_root("action-refusals-root");
+        let log = fresh_root("action-refusals-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-ref", "live-ref");
+        fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "action-refusals");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        // An action name this route does not answer: 400, and bee is never
+        // reached.
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "compound", "feat-ref"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!error_of(resp).await.is_empty(), "the 400 must say something");
+        assert!(
+            !log.exists(),
+            "an unknown kind must never reach the project's bee at all"
+        );
+
+        // No such project: 404.
+        let resp = router(st.clone())
+            .oneshot(action_req("no-such-project", "uat-approve", "feat-ref"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(!error_of(resp).await.is_empty());
+
+        // Opted in, but nothing vendored to write the gate with: 409.
+        let bare = fresh_root("action-refusals-bare");
+        write(&bare, ".bee/state.json", r#"{"phase":"swarming"}"#);
+        let bare_project = register(&st, &bare, "action-refusals-bare");
+        st.engine
+            .set_orchestration_enabled(&bare_project.id, true)
+            .unwrap();
+        let resp = router(st)
+            .oneshot(action_req(&bare_project.id, "uat-approve", "feat-ref"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a project with no bee is a conflict, not a not-found"
+        );
+        let msg = error_of(resp).await;
+        assert!(
+            msg.contains("not set up with bee"),
+            "the 409 must name what is missing: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// The must-have: when bee itself refuses — an advisor precondition, a
+    /// plan conflict, `WORKTREE_MERGE_UAT_PENDING` — the card gets bee's own
+    /// words, its stderr tail, because bee is the only party that knows why.
+    /// 502, not 500: the failure is downstream, in the process this route
+    /// called.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_hands_back_a_refusing_bees_own_stderr() {
+        let dir = fresh_root("action-stderr-cfg");
+        let root = fresh_root("action-stderr-root");
+        let log = fresh_root("action-stderr-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-err", "live-err");
+        fake_bee(
+            &root,
+            &log,
+            "",
+            "bee: refusing --merge: the advisor precondition is unmet",
+            1,
+        );
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "action-stderr");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st)
+            .oneshot(action_req(&project.id, "gate-approve", "feat-err"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let msg = error_of(resp).await;
+        assert!(
+            msg.contains("the advisor precondition is unmet"),
+            "bee's own refusal must reach the card verbatim: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D1's permission half: the card's Approve types the same `Approve`
+    /// the terminal's own button sends, into the feature's own BLOCKED pane
+    /// and no other; Reject sends the `escape` a human presses to dismiss
+    /// the prompt. No bee run at all — the prompt lives in the pane.
+    #[tokio::test]
+    async fn bee_action_permission_answers_the_blocked_pane_the_card_shows() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("action-permission-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-permission-root");
+        write_cross_project_live_feature(&root, "feat-perm", "live-perm");
+
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        let pane = fake
+            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .await
+            .unwrap();
+        write(
+            &root,
+            ".bee/sessions/live-blocked.json",
+            &activity_session_json(
+                "live-blocked",
+                "blocked",
+                &rfc3339_seconds_ago(3),
+                Some(&pane.pane_id),
+                &root,
+                Some("feat-perm"),
+                None,
+            ),
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "action-permission");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "permission-approve", "feat-perm"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = action_json(resp).await;
+        assert_eq!(json["ok"], true, "{json}");
+        let screen = pane_screen(&st, &pane.pane_id).await;
+        assert!(
+            screen.contains("Approve"),
+            "Approve must reach the pane as the terminal button's own text: {screen:?}"
+        );
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "permission-reject", "feat-perm"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let screen = pane_screen(&st, &pane.pane_id).await;
+        assert!(
+            screen.contains("<escape>"),
+            "Reject must send the escape key that dismisses the prompt: {screen:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D1: a permission answer is only ever valid against an agent that is
+    /// actually sitting on a prompt. With no blocked pane bound to the
+    /// feature there is nothing to answer, and the route says so (409)
+    /// rather than typing `Approve` into whatever else happens to be
+    /// running in that checkout.
+    #[tokio::test]
+    async fn bee_action_permission_refuses_when_no_agent_is_waiting() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("action-noprompt-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-noprompt-root");
+        write_cross_project_live_feature(&root, "feat-quiet", "live-quiet");
+
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        let pane = fake
+            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .await
+            .unwrap();
+        // The agent is live and bound to the feature — just working, not
+        // blocked. That is precisely the case an Approve must not reach.
+        write(
+            &root,
+            ".bee/sessions/live-working.json",
+            &activity_session_json(
+                "live-working",
+                "working",
+                &rfc3339_seconds_ago(3),
+                Some(&pane.pane_id),
+                &root,
+                Some("feat-quiet"),
+                None,
+            ),
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "action-noprompt");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let before = pane_screen(&st, &pane.pane_id).await;
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "permission-approve", "feat-quiet"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("no agent is waiting on a permission prompt for this feature"),
+            "the 409 must say what is not there: {body}"
+        );
+        assert_eq!(
+            pane_screen(&st, &pane.pane_id).await,
+            before,
+            "a working agent's pane must be left untouched"
         );
 
         std::fs::remove_dir_all(&dir).ok();
