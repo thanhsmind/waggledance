@@ -21,7 +21,9 @@ feature's branch checkout counts as present in both places; after
 board-pane-lane-pin the main-checkout share was keyed by the session's own
 feature, which is the very feature the branch-checkout share already gave it,
 so one terminal wore two identical markers. The branch-checkout marker is the
-one kept. Decision logged 2026-08-23 (touches 3daa1ea7).
+one kept. Decision logged 2026-08-23 (touches 3daa1ea7). *Reconciled
+2026-08-23 (board-approve-actions):* the same feature join also selects the
+one pane a board Approve/Reject reaches.
 
 ## Verify
 
