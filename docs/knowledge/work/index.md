@@ -23,6 +23,7 @@ never a generation timestamp or any other wall-clock value.
 - [bee-artifact-rename/](bee-artifact-rename/index.md) — 1 concept(s)
 - [board-declutter/](board-declutter/index.md) — 1 concept(s)
 - [board-new-task/](board-new-task/index.md) — 1 concept(s)
+- [board-pane-lane-pin/](board-pane-lane-pin/index.md) — 1 concept(s)
 - [board-topbar-polish/](board-topbar-polish/index.md) — 1 concept(s)
 - [board-trim/](board-trim/index.md) — 1 concept(s)
 - [bundle-mono-font/](bundle-mono-font/index.md) — 1 concept(s)
