@@ -3814,9 +3814,29 @@ fn project_feature_panes(
         .filter(|f| !worktree_features.contains(f))
         .collect();
     for (feature, panes) in key_main_panes_by_feature(main_panes, &main_features) {
-        out.entry(feature).or_default().extend(panes);
+        merge_panes_once(out.entry(feature).or_default(), panes);
     }
     out
+}
+
+/// board-pane-dedupe: append `incoming` onto a feature's pane list, skipping
+/// any pane whose id the list already holds. One pane can validate into BOTH
+/// a worktree bucket and the main bucket -- its shell sits in the main
+/// checkout while its foreground process runs inside the feature's worktree
+/// (`project_panes` accepts either directory) -- and after
+/// board-pane-lane-pin the main bucket keys that pane by its session's
+/// feature, which is the same feature the worktree bucket already gave it.
+/// A card never shows the same pane twice; the worktree bucket's copy,
+/// already in `existing`, wins.
+fn merge_panes_once(
+    existing: &mut Vec<views::TerminalPaneView>,
+    incoming: Vec<views::TerminalPaneView>,
+) {
+    for pane in incoming {
+        if !existing.iter().any(|p| p.pane_id == pane.pane_id) {
+            existing.push(pane);
+        }
+    }
 }
 
 /// board-pane-lane-pin: how the main checkout's panes are handed to feature
@@ -3898,6 +3918,17 @@ mod key_main_panes_by_feature_tests {
         let out = key_main_panes_by_feature(vec![pane("w1:p1", Some("lane-x"))], &["alpha"]);
         assert_eq!(ids(&out, "lane-x"), vec!["w1:p1"]);
         assert!(!out.contains_key("alpha"));
+    }
+
+    #[test]
+    fn merge_panes_once_skips_a_pane_the_feature_already_holds() {
+        let mut existing = vec![pane("w5:pA", Some("alpha"))];
+        merge_panes_once(
+            &mut existing,
+            vec![pane("w5:pA", Some("alpha")), pane("w5:pB", Some("alpha"))],
+        );
+        let ids: Vec<&str> = existing.iter().map(|p| p.pane_id.as_str()).collect();
+        assert_eq!(ids, vec!["w5:pA", "w5:pB"]);
     }
 
     #[test]
