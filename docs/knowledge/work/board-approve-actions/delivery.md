@@ -67,6 +67,32 @@ pane it acts on. `app.js` keys its confirm dialog (D2) and its one-shot in-fligh
 guard off `data-action-kind`, so the markup contract is what the browser layer
 reads — never the button label.
 
+## Settled in execution
+
+Rules that settled while the cells ran, each a capture stub merged here:
+
+- **Pair placement.** The action pair renders as a *sibling* after the card's
+  `</details>` (and after the Ready-to-merge row's `</a>`), never nested: a
+  button inside `<summary>` toggles the disclosure and a button inside `<a>`
+  is invalid markup. One shared rule, `bee_hub_action_kind` (opt-in →
+  permission → uat → gate `shape`/`execution`; `context` earns no pair),
+  decides the stop for card and row alike so the two surfaces cannot drift.
+- **Terminal-family switch.** The pane half of the action route honors the
+  terminal-family switch exactly as `/input` and `/keys` do: switch off → the
+  gate is still written, the response reads `woke:false`, and no herdr call is
+  made; permission kinds answer the `/input` route's 404.
+- **Watcher broadcast.** The file watcher broadcasts exactly two non-markdown
+  shapes — `.bee/state.json` and direct children of `.bee/lanes/*.json` —
+  reported but never indexed; sessions, cells, logs and reservations stay
+  silent. The browser steers those two shapes to board surfaces only, behind
+  one 1.5 s trailing reload timer that re-arms instead of firing while a
+  dialog is open, so a burst of lane writes is one reload and a confirm never
+  vanishes under the user.
+- **Permission reject (unverified).** Rejecting a permission prompt sends the
+  herdr key `escape`; no live blocked Claude pane was available to verify that
+  it dismisses the prompt. Text `No` + submit is the named fallback — a
+  one-line swap in `bee_action_permission` if a live check disagrees.
+
 ## Boundary
 
 Buttons that *start an agent run* — Run review, Run compound, Start todo — are
