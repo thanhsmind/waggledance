@@ -30,7 +30,7 @@ included, first project wins). Session ↔ card: `activity.feature`.
 terminal markers — a main-checkout pane whose session names a feature
 appears on that card only (decision `3daa1ea7`, board-pane-lane-pin); and
 the feature itself is resolved cell > worktree > lane > record
-(agent-feature-resolution). *Reconciled 2026-08-23 (board-approve-actions):*
+(agent-feature-resolution). *Reconciled 2026-08-23 (board-approve-actions, decision `4d63b6e7`):*
 the same join now also decides which pane a board Approve/Reject reaches —
 only a pane whose session names the feature, never a directory neighbour.
 

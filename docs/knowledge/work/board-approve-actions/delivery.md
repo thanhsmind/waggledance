@@ -92,7 +92,7 @@ Rules that settled while the cells ran, each a capture stub merged here:
   permission keystroke reaches only a pane whose session `activity.feature`
   equals the requested feature (`TerminalPaneView.bee_feature`) — the same
   join that pins a main-checkout pane to one card (decision `3daa1ea7`,
-  board-pane-lane-pin). A pane with no live bee session is never a target,
+  board-pane-lane-pin; reconciled by decision `4d63b6e7`). A pane with no live bee session is never a target,
   so two lanes sharing the main checkout can never receive each other's
   Approve. `state.json` is broadcast only when its `{feature, phase,
   approved_gates}` projection changes, and the 1.5 s debounce applies only
