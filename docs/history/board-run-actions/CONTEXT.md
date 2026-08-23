@@ -55,12 +55,16 @@ Research of record: `docs/history/research/board-actions-from-orchestrators.md`.
 
 ## Outstanding Questions
 
-### Deferred To Planning
+### Resolved in planning and execution
 
-- [ ] Does `bee herding run` accept the project's string `herding.agent_command` ("claude-sonnet" registry name) without `--agent`? — `--dry-run` answers it.
-- [ ] Which ledger field marks a run finished for the card lock release when the pane was left open as forensics.
+<!-- bee:not-a-deferral: both questions were answered before close; kept as the record of what planning had to find out -->
+- [x] `bee herding run` is not the spawner at all — its brief forbids the bee workflow D2 needs; waggledance spawns through `orchestrate::dispatch_run` (decision `4b743b19`, supersedes D1's clause). The string form of `herding.agent_command` is resolved through `herding.agents` by waggledance's own reader.
+- [x] The lock releases when the run's pane no longer exists in the herdr snapshot, not on any ledger field — a forensics pane left open keeps the lock honestly.
+<!-- /bee:not-a-deferral -->
 
-## Deferred Ideas
+## Out of scope
 
+<!-- bee:not-a-deferral: rejected alternatives recorded by D3/D4, not promises -->
 - A preset picker per click (rejected in D4).
 - Queueing a second run behind the first (rejected in D3).
+<!-- /bee:not-a-deferral -->
