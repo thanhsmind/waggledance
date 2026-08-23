@@ -923,11 +923,29 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                         .iter()
                         .map(|(id, bee)| (id.clone(), bee.feature.clone()))
                         .collect();
+                // board-run-actions D3, keyed by project id like the pane
+                // map above: the home board merges several projects' rows
+                // into one column, so a feature name alone would not say
+                // whose run is live.
+                let live_runs: std::collections::HashMap<String, views::BeeHubLiveRuns> = rollups
+                    .iter()
+                    .map(|(p, _)| {
+                        (
+                            p.id.clone(),
+                            project_live_board_runs(&st.engine, &p.id, snapshot.as_ref()),
+                        )
+                    })
+                    .collect();
                 let pairs: Vec<(
                     &waggledance_core::domain::Project,
                     &waggledance_core::bee::BeeProjectRollup,
                 )> = rollups.iter().map(|(p, r)| (p, r)).collect();
-                views::bee_cross_project_features_section(&pairs, &feature_panes, &feature_activity)
+                views::bee_cross_project_features_section(
+                    &pairs,
+                    &feature_panes,
+                    &feature_activity,
+                    &live_runs,
+                )
             };
             // home-terminal-parity-2: the same configured D8 preset labels
             // `terminal_page_inner` already threads into `terminal_page`, so
@@ -2886,6 +2904,56 @@ fn is_bee_project(project: &waggledance_core::domain::Project) -> bool {
     project.root_path.join(".bee").is_dir()
 }
 
+/// How far back a board looks for a still-live board run (board-run-actions
+/// D3). A live run is `working` and has a pane herdr still hosts, so the
+/// window only has to be wide enough that a run started before a burst of
+/// finished ones is still in it — deliberately smaller than
+/// `RUNS_PAGE_LIMIT`, since this read happens on every board render.
+const BOARD_LIVE_RUN_SCAN: usize = 50;
+
+/// (board-run-actions D3) This project's feature -> its one live board run,
+/// as the two boards read it. The JOIN is the point: bee's ledger says which
+/// runs are still `working`, and the herdr snapshot the caller already holds
+/// says which panes still exist — a `working` row whose pane is gone is a
+/// crashed session and must not lock its card forever, which is exactly the
+/// rule [`views::bee_hub_live_run_entry`] encodes.
+///
+/// `feature` is read per run rather than off the row struct: the column is on
+/// `runs` but not yet on `domain::Run` (see that struct's own note), so the
+/// status filter runs FIRST and the extra read only ever touches the handful
+/// of `working` rows, never the whole scan window.
+///
+/// A `None` snapshot — the terminal switch off, or herdr unreachable — means
+/// no pane can be proven alive, so nothing locks: the same fail-open shape
+/// every other pane join on these two pages already takes.
+fn project_live_board_runs(
+    engine: &Engine,
+    project_id: &str,
+    snapshot: Option<&herdr::Snapshot>,
+) -> views::BeeHubLiveRuns {
+    let mut out = views::BeeHubLiveRuns::new();
+    let Some(snap) = snapshot else {
+        return out;
+    };
+    let Ok(runs) = engine.list_runs(project_id, BOARD_LIVE_RUN_SCAN) else {
+        return out;
+    };
+    for run in runs.iter().filter(|r| r.status == "working") {
+        let feature = engine.run_feature(&run.id).ok().flatten();
+        let pane_alive = snap.panes.iter().any(|p| p.pane_id == run.pane_id);
+        if let Some((feature, live)) = views::bee_hub_live_run_entry(
+            feature.as_deref(),
+            &run.status,
+            &run.task,
+            &run.pane_id,
+            pane_alive,
+        ) {
+            out.insert(feature, live);
+        }
+    }
+    out
+}
+
 /// `GET /p/:id/_bee` — the read-only cell board (D4). Renders the four D7
 /// buckets over the project's live `.bee/cells/`. A project with no `.bee/`
 /// gets a clean not-found, never an empty bee page (D3).
@@ -2934,11 +3002,17 @@ async fn bee_board(State(st): State<AppState>, Path(id): Path<String>) -> Respon
         &herdr_session_ids(herdr_snapshot.as_ref()),
     );
     let feature_panes = project_feature_panes(herdr_snapshot.as_ref(), &project, &rollup, &bee);
+    // board-run-actions D3: the same herdr snapshot, joined a third way —
+    // which of this project's features has a board run still going, so its
+    // Todo/Review/Compound row reads `running: <action>` instead of offering
+    // the button again.
+    let live_runs = project_live_board_runs(&st.engine, &project.id, herdr_snapshot.as_ref());
     Html(views::bee_board_page(
         &project,
         &rollup.snapshot,
         &feature_panes,
         &bee.feature,
+        &live_runs,
     ))
     .into_response()
 }
@@ -29018,6 +29092,147 @@ mod bee_route_tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// bra-3 (D3, must-have): the board itself reads the lock, not only the
+    /// route. A `working` run carrying this feature, whose pane herdr still
+    /// hosts, replaces that feature's run button with `running: <action>`
+    /// linking to the pane. The control in the same test is the point: an
+    /// identical board with no such run still offers the button, so this
+    /// pins the JOIN `project_live_board_runs` makes rather than the mere
+    /// presence of the markup.
+    #[tokio::test]
+    async fn bee_board_reads_a_live_board_run_as_the_feature_rows_running_line() {
+        let dir = fresh_root("board-live-run-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("board-live-run-root");
+        write(
+            &root,
+            ".bee/lanes/run-feat.json",
+            &lane_json("run-feat", "compounding", "standard", "none", None, None),
+        );
+
+        let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
+            &root,
+            "w1:p1",
+            herdr::AgentStatus::Idle,
+        )));
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = herdr_double.clone();
+        let project = register(&st, &root, "board-live-run");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        // Control first: no run recorded yet, so the column offers its
+        // button.
+        let before =
+            body_string(get(router(st.clone()), &format!("/p/{}/_bee", project.id)).await).await;
+        assert!(
+            before.contains("data-action-feature=\"run-feat\" data-action-kind=\"compound\"")
+                && before.contains(">Run compound</button>"),
+            "with nothing live the Compound row must offer its button: {before}"
+        );
+        assert!(
+            // The class name alone also lives in the page's own inline
+            // stylesheet, so both halves of this test read the ELEMENT.
+            !before.contains("<p class=\"bee-hub__running\">"),
+            "nothing is running yet: {before}"
+        );
+
+        let now = waggledance_core::indexer::now_rfc3339();
+        st.engine
+            .insert_run(
+                &waggledance_core::domain::Run {
+                    id: "run-live".into(),
+                    project_id: project.id.clone(),
+                    pane_id: "w1:p1".into(),
+                    preset_label: Some("bee:herding".into()),
+                    task: "/bee-capturing flush the capture queue and compound feature run-feat"
+                        .into(),
+                    baseline: String::new(),
+                    marker: "HERDR_DONE_abc".into(),
+                    status: "working".into(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                Some("run-feat"),
+            )
+            .unwrap();
+
+        let body =
+            body_string(get(router(st.clone()), &format!("/p/{}/_bee", project.id)).await).await;
+        assert!(
+            body.contains("<p class=\"bee-hub__running\">"),
+            "a live board run must put the running line on its feature's row: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "class=\"bee-hub__running-pane\" href=\"/p/{}/_terminal/pane/w1:p1\">compound</a>",
+                project.id
+            )),
+            "the line names the action and links the pane the run is in: {body}"
+        );
+        assert!(
+            // The container, not the label: the label also appears in this
+            // page's own inline stylesheet comment.
+            !body.contains("data-action-feature=\"run-feat\""),
+            "D3 is a lock: the button is replaced, never offered beside it: {body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// bra-3, over the vendored client source `views::APP_JS`, beside the
+    /// bap-3 grep test above: the run half of the same handler. Each of the
+    /// three buttons must ask before it starts an agent — naming the feature
+    /// — and must post the kind spelling `BeeRunKind::from_str` parses.
+    #[test]
+    fn the_card_action_handler_confirms_every_run_and_posts_its_own_kind() {
+        let js = views::APP_JS;
+        let start = js
+            .find("if (!document.querySelector(\".bee-hub__actions\")) return;")
+            .expect("the card-action handler must bind only where a pair renders");
+        let end = js[start..]
+            .find("// Terminal settings (Settings page")
+            .map(|i| start + i)
+            .expect("the handler is followed by the terminal settings block");
+        let block = &js[start..end];
+
+        for question in [
+            "\"Start feature \" + f + \" in a new agent?\"",
+            "\"Run an independent review of \" + f + \"?\"",
+            "\"Run the capture flush and compound for \" + f + \"?\"",
+        ] {
+            assert!(
+                block.contains(question),
+                "every run click must confirm in the board's own voice, naming the feature: {question}"
+            );
+        }
+        for kind in ["\"start-todo\"", "\"run-review\"", "\"run-compound\""] {
+            assert!(
+                block.contains(kind),
+                "the run body must carry the kind the board action route parses: {kind}"
+            );
+        }
+        assert!(
+            block.contains("btn.classList.contains(\"bee-hub__action--run\")")
+                && block.contains("askConfirm(RUN_CONFIRM[kind](feature), RUN_SUB,"),
+            "a run click reaches the confirm before anything is posted: {block}"
+        );
+        assert!(
+            block.contains("sendAction(box, btn, \"starting…\", {"),
+            "a confirmed run locks its button behind an in-flight label"
+        );
+        assert!(
+            !block.contains("window.confirm(") && !block.contains("alert("),
+            "the run dialog is the board's own, never a native modal"
+        );
+        assert!(
+            !block.contains("setInterval") && !block.contains("setTimeout"),
+            "the run's outcome arrives on the existing /ws reload, never a new poll"
+        );
     }
 
     /// D4's refusal: a project whose bee store records no default preset has

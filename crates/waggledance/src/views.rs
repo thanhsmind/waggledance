@@ -2797,29 +2797,13 @@ pub fn terminal_down_page(project: &Project) -> String {
 /// nowhere close to a revival of the D1 Sessions panel it sits where that
 /// panel used to live; see that function's own doc comment for exactly how
 /// little it carries.
+///
+/// board-run-actions D3 hands in `live_runs`, this project's own live board
+/// runs — what turns a Todo, Review or Compound row's run button into the
+/// `running: <action>` line while a board-triggered run for that feature is
+/// still going. An empty map means no lock anywhere, which is exactly what
+/// this page rendered before that feature.
 pub fn bee_board_page(
-    project: &Project,
-    snapshot: &BeeSnapshot,
-    feature_panes: &std::collections::HashMap<String, Vec<TerminalPaneView>>,
-    feature_activity: &BeeFeatureActivity,
-) -> String {
-    bee_board_page_with_live_runs(
-        project,
-        snapshot,
-        feature_panes,
-        feature_activity,
-        &BeeHubLiveRuns::new(),
-    )
-}
-
-/// [`bee_board_page`] plus this project's own live board runs
-/// (board-run-actions D3) — what turns a Todo, Review or Compound row's run
-/// button into the `running: <action>` line while a board-triggered run for
-/// that feature is still going. It rides as a separate entry point rather
-/// than as a fifth parameter on `bee_board_page` so the route can adopt it in
-/// its own step; the four-argument spelling above renders exactly what it
-/// rendered before this feature (an empty map = no lock anywhere).
-pub fn bee_board_page_with_live_runs(
     project: &Project,
     snapshot: &BeeSnapshot,
     feature_panes: &std::collections::HashMap<String, Vec<TerminalPaneView>>,
@@ -4697,30 +4681,11 @@ fn bee_cross_project_read_errors_strip(rollups: &[(&Project, &BeeProjectRollup)]
     )
 }
 
+/// board-run-actions D3 hands in `live_runs`, every project's own live board
+/// runs, keyed by project id exactly like the pane map beside it — this page
+/// merges several projects' rows into one column, so a feature name alone
+/// would not say whose run it is. An empty map means no lock anywhere.
 pub fn bee_cross_project_features_section(
-    rollups: &[(&Project, &BeeProjectRollup)],
-    feature_panes: &std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, Vec<TerminalPaneView>>,
-    >,
-    feature_activity: &std::collections::HashMap<String, BeeFeatureActivity>,
-) -> String {
-    bee_cross_project_features_section_with_live_runs(
-        rollups,
-        feature_panes,
-        feature_activity,
-        &std::collections::HashMap::new(),
-    )
-}
-
-/// [`bee_cross_project_features_section`] plus every project's own live board
-/// runs (board-run-actions D3), keyed by project id exactly like the pane map
-/// beside it — the homepage merges several projects' rows into one column, so
-/// a feature name alone would not say whose run it is. Same reason as
-/// [`bee_board_page_with_live_runs`] for riding as a second entry point: the
-/// three-argument spelling above renders exactly what it rendered before this
-/// feature.
-pub fn bee_cross_project_features_section_with_live_runs(
     rollups: &[(&Project, &BeeProjectRollup)],
     feature_panes: &std::collections::HashMap<
         String,
@@ -5582,11 +5547,10 @@ pub type BeeHubLiveRuns = std::collections::HashMap<String, BeeHubLiveRun>;
 /// `/bee-capturing ...` is the Run compound click (D1's two slash lines),
 /// and anything else a board click recorded is the Start dispatch (D2), whose
 /// task is a brief rather than a slash command.
-/// Dead until the board routes call it: the wiring lives in
-/// `crates/waggledance/src/server.rs` (`bee_board` and `index_page` build the
-/// map from the runs they already list), which is why the attribute is here
-/// rather than the call site being missing silently.
-#[allow(dead_code)]
+///
+/// Reached through [`bee_hub_live_run_entry`], whose callers are the two
+/// board routes in `crates/waggledance/src/server.rs` (`bee_board` and
+/// `index_page`, via `project_live_board_runs`).
 pub fn bee_hub_live_run_action(task: &str) -> &'static str {
     let task = task.trim_start();
     if task.starts_with("/bee-reviewing") {
@@ -5610,11 +5574,10 @@ pub fn bee_hub_live_run_action(task: &str) -> &'static str {
 /// checked (`pane_alive`). The last clause is the one that matters: a
 /// `working` row whose pane is gone is a crashed or closed session, and
 /// without it that row would lock the feature's button forever.
-/// Dead until the board routes call it: the wiring lives in
-/// `crates/waggledance/src/server.rs` (`bee_board` and `index_page` build the
-/// map from the runs they already list), which is why the attribute is here
-/// rather than the call site being missing silently.
-#[allow(dead_code)]
+///
+/// Called from `crates/waggledance/src/server.rs::project_live_board_runs`,
+/// which both board routes (`bee_board` and `index_page`) fold over the runs
+/// they already list.
 pub fn bee_hub_live_run_entry(
     feature: Option<&str>,
     status: &str,
@@ -13689,6 +13652,7 @@ mod tests {
             &pairs,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -13760,6 +13724,7 @@ mod tests {
             &pairs,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -13796,6 +13761,7 @@ mod tests {
         let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
         let html = bee_cross_project_features_section(
             &pairs,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
@@ -13978,6 +13944,7 @@ mod tests {
             &pairs,
             &feature_panes,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         let blocked_at = html
@@ -14073,6 +14040,7 @@ mod tests {
             &pairs,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         let pos_newer = html.find("newer-feat").expect("newer-feat must render");
@@ -14157,6 +14125,7 @@ mod tests {
             &pairs,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -14219,6 +14188,7 @@ mod tests {
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
         let html = bee_cross_project_features_section(
             &pairs,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
@@ -14292,9 +14262,11 @@ mod tests {
             &with_empty,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         let html_without = bee_cross_project_features_section(
             &without_empty,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
@@ -14381,6 +14353,7 @@ mod tests {
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
         let html = bee_cross_project_features_section(
             &pairs,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
