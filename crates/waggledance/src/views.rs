@@ -1632,8 +1632,9 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    it as a small round-button column in its lower-right corner. Two elements
    carry that: `.term-scroll` is a rail running the screen's full height
    down its right edge, anchored `absolute` against `.term-screen-wrap` —
-   the element that IS the screen — and `.term-scroll__stack` is the visible
-   button column inside it. The rail is what the screen bounds: the column
+   the element that IS the screen — and `.term-scroll__stack` is the
+   button column inside it — a transparent layout box only: the three round
+   buttons are the whole visible shape, no square plate behind them. The rail is what the screen bounds: the column
    can neither reach past the frame's right edge nor hang below the frame
    onto the keys and the reply composer that follow it in the flow. The
    earlier free `sticky` placement leaned on an auto side margin and a
@@ -1663,7 +1664,7 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    be pushed out of the screen's bounds. */
 .term-screen-wrap { position: relative; display: flow-root; }
 .term-scroll { position: absolute; right: var(--space-3); top: var(--space-3); bottom: var(--space-3); display: flex; flex-direction: column; justify-content: flex-end; z-index: 2; width: max-content; pointer-events: none; }
-.term-scroll__stack { position: sticky; bottom: calc(var(--space-3) + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: var(--space-2); width: max-content; padding: var(--space-1); border-radius: var(--radius-sm); background: var(--color-surface-raised); box-shadow: 0 1px 4px rgb(0 0 0 / 0.35); pointer-events: auto; }
+.term-scroll__stack { position: sticky; bottom: calc(var(--space-3) + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: var(--space-2); width: max-content; background: transparent; pointer-events: auto; }
 /* Each button is a fixed-size circle — equal `width`/`height`, not a
    `min-width` — so `border-radius: 50%` draws a true circle rather than a
    pill. Fixed at 44px it keeps the same touch-target floor the named keys'
