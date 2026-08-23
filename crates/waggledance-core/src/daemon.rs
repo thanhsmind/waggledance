@@ -121,13 +121,18 @@ pub fn looks_like_daemon(body: &str) -> bool {
 fn health_body(host: &str, port: u16) -> Option<String> {
     // A wildcard-bound daemon can't be dialed back on its own bind address on
     // every platform (e.g. WSAEADDRNOTAVAIL on macOS/Windows), so connect to
-    // loopback instead. Only the connect target changes -- the `Host:` header
-    // below keeps using the original, unsubstituted `host`.
+    // loopback instead. The `Host:` header names the same loopback address
+    // the probe dials: the daemon's Host guard (`server.rs`
+    // `require_loopback_host`) only admits loopback names or the configured
+    // hostname, so a literal `Host: 0.0.0.0` is answered 421 and a live
+    // wildcard-bound daemon would read as not running. IPv6 loopback is
+    // bracketed, which is both the socket-address spelling and the Host
+    // header spelling.
     let connect_host = if is_wildcard(host) {
         if host == "0.0.0.0" {
             "127.0.0.1"
         } else {
-            "::1"
+            "[::1]"
         }
     } else {
         host
@@ -149,7 +154,7 @@ fn health_body(host: &str, port: u16) -> Option<String> {
     stream
         .set_write_timeout(Some(Duration::from_millis(500)))
         .ok();
-    let req = format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET /health HTTP/1.1\r\nHost: {connect_host}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).ok()?;
     let mut buf = String::new();
     let _ = stream.take(4096).read_to_string(&mut buf);
@@ -237,23 +242,38 @@ mod tests {
         // on that address on every platform (macOS/Windows reject it), so
         // health_check must substitute loopback at the connect call site.
         // This test proves that substitution by listening on 127.0.0.1 only
-        // and calling health_check with "0.0.0.0".
+        // and calling health_check with "0.0.0.0" — and that the `Host:`
+        // header names the dialed loopback too, since the daemon's Host
+        // guard answers 421 to a literal `Host: 0.0.0.0` and `waggledance
+        // status` would then read a live daemon as not running.
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
         let handle = std::thread::spawn(move || {
+            let mut request = String::new();
             if let Ok((mut stream, _)) = listener.accept() {
                 // Drain the request so the client's write doesn't block/hang.
                 let mut buf = [0u8; 512];
-                let _ = stream.read(&mut buf);
+                if let Ok(n) = stream.read(&mut buf) {
+                    request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                }
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
             }
+            request
         });
 
         assert!(health_check("0.0.0.0", port));
 
-        handle.join().unwrap();
+        let request = handle.join().unwrap();
+        assert!(
+            request.contains("\r\nHost: 127.0.0.1\r\n"),
+            "the probe must present the loopback it dialed as Host, got: {request:?}"
+        );
+        assert!(
+            !request.contains("0.0.0.0"),
+            "the wildcard bind address must never reach the Host header: {request:?}"
+        );
     }
 }
