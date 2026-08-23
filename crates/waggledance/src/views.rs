@@ -361,12 +361,26 @@ pub fn home_page(
             ""
         },
     );
+    // board-new-task (N1): the one entry point for filing a task, sitting
+    // *before* Orchestrator so the pair reads "make work, then go look at
+    // it". A button and not an anchor — unlike Orchestrator it has no
+    // destination to survive a reload to, and its whole behaviour is the
+    // overlay below.
+    let actions = format!(
+        r#"<button type="button" class="fg-btn fg-btn--ghost topbar__new-task" data-new-task-open>+ New task</button>
+    {orchestrator}"#
+    );
     let body = format!(
         r#"{topbar}
 {section}
-{tabbar}"#,
-        topbar = topbar_full("", "", &orchestrator, ""),
+{tabbar}
+{new_task}"#,
+        topbar = topbar_full("", "", &actions, ""),
         section = section,
+        // Rendered once per page and on both tabs, at the end of the body
+        // where a fixed, full-viewport scrim belongs — it is a sibling of
+        // the shell, never a descendant of the column it covers.
+        new_task = new_task_overlay(projects),
         // console-phone-layout (P2): rendered at every width and revealed
         // by CSS under the handset breakpoint alone. Markup-at-every-width
         // rather than a width-conditional render because this page has no
@@ -376,6 +390,62 @@ pub fn home_page(
         tabbar = home_tabbar(tab),
     );
     layout_with_drawer(title, "", &body, true)
+}
+
+/// board-new-task (N1): the "+ New task" dialog, rendered hidden on every
+/// home page and revealed by `assets/app.js`.
+///
+/// Markup-always, hidden-by-default rather than built by script on first
+/// open, for the same reason the handset tab bar is: the homepage does a
+/// full `location.reload()` on any watched change, so anything a script
+/// had to construct would have to be constructed again on every reload,
+/// and the server already knows the one thing the dialog needs that the
+/// client does not — the project list.
+///
+/// The select offers **top-level projects only**. A worktree row
+/// (`worktree_branch`) is a branch checkout of a project already in the
+/// list, and its backlog is the same feature's work seen mid-flight —
+/// filing a fresh proposal there would put it somewhere that disappears
+/// when the branch merges.
+///
+/// No project's `root_path` is rendered here, on this or any other home
+/// element: the option's value is the project id the POST route resolves
+/// server-side, so the page never discloses a filesystem path.
+fn new_task_overlay(projects: &[(Project, usize, Vec<TerminalPaneView>)]) -> String {
+    let mut options = String::new();
+    for (p, _, _) in projects
+        .iter()
+        .filter(|(p, _, _)| worktree_branch(&p.id).is_none())
+    {
+        // The first top-level project is preselected, so the dialog always
+        // opens on a real destination. `app.js` narrows this to the
+        // rail-filtered project when the filter has picked one out — a
+        // client-side state the server never sees.
+        let selected = if options.is_empty() { " selected" } else { "" };
+        options.push_str(&format!(
+            r#"
+        <option value="{id}"{selected}>{name}</option>"#,
+            id = esc(&p.id),
+            name = esc(&p.name),
+        ));
+    }
+    format!(
+        r#"<div class="task-overlay" data-new-task hidden>
+  <form class="task-box" data-new-task-form>
+    <h2 class="task-box__title">New task</h2>
+    <p class="task-box__sub">Add a task to a project's backlog</p>
+    <textarea class="fg-input task-box__input" name="task" rows="4" placeholder="What needs doing?" aria-label="Task"></textarea>
+    <p class="task-box__hint">Press Enter to submit, Shift + Enter for newline</p>
+    <select class="fg-input" name="project" aria-label="Project">{options}
+    </select>
+    <p class="task-box__error" data-new-task-error hidden></p>
+    <div class="task-box__actions">
+      <button type="button" class="fg-btn fg-btn--ghost" data-new-task-cancel>Cancel</button>
+      <button type="submit" class="fg-btn fg-btn--primary" data-new-task-submit>Start</button>
+    </div>
+  </form>
+</div>"#
+    )
 }
 
 /// console-phone-layout (P1): the handset drawer's whole mechanism — a
@@ -8353,6 +8423,219 @@ mod tests {
         assert!(
             !terminals.contains("topbar__orchestrator--on"),
             "the Orchestrator button must not read as current off the board: {terminals}"
+        );
+    }
+
+    /// board-new-task (N1): the "+ New task" button is the one entry point
+    /// for filing a task, so it has to be on both home tabs — a reader who
+    /// is looking at Terminals should not have to cross to the board first.
+    /// The overlay ships with the page and ships hidden: `assets/app.js`
+    /// only reveals it, so a page that rendered it visible would put a
+    /// scrim over the board on load.
+    #[test]
+    fn home_page_carries_the_new_task_button_on_both_tabs_over_a_hidden_overlay() {
+        for tab in [HomeTab::Kanban, HomeTab::Terminals] {
+            let body = home_page(&[], false, &[], None, "", tab, &[], None, true, &[]);
+            assert!(
+                body.contains(
+                    r#"<button type="button" class="fg-btn fg-btn--ghost topbar__new-task" data-new-task-open>+ New task</button>"#
+                ),
+                "every home tab must offer the New task button: {body}"
+            );
+            // Beside Orchestrator, and before it: make work, then go look
+            // at it.
+            let new_task = body.find("topbar__new-task").unwrap();
+            let orchestrator = body.find("topbar__orchestrator").unwrap();
+            assert!(
+                new_task < orchestrator,
+                "New task must sit before Orchestrator in the topbar: {body}"
+            );
+            assert!(
+                body.contains(r#"<div class="task-overlay" data-new-task hidden>"#),
+                "the dialog must render hidden on every home tab: {body}"
+            );
+            assert!(
+                body.contains(r#"<p class="task-box__error" data-new-task-error hidden></p>"#),
+                "the inline error line must render, hidden, with the dialog: {body}"
+            );
+        }
+    }
+
+    /// board-new-task (N1): the project picker offers top-level projects
+    /// only. A worktree row is a branch checkout of a project already in the
+    /// list, and a fresh proposal filed against it would live in a backlog
+    /// that disappears when the branch merges.
+    ///
+    /// The first top-level project is preselected so the dialog always opens
+    /// on a real destination, and no project's `root_path` reaches the page.
+    #[test]
+    fn the_new_task_picker_lists_top_level_projects_only_and_preselects_the_first() {
+        let mut top = sample_project();
+        top.id = "proj-1".into();
+        top.name = "Proj One".into();
+        let mut second = sample_project();
+        second.id = "proj-2".into();
+        second.name = "Proj Two".into();
+        let mut branch = sample_project();
+        branch.id = "proj-1--wt--feature-x".into();
+        branch.name = "Proj One (feature-x)".into();
+        branch.root_path = std::path::PathBuf::from("/tmp/secret-worktree-path");
+        let projects = vec![
+            (top, 0usize, Vec::new()),
+            (branch, 0usize, Vec::new()),
+            (second, 0usize, Vec::new()),
+        ];
+
+        let body = home_page(
+            &projects,
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Kanban,
+            &[],
+            None,
+            true,
+            &[],
+        );
+        let select = body
+            .split(r#"<select class="fg-input" name="project" aria-label="Project">"#)
+            .nth(1)
+            .and_then(|rest| rest.split("</select>").next())
+            .expect("the dialog must carry a project select");
+        assert!(
+            select.contains(r#"<option value="proj-1" selected>Proj One</option>"#),
+            "the first top-level project must be listed and preselected: {select}"
+        );
+        assert!(
+            select.contains(r#"<option value="proj-2">Proj Two</option>"#),
+            "every top-level project must be listed: {select}"
+        );
+        assert!(
+            !select.contains("proj-1--wt--feature-x"),
+            "a worktree branch must never be offered as a backlog destination: {select}"
+        );
+        assert_eq!(
+            select.matches("<option").count(),
+            2,
+            "exactly the two top-level projects, no more: {select}"
+        );
+        assert!(
+            !body.contains("/tmp/secret-worktree-path"),
+            "no project's filesystem path may reach this page: {body}"
+        );
+    }
+
+    /// board-new-task (N1): the button leaves the bar on a handset alongside
+    /// Orchestrator. Asserted against the stylesheet's own handset block
+    /// rather than a rendered page, because the markup renders at every
+    /// width and only `app.css` decides who sees it — the same shape
+    /// `the_home_shell_collapses_into_a_drawer_and_a_tab_bar_only_under_the_handset_breakpoint`
+    /// uses for the rest of that promise.
+    #[test]
+    fn the_new_task_button_leaves_the_handset_bar_with_the_orchestrator_button() {
+        let css = include_str!("../assets/app.css");
+        let query = css
+            .find("@media (max-width: 700px) {")
+            .expect("app.css declares no handset block for the home shell");
+        let end = css[query + 1..]
+            .find("@media")
+            .map(|i| query + 1 + i)
+            .unwrap_or(css.len());
+        let narrow = &css[query..end];
+        assert!(
+            narrow.contains(".topbar__new-task {\n    display: none;\n  }"),
+            "New task must give way on a handset, in the same block Orchestrator does: {narrow}"
+        );
+    }
+
+    /// board-new-task (N1): the dialog is a real overlay, not a box parked
+    /// in the flow — it dims the page and stacks at the modal layer, the
+    /// same mechanism the jump palette already uses. Stylesheet-parity, for
+    /// the same reason as the test above: `views.rs` renders the class,
+    /// `app.css` is the only place the promise can break.
+    #[test]
+    fn the_new_task_dialog_carries_its_overlay_and_error_rules() {
+        let css = include_str!("../assets/app.css");
+        let overlay = css
+            .split(".task-overlay {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("app.css must carry a .task-overlay rule");
+        assert!(
+            overlay.contains("position: fixed;")
+                && overlay.contains("inset: 0;")
+                && overlay.contains("background: var(--color-scrim);")
+                && overlay.contains("z-index: var(--z-modal);"),
+            "the dialog must scrim the page from the modal layer: {overlay}"
+        );
+        assert!(
+            css.contains(".task-overlay[hidden] {\n  display: none;\n}"),
+            "the server renders the overlay `hidden`; the stylesheet has to honour it: {css}"
+        );
+        let box_rule = css
+            .split(".task-box {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("app.css must carry a .task-box rule");
+        assert!(
+            box_rule.contains("width: min(560px, 92vw);"),
+            "the dialog must keep the jump palette's own footprint: {box_rule}"
+        );
+        // N3: a refusal is shown, never spoken through an alert — so it
+        // needs a colour that reads as refusal.
+        let error_rule = css
+            .split(".task-box__error {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("app.css must carry a .task-box__error rule");
+        assert!(
+            error_rule.contains("color: var(--color-danger);"),
+            "the inline error must speak in the danger colour: {error_rule}"
+        );
+    }
+
+    /// board-new-task: the seam between the three files this feature
+    /// touches — the view names the controls, the script binds exactly
+    /// those names, and the URL it builds is the route `server.rs` mounts.
+    /// A rename on either side silently unwires the dialog; nothing else in
+    /// the build would notice.
+    #[test]
+    fn the_new_task_script_binds_the_hooks_the_view_actually_renders() {
+        let js = include_str!("../assets/app.js");
+        let body = home_page(
+            &[],
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Kanban,
+            &[],
+            None,
+            true,
+            &[],
+        );
+        for hook in [
+            "data-new-task-open",
+            "data-new-task-form",
+            "data-new-task-error",
+            "data-new-task-cancel",
+            "data-new-task-submit",
+        ] {
+            assert!(body.contains(hook), "the view must render {hook}: {body}");
+            assert!(js.contains(hook), "the script must bind {hook}");
+        }
+        assert!(
+            js.contains(r#"fetch("/api/projects/" + encodeURIComponent(project) + "/pbi""#),
+            "the script must post to the route server.rs mounts for this dialog"
+        );
+        // N3: the refusal lands in the dialog, never in an alert.
+        assert!(
+            !js.split("data-new-task")
+                .nth(1)
+                .unwrap_or("")
+                .contains("alert("),
+            "the New task dialog must never report a failure through alert()"
         );
     }
 

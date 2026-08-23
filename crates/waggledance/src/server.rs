@@ -469,6 +469,11 @@ fn router(state: AppState) -> Router {
             "/api/projects/:id/orchestration",
             post(update_project_orchestration),
         )
+        // board-new-task (N2): the home board's "+ New task" dialog files
+        // its task into this project's own backlog — see
+        // `create_project_pbi` for why the project's own `.bee/bin/bee` is
+        // the only thing that ever writes it.
+        .route("/api/projects/:id/pbi", post(create_project_pbi))
         // Gated (D4/D7/D12): `terminal_family_enabled` is the only check
         // left in front of this route.
         .route("/p/:id/_terminal", get(terminal_page))
@@ -1272,6 +1277,230 @@ async fn update_project_orchestration(
         .engine
         .set_orchestration_enabled(&id, form.enabled.is_some());
     Redirect::to("/settings?saved=1").into_response()
+}
+
+/// `POST /api/projects/:id/pbi` body (board-new-task N2) — one free-text
+/// task, exactly as typed into the home board's dialog. Deliberately the
+/// only field: the title/CoS split, the status and the id are all decided
+/// server-side or by bee itself, so a request has nowhere to put a
+/// `--status`, a `--feature` or an `--id` even if a client tries.
+#[derive(serde::Deserialize)]
+struct CreatePbiBody {
+    task: String,
+}
+
+/// The largest title bee's own `backlog pbi add` accepts (its `--title` is
+/// documented "Required, non-empty", <=200 chars). Clipping here rather
+/// than letting the CLI refuse turns a long first line into a shortened
+/// task instead of an error the reader can do nothing useful about.
+const PBI_TITLE_MAX_CHARS: usize = 200;
+
+/// Split the dialog's free text into bee's `--title` and `--cos` (N2).
+/// Leading blank lines are skipped, so a task pasted with a newline in
+/// front still titles from its first real line rather than from "". The
+/// first non-blank line is the title, clipped to [`PBI_TITLE_MAX_CHARS`]
+/// *characters* (never bytes — a byte slice would split a multi-byte
+/// character and panic); everything after it, trimmed, is the CoS.
+/// `None` means there was no non-blank line at all — the 400 below.
+fn split_task(task: &str) -> Option<(String, String)> {
+    let mut lines = task.lines().skip_while(|l| l.trim().is_empty());
+    let title_line = lines.next()?.trim();
+    if title_line.is_empty() {
+        return None;
+    }
+    let title: String = title_line.chars().take(PBI_TITLE_MAX_CHARS).collect();
+    let cos = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    Some((title, cos))
+}
+
+/// The project's own vendored bee, or `None` (N2). Never a PATH lookup:
+/// the binary that writes a project's backlog has to be that project's
+/// own, and a PATH hit would let whatever `bee` happens to be on the
+/// daemon's PATH write into a repo that never vendored one. `bee.exe` is
+/// tried for the same reason the repo's own hooks try it — a Windows
+/// checkout vendors that name.
+fn project_bee_binary(root: &std::path::Path) -> Option<PathBuf> {
+    ["bee", "bee.exe"]
+        .iter()
+        .map(|name| root.join(".bee").join("bin").join(name))
+        .find(|p| is_executable_file(p))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Windows has no executable bit — the file being there is the whole test,
+/// the same thing every Windows launcher checks.
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// Every refusal this route makes, in the one shape the dialog reads back
+/// (N3): a JSON `{error}` whose text is shown inline under the textarea.
+/// Never an HTML error page — this route's only caller is `fetch`.
+fn pbi_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(json!({ "error": message.into() }))).into_response()
+}
+
+/// The stderr a failed bee run gets to say for itself, bounded (N3). A
+/// bounded tail rather than the whole stream because this string lands in
+/// a dialog, and because a runaway stderr should not become the response
+/// body; the *tail* rather than the head because bee prints its actual
+/// refusal last. Counted in characters, never bytes, so the cut can never
+/// land mid-character.
+fn stderr_tail(stderr: &[u8]) -> String {
+    const MAX: usize = 300;
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        return "this project's bee refused the task without saying why".to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= MAX {
+        return text.to_string();
+    }
+    chars[chars.len() - MAX..].iter().collect()
+}
+
+/// Pull the created PBI's id out of what `bee backlog pbi add --json`
+/// printed. The CLI prints its JSON object and then a trailing
+/// `[bee] backlog pbi add 1ms` timing line on the same stream, so the
+/// whole stdout is not itself parseable JSON — the first balanced `{...}`
+/// block is. The scan below is the fallback for the one case that framing
+/// cannot survive: an unbalanced brace inside the echoed title.
+fn parse_pbi_id(stdout: &str) -> Option<String> {
+    if let Some(start) = stdout.find('{') {
+        let mut depth = 0usize;
+        for (i, ch) in stdout[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let block = &stdout[start..start + i + ch.len_utf8()];
+                        if let Some(id) = serde_json::from_str::<serde_json::Value>(block)
+                            .ok()
+                            .and_then(|v| v.get("id")?.as_str().map(str::to_string))
+                            .filter(|id| !id.is_empty())
+                        {
+                            return Some(id);
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    scan_json_id(stdout)
+}
+
+/// `parse_pbi_id`'s fallback: the first `"id": "…"` pair in the text. It
+/// cannot be fooled by an `id` inside an echoed *value*, because a `"` in
+/// a JSON string arrives escaped (`\"`) and so never forms the literal
+/// `"id"` this looks for.
+fn scan_json_id(text: &str) -> Option<String> {
+    let mut rest = text;
+    while let Some(pos) = rest.find("\"id\"") {
+        let after = rest[pos + 4..].trim_start();
+        if let Some(value) = after
+            .strip_prefix(':')
+            .map(str::trim_start)
+            .and_then(|a| a.strip_prefix('"'))
+            .and_then(|a| a.split('"').next())
+            .filter(|id| !id.is_empty())
+        {
+            return Some(value.to_string());
+        }
+        rest = &rest[pos + 4..];
+    }
+    None
+}
+
+/// `POST /api/projects/:id/pbi` (board-new-task N2/N3) — file the home
+/// board's "+ New task" text into this project's backlog as a `proposed`
+/// PBI, which the board's Todo column already renders.
+///
+/// The write goes through the project's own `.bee/bin/bee`, never through
+/// this process: `.bee/backlog.jsonl` is an append-only event log with a
+/// schema and an id-collision rule the CLI owns (and whose own write-guard
+/// hook blocks direct edits for exactly that reason), so a second writer
+/// here would be a second implementation of that schema, drifting from the
+/// first the moment either changed. That also decides the 409: a project
+/// that vendored no bee has no writer, and this route refuses rather than
+/// reaching for one on PATH — see `project_bee_binary`.
+///
+/// The four refusals are the ones N3 names, each as an inline `{error}`:
+/// nothing typed (400), no such project (404), no bee in the project
+/// (409), and bee itself refusing (502, carrying its own stderr tail).
+async fn create_project_pbi(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<CreatePbiBody>,
+) -> Response {
+    let Some((title, cos)) = split_task(&body.task) else {
+        return pbi_error(StatusCode::BAD_REQUEST, "a task needs some text");
+    };
+    let Ok(Some(project)) = st.engine.get_project(&id) else {
+        return pbi_error(StatusCode::NOT_FOUND, "project not found");
+    };
+    let Some(bee) = project_bee_binary(&project.root_path) else {
+        return pbi_error(
+            StatusCode::CONFLICT,
+            "this project is not set up with bee, so it has no backlog to add to",
+        );
+    };
+
+    let mut cmd = tokio::process::Command::new(&bee);
+    cmd.arg("backlog").arg("pbi").arg("add");
+    cmd.arg("--title").arg(&title);
+    // Omitted, not passed empty (N2): a single-line task has no CoS, and an
+    // empty `--cos` would record one that is merely blank.
+    if !cos.is_empty() {
+        cmd.arg("--cos").arg(&cos);
+    }
+    cmd.arg("--json")
+        // The whole reason the binary is resolved from the project rather
+        // than the daemon: bee writes `.bee/backlog.jsonl` relative to its
+        // own working directory, so this is what decides *which* backlog
+        // receives the task.
+        .current_dir(&project.root_path)
+        // Nothing on this server's stdin belongs to a spawned CLI, and a
+        // child that inherits it can block forever waiting on a prompt.
+        .stdin(std::process::Stdio::null());
+
+    let out = match cmd.output().await {
+        Ok(out) => out,
+        Err(e) => {
+            return pbi_error(
+                StatusCode::BAD_GATEWAY,
+                format!("could not run this project's bee: {e}"),
+            )
+        }
+    };
+    if !out.status.success() {
+        return pbi_error(StatusCode::BAD_GATEWAY, stderr_tail(&out.stderr));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let Some(pbi_id) = parse_pbi_id(&stdout) else {
+        return pbi_error(
+            StatusCode::BAD_GATEWAY,
+            "this project's bee did not report a new task id",
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "id": pbi_id, "project_id": project.id })),
+    )
+        .into_response()
 }
 
 /// The Telegram credential state `settings_page` renders — masked to the
@@ -5287,6 +5516,27 @@ mod bee_route_tests {
     async fn body_string(resp: Response) -> String {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The home page with the "+ New task" dialog removed (board-new-task
+    /// N1). Two assertions below sweep the *whole* home page for a token —
+    /// the word "error", and a `<select>` element — and both were exact
+    /// when nothing else on the page could carry one. The dialog now
+    /// renders on every home page and carries both: an empty, hidden inline
+    /// error line whose class names the word, and the project picker. Both
+    /// are its own chrome and neither is what those assertions are about
+    /// (a raw herdr error surfacing as text; the retired terminals pane
+    /// picker), so they look at the page without it rather than being
+    /// weakened to match.
+    fn without_new_task_dialog(body: &str) -> String {
+        let Some((before, rest)) = body.split_once(r#"<div class="task-overlay""#) else {
+            return body.to_string();
+        };
+        let after = rest
+            .split_once("</form>\n</div>")
+            .map(|(_, after)| after)
+            .unwrap_or("");
+        format!("{before}{after}")
     }
 
     /// The `server.rs` ↔ `daemon.rs` health handshake, checked across the
@@ -17954,9 +18204,10 @@ mod bee_route_tests {
             body.contains("<span class=\"proj-row__name\">demo</span>"),
             "the row itself must still render when herdr is down: {body}"
         );
+        let page = without_new_task_dialog(&body);
         assert!(
-            !body.to_lowercase().contains("error"),
-            "a down herdr must never surface a raw error on the home page: {body}"
+            !page.to_lowercase().contains("error"),
+            "a down herdr must never surface a raw error on the home page: {page}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -19985,9 +20236,10 @@ mod bee_route_tests {
             body.contains("data-agent-drawer-homepage"),
             "the tab's own drawer instance must be marked as the homepage variant: {body}"
         );
+        let tab = without_new_task_dialog(&body);
         assert!(
-            !body.contains("<select") && !body.contains("terminals-pane-select"),
-            "the tab must render no select element at all: {body}"
+            !tab.contains("<select") && !tab.contains("terminals-pane-select"),
+            "the tab must render no select element at all: {tab}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -24028,6 +24280,307 @@ mod bee_route_tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    // ── board-new-task: `POST /api/projects/:id/pbi` ─────────────────
+    //
+    // The route's whole job is to run the *project's own* `.bee/bin/bee`
+    // with the right argv in the right directory, so these tests put a
+    // real executable at that exact path — a shell script that records the
+    // argv and cwd it was handed and prints what bee prints. That is the
+    // only way to prove the argv split, the `--cos` omission and the cwd
+    // (N2) without a bee-shaped repository per test; it also keeps every
+    // one of them honest about the boundary that matters: nothing but that
+    // script ever writes a backlog.
+    //
+    // Unix-only: the fixture is a `#!/bin/sh` script. The route itself is
+    // cross-platform (`is_executable_file` has its own Windows arm).
+
+    /// Write `<root>/.bee/bin/bee` as an executable script that appends its
+    /// cwd (first line) then one argument per line to `log`, prints
+    /// `stdout`/`stderr`, and exits with `code`.
+    #[cfg(unix)]
+    fn fake_bee(root: &Path, log: &Path, stdout: &str, stderr: &str, code: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join(".bee").join("bin").join("bee");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             {{ pwd; for a in \"$@\"; do printf '%s\\n' \"$a\"; done; }} > '{log}'\n\
+             printf '%s' '{stdout}'\n\
+             printf '%s' '{stderr}' >&2\n\
+             exit {code}\n",
+            log = log.display(),
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn pbi_req(id: &str, task: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .uri(format!("/api/projects/{id}/pbi"))
+            .method("POST")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "task": task }).to_string()))
+            .unwrap()
+    }
+
+    /// The cwd (line 1) and argv (the rest) the fake bee was handed.
+    #[cfg(unix)]
+    fn recorded(log: &Path) -> (String, Vec<String>) {
+        let text = std::fs::read_to_string(log)
+            .unwrap_or_else(|e| panic!("the project's bee was never run: {e}"));
+        let mut lines = text.lines();
+        let cwd = lines.next().unwrap_or_default().to_string();
+        (cwd, lines.map(str::to_string).collect())
+    }
+
+    #[cfg(unix)]
+    async fn error_of(resp: Response) -> String {
+        let body = body_string(resp).await;
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_else(|| panic!("a refusal must answer JSON {{error}}, got: {body}"))
+    }
+
+    /// board-new-task (N2): a multi-line task becomes one `--title` (the
+    /// first non-blank line) and one `--cos` (everything after it), run by
+    /// the project's own bee *in the project's own directory* — which is
+    /// what decides which backlog receives the item. The id bee reports
+    /// comes back with the project it was filed against (N3), parsed out
+    /// from under the trailing `[bee] …` timing line the CLI also prints.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_project_pbi_runs_the_projects_own_bee_with_the_split_task() {
+        let dir = fresh_root("pbi-happy-cfg");
+        let root = fresh_root("pbi-happy-root");
+        let log = fresh_root("pbi-happy-log").join("argv");
+        fake_bee(
+            &root,
+            &log,
+            "{\"id\":\"p-abc12345\"}\n[bee] backlog pbi add 1ms\n",
+            "",
+            0,
+        );
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "pbi-happy");
+        let app = router(st);
+
+        let resp = app
+            .oneshot(pbi_req(&project.id, "\n\nFix header\nAlign to 8px\n"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["id"].as_str(), Some("p-abc12345"), "{body}");
+        assert_eq!(
+            json["project_id"].as_str(),
+            Some(project.id.as_str()),
+            "{body}"
+        );
+
+        let (cwd, argv) = recorded(&log);
+        assert_eq!(
+            std::fs::canonicalize(&cwd).unwrap(),
+            std::fs::canonicalize(&project.root_path).unwrap(),
+            "bee must run in the project's own root, or it writes another project's backlog"
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "backlog",
+                "pbi",
+                "add",
+                "--title",
+                // The leading blank lines are skipped, not titled from.
+                "Fix header",
+                "--cos",
+                "Align to 8px",
+                "--json",
+            ],
+            "the task must reach bee as a title plus a CoS"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// board-new-task (N2): a one-line task has no CoS, and `--cos` is
+    /// *omitted* rather than passed empty — an empty flag would record a
+    /// blank condition of satisfaction instead of none. A first line past
+    /// bee's own 200-character title limit is clipped here, so a long
+    /// paste becomes a shortened task rather than a refusal the reader can
+    /// do nothing about.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_project_pbi_omits_an_empty_cos_and_clips_an_overlong_title() {
+        let dir = fresh_root("pbi-single-line-cfg");
+        let root = fresh_root("pbi-single-line-root");
+        let log = fresh_root("pbi-single-line-log").join("argv");
+        fake_bee(&root, &log, "{\"id\":\"p-1\"}\n", "", 0);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "pbi-single-line");
+        let app = router(st.clone());
+
+        let resp = app
+            .oneshot(pbi_req(&project.id, "  Tidy the rail  "))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, argv) = recorded(&log);
+        assert_eq!(
+            argv,
+            vec![
+                "backlog",
+                "pbi",
+                "add",
+                "--title",
+                "Tidy the rail",
+                "--json"
+            ],
+            "a single-line task must carry no --cos at all"
+        );
+
+        let long = "x".repeat(201);
+        let resp = router(st)
+            .oneshot(pbi_req(&project.id, &long))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, argv) = recorded(&log);
+        let title = &argv[argv.iter().position(|a| a == "--title").unwrap() + 1];
+        assert_eq!(
+            title.chars().count(),
+            200,
+            "a 201-character first line must be clipped to bee's own 200-character limit"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// board-new-task (N3): the refusals the dialog has to be able to show
+    /// inline. A task with nothing in it never reaches bee at all; an id
+    /// naming no project is a 404; and a project that vendored no bee is a
+    /// 409 that says so in words the reader can act on — this route never
+    /// falls back to a `bee` on the daemon's PATH, which would write into a
+    /// repository that never opted in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_project_pbi_names_its_refusals_without_ever_running_a_foreign_bee() {
+        let dir = fresh_root("pbi-refusals-cfg");
+        let root = fresh_root("pbi-refusals-root");
+        let log = fresh_root("pbi-refusals-log").join("argv");
+        fake_bee(&root, &log, "{\"id\":\"p-1\"}\n", "", 0);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "pbi-refusals");
+
+        // Nothing typed: 400, and bee is never reached.
+        let resp = router(st.clone())
+            .oneshot(pbi_req(&project.id, "   \n\t\n  "))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !error_of(resp).await.is_empty(),
+            "the 400 must say something"
+        );
+        assert!(
+            !log.exists(),
+            "an empty task must never reach the project's bee at all"
+        );
+
+        // No such project: 404.
+        let resp = router(st.clone())
+            .oneshot(pbi_req("no-such-project", "Fix header"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(!error_of(resp).await.is_empty());
+
+        // A registered project with no vendored bee: 409, in words.
+        let bare = fresh_root("pbi-refusals-bare-root");
+        std::fs::create_dir_all(&bare).unwrap();
+        let bare_project = register(&st, &bare, "pbi-refusals-bare");
+        let resp = router(st)
+            .oneshot(pbi_req(&bare_project.id, "Fix header"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a project with no bee is a conflict, not a not-found"
+        );
+        let msg = error_of(resp).await;
+        assert!(
+            msg.contains("not set up with bee"),
+            "the 409 must name what is missing: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// board-new-task (N3): when bee itself refuses, the reader gets bee's
+    /// own words — its stderr tail — rather than a generic failure, because
+    /// bee is the only party that knows why (a duplicate id, a malformed
+    /// log, a title it rejected). `502`, not `500`: the failure is
+    /// downstream of this server, in the process it called.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_project_pbi_hands_back_a_failing_bees_own_stderr() {
+        let dir = fresh_root("pbi-cli-fails-cfg");
+        let root = fresh_root("pbi-cli-fails-root");
+        let log = fresh_root("pbi-cli-fails-log").join("argv");
+        fake_bee(&root, &log, "", "bee: refusing a duplicate add", 1);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "pbi-cli-fails");
+        let app = router(st);
+
+        let resp = app
+            .oneshot(pbi_req(&project.id, "Fix header"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let msg = error_of(resp).await;
+        assert!(
+            msg.contains("refusing a duplicate add"),
+            "bee's own refusal must reach the dialog: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The two halves of `parse_pbi_id`, at the unit level where the odd
+    /// shapes are cheap to state: bee's real stdout (a JSON object followed
+    /// by its own timing line, so the whole stream is not itself JSON), and
+    /// the fallback for a title whose unbalanced brace defeats the framing.
+    #[test]
+    fn the_pbi_id_is_read_out_from_under_bees_trailing_timing_line() {
+        assert_eq!(
+            parse_pbi_id(
+                "{\n  \"id\": \"p-ee25b0ff\",\n  \"cos\": \"\"\n}\n[bee] backlog pbi add 1ms\n"
+            )
+            .as_deref(),
+            Some("p-ee25b0ff")
+        );
+        // An unbalanced brace inside the echoed title: the block framing
+        // cannot close, and the scan is what still finds the id.
+        assert_eq!(
+            parse_pbi_id("{\"id\":\"p-2\",\"title\":\"fix {\"}\n[bee] x 1ms").as_deref(),
+            Some("p-2")
+        );
+        assert_eq!(parse_pbi_id("[bee] backlog pbi add 1ms\n"), None);
     }
 
     /// D9a: an ordinary path outside every existing project root DOES
