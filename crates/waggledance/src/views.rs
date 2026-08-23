@@ -434,7 +434,7 @@ fn new_task_overlay(projects: &[(Project, usize, Vec<TerminalPaneView>)]) -> Str
   <form class="task-box" data-new-task-form>
     <h2 class="task-box__title">New task</h2>
     <p class="task-box__sub">Add a task to a project's backlog</p>
-    <textarea class="fg-input task-box__input" name="task" rows="4" placeholder="What needs doing?" aria-label="Task"></textarea>
+    <textarea class="fg-input fg-input--area task-box__input" name="task" rows="5" placeholder="What needs doing?" aria-label="Task"></textarea>
     <p class="task-box__hint">Press Enter to submit, Shift + Enter for newline</p>
     <select class="fg-input" name="project" aria-label="Project">{options}
     </select>
