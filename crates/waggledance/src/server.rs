@@ -1664,7 +1664,11 @@ async fn feature_bound_panes(
     else {
         return Vec::new();
     };
-    let bee = project_bee_activity(project, &rollup);
+    let bee = project_bee_activity(
+        project,
+        &rollup,
+        &herdr_session_ids(herdr_snapshot.as_ref()),
+    );
     let mut panes = project_feature_panes(herdr_snapshot.as_ref(), project, &rollup, &bee);
     panes.remove(feature).unwrap_or_default()
 }
