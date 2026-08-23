@@ -106,7 +106,9 @@ remote caller and no distinct roles.
 - **R1.** Every MCP-registration fix preserves the original config as a `.bak`
   sibling before changing it (`~/.claude.json.bak`, `config.toml.bak`,
   `mcp_config.json.bak`), so nothing an operator configured is lost; a tool that
-  isn't installed is never written to at all. The Agent-instruction fix does not
+  isn't installed is never written to at all. A rewritten config keeps its keys
+  in the order the operator had them — the fix changes only the entry it
+  registers, never the file's layout. The Agent-instruction fix does not
   need this: it edits only the text between its
   `<!-- waggledance:START -->` / `<!-- waggledance:END -->` markers and leaves all other
   content in place, so there is nothing to preserve separately. (Supersedes the

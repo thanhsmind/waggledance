@@ -1,7 +1,7 @@
 ---
 area: appearance
-updated: 2026-07-16
-sources: [adopt-atelier-design-system]
+updated: 2026-08-23
+sources: [adopt-atelier-design-system, console-theme-kanban]
 decisions: [D1, D2, D3, D4, D5, D6]
 coverage: full
 ---
@@ -29,7 +29,7 @@ presentation layer and the scheme control — not what any individual page shows
 
 | # | Element | Meaning | Values |
 |---|---|---|---|
-| 1 | Color scheme | The active color palette for the whole interface | `light` (native) · `dark` |
+| 1 | Color scheme | The active color palette for the whole interface | `dark` (the theme's native scheme) · `light` |
 | 2 | Scheme source (first load) | What decides the scheme when nothing is remembered | the operating-system / browser light-or-dark preference |
 | 3 | Remembered scheme | The operator's explicit choice, kept for next time | `light` · `dark` · unset (follow the OS preference) |
 | 4 | Visual style | The single design language every page shares | one fixed style — a warm, editorial look: rounded controls, soft elevation, one accent color used for actions, links, and focus alike |
@@ -79,7 +79,13 @@ presentation layer and the scheme control — not what any individual page shows
   preferred display typeface ships **embedded** in the stylesheet (Latin +
   Vietnamese coverage, all weights), so the intended typography renders offline
   and identically on every machine, no local install required. Scripts outside
-  the embedded coverage fall back to the system sans-serif.
+  the embedded coverage fall back to the system sans-serif. The interface ships
+  exactly one theme — the **console** look, dark-native, with its light scheme —
+  built on the same token contract; every surface, the board included, inherits
+  that one theme and keeps no page-local palette of its own (the board's ten
+  project identity hues are the one page-scoped set, re-expressed for the dark
+  surfaces). The faces are a geometric sans for display and body and its
+  matching monospace for code, counts and branch names.
 
 ### Desktop loading screen
 
@@ -141,10 +147,14 @@ authentication. The scheme choice is per-browser (local), not shared or synced.
 
 ## Pointers (implementation)
 
-- `crates/waggledance/assets/atelier/` — vendored Atelier design system (contract
-  tokens, core roles, editorial pattern, theme with Light + Dark schemes).
-- `crates/waggledance/assets/app.css` — app-side glue authored from Atelier tokens.
-- `crates/waggledance/src/views.rs` — `layout()` sets `data-theme="atelier"` +
+- `crates/waggledance/assets/atelier/` — the vendored design-system contract
+  (tokens, core roles, editorial pattern) plus `console.css`, the one shipped
+  theme adapter (`data-theme=console`, dark-native + light scheme); `fonts.css`
+  embeds Geist and Geist Mono (variable, latin + vietnamese). The earlier
+  Atelier theme file is gone.
+- `crates/waggledance/assets/app.css` — app-side glue authored from the contract
+  tokens.
+- `crates/waggledance/src/views.rs` — `layout()` sets `data-theme="console"` +
   `class="fg-root"` and the no-flash scheme script; `APP_CSS` concatenates the
   bundle + glue; `.fg-*` roles across the page builders.
 - `crates/waggledance/assets/app.js` — scheme toggle + mermaid re-init, keyed off

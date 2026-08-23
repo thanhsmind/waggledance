@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
-updated: 2026-08-22
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity]
+updated: 2026-08-23
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact]
 decisions: []
 coverage: partial
 ---
@@ -62,10 +62,25 @@ project.
    board's entry point, and the only element there that marks itself the current
    page, which it does while the board is showing. It is a real address
    (`/?tab=kanban`) and not a script-driven control, so it works with scripting
-   off and survives the page's own reloads. Nothing sits beneath the top bar in
+   off and survives the page's own reloads. While current it reads as a quiet
+   ink wash, never a loud filled pill. Nothing sits beneath the top bar in
    place of the retired row of tabs; the `tab=` addresses — `kanban`, `projects`,
    `terminals` — all keep resolving exactly as they did, and `/?tab=projects`
    still lands on the board.
+   Beside Orchestrator sits **+ New task**, the board's one way to put work in
+   (decisions `82078151`, `cb52bbd1`, `6e29ccc5`): it opens an in-page dialog
+   with a task box — a real multi-line field with a comfortable minimum
+   height — and a project picker listing the top-level registered projects
+   (never their worktree branches), preselecting the rail's filtered project
+   when one is set, else the first. Enter files the task, Shift+Enter breaks a
+   line; Cancel, Esc or a click on the scrim closes it. The first non-empty
+   line becomes the item's title (clipped to 200 characters) and the rest its
+   conditions of satisfaction; the item lands as a proposed backlog item in
+   that project, which the Todo column already renders, and the page reloads so
+   it appears. A refusal — nothing typed, an unknown project, a project not set
+   up with bee, or bee itself refusing — shows inline under the task box and
+   keeps the typed text. On a handset both buttons hide; the bottom tab bar
+   carries the board instead.
 2. The **left rail**, described below. It is the same rail on the board and on
    the terminals view, so reaching another agent, or another project, never
    depends on which of the two a reader happens to be looking at.
@@ -74,10 +89,12 @@ project.
 The rail reads top down in the order the question does — who is working right
 now, then what there is to work on:
 
-- **Pinned**, the live agent terminals. Same inventory and same order as the
+- **Agents**, the live agent terminals, its heading led by a pin glyph. Same
+  inventory and same order as the
   terminals view's own switcher: blocked first, then working, then the rest.
-  Each row carries a status dot, the project it belongs to, and its workspace
-  and tab, and leads to that terminal. A row whose terminal a live agent
+  Each row reads as two lines — a status dot, the project it belongs to, and
+  its workspace and tab on the first; the feature it works, led by a purpose
+  icon, on the second — and leads to that terminal. A row whose terminal a live agent
   session claims also names that agent's own state and the feature it is
   working; a row no such session claims reads exactly as it did before. That address names the pane and nothing
   else — a terminal's own title, session name and working directory never appear
@@ -88,8 +105,11 @@ now, then what there is to work on:
   disappearing. The rail no longer carries a Board row — it pointed at the page
   it was already on, and the Orchestrator link answers that now.
 - **Projects**, the registered projects, each one a group that collapses. The
-  summary is the project's name line: its dot, its name, and the control that
-  removes it from the registry, which stays reachable while the group is closed.
+  summary is the project's name line: a folder glyph, its dot, its name, and a
+  **…** disclosure menu offering **Docs** (the project's reading pages) and
+  **Remove** (unregister, with the usual confirmation) — the menu, not a bare
+  remove control, and it stays reachable while the group is closed. A worktree
+  branch row keeps only its dot, never a glyph.
   Everything a collapsed group should fold away sits in the body — the markdown
   count and last-seen line, the badges, and the worktree branches. Groups open
   by default; the set a reader leaves closed is remembered for that browser
@@ -97,6 +117,11 @@ now, then what there is to work on:
   memory of it needs scripting. Typing in the rail's filter forces every still
   matching group open, because a match hidden inside a closed group reads as no
   match at all, and clearing the filter restores the reader's own collapsed set.
+  The filter matches the row's own words, never the menu's labels.
+- On a wide screen the whole rail folds: a chevron at its top collapses it to a
+  narrow strip (about 44px) and back, and that choice is remembered for the
+  browser alone. The handset drawer is a different mechanism and is untouched
+  by it.
 
 At most one thing in this frame is marked the current page: the Orchestrator
 link while the board is showing, or, on the terminals view, the pinned row of
@@ -226,31 +251,68 @@ they read anything else.
 
 The board's main section is feature-centric: one card per feature, never one card per
 cell. Every feature the store knows about — whether it still has live work or has
-already shipped — is placed into exactly one of three groups:
+already shipped — is placed into exactly one of five columns, left to right —
+**Todo, In Progress, Review, Compound, Ready to merge** — or into the **Archive**
+bar beneath them. Membership is decided in one fixed priority order, so a feature
+never appears twice and never in two columns at once. Each column opens with the
+same header: a status dot in the column's own lane hue, the column's name, and a
+right-aligned count in the monospace face; the In Progress header also carries a
+"waiting" chip, only when a real count of features waiting on a person backs it.
+In Progress is the one column that renders cards; the other four render dense rows.
+A dense row reads as one continuous text run — title, then its facts — that wraps in
+full rather than truncating, so nothing a row says is ever hidden behind an ellipsis.
 
-- **Waiting on you** — a feature whose live work is sitting at a gate that has not yet
-  been approved, or that carries a paused handoff note. Three things never place a
-  feature here: the independent-review gate never counts as a stop (see "Independent
-  review is always invoked," below); a handoff explicitly recorded as a clean,
-  already-claimed handover to the next piece of work — a `planned-next` handoff — never
-  counts as waiting either; and an unapproved gate that a **later** gate has already
-  been approved past is not a stop at all. Work that reached the execution gate has
-  plainly been through the earlier ones whatever their flags say, and naming an
-  earlier one would claim a decision is owed that nobody is waiting on. A feature
-  whose interview genuinely stopped for an answer — nothing approved after it — is
-  still placed here, which is the case this group exists to catch.
-- **In Progress** — every other feature that still has live work and is not waiting on
-  a person.
+- **Todo** — a feature whose cells exist, are all still open, and none is claimed.
+- **In Progress** — every feature that has live work — a cell being worked, the
+  checkout's active feature, a live session naming it, or a granted worktree of its
+  own — and is not finished-and-idle. A card here additionally carries one line
+  reading **Waiting on you —** followed by the reason, when its live work is sitting
+  at a gate that has not yet been approved, or when it carries a paused handoff
+  note; there is no separate Waiting-on-you column any more. Three things never
+  raise that line: the independent-review gate never counts as a stop (see
+  "Independent review is always invoked," below); a handoff explicitly recorded as
+  a clean, already-claimed handover to the next piece of work — a `planned-next`
+  handoff — never counts as waiting either; and an unapproved gate that a **later**
+  gate has already been approved past is not a stop at all. Work that reached the
+  execution gate has plainly been through the earlier ones whatever their flags
+  say, and naming an earlier one would claim a decision is owed that nobody is
+  waiting on. A feature whose interview genuinely stopped for an answer — nothing
+  approved after it — still carries the line, which is the case it exists to catch.
+- **Review** — a feature with no live work that still holds an unsettled review
+  candidate.
+- **Compound** — a feature whose own phase is exactly the compounding step.
 - **Ready to merge** — a feature whose work is finished in its own worktree and is
   waiting only for the human to land it: the worktree is still open, the execution
   gate was approved, and every cell that was not dropped is capped (a worktree with
   no cells at all is never ready). The card says whether the acceptance test is
   already approved or still pending, and how long the feature has been ready
   (its latest cap); approved cards come first. Once bee records its own
-  merge-readiness fact, that fact outranks this derivation.
-- **Finished** — a feature that has either fully shipped (compounding complete) or been
-  archived. A card in this group carries a chip naming the state of its worktree: still
-  the main checkout, an open worktree, or one already merged.
+  merge-readiness fact, that fact outranks this derivation. The card names its
+  worktree branch as a line of its own — the one fact a merge needs — the same
+  branch line an In Progress card carries (decision `8b057354`).
+- **Archive** (Finished) — a feature that has either fully shipped (compounding
+  complete) or been archived. Finished is not a column: it is a collapsed bar that
+  spans the board beneath the five columns, labelled ARCHIVE and stating its true
+  count while closed; opening it shows the finished rows. A row here carries a chip
+  naming the state of its worktree: still the main checkout, an open worktree, or one
+  already merged. Finished is checked before Review, so a closed feature stays closed
+  even while it carries an unresolved review candidate.
+
+A card's branch line names only a real branch. A feature worked in the main
+checkout has no branch, so its card carries no branch line at all — "main
+checkout" is the absence of a branch, never a branch named *Main* beside a
+branch glyph; the Finished chip above is where that state is still read.
+
+Every card title is led by one glyph so a column reads by shape before by word:
+the column's own state mark — an open circle for Todo, an activity mark for In
+Progress, an eye for Waiting on you, stacked layers for Compound, a merge mark
+for Ready to merge, a check for Finished — tinted in that column's lane hue.
+When an agent session is attached to the card, that agent's own mark replaces
+the column glyph (Claude, OpenAI/Codex and Gemini each in their vendor colour,
+a generic prompt mark for any other agent); an active session (working or
+blocked) outranks a quiet one, and a card with no agent pane keeps the column
+glyph. The agent's style name never spells a program name on a page where the
+terminal switch is off.
 
 A card shows the feature's human title with its slug as a subtitle beneath it, its
 Feature Boundary sentence, and a description. The title and description are read from
@@ -298,7 +360,9 @@ it is working. When several sessions name the same feature, the one that spoke
 last speaks for the card: the line names a single agent, so it names the
 freshest.
 
-The line reads **agent: state · cell · quiet age**:
+The line reads **agent: state · cell · quiet age**, and it takes a full-width
+row of its own beneath the title; the cell title wraps inside the card and is
+never clipped to one line:
 
 - **State** is one of five words — *working*, *idle*, *exited*, and the two
   that call for a person: *needs an answer* and *needs approval*. The word
@@ -335,10 +399,13 @@ agent is doing and which cell it holds, never who it is.
 
 ### The terminals running behind a card
 
-On the cross-project board, a Waiting on you or In Progress card also carries one
-marker per terminal session running in that feature's own checkout, each showing
-that session's state and the program it runs, and each opening that session's own
-terminal view. Finished rows carry none.
+On the cross-project board, an In Progress card also carries one marker per
+terminal session running in that feature's own checkout, each showing that
+session's state and the program it runs, and each opening that session's own
+terminal view. A collapsed card badges only the sessions that are working or
+blocked; the quiet ones move inside the card's expandable body, and the card
+states how many it folded away so a closed card never understates what is
+behind it. Finished rows carry none.
 
 Which sessions those are is decided by the checkout, not by the feature, because
 nothing in the record ties a session to a feature: a session knows which feature
@@ -363,7 +430,7 @@ per-project board carries no such markers.
 
 ### How each group is ordered, and how Finished is cut short
 
-Within the Waiting on you and In Progress groups, features are listed by name.
+Within the In Progress column, features are listed by name.
 
 Finished is different, because it is the group that grows without bound — a
 long-running project accumulates hundreds of finished features while the other two
@@ -391,8 +458,8 @@ finish. This list is never capped or truncated: every feature that has shipped i
 named here, no matter how many there are. A project with nothing finished yet shows a
 single honest line instead of a collapsible, zeroed list.
 
-A feature that has fully shipped appears twice on the board by design: once as a card
-in the Feature Hub's own Finished group, and again as a line in this list. The two are
+A feature that has fully shipped appears twice on the board by design: once as a row
+in the Feature Hub's own Archive bar, and again as a line in this list. The two are
 not competing claims about the same thing — the Hub groups every feature, live or
 shipped, by its current status at a glance, while this list is the complete, standing
 record of everything that has ever shipped, and is the one place that record is
@@ -465,10 +532,13 @@ An unknown cell or feature name returns a clean not-found, never a blank page.
 
 ### It never writes to a project's store
 
-The surface never writes to a project's `.bee/` directory. It approves no gate, claims
-no cell, edits no backlog item, and ends no session. Those actions belong to the bee
-CLI and to the live sessions that own that state; a dashboard that wrote there would
-race a running agent.
+The surface never writes to a project's `.bee/` directory itself. It approves no gate,
+claims no cell, edits no backlog item, and ends no session. Those actions belong to the
+bee CLI and to the live sessions that own that state; a dashboard that wrote there would
+race a running agent. The one thing the board can put into a project — a task filed
+from **+ New task** — goes through that project's own bee CLI, run at the project
+root, exactly as an agent would file it; a project that carries no bee gets a refusal,
+never a substitute writer (decision `cb52bbd1`).
 
 This is enforced, not merely intended: the project's entire `.bee/` tree — every file
 and every directory in it — is compared byte for byte before a request and after it,

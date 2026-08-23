@@ -25,6 +25,9 @@ right slot is the board's entry point.** (decision `393b93bb`)
 A real anchor to `/?tab=kanban`, marked current on the board. The `tab=`
 query values (`kanban`, `projects`, `terminals`) keep resolving exactly as
 before; only the strip under the topbar disappears.
+*Reconciled 2026-08-23:* this holds on wide screens only — at the 700px
+handset breakpoint decision `41015896` hides the Orchestrator button and
+the bottom tab bar's Board item is the board's entry point.
 
 **D2 — The rail gains a `Pinned` group of live agent terminals above
 `Projects`.** (decision `94cb9efb`)
@@ -57,4 +60,5 @@ keyed by project id; the rail filter forces a matching group open.
 - Exact-literal tests on the strip and the rail move in lockstep with the
   markup — a quietly broken one is a red base.
 - The phone phase of the rail stays OWED; this feature adds no
-  narrow-screen behaviour.
+  narrow-screen behaviour. *Reconciled 2026-08-23:* that phase landed
+  under console-phone-layout (decisions `d87ef556`, `41015896`).

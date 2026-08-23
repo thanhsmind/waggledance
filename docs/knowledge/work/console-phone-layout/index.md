@@ -1,6 +1,3 @@
----
-okf_version: 0.1
----
 <!--
 GENERATED FILE — do not hand-edit.
 Rendered by `bee knowledge index` from concept frontmatter inside docs/knowledge/ (okf-foundation D21).
@@ -9,13 +6,8 @@ Deterministic: byte-identical for the same bundle contents — path-sorted entri
 never a generation timestamp or any other wall-clock value.
 -->
 
-# Knowledge Bundle
+# work/console-phone-layout/
 
-## Sections
+## Concepts
 
-- [patterns/](patterns/index.md) — 1 concept(s)
-- [work/](work/index.md) — 54 concept(s)
-
-## Critical patterns
-
-None.
+- [console-phone-layout — delivery](delivery.md) — Delivery record for work item console-phone-layout: 3 capped cell(s), 6 recorded deviation(s).

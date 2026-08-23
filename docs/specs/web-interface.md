@@ -1,7 +1,7 @@
 ---
 area: web-interface
-updated: 2026-08-13
-sources: [file-nav-ux, ui-polish-settings-sidebar, agent-terminal, terminal-open-access, cross-board, board-drop-live, upstream-short-link, upstream-code-viewer]
+updated: 2026-08-23
+sources: [file-nav-ux, ui-polish-settings-sidebar, agent-terminal, terminal-open-access, cross-board, board-drop-live, upstream-short-link, upstream-code-viewer, console-theme-kanban, console-rail-orchestrator, rail-collapse]
 decisions: [12d62831, 99e8df73, 184c77b0]
 coverage: partial
 ---
@@ -56,17 +56,18 @@ content itself.
 ### Project list
 
 - **Triggers:** opening `/` or clicking the brand from anywhere.
-- **What sits above it:** when at least one registered project carries a bee
-  store, this page opens with one roll-up section — those projects' features in a
-  single board — and the project list follows beneath it. When no project carries
-  a bee store, the section does not appear and the page is the project list
-  alone. Nothing inside the list itself changes either way: same rows, same
-  order, same markers, same suggestions. That section belongs to the bee surface
-  and is specified in `bee-cockpit.md`.
+- **Where it sits:** the project list is the home page's left rail, beside the
+  cross-project board (there is no longer a separate Projects tab; `/?tab=projects`
+  lands on the board with the rail). The board belongs to the bee surface and is
+  specified in `bee-cockpit.md`, which also owns the rail's frame — its Agents
+  group, the collapsible project groups, the wide-screen fold and the handset
+  drawer. Everything below describes the rows themselves, which keep their
+  markers, order and suggestions whichever frame they render in.
 - **What it shows:** one row per registered project, every name on the same
   left edge. A row links to the project's default file and shows its name,
   file count, and last-seen time — never the filesystem path (per R5). Each
-  row carries a delete control that unregisters the project. A worktree of a
+  row carries a **…** menu holding **Docs** and **Remove**; Remove is the
+  delete control that unregisters the project. A worktree of a
   registered project is indented under the project it branches from and
   labelled by its branch alone, so one repository with three checkouts reads
   as one project with three branches rather than four unrelated entries; a
@@ -112,7 +113,7 @@ content itself.
   does not appear at all — showing it while the group itself is switched
   off would disclose that this host has a host-wide pane group configured,
   with nothing left to gate that disclosure.
-- **Delete / unregister:** activating a row's delete control asks the operator
+- **Delete / unregister:** activating a row's Remove item asks the operator
   to confirm, then removes the project from the registry and returns to the
   list. This removes only the registry entry and its index — **the files on
   disk are untouched**, and re-registering re-scans them. The endpoint is

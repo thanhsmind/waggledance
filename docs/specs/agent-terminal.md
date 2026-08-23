@@ -1,7 +1,7 @@
 ---
 area: agent-terminal
-updated: 2026-08-22
-sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity]
+updated: 2026-08-23
+sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact]
 decisions: [D1, D2, D3, D4, D5, D6, D7, D8, D9, D10]
 coverage: partial
 ---
@@ -147,7 +147,8 @@ implementation. Code entry points are listed in `reading-map.md`.
   scrolled off below. Once the screen's own bottom comes into view the stack
   stops there rather than travelling past it — it never leaves the screen's
   frame, never covers the reply controls beneath the screen, and stays clear
-  of a phone's own safe-area inset, regardless of the pane's height or the
+  of a phone's own safe-area inset and of the handset's bottom tab bar (it
+  sits above the bar, never behind it), regardless of the pane's height or the
   window's width. While an
   operator has stepped back this way, the pane's normal live refresh stops
   updating that view, so it is never overwritten out from under them.
@@ -323,9 +324,13 @@ job, which remains the one cross-project view.
   group out, the same as everywhere else it is gated. Plain shells are left
   out; this list is agents only. A pane claimed by more than one project
   (see Business Rules, Project scoping) is listed once, under the first
-  project that claims it, never twice. Panes are grouped under a heading for
-  each status — working, waiting on the operator, done, or idle — and each
-  row opens straight onto that pane's own terminal page.
+  project that claims it, never twice. Panes are grouped under one heading per
+  project — the same shape the project page's own list uses — and each
+  row opens straight onto that pane's own terminal page. A row is one line:
+  the status pill, then what the agent is doing — its terminal title, or the
+  pane's name when it has none — clipped with an ellipsis rather than
+  wrapped; the pane address and the feature it works sit in the row's hover
+  title, since the terminal the row leads to already shows them.
 - **When it refreshes:** the drawer's contents are fetched only while it is
   open, on a short repeating interval; closing it stops the refresh, so
   having the drawer available costs nothing while it isn't in use.
@@ -649,6 +654,15 @@ operates waggledance every time the network path to its port changes.
 No settled screenshot captured yet.
 
 ## Pointers (implementation)
+
+- Research briefs behind the agent-status model:
+  `docs/history/research/agent-orchestrator-terminal-ux.md` (the
+  waiting-input/blocked split, in-browser attention path, replay cover,
+  composer routing — keep herdr's snapshot model) and
+  `docs/history/research/agent-status-herdr-vs-agent-orchestrator.md`
+  (hook-reported status vs screen-regex; the adopt path is bee-installed hooks
+  reporting per-session activity, which is what bee-agent-activity shipped),
+  plus `docs/history/research/bee-agent-activity-contract.md`.
 
 - `crates/waggledance/src/server.rs` — the image attach route
   (`POST /p/:id/_terminal/:pane_id/attach`): raw-body upload, declared-MIME

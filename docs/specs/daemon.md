@@ -101,7 +101,10 @@ serves (see the web-interface and agent-integration areas for that).
   daemon is bound to listen on all interfaces (no single specific host), the
   liveness check dials the local loopback address rather than the wildcard
   address itself — dialing the wildcard address directly is unreliable across
-  operating systems. This keeps R2's single-daemon guarantee intact regardless
+  operating systems — and the request names, as its host, the very address it
+  dialed (the IPv4 or the bracketed IPv6 loopback for a wildcard bind, else the
+  literal configured host), so a daemon that checks the host it is asked for
+  recognises its own probe and answers healthy. This keeps R2's single-daemon guarantee intact regardless
   of which host the daemon is bound to; before this fix, a launcher on some
   operating systems could wrongly conclude an all-interfaces-bound daemon was
   not running and start a duplicate.
