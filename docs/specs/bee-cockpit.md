@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
 updated: 2026-08-23
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact]
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness]
 decisions: []
 coverage: partial
 ---
@@ -382,6 +382,16 @@ never clipped to one line:
 A record that has not spoken for more than ninety seconds also carries a
 muted **no signal** marker. Its state still reads; what changes is that
 nothing counts it as a call for a person.
+
+A record stays on its pane for as long as the session is alive, and alive
+has two witnesses — either one suffices. The first is bee's own heartbeat,
+thirty minutes. The second is herdr still hosting that session id in the
+pane: a session blocked on a gate question writes nothing while the person
+is away, so its heartbeat alone would age out inside the hour and the pane
+would fall back to herdr's own reading of that dialog, which is *idle*.
+herdr listing the id is proof the agent is still there, so the record keeps
+speaking and *needs approval* stays on the pane until the answer lands. A
+stale record nobody hosts is history and leaves the pane to herdr.
 
 Two rules follow this reading wherever else it surfaces:
 

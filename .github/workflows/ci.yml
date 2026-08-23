@@ -35,5 +35,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Parse install.ps1
+        # The installer is rewritten by hand and pwsh is absent on the dev
+        # machine; a parse failure here is the only syntax check it gets.
+        shell: pwsh
+        run: |
+          $src = Get-Content -Raw -Path install.ps1
+          $null = [ScriptBlock]::Create($src)
+          Write-Host "install.ps1 parsed OK"
+
       - name: Test
         run: cargo test --workspace
