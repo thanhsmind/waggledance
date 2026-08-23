@@ -1593,6 +1593,23 @@ impl BeeActionKind {
     }
 }
 
+/// bap-6: a feature name reaches the filesystem — `bee_action_gate` probes
+/// `.bee/lanes/<feature>.json` to decide `--lane` versus `--no-lane` — and a
+/// name is not a path. Anything carrying a separator or a leading dot is
+/// refused here, before any probe: `..%2f..%2fetc` never becomes a `is_file`
+/// call outside `.bee/lanes/`, and a blank name never becomes `.json`.
+///
+/// This is a shape check, not an existence check. A well-formed name that
+/// names no lane is fine and stays fine — `bee_action_gate` reads that as
+/// `--no-lane` and lets bee itself have the final word, which is the whole
+/// posture of this route (D5: it relays, it does not decide).
+fn valid_feature_name(feature: &str) -> bool {
+    !feature.is_empty()
+        && !feature.starts_with('.')
+        && !feature.contains('/')
+        && !feature.contains('\\')
+}
+
 /// Every refusal this route makes, in the one shape the card reads back
 /// inline: a JSON `{error}`, never an HTML error page — this route's only
 /// caller is `fetch`. Deliberately its own function rather than a shared one
@@ -1622,6 +1639,12 @@ fn gate_wake_line(gate: BeeGate, approved: bool) -> String {
 /// answer. A herdr that is down, an absent `.bee/`, or a feature with no
 /// checkout of its own all yield an empty list, which every caller here
 /// reads as "no live pane" rather than as an error.
+///
+/// bap-6: this list is a *rendering* join and is deliberately generous —
+/// [`project_feature_panes`] maps every main-checkout pane onto every
+/// feature with no worktree of its own, because a badge only says "this
+/// checkout is busy". A write must not be that generous, so both callers
+/// narrow it further with [`pane_is_bound_to_feature`].
 async fn feature_bound_panes(
     st: &AppState,
     project: &waggledance_core::domain::Project,
@@ -1637,6 +1660,28 @@ async fn feature_bound_panes(
     let bee = project_bee_activity(project, &rollup);
     let mut panes = project_feature_panes(herdr_snapshot.as_ref(), project, &rollup, &bee);
     panes.remove(feature).unwrap_or_default()
+}
+
+/// bap-6: may this pane be *typed into* on behalf of `feature`?
+///
+/// Two things must hold, and the second is the one a rendering join does not
+/// give: the pane must be an agent's (never a shell, which would execute the
+/// line as a command), and the live session sitting in it must itself be on
+/// this feature. `TerminalPaneView.bee_feature` is that session's own
+/// `activity.feature`, stamped on by [`apply_bee_activity`] — the same field
+/// `bee_board` shows on the pane row.
+///
+/// Without this second half, a main-checkout pane belongs to *every*
+/// worktree-less feature on the board ([`project_feature_panes`]), so an
+/// Approve on feature A could type into the agent blocked on feature B.
+///
+/// `bee_feature: None` is never a target: no live session claims that pane
+/// (or the project's bee predates the `activity.feature` field, bee 2.20.0).
+/// There is nothing that says the agent in it is working on this feature, so
+/// the answer is "no pane" — the gate stays written and `woke` reads false,
+/// which is the same thing that happens with no pane at all.
+fn pane_is_bound_to_feature(pane: &views::TerminalPaneView, feature: &str) -> bool {
+    pane.kind != "shell" && pane.bee_feature.as_deref() == Some(feature)
 }
 
 /// D4's second, best-effort half: one line into the feature's own live agent
@@ -1663,7 +1708,7 @@ async fn wake_feature_pane(
         return false;
     }
     let panes = feature_bound_panes(st, project, feature).await;
-    let Some(pane) = panes.iter().find(|p| p.kind != "shell") else {
+    let Some(pane) = panes.iter().find(|p| pane_is_bound_to_feature(p, feature)) else {
         return false;
     };
     st.herdr.send_input(&pane.pane_id, line, true).await.is_ok()
@@ -1750,7 +1795,11 @@ async fn bee_action_gate(
 /// approve is valid for (the terminal button's own rule, decision
 /// `110d9120`). No such pane is a `409`: the human is answering a prompt
 /// that is no longer there, and guessing a pane would type `Approve` into
-/// whatever happens to be running.
+/// whatever happens to be running. bap-6: "the feature's bound pane" means
+/// the live session in it is on THIS feature
+/// ([`pane_is_bound_to_feature`]), not merely that it shares the checkout —
+/// two agents blocked in one main checkout on two different features are
+/// exactly what that distinction is for.
 ///
 /// Approve sends the literal text `Approve` with `submit: true`, byte for
 /// byte what `assets/app.js`'s terminal Approve button posts. Reject sends
@@ -1775,7 +1824,7 @@ async fn bee_action_permission(
     }
     let panes = feature_bound_panes(st, project, feature).await;
     let Some(pane) = panes.iter().find(|p| {
-        p.kind != "shell"
+        pane_is_bound_to_feature(p, feature)
             && p.bee_state.as_ref() == Some(&waggledance_core::bee::BeeActivityState::Blocked)
     }) else {
         return action_error(
@@ -1813,7 +1862,10 @@ async fn bee_action_permission(
 /// Guarded by exactly two things: the Host allowlist every route in this
 /// router sits behind, and D3's per-project `orchestration.enabled` opt-in.
 /// A project that never opted in is a `403` naming its remedy, and nothing
-/// runs — no bee spawn, no keystroke, not even a rollup read.
+/// runs — no bee spawn, no keystroke, not even a rollup read. The body's own
+/// two fields are shape-checked first (bap-6, [`valid_feature_name`]): both
+/// halves below turn `feature` into either a path probe or a pane lookup, so
+/// a name that is not a name is a `400` before either happens.
 async fn bee_action(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -1825,6 +1877,12 @@ async fn bee_action(
             format!("unknown board action {:?}", body.kind),
         );
     };
+    if !valid_feature_name(&body.feature) {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            format!("{:?} is not a feature name", body.feature),
+        );
+    }
     let Ok(Some(project)) = st.engine.get_project(&id) else {
         return action_error(StatusCode::NOT_FOUND, "project not found");
     };
@@ -26726,6 +26784,23 @@ mod bee_route_tests {
             .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
             .await
             .unwrap();
+        // bap-6: the wake target is the pane whose own live session says it
+        // is on this feature, so the fixture has to bind one — a bare pane in
+        // the checkout is no longer enough, and the sibling test below proves
+        // why.
+        write(
+            &root,
+            ".bee/sessions/live-wake-bound.json",
+            &activity_session_json(
+                "live-wake-bound",
+                "working",
+                &rfc3339_seconds_ago(3),
+                Some(&pane.pane_id),
+                &root,
+                Some("feat-wake"),
+                None,
+            ),
+        );
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -27426,5 +27501,280 @@ mod bee_route_tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&sibling).ok();
+    }
+
+    /// bap-6, the must-have this cell exists for: a feature with no worktree
+    /// of its own shares the main checkout with every other such feature, so
+    /// the rendering join hands BOTH panes to BOTH cards. A write may not be
+    /// that generous — the pane a click reaches is the one whose own live
+    /// session says it is on that feature.
+    ///
+    /// Two agents, one checkout, two features, both sitting on a permission
+    /// prompt: Approve on `feat-alpha` must reach alpha's pane and leave
+    /// beta's — an agent blocked on something else entirely — untouched.
+    /// The gate half's wake line is held to the same rule in the same run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_never_types_into_a_pane_bound_to_a_different_feature() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("action-crossfeature-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-crossfeature-root");
+        let log = fresh_root("action-crossfeature-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-alpha", "live-alpha");
+        write_cross_project_live_feature(&root, "feat-beta", "live-beta");
+        fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+
+        // Both panes run in the project's own main checkout: neither feature
+        // has a worktree, so `project_feature_panes` maps both onto both
+        // cards. Only `activity.feature` tells them apart.
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        let alpha_pane = fake
+            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .await
+            .unwrap();
+        let beta_pane = fake
+            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .await
+            .unwrap();
+        for (session, feature, pane_id) in [
+            ("live-alpha-agent", "feat-alpha", &alpha_pane.pane_id),
+            ("live-beta-agent", "feat-beta", &beta_pane.pane_id),
+        ] {
+            write(
+                &root,
+                &format!(".bee/sessions/{session}.json"),
+                &activity_session_json(
+                    session,
+                    "blocked",
+                    &rfc3339_seconds_ago(3),
+                    Some(pane_id),
+                    &root,
+                    Some(feature),
+                    None,
+                ),
+            );
+        }
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "action-crossfeature");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        // Deliberately the SECOND pane in herdr's own order: a plain
+        // "first non-shell blocked pane in this checkout" scan lands on
+        // alpha's, so this direction is the one that catches the bug.
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "permission-approve", "feat-beta"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            pane_screen(&st, &beta_pane.pane_id)
+                .await
+                .contains("Approve"),
+            "the answer must reach the agent blocked on the feature that was clicked"
+        );
+        let alpha_screen = pane_screen(&st, &alpha_pane.pane_id).await;
+        assert!(
+            !alpha_screen.contains("Approve"),
+            "an Approve on one feature must never type into the agent blocked on another: {alpha_screen:?}"
+        );
+
+        // The gate half's wake line answers to the same rule, in the same
+        // direction and for the same reason.
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "uat-approve", "feat-beta"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            action_json(resp).await["woke"],
+            true,
+            "beta's own pane is live and bound, so it is woken"
+        );
+        assert!(
+            pane_screen(&st, &beta_pane.pane_id)
+                .await
+                .contains("uat approved from the board"),
+            "the wake line goes to the feature's own pane"
+        );
+        let alpha_screen = pane_screen(&st, &alpha_pane.pane_id).await;
+        assert!(
+            !alpha_screen.contains("uat approved from the board"),
+            "beta's gate must not wake alpha's agent: {alpha_screen:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// bap-6: `feature` comes off the wire and becomes a path
+    /// (`.bee/lanes/<feature>.json`, probed to choose `--lane`). A name that
+    /// is not a name — empty, dot-led, or carrying a separator — is a `400`
+    /// before that probe and before bee is spawned at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_refuses_a_feature_name_that_is_really_a_path() {
+        let dir = fresh_root("action-featname-cfg");
+        let root = fresh_root("action-featname-root");
+        let log = fresh_root("action-featname-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-ok", "live-ok");
+        fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "action-featname");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../../etc/passwd",
+            "feat/../../secret",
+            "..\\..\\windows",
+            ".hidden",
+        ] {
+            let resp = router(st.clone())
+                .oneshot(action_req(&project.id, "uat-approve", bad))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{bad:?} is not a feature name"
+            );
+            assert!(
+                !error_of(resp).await.is_empty(),
+                "the 400 must say what it refused"
+            );
+        }
+        assert!(
+            !log.exists(),
+            "a malformed feature name must never reach the project's bee at all"
+        );
+
+        // The same route, the same day, with a real name: still fine.
+        let resp = router(st)
+            .oneshot(action_req(&project.id, "uat-approve", "feat-ok"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// bap-6, the gap the sibling 421 tests left: the board's one write route
+    /// sits behind the same router-wide `Host` allowlist every other write
+    /// does. A foreign `Host` — a page on `evil.tld` posting at a daemon
+    /// bound to loopback — is refused with 421, and nothing runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreign_host_to_bee_action_is_refused_and_writes_no_gate() {
+        let dir = fresh_root("action-foreign-cfg");
+        let root = fresh_root("action-foreign-root");
+        let log = fresh_root("action-foreign-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-foreign", "live-foreign");
+        fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "action-foreign");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let req = Request::builder()
+            .header(header::HOST, "evil.tld")
+            .uri(format!("/p/{}/_bee/actions", project.id))
+            .method("POST")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "kind": "uat-approve", "feature": "feat-foreign" }).to_string(),
+            ))
+            .unwrap();
+        let resp = router(st).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert!(
+            !log.exists(),
+            "a foreign Host must never reach bee_action's gate write at all"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// bap-6, over the vendored client source `views::APP_JS` (the same
+    /// grep-based proof shape bap-3 uses — this handler has no test runtime
+    /// of its own): the 1.5 s trailing timer belongs to ONE burst, the bee
+    /// gate write a board watches for. The dev `"reload"` frame and every
+    /// ordinary document change reload at once, and the modal rule holds one
+    /// pending reload instead of re-arming a fresh window forever.
+    #[test]
+    fn the_reload_debounce_is_scoped_to_bee_signals_on_a_board() {
+        let js = views::APP_JS;
+        let start = js
+            .find("var RELOAD_DEBOUNCE_MS = 1500;")
+            .expect("the reload timer must keep its 1500 ms window");
+        let end = js[start..]
+            .find("// Terminal screen poll")
+            .map(|i| start + i)
+            .expect("the socket block is followed by the terminal poller");
+        let block = &js[start..end];
+
+        assert!(
+            block.contains("function scheduleReload()") && block.contains("function modalOpen()"),
+            "the debounced path and the dialog rule both stay in this block"
+        );
+
+        // The dev-reload frame: immediate, never debounced.
+        let dev_at = block
+            .find("if (ev.data === \"reload\")")
+            .expect("the dev-reload frame must still be handled");
+        let dev_line = &block[dev_at..dev_at + block[dev_at..].find('\n').unwrap()];
+        assert!(
+            !dev_line.contains("scheduleReload"),
+            "an asset reload has no burst behind it: {dev_line}"
+        );
+        assert!(
+            dev_line.contains("reloadNow()"),
+            "the dev-reload frame reloads at once: {dev_line}"
+        );
+
+        // The one debounced path, and the immediate fallback beside it.
+        assert!(
+            block.contains("if (isBeeSignalBurst(msg.changed)) { scheduleReload(); return; }"),
+            "only a bee signal on a board surface waits for the timer: {block}"
+        );
+        assert!(
+            block.contains("function isBeeSignalBurst(changed)")
+                && block.contains("isBeeSignal(c.slice(slash + 1))"),
+            "the burst test is the same two bee-signal shapes watch.rs broadcasts"
+        );
+
+        // The modal rule: one pending reload, never a self-re-arming timer.
+        let sched_at = block
+            .find("function scheduleReload()")
+            .expect("scheduleReload must exist");
+        let sched_end = block[sched_at..]
+            .find("\n  function ")
+            .map(|i| sched_at + i)
+            .unwrap_or(block.len());
+        let sched = &block[sched_at..sched_end];
+        let sched_body = &sched[sched.find('{').expect("scheduleReload has a body")..];
+        assert!(
+            !sched_body.contains("scheduleReload()"),
+            "the timer must not re-arm itself behind an open dialog: {sched}"
+        );
+        assert!(
+            block.contains("reloadPending = true;")
+                && block.contains("function flushPendingReload()"),
+            "a reload blocked by a modal becomes one pending reload"
+        );
     }
 }

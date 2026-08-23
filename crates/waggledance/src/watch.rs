@@ -64,6 +64,11 @@ pub fn spawn_watchers(
 /// card a human just approved keeps showing the stop they cleared until a
 /// manual reload). Every other path — session heartbeats, cells, logs,
 /// reservations — is still dropped here.
+///
+/// `.bee/state.json` is reported only when its *gate-relevant projection*
+/// moved (bap-6, [`state_gate_projection`]). bee rewrites that file on
+/// worker and waiting-on churn every turn, and broadcasting each of those
+/// writes reloads every open board on the pace of an agent's typing.
 fn reindex_paths(engine: &Engine, paths: &[std::path::PathBuf]) -> Vec<String> {
     let projects = engine.list_projects().unwrap_or_default();
     let mut changed = Vec::new();
@@ -83,9 +88,16 @@ fn reindex_paths(engine: &Engine, paths: &[std::path::PathBuf]) -> Vec<String> {
         };
         let content_changed = if report_only {
             // No stored copy to diff against (the engine indexes markdown
-            // only), so every write reports. The client debounces the burst
-            // bee emits when it rewrites a lane and its projections together.
-            true
+            // only), so a lane write always reports; the client debounces the
+            // burst bee emits when it rewrites a lane and its projections
+            // together. `.bee/state.json` is the exception (bap-6): it is
+            // rewritten on worker and waiting-on churn every turn, so it is
+            // diffed against its own gate-relevant projection first.
+            if is_bee_state_file(path) {
+                state_gate_projection_changed(path)
+            } else {
+                true
+            }
         } else if path.exists() {
             // Reindex the file and refresh its outgoing links (keeps backlinks
             // live). Only a genuine content change reports true.
@@ -133,14 +145,11 @@ fn is_markdown(p: &Path) -> bool {
 /// Cells, logs, reservations and every other `.bee/` path are excluded for
 /// the same reason — they do not decide what a card says.
 fn is_bee_signal(p: &Path) -> bool {
-    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let parent = p.parent();
-    let parent_name = parent.and_then(|d| d.file_name()).and_then(|n| n.to_str());
-    if name == "state.json" && parent_name == Some(".bee") {
+    if is_bee_state_file(p) {
         return true;
     }
+    let parent = p.parent();
+    let parent_name = parent.and_then(|d| d.file_name()).and_then(|n| n.to_str());
     let grandparent_name = parent
         .and_then(|d| d.parent())
         .and_then(|d| d.file_name())
@@ -148,6 +157,79 @@ fn is_bee_signal(p: &Path) -> bool {
     parent_name == Some("lanes")
         && grandparent_name == Some(".bee")
         && p.extension().and_then(|e| e.to_str()) == Some("json")
+}
+
+/// `<root>/.bee/state.json` — the unlaned gate record, and the one bee
+/// signal that is rewritten constantly for reasons no board cares about.
+fn is_bee_state_file(p: &Path) -> bool {
+    p.file_name().and_then(|n| n.to_str()) == Some("state.json")
+        && p.parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            == Some(".bee")
+}
+
+/// The only part of `.bee/state.json` a board card's text is derived from:
+/// which feature the session is on, its phase, and which gates are approved.
+/// Everything else in that file — the live worker list, the waiting-on mark,
+/// heartbeats, handoff bookkeeping — is rewritten on ordinary turn churn and
+/// changes nothing a card shows.
+///
+/// Kept as a `serde_json::Value` of exactly those three keys rather than a
+/// typed struct: bee owns this file's schema, and a projection that only
+/// *reads* three names by string cannot go stale when bee adds a fourth.
+type GateProjection = serde_json::Value;
+
+/// The last gate-relevant projection seen for each `.bee/state.json` on
+/// disk, keyed by absolute path — the report-only sibling of the content
+/// cache `reindex_paths` leans on for markdown (the engine's own index).
+/// Process-wide and unbounded by design: there is one entry per registered
+/// project's state file, so it is bounded by the project list.
+fn state_projections(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, GateProjection>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, GateProjection>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Read `path` and project it onto the three gate-relevant keys. `None` when
+/// the file cannot be read or is not JSON — mid-write, mid-rename, or
+/// truncated. That case reports nothing: the write that finishes it is a
+/// separate event and will be compared normally.
+fn state_gate_projection(path: &Path) -> Option<GateProjection> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pick = |key: &str| value.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    Some(serde_json::json!({
+        "feature": pick("feature"),
+        "phase": pick("phase"),
+        "approved_gates": pick("approved_gates"),
+    }))
+}
+
+/// `true` only when this write moved something a board renders (bap-6). The
+/// first sight of a state file always counts as a change — there is nothing
+/// to compare it against, and a board that just came up wants the render.
+///
+/// An unreadable or unparsable file leaves the remembered projection alone
+/// rather than clearing it: a transient bad read must not turn the next good
+/// write into a spurious "first sight" broadcast.
+fn state_gate_projection_changed(path: &Path) -> bool {
+    let Some(next) = state_gate_projection(path) else {
+        return false;
+    };
+    let Ok(mut cache) = state_projections().lock() else {
+        // A poisoned cache is not a reason to go silent on gate writes.
+        return true;
+    };
+    match cache.get(path) {
+        Some(prev) if *prev == next => false,
+        _ => {
+            cache.insert(path.to_path_buf(), next);
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -285,6 +367,72 @@ mod tests {
                 "{other} must not be broadcast"
             );
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// bap-6: `.bee/state.json` is rewritten on ordinary turn churn — the
+    /// live worker list, the waiting-on mark, heartbeats — and broadcasting
+    /// each of those reloads every open board for nothing. Only a move in
+    /// the gate-relevant projection (`feature`, `phase`, `approved_gates`)
+    /// is news; the lane file's own broadcast is untouched.
+    #[test]
+    fn reindex_paths_broadcasts_state_json_only_when_its_gate_projection_moves() {
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-watch-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# A\ncontent");
+
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&dir, None).unwrap();
+        let state = dir.join(".bee/state.json");
+        let expected = vec![format!("{}/.bee/state.json", project.id)];
+
+        let record = |workers: &str, uat: bool| {
+            format!(
+                r#"{{"feature":"board-approve-actions","phase":"swarming",
+                     "approved_gates":{{"shape":true,"execution":true,"uat":{uat}}},
+                     "workers":[{workers}],"waiting_on":{{"kind":"turn-end"}}}}"#
+            )
+        };
+
+        // First sight of the file: nothing to compare against, so it reports.
+        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+        std::fs::write(&state, record("\"w1\"", false)).unwrap();
+        assert_eq!(
+            reindex_paths(&engine, std::slice::from_ref(&state)),
+            expected,
+            "the first state.json a board sees must render it"
+        );
+
+        // Ordinary turn churn: a worker joins, the gates are untouched.
+        std::fs::write(&state, record("\"w1\",\"w2\"", false)).unwrap();
+        assert!(
+            reindex_paths(&engine, std::slice::from_ref(&state)).is_empty(),
+            "a worker/waiting-on rewrite must not reload every open board"
+        );
+
+        // The uat gate flips: that is exactly what a card renders.
+        std::fs::write(&state, record("\"w1\",\"w2\"", true)).unwrap();
+        assert_eq!(
+            reindex_paths(&engine, std::slice::from_ref(&state)),
+            expected,
+            "a gate approval must reach /ws or the answered card stays stale"
+        );
+
+        // Unparsable (mid-write, truncated) reports nothing, and leaves the
+        // remembered projection alone — the good write that follows is
+        // compared against the gates, not against a cleared cache.
+        std::fs::write(&state, "{\"feature\":").unwrap();
+        assert!(
+            reindex_paths(&engine, std::slice::from_ref(&state)).is_empty(),
+            "half-written JSON is not a gate change"
+        );
+        std::fs::write(&state, record("\"w3\"", true)).unwrap();
+        assert!(
+            reindex_paths(&engine, std::slice::from_ref(&state)).is_empty(),
+            "the same gates after a bad read must still be quiet"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

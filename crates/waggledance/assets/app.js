@@ -1558,16 +1558,19 @@
     return changed.indexOf(pid + "/" + rest) !== -1;
   }
 
-  // Every reload goes through one trailing 1500 ms timer. bee rewrites a
-  // lane and its projections inside a single command, so one approval lands
-  // as a burst of change events; without the timer that is a burst of
-  // reloads, each one throwing away the page mid-paint. The timer is also
-  // where the dialog rule lives (D2's confirm is a real modal the human is
-  // mid-answer in) — a reload that would pull it out from under them waits
-  // for it to close instead of firing. No network happens on this timer; it
-  // is the push signal waiting its turn, never a poll.
+  // The trailing 1500 ms timer exists for exactly ONE burst: bee rewrites a
+  // lane and its projections inside a single command, so one board approval
+  // lands as several change events, and reloading on each throws the page
+  // away mid-paint. bap-6 scopes the timer to that burst — a bee signal seen
+  // from a surface that renders bee state. Everything else (a markdown
+  // document page, the dev `"reload"` frame) reloads the moment its own
+  // change arrives, the behaviour those pages had before the timer existed:
+  // a 1.5 s wait there buys nothing and only makes editing feel laggy.
+  // No network happens on this timer; it is the push signal waiting its
+  // turn, never a poll.
   var RELOAD_DEBOUNCE_MS = 1500;
   var reloadTimer = null;
+  var reloadPending = false;
   function modalOpen() {
     var els = document.querySelectorAll(
       "dialog[open], .task-overlay, [role=dialog]"
@@ -1580,24 +1583,71 @@
     }
     return false;
   }
+  // The one place a reload actually happens, and the one place the dialog
+  // rule lives (D2's confirm is a real modal the human is mid-answer in): a
+  // reload that would pull it out from under them becomes ONE pending
+  // reload, never a fresh 1.5 s timer armed over and over behind a dialog
+  // nobody has closed yet. The flag is flushed by the events that close a
+  // modal, so the reload lands as soon as the dialog is gone instead of up
+  // to a second and a half later.
+  function reloadNow() {
+    if (modalOpen()) { reloadPending = true; return; }
+    location.reload();
+  }
+  function flushPendingReload() {
+    if (!reloadPending || modalOpen()) return;
+    reloadPending = false;
+    location.reload();
+  }
+  // A modal closes on a click (its own button, or the backdrop), on a key
+  // (Escape), or — for a real `<dialog>` — by firing `close`, which does not
+  // bubble and so is caught in the capture phase. The deferred check runs
+  // after the current task so the DOM has already settled; this is a
+  // one-shot flush of a flag, never a timer that re-arms itself.
+  ["click", "keyup", "close"].forEach(function (type) {
+    document.addEventListener(
+      type,
+      function () { setTimeout(flushPendingReload, 0); },
+      true
+    );
+  });
   function scheduleReload() {
     if (reloadTimer !== null) clearTimeout(reloadTimer);
     reloadTimer = setTimeout(function () {
       reloadTimer = null;
-      if (modalOpen()) { scheduleReload(); return; }
-      location.reload();
+      reloadNow();
     }, RELOAD_DEBOUNCE_MS);
+  }
+  // Is this reload the bee-signal burst the timer exists for? Only on a
+  // surface that renders bee state — the home board and `/p/<id>/_bee…`,
+  // the same two branches `shouldReload` splits on. On a document or code
+  // page a bee signal is not a reload at all, so the question never gets
+  // here; when it does, the answer decides debounced versus immediate.
+  function isBeeSignalBurst(changed) {
+    var m = location.pathname.match(/^\/p\/([^\/]+)\/(.*)$/);
+    if (m) {
+      var rest;
+      try { rest = decodeURIComponent(m[2]); } catch (e) { return false; }
+      if (!/^_bee(\/|$)/.test(rest)) return false;
+    }
+    return changed.some(function (c) {
+      var slash = c.indexOf("/");
+      return slash !== -1 && isBeeSignal(c.slice(slash + 1));
+    });
   }
   function connect() {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
     var ws = new WebSocket(proto + "//" + location.host + "/ws");
     ws.onmessage = function (ev) {
-      if (ev.data === "reload") { scheduleReload(); return; }
+      // The dev-reload frame says the served assets changed: there is no
+      // burst behind it and no board state to settle, so it reloads at once.
+      if (ev.data === "reload") { reloadNow(); return; }
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg && Array.isArray(msg.changed) && shouldReload(msg.changed)) {
-        scheduleReload();
-      }
+      if (!msg || !Array.isArray(msg.changed)) return;
+      if (!shouldReload(msg.changed)) return;
+      if (isBeeSignalBurst(msg.changed)) { scheduleReload(); return; }
+      reloadNow();
     };
     ws.onclose = function () { setTimeout(connect, 3000); };
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
