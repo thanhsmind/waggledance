@@ -106,9 +106,11 @@ Rules that settled while the cells ran, each a capture stub merged here:
 ## Boundary
 
 Buttons that *start an agent run* — Run review, Run compound, Start todo — are
-not part of this feature; they are `board-run-actions`. Free-text and further
-canned replies on the card stay deferred
-(`docs/history/terminal-approve-button/CONTEXT.md`).
+not part of this feature; they are `board-run-actions`.
+<!-- bee:not-a-deferral: records an earlier feature's boundary (terminal-approve-button), not a promise this feature makes -->
+Free-text and further canned replies on the card remain outside scope, as
+`docs/history/terminal-approve-button/CONTEXT.md` already records.
+<!-- /bee:not-a-deferral -->
 
 Backlog row **"Agent board V2: on-board Approve/Reject buttons"**
 (`.bee/backlog.jsonl`) is delivered by this feature.

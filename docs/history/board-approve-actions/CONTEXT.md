@@ -71,11 +71,15 @@ These are fixed. Planning must implement them exactly — cited, never reinterpr
 
 ## Outstanding Questions
 
-### Deferred To Planning
+### Resolved in planning and execution
 
-- [ ] Does `bee gate` accept a `--reason` for `--actor user`, so the record can say "board click"? — read `bee gate --help --json`; if not, the wake-up line is the only provenance.
-- [ ] Which bee CLI refusals (advisor precondition, plan-conflict precondition, `WORKTREE_MERGE_UAT_PENDING`) must surface verbatim on the card instead of a generic error.
+<!-- bee:not-a-deferral: both questions were answered by bap-1; kept as the record of what planning had to find out -->
+- [x] `bee gate` takes no `--reason` for `--actor user`; the wake-up line into the bound pane is the board click's only provenance.
+- [x] Every bee CLI refusal reaches the card verbatim as bee's stderr tail (502), never a generic error.
+<!-- /bee:not-a-deferral -->
 
-## Deferred Ideas
+## Out of scope
 
-- More canned replies (Retry, free-text reply) on the card — `docs/history/terminal-approve-button/CONTEXT.md:71-73` already defers this.
+<!-- bee:not-a-deferral: restates an earlier feature's boundary, not a promise this feature makes -->
+- More canned replies (Retry, free-text reply) on the card — outside this feature, as `docs/history/terminal-approve-button/CONTEXT.md:71-73` already records.
+<!-- /bee:not-a-deferral -->
