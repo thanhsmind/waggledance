@@ -11,7 +11,9 @@ never a generation timestamp or any other wall-clock value.
 ## Sections
 
 - [agent-board/](agent-board/index.md) — 1 concept(s)
+- [agent-feature-resolution/](agent-feature-resolution/index.md) — 1 concept(s)
 - [agent-terminal/](agent-terminal/index.md) — 1 concept(s)
+- [agents-drawer-feature/](agents-drawer-feature/index.md) — 1 concept(s)
 - [archive-visibility/](archive-visibility/index.md) — 1 concept(s)
 - [archived-cell-fallback/](archived-cell-fallback/index.md) — 1 concept(s)
 - [archived-feature-docs/](archived-feature-docs/index.md) — 1 concept(s)
@@ -68,6 +70,7 @@ never a generation timestamp or any other wall-clock value.
 - [settle-test-gaps/](settle-test-gaps/index.md) — 1 concept(s)
 - [shell-input-newline/](shell-input-newline/index.md) — 1 concept(s)
 - [status-wildcard-host/](status-wildcard-host/index.md) — 1 concept(s)
+- [tabbar-collapse/](tabbar-collapse/index.md) — 1 concept(s)
 - [term-frame-blocks/](term-frame-blocks/index.md) — 1 concept(s)
 - [term-keys-one-row/](term-keys-one-row/index.md) — 1 concept(s)
 - [term-url-links/](term-url-links/index.md) — 1 concept(s)

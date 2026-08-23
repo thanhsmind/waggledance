@@ -27,7 +27,8 @@ query values (`kanban`, `projects`, `terminals`) keep resolving exactly as
 before; only the strip under the topbar disappears.
 *Reconciled 2026-08-23:* this holds on wide screens only — at the 700px
 handset breakpoint decision `41015896` hides the Orchestrator button and
-the bottom tab bar's Board item is the board's entry point.
+the bottom tab bar's Board item is the board's entry point — a bar that
+since `75a5b463` (tabbar-collapse) is hidden by default behind a handle.
 
 **D2 — The rail gains a `Pinned` group of live agent terminals above
 `Projects`.** (decision `94cb9efb`)

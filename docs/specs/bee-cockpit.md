@@ -411,8 +411,10 @@ states how many it folded away so a closed card never understates what is
 behind it. Finished rows carry none.
 
 Which sessions those are is decided first by the session, then by the checkout.
-A session's own activity record names the feature it is working (its bound lane,
-else the project's active feature) and the terminal it occupies, so a session
+A session's feature is resolved by the strongest evidence first — the cell it
+holds, else the branch checkout its directory sits in, else the lane it is bound
+to, else its own activity record (for an unbound session, the project's active
+feature) — and its activity record names the terminal it occupies, so a session
 that speaks is marked on that one feature's card and on no other — even when it
 runs in the project's main checkout beside sessions working other features. Only
 a terminal no session claims — a shell, an agent bee never saw — falls back to

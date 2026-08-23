@@ -17,7 +17,8 @@ bee:
 
 A board card's terminal markers are now decided first by the session, then by
 the checkout. A session's own activity record names the feature it is working
-(its bound lane, else the project's active feature), so a session that speaks
+(resolved per agent-feature-resolution: held cell, branch checkout, bound
+lane, then the record itself), so a session that speaks
 is marked on that one feature's card and on no other — even when it runs in the
 project's main checkout beside sessions working other features. Only a terminal
 no session claims (a shell, an agent bee never saw) still falls back to the

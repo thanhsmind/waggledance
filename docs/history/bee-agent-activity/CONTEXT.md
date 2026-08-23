@@ -26,6 +26,11 @@ Absent `feature`/`cell` render as "—".
 Session ↔ pane: `activity.pane == pane_id`. Session ↔ project:
 `activity.cwd` through the same Boundary rule panes use (worktree siblings
 included, first project wins). Session ↔ card: `activity.feature`.
+*Reconciled 2026-08-23:* the feature join also decides a board card's
+terminal markers — a main-checkout pane whose session names a feature
+appears on that card only (decision `3daa1ea7`, board-pane-lane-pin); and
+the feature itself is resolved cell > worktree > lane > record
+(agent-feature-resolution).
 
 **A3 — Vocabulary and precedence.** (decision `8105fd2f`)
 Five states: working, waiting_input ("needs an answer"), blocked ("needs

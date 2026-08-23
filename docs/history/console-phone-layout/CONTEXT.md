@@ -23,6 +23,9 @@ toggle, no script, survives the homepage's full reload.
 
 **P2 — A bottom tab bar of four items: Board · Agents · Projects ·
 Settings.** (decision `41015896`)
+*Reconciled 2026-08-23:* the bar is collapsible — hidden by default behind a
+remembered bottom-edge handle, visible with scripting off (decision
+`75a5b463`, tabbar-collapse).
 Real anchors (`/?tab=kanban`, `/?tab=terminals`, `/settings`) except
 Projects, which is the drawer's toggle label; the current item carries
 `aria-current`. The topbar's Orchestrator button hides at that width. No
