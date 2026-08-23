@@ -2650,11 +2650,12 @@
       // outright on the project page (`homepage: false`, unchanged).
       item.href = homepage ? "/?tab=terminals&pane=" + encodeURIComponent(agent.pane_id) : agent.url;
 
-      // One line per row: the status pill, then what the agent is doing —
-      // its terminal title (`AgentPaneRow.title`), falling back to the pane
-      // name when it has none. The pane address and feature lane already
-      // live on the terminal tab the row leads to, so they do not repeat
-      // here; the line clips with an ellipsis rather than wrapping.
+      // Line one: the status pill, then what the agent is doing — its
+      // terminal title (`AgentPaneRow.title`), falling back to the pane
+      // name when it has none, clipped with an ellipsis. Line two, only
+      // when bee names a feature for the pane, is that feature lane — the
+      // hover title alone never shows on a touch screen (agents-drawer-
+      // feature). The pane address stays on the tab the row leads to.
       // Status: bee's own state wins over herdr's screen-derived status
       // wherever both exist — the same precedence `views::pane_tone` /
       // `pane_status_word` apply server-side.
@@ -2666,10 +2667,19 @@
       pill.appendChild(document.createTextNode(agent.bee_state ? beeStateWord(agent.bee_state) : agent.status));
       item.appendChild(pill);
 
+      var text = document.createElement("span");
+      text.className = "agent-drawer__text";
       var title = document.createElement("span");
       title.className = "agent-drawer__title";
       title.textContent = agent.title || agent.name;
-      item.appendChild(title);
+      text.appendChild(title);
+      if (agent.feature) {
+        var feature = document.createElement("span");
+        feature.className = "agent-drawer__feature";
+        feature.textContent = agent.feature;
+        text.appendChild(feature);
+      }
+      item.appendChild(text);
       // The full address stays reachable on hover.
       item.title = agent.name + " · " + agent.workspace + ":" + agent.tab + (agent.feature ? " · " + agent.feature : "");
 
