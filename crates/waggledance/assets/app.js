@@ -2589,56 +2589,28 @@
       // outright on the project page (`homepage: false`, unchanged).
       item.href = homepage ? "/?tab=terminals&pane=" + encodeURIComponent(agent.pane_id) : agent.url;
 
-      // Two-line row: status + pane address on the head line, then the
-      // agent's terminal title (what it is doing) on its own line below.
-      var head = document.createElement("span");
-      head.className = "agent-drawer__head";
-
-      // One status pill, one word: bee's own state wins over herdr's
-      // screen-derived status wherever both exist — the same precedence
-      // `views::pane_tone` / `pane_status_word` apply server-side — so a
-      // pane never reads "working … working" or "done … idle" twice on
-      // one line. The two need-you states take the blocked tone.
+      // One line per row: the status pill, then what the agent is doing —
+      // its terminal title (`AgentPaneRow.title`), falling back to the pane
+      // name when it has none. The pane address and feature lane already
+      // live on the terminal tab the row leads to, so they do not repeat
+      // here; the line clips with an ellipsis rather than wrapping.
+      // Status: bee's own state wins over herdr's screen-derived status
+      // wherever both exist — the same precedence `views::pane_tone` /
+      // `pane_status_word` apply server-side.
       var pill = document.createElement("span");
       pill.className = "fg-status" + pillModifier(pillStatus(agent));
       var dot = document.createElement("span");
       dot.className = "fg-status__dot";
       pill.appendChild(dot);
       pill.appendChild(document.createTextNode(agent.bee_state ? beeStateWord(agent.bee_state) : agent.status));
-      head.appendChild(pill);
+      item.appendChild(pill);
 
-      var name = document.createElement("span");
-      name.textContent = agent.name;
-      head.appendChild(name);
-
-      // Rows already sit under their project's section heading
-      // (`renderByProject`), so this carries only the pane address.
-      var suffix = document.createElement("span");
-      suffix.className = "agent-drawer__suffix";
-      suffix.textContent = agent.workspace + ":" + agent.tab;
-      head.appendChild(suffix);
-
-      // A6: the feature lane the session is bound to. Absent for a pane no
-      // live bee session claims, in which case the row renders exactly as
-      // it did before. (bee's state word already rides the pill above.)
-      if (agent.feature) {
-        var beeFeature = document.createElement("span");
-        beeFeature.className = "agent-drawer__feature";
-        beeFeature.textContent = agent.feature;
-        head.appendChild(beeFeature);
-      }
-
-      item.appendChild(head);
-
-      // drawer-title-1: the agent's own terminal title — what it is doing
-      // right now (`AgentPaneRow.title`). Skipped when empty or when it
-      // merely repeats the name, so a titleless agent's row stays one line.
-      if (agent.title && agent.title !== agent.name) {
-        var title = document.createElement("span");
-        title.className = "agent-drawer__suffix";
-        title.textContent = agent.title;
-        item.appendChild(title);
-      }
+      var title = document.createElement("span");
+      title.className = "agent-drawer__title";
+      title.textContent = agent.title || agent.name;
+      item.appendChild(title);
+      // The full address stays reachable on hover.
+      item.title = agent.name + " · " + agent.workspace + ":" + agent.tab + (agent.feature ? " · " + agent.feature : "");
 
       return item;
     }
