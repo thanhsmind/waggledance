@@ -1981,6 +1981,66 @@ fn read_config(bee_dir: &Path, root: &Path, read_errors: &mut Vec<String>) -> Op
     }
 }
 
+/// The argv a board-spawned agent is started with (board-run-actions D4):
+/// the project's OWN default preset, read out of its own
+/// `.bee/config.json` `herding` block. Never a caller-supplied command —
+/// the board offers no agent picker, and a request body has nowhere to put
+/// an argv even if it tried.
+///
+/// bee records the preset in two shapes and both are honored, because both
+/// exist in the field:
+///
+/// - `"agent_command": "claude-sonnet"` — a NAME, resolved through
+///   `herding.agents` (an object of name to argv token array). An unknown
+///   name is `None`, never a guess at a binary.
+/// - `"agent_command": ["claude", "--model", "sonnet"]` — the argv itself.
+///
+/// `None` means this project has no board-spawnable preset: no
+/// `.bee/config.json`, no `herding` block, no `agent_command`, a name that
+/// resolves to nothing, or an argv that is empty or holds a non-string
+/// token. The caller refuses and names the file — spawning something
+/// guessed would start an arbitrary process in somebody's repository.
+///
+/// Like [`read_config`] this reads `config.json` only, never the
+/// machine-local `config.local.json` overlay — see [`BeeConfig`] for why
+/// reproducing bee's own resolution order here would be silently wrong.
+pub fn herding_agent_argv(root: &Path) -> Option<Vec<String>> {
+    let raw = fs::read_to_string(root.join(".bee").join("config.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    herding_agent_argv_from_config(&value)
+}
+
+/// [`herding_agent_argv`]'s pure half, over an already-parsed
+/// `.bee/config.json` — the seam the shape tests drive, so neither form
+/// needs a temporary directory to prove.
+fn herding_agent_argv_from_config(config: &Value) -> Option<Vec<String>> {
+    let herding = config.get("herding")?;
+    match herding.get("agent_command")? {
+        Value::Array(tokens) => argv_tokens(tokens),
+        Value::String(name) => {
+            let agents = herding.get("agents")?;
+            match agents.get(name.as_str())? {
+                Value::Array(tokens) => argv_tokens(tokens),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A JSON array as an argv: every token a string, and at least one of them.
+/// A single non-string token voids the whole argv rather than being skipped
+/// — a command with a hole in it is not a command.
+fn argv_tokens(tokens: &[Value]) -> Option<Vec<String>> {
+    if tokens.is_empty() {
+        return None;
+    }
+    tokens
+        .iter()
+        .map(|t| t.as_str().map(str::to_string))
+        .collect()
+}
+
 /// Normalize `.bee/config.json`'s `gate_bypass` key defensively, because its
 /// value type is not stable across stores (`false` here, `"total"` in the
 /// beehive store). A missing key (`None`, the caller passes
@@ -7739,6 +7799,101 @@ mod tests {
         );
         let config = snap.config.as_ref().expect("config should have been read");
         assert_eq!(config.gate_bypass.as_deref(), Some("total"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// board-run-actions D4, the shape this repo's own store records: a
+    /// STRING `agent_command` names an entry in `herding.agents`, and the
+    /// argv is that entry — never the name itself, which is not a binary.
+    #[test]
+    fn herding_agent_command_as_a_name_resolves_through_the_agents_registry() {
+        let root = fresh_root("herding-argv-name");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "gate_bypass": false,
+                "herding": {
+                    "agent_command": "claude-sonnet",
+                    "agents": {
+                        "claude-sonnet": ["claude", "--model", "sonnet"],
+                        "other": ["codex"]
+                    }
+                }
+            }"#,
+        );
+
+        assert_eq!(
+            herding_agent_argv(&root),
+            Some(vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string()
+            ])
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other recorded shape: an ARRAY `agent_command` is the argv
+    /// itself, with no registry lookup at all (a store carrying no
+    /// `herding.agents` still spawns).
+    #[test]
+    fn herding_agent_command_as_an_array_is_the_argv_itself() {
+        let root = fresh_root("herding-argv-array");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{"herding": {"agent_command": ["codex", "--full-auto"]}}"#,
+        );
+
+        assert_eq!(
+            herding_agent_argv(&root),
+            Some(vec!["codex".to_string(), "--full-auto".to_string()])
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every way a project has no board-spawnable preset answers the same
+    /// `None`, so the route can refuse once and name `.bee/config.json`
+    /// rather than guessing at a binary. A name with no registry entry is
+    /// deliberately in this list: resolving it to the name itself would run
+    /// `claude-sonnet` as a command.
+    #[test]
+    fn a_project_with_no_usable_herding_preset_yields_no_argv() {
+        let root = fresh_root("herding-argv-absent");
+        assert_eq!(herding_agent_argv(&root), None, "no config.json at all");
+
+        for (case, body) in [
+            ("no herding block", r#"{"gate_bypass": false}"#),
+            (
+                "no agent_command",
+                r#"{"herding": {"agents": {"a": ["x"]}}}"#,
+            ),
+            (
+                "a name with no registry entry",
+                r#"{"herding": {"agent_command": "missing", "agents": {"a": ["x"]}}}"#,
+            ),
+            (
+                "a name with no registry at all",
+                r#"{"herding": {"agent_command": "claude-sonnet"}}"#,
+            ),
+            ("an empty argv", r#"{"herding": {"agent_command": []}}"#),
+            (
+                "an argv with a non-string token",
+                r#"{"herding": {"agent_command": ["claude", 7]}}"#,
+            ),
+            (
+                "an agent_command that is neither name nor argv",
+                r#"{"herding": {"agent_command": {"cmd": "claude"}}}"#,
+            ),
+            ("unparseable json", "{not json"),
+        ] {
+            write(&root, ".bee/config.json", body);
+            assert_eq!(herding_agent_argv(&root), None, "{case} must yield no argv");
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }

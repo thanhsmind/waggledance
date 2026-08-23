@@ -2797,11 +2797,18 @@ pub fn terminal_down_page(project: &Project) -> String {
 /// nowhere close to a revival of the D1 Sessions panel it sits where that
 /// panel used to live; see that function's own doc comment for exactly how
 /// little it carries.
+///
+/// board-run-actions D3 hands in `live_runs`, this project's own live board
+/// runs — what turns a Todo, Review or Compound row's run button into the
+/// `running: <action>` line while a board-triggered run for that feature is
+/// still going. An empty map means no lock anywhere, which is exactly what
+/// this page rendered before that feature.
 pub fn bee_board_page(
     project: &Project,
     snapshot: &BeeSnapshot,
     feature_panes: &std::collections::HashMap<String, Vec<TerminalPaneView>>,
     feature_activity: &BeeFeatureActivity,
+    live_runs: &BeeHubLiveRuns,
 ) -> String {
     let body = format!(
         r#"{topbar}
@@ -2820,7 +2827,13 @@ pub fn bee_board_page(
         style = bee_hub_style(),
         top = bee_board_top(project),
         live = bee_live_strip_section(snapshot),
-        board = bee_feature_hub_section(project, snapshot, feature_panes, feature_activity),
+        board = bee_feature_hub_section(
+            project,
+            snapshot,
+            feature_panes,
+            feature_activity,
+            live_runs
+        ),
         finished = bee_finished_section(&project.id, &snapshot.shipped),
         panels = bee_panels_section(snapshot),
     );
@@ -3013,6 +3026,20 @@ fn bee_hub_style() -> String {
    connect back to a feature. Same two tokens the New task dialog's own
    refusal line uses (app.css), for the same reason. */
 .bee-hub__actions-error { flex-basis: 100%; color: var(--color-danger); font-size: var(--type-caption-size); }
+/* board-run-actions D1/D2: the single Start / Run review / Run compound
+   button a Todo, Review or Compound row carries. It reuses `.bee-hub__action`
+   above verbatim -- same padding, hairline border and 44px target -- and adds
+   only the quiet accent outline that says "this spends an agent", so a run
+   button never reads as the Approve primary answering a stop that already
+   exists. */
+.bee-hub__action--run { border-color: var(--color-action); color: var(--color-action); }
+/* board-run-actions D3: the lock's own reading. While one board-triggered
+   run is live for a feature its row shows this line INSTEAD of the button --
+   the same dense muted second line `.bee-hub__merge` gives a Ready to merge
+   row, since both say one thing about the row above them -- with the action
+   word itself as the link to the pane the run is in. */
+.bee-hub__running { margin: 0; padding: 0 14px 12px; color: var(--color-text-muted); font-size: var(--type-caption-size); }
+.bee-hub__running-pane { color: inherit; }
 /* card-collapse-inprogress D1/D3/D6: the collapsed header row -- name plus
    chevron -- is the details element's own `<summary>`, native to the
    `<details>`/`<summary>` disclosure this card now uses (no JS, no
@@ -3800,6 +3827,7 @@ fn bee_feature_hub_section(
     snapshot: &BeeSnapshot,
     feature_panes: &std::collections::HashMap<String, Vec<TerminalPaneView>>,
     feature_activity: &BeeFeatureActivity,
+    live_runs: &BeeHubLiveRuns,
 ) -> String {
     let archived_features: std::collections::HashSet<String> =
         list_archived_feature_dirs(&project.root_path)
@@ -3812,6 +3840,7 @@ fn bee_feature_hub_section(
         &snapshot.backlog.pbis,
         feature_panes,
         feature_activity,
+        live_runs,
     )
 }
 
@@ -4354,6 +4383,7 @@ fn bee_render_hub_section(
     pbis: &[BeePbi],
     feature_panes: &std::collections::HashMap<String, Vec<TerminalPaneView>>,
     feature_activity: &BeeFeatureActivity,
+    live_runs: &BeeHubLiveRuns,
 ) -> String {
     let mut todo_rows: Vec<String> = Vec::new();
     // D7: collected as (sort key, rendered html) rather than appended
@@ -4458,38 +4488,20 @@ fn bee_render_hub_section(
             }
             BeeHubPlacement::Review(data) => {
                 review_count += 1;
-                review_rows.push(bee_hub_finished_row(
-                    "review",
-                    &bee_hub_feature_href(&project.id, &data.feature),
-                    &data.feature,
-                    data.docs.as_ref(),
-                    None,
-                    None,
-                    None,
+                review_rows.push(bee_hub_run_row(
+                    project, "review", data, None, None, live_runs,
                 ));
             }
             BeeHubPlacement::Compound(data) => {
                 compound_count += 1;
-                compound_rows.push(bee_hub_finished_row(
-                    "compound",
-                    &bee_hub_feature_href(&project.id, &data.feature),
-                    &data.feature,
-                    data.docs.as_ref(),
-                    None,
-                    None,
-                    None,
+                compound_rows.push(bee_hub_run_row(
+                    project, "compound", data, None, None, live_runs,
                 ));
             }
             BeeHubPlacement::Todo(data) => {
                 todo_count += 1;
-                todo_rows.push(bee_hub_finished_row(
-                    "todo",
-                    &bee_hub_feature_href(&project.id, &data.feature),
-                    &data.feature,
-                    data.docs.as_ref(),
-                    None,
-                    None,
-                    None,
+                todo_rows.push(bee_hub_run_row(
+                    project, "todo", data, None, None, live_runs,
                 ));
             }
         }
@@ -4669,6 +4681,10 @@ fn bee_cross_project_read_errors_strip(rollups: &[(&Project, &BeeProjectRollup)]
     )
 }
 
+/// board-run-actions D3 hands in `live_runs`, every project's own live board
+/// runs, keyed by project id exactly like the pane map beside it — this page
+/// merges several projects' rows into one column, so a feature name alone
+/// would not say whose run it is. An empty map means no lock anywhere.
 pub fn bee_cross_project_features_section(
     rollups: &[(&Project, &BeeProjectRollup)],
     feature_panes: &std::collections::HashMap<
@@ -4676,6 +4692,7 @@ pub fn bee_cross_project_features_section(
         std::collections::HashMap<String, Vec<TerminalPaneView>>,
     >,
     feature_activity: &std::collections::HashMap<String, BeeFeatureActivity>,
+    live_runs: &std::collections::HashMap<String, BeeHubLiveRuns>,
 ) -> String {
     let mut todo_rows: Vec<String> = Vec::new();
     let mut todo_pbi_rows: Vec<String> = Vec::new();
@@ -4699,6 +4716,7 @@ pub fn bee_cross_project_features_section(
     let mut ready_to_merge_count = 0usize;
     let no_panes: Vec<TerminalPaneView> = Vec::new();
     let no_activity: Vec<BeeActivityEntry> = Vec::new();
+    let no_runs: BeeHubLiveRuns = BeeHubLiveRuns::new();
 
     // Classify every project's placements once; reused below both to build
     // the colour map (over only the projects that actually placed
@@ -4739,6 +4757,10 @@ pub fn bee_cross_project_features_section(
         let project_panes = feature_panes.get(project.id.as_str());
         let project_activity = feature_activity.get(project.id.as_str());
         let project_color = project_colors.get(project.id.as_str()).copied();
+        // board-run-actions D3: this project's own live board runs, looked up
+        // exactly like the pane map above — a merged column holds several
+        // projects' rows, so a feature name is only unique within its project.
+        let project_runs = live_runs.get(project.id.as_str()).unwrap_or(&no_runs);
 
         for placement in placements {
             match placement {
@@ -4826,38 +4848,35 @@ pub fn bee_cross_project_features_section(
                 }
                 BeeHubPlacement::Review(data) => {
                     review_count += 1;
-                    review_rows.push(bee_hub_finished_row(
+                    review_rows.push(bee_hub_run_row(
+                        project,
                         "review",
-                        &bee_hub_feature_href(&project.id, &data.feature),
-                        &data.feature,
-                        data.docs.as_ref(),
+                        data,
                         Some(&project.name),
                         project_color,
-                        None,
+                        project_runs,
                     ));
                 }
                 BeeHubPlacement::Compound(data) => {
                     compound_count += 1;
-                    compound_rows.push(bee_hub_finished_row(
+                    compound_rows.push(bee_hub_run_row(
+                        project,
                         "compound",
-                        &bee_hub_feature_href(&project.id, &data.feature),
-                        &data.feature,
-                        data.docs.as_ref(),
+                        data,
                         Some(&project.name),
                         project_color,
-                        None,
+                        project_runs,
                     ));
                 }
                 BeeHubPlacement::Todo(data) => {
                     todo_count += 1;
-                    todo_rows.push(bee_hub_finished_row(
+                    todo_rows.push(bee_hub_run_row(
+                        project,
                         "todo",
-                        &bee_hub_feature_href(&project.id, &data.feature),
-                        &data.feature,
-                        data.docs.as_ref(),
+                        data,
                         Some(&project.name),
                         project_color,
-                        None,
+                        project_runs,
                     ));
                 }
             }
@@ -5505,6 +5524,126 @@ fn bee_hub_action_pair(project_id: &str, feature: &str, kind: &str) -> String {
     )
 }
 
+/// (board-run-actions D3) One board-triggered run that is live right now, as
+/// the board reads it: which action it is (`start` / `review` / `compound` --
+/// the same three words the buttons carry, so the running line and the button
+/// it replaces never name the same run differently) and the pane it runs in,
+/// which is what the row links at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeeHubLiveRun {
+    pub action: String,
+    pub pane_id: String,
+}
+
+/// (board-run-actions D3) Feature name -> its one live board run. D3 locks
+/// the board to one board-triggered run per feature at a time, so this maps
+/// to a single run and never to a list: a second click is a refusal at the
+/// route, never a queue on the board.
+pub type BeeHubLiveRuns = std::collections::HashMap<String, BeeHubLiveRun>;
+
+/// (board-run-actions D3) Which action word a recorded run's task text names.
+/// The board reads it off the task rather than off a kind column because the
+/// task IS what was sent: `/bee-reviewing ...` is the Run review click and
+/// `/bee-capturing ...` is the Run compound click (D1's two slash lines),
+/// and anything else a board click recorded is the Start dispatch (D2), whose
+/// task is a brief rather than a slash command.
+///
+/// Reached through [`bee_hub_live_run_entry`], whose callers are the two
+/// board routes in `crates/waggledance/src/server.rs` (`bee_board` and
+/// `index_page`, via `project_live_board_runs`).
+pub fn bee_hub_live_run_action(task: &str) -> &'static str {
+    let task = task.trim_start();
+    if task.starts_with("/bee-reviewing") {
+        "review"
+    } else if task.starts_with("/bee-capturing") {
+        "compound"
+    } else {
+        "start"
+    }
+}
+
+/// (board-run-actions D3) One recorded run reduced to the board's own
+/// liveness rule, taken as plain values so the caller can feed it whichever
+/// fields the run row carries -- today `task`, `pane_id` and `status`, with
+/// the feature handed in separately until the runs table grows its own
+/// column, and this signature does not change when it does.
+///
+/// A run counts as live only when all three hold: its status is still
+/// `working` (the protocol's own word for a run with no outcome yet), it
+/// names a pane, and that pane is still in the herdr snapshot the caller
+/// checked (`pane_alive`). The last clause is the one that matters: a
+/// `working` row whose pane is gone is a crashed or closed session, and
+/// without it that row would lock the feature's button forever.
+///
+/// Called from `crates/waggledance/src/server.rs::project_live_board_runs`,
+/// which both board routes (`bee_board` and `index_page`) fold over the runs
+/// they already list.
+pub fn bee_hub_live_run_entry(
+    feature: Option<&str>,
+    status: &str,
+    task: &str,
+    pane_id: &str,
+    pane_alive: bool,
+) -> Option<(String, BeeHubLiveRun)> {
+    let feature = feature.map(str::trim).filter(|f| !f.is_empty())?;
+    if status != "working" || pane_id.is_empty() || !pane_alive {
+        return None;
+    }
+    Some((
+        feature.to_string(),
+        BeeHubLiveRun {
+            action: bee_hub_live_run_action(task).to_string(),
+            pane_id: pane_id.to_string(),
+        },
+    ))
+}
+
+/// (board-run-actions D1/D2) The single run button a Todo, Review or Compound
+/// row carries -- Start, Run review, Run compound. Deliberately the same
+/// container, the same three data attributes and the same `.bee-hub__action`
+/// class [`bee_hub_action_pair`] uses, so `assets/app.js` binds ONE selector
+/// for every button on the board and a run click travels the same relay road
+/// an approve click already does (board-approve-actions D5). One button, not
+/// a pair: a run has no second half to answer.
+fn bee_hub_run_button(project_id: &str, feature: &str, kind: &str, label: &str) -> String {
+    format!(
+        r#"<div class="bee-hub__actions" data-action-feature="{feature}" data-action-kind="{kind}" data-action-project="{pid}"><button type="button" class="bee-hub__action bee-hub__action--run">{label}</button></div>"#,
+        feature = esc(feature),
+        kind = esc(kind),
+        pid = esc(project_id),
+        label = esc(label),
+    )
+}
+
+/// (board-run-actions D1/D2) Which run a column offers, as (kind, label) --
+/// the ONE mapping from a board column to the action its rows can start, read
+/// by both boards through [`bee_hub_run_row`]. Every other column answers
+/// `None`: Finished has nothing left to run, and Ready to merge already
+/// carries its own uat pair (board-approve-actions D1).
+fn bee_hub_run_action_for_group(group_key: &str) -> Option<(&'static str, &'static str)> {
+    match group_key {
+        "todo" => Some(("start", "Start")),
+        "review" => Some(("review", "Run review")),
+        "compound" => Some(("compound", "Run compound")),
+        _ => None,
+    }
+}
+
+/// (board-run-actions D3) The lock's own reading: `running: <action>` with the
+/// action word linking to the pane the run is in, on the same
+/// `/p/:id/_terminal/pane/:pane_id` route every other pane anchor on the board
+/// uses. It renders INSTEAD of the button, never beside it -- D3 is a lock,
+/// not a warning -- and, like the button, sits outside the row's own anchor: a
+/// nested `<a>` is markup no browser agrees on.
+fn bee_hub_running_line(project_id: &str, run: &BeeHubLiveRun) -> String {
+    format!(
+        r#"<p class="bee-hub__running">running: <a class="bee-hub__running-pane" href="/p/{pid}/_terminal/pane/{pane}">{action}</a></p>"#,
+        pid = esc(project_id),
+        pane = esc(&run.pane_id),
+        action = esc(&run.action),
+    )
+}
+
 struct BeeHubCardArgs<'a> {
     project_id: &'a str,
     feature: &'a str,
@@ -6063,6 +6202,64 @@ fn bee_hub_ready_to_merge_row(
         None => String::new(),
     };
     format!("{row}{actions}")
+}
+
+/// (board-run-actions D1/D2/D3) One whole Todo, Review or Compound entry: the
+/// dense row itself ([`bee_hub_finished_row`]) and then, on an opted-in
+/// project, either the column's own run button or -- when this feature already
+/// has a live board run -- the running line that replaces it. The ONE place
+/// both boards build these three columns' markup, the same one-source rule
+/// [`bee_hub_ready_to_merge_row`] follows directly above, so the per-project
+/// board and the homepage can never grow two spellings of the same row.
+///
+/// Three rules meet here and the order below IS each of them:
+///
+/// 1. `orchestration_enabled` (board-approve-actions D3, inherited) gates
+///    everything. A project that has not opted in renders the bare row it
+///    rendered before this feature -- no button and no running line, since a
+///    project the board cannot start a run on has no board run to report.
+/// 2. A live run wins over the button (D3): while one is live the row reads
+///    `running: <action>` and offers nothing to press. Never both.
+/// 3. Otherwise the column's own action ([`bee_hub_run_action_for_group`]).
+///
+/// The button is a SIBLING of the row's anchor for the same reason the
+/// approve pair is: a `<button>` inside an `<a>` is invalid markup whose click
+/// target no browser agrees on.
+///
+/// Only feature rows come through here. A proposed PBI's Todo row still
+/// renders through [`bee_hub_finished_row`] directly and carries no button:
+/// D2's Start is a dispatch on a FEATURE, and a PBI has no feature slug to
+/// open a worktree for.
+fn bee_hub_run_row(
+    project: &Project,
+    group_key: &str,
+    data: &BeeHubFinishedData,
+    project_label: Option<&str>,
+    project_color: Option<u8>,
+    live_runs: &BeeHubLiveRuns,
+) -> String {
+    let row = bee_hub_finished_row(
+        group_key,
+        &bee_hub_feature_href(&project.id, &data.feature),
+        &data.feature,
+        data.docs.as_ref(),
+        project_label,
+        project_color,
+        None,
+    );
+    if !project.orchestration_enabled {
+        return row;
+    }
+    if let Some(run) = live_runs.get(data.feature.as_str()) {
+        return format!("{row}{line}", line = bee_hub_running_line(&project.id, run));
+    }
+    match bee_hub_run_action_for_group(group_key) {
+        Some((kind, label)) => format!(
+            "{row}{button}",
+            button = bee_hub_run_button(&project.id, &data.feature, kind, label),
+        ),
+        None => row,
+    }
 }
 
 /// The Ready to merge row's own summary line (bee-agent-activity R1): which
@@ -9773,6 +9970,7 @@ mod tests {
             &[],
             &feature_panes,
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         let blocked_at = html
@@ -9820,6 +10018,7 @@ mod tests {
             &[],
             &feature_panes,
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         let at = |feature: &str| {
@@ -9864,6 +10063,7 @@ mod tests {
             &[],
             &feature_panes,
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         let at = |feature: &str| {
@@ -11498,6 +11698,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -11568,6 +11769,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -11636,6 +11838,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -11777,6 +11980,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -11873,6 +12077,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -11941,6 +12146,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12001,6 +12207,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
         let strip_html = bee_live_strip_section(&snapshot);
 
@@ -12069,6 +12276,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12138,6 +12346,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12431,6 +12640,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12510,6 +12720,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12570,6 +12781,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12644,6 +12856,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12721,6 +12934,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12786,6 +13000,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12861,6 +13076,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12912,6 +13128,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -12971,6 +13188,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -13434,6 +13652,7 @@ mod tests {
             &pairs,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -13505,6 +13724,7 @@ mod tests {
             &pairs,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -13541,6 +13761,7 @@ mod tests {
         let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
         let html = bee_cross_project_features_section(
             &pairs,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
@@ -13723,6 +13944,7 @@ mod tests {
             &pairs,
             &feature_panes,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         let blocked_at = html
@@ -13818,6 +14040,7 @@ mod tests {
             &pairs,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         let pos_newer = html.find("newer-feat").expect("newer-feat must render");
@@ -13902,6 +14125,7 @@ mod tests {
             &pairs,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -13964,6 +14188,7 @@ mod tests {
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
         let html = bee_cross_project_features_section(
             &pairs,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
@@ -14037,9 +14262,11 @@ mod tests {
             &with_empty,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         let html_without = bee_cross_project_features_section(
             &without_empty,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
@@ -14126,6 +14353,7 @@ mod tests {
             vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
         let html = bee_cross_project_features_section(
             &pairs,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
@@ -15262,6 +15490,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         let active_link = "href=\"/p/proj-1/_bee/feature/active-feat\"";
@@ -16029,6 +16258,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         // The tiles lead the board: markup order is what a phone reads.
@@ -16328,6 +16558,199 @@ mod tests {
             !row.contains("bee-hub__actions"),
             "an approved uat is no longer a stop and owes no pair: {row}"
         );
+    }
+
+    /// (board-run-actions D1/D2) Each of the three columns that can start a
+    /// run carries exactly ONE button, with the column's own kind and label:
+    /// Todo starts a feature (D2), Review and Compound send their slash line
+    /// into the feature's session (D1). Like the approve pair, the button is a
+    /// sibling of the row's anchor, never nested in it.
+    #[test]
+    fn bee_hub_run_row_carries_one_run_button_per_column_when_opted_in() {
+        let mut project = sample_project();
+        project.orchestration_enabled = true;
+        let data = BeeHubFinishedData {
+            feature: "feat-a".to_string(),
+            docs: None,
+        };
+        let no_runs = BeeHubLiveRuns::new();
+
+        for (group, kind, label) in [
+            ("todo", "start", "Start"),
+            ("review", "review", "Run review"),
+            ("compound", "compound", "Run compound"),
+        ] {
+            let row = bee_hub_run_row(&project, group, &data, None, None, &no_runs);
+            assert!(
+                row.contains(&format!(r#"data-action-kind="{kind}""#))
+                    && row.contains(r#"data-action-feature="feat-a""#)
+                    && row.contains(r#"data-action-project="proj-1""#),
+                "a {group} row must carry the {kind} action: {row}"
+            );
+            assert!(
+                row.contains(&format!(
+                    r#"<button type="button" class="bee-hub__action bee-hub__action--run">{label}</button>"#
+                )),
+                "a {group} row's button reads {label}: {row}"
+            );
+            assert_eq!(
+                row.matches("bee-hub__action--run").count(),
+                1,
+                "one run button per row, never a pair: {row}"
+            );
+            let anchor_end = row.find("</a>").expect("the dense row is still an anchor");
+            let actions_at = row.find("bee-hub__actions").expect("run button");
+            assert!(
+                anchor_end < actions_at,
+                "the button must sit outside the row's anchor, never nested in it: {row}"
+            );
+        }
+
+        // Finished is not a column a run starts from, so it keeps the bare row.
+        let row = bee_hub_run_row(&project, "finished", &data, None, None, &no_runs);
+        assert!(!row.contains("bee-hub__actions"), "{row}");
+    }
+
+    /// (board-run-actions D3) One board-triggered run per feature at a time:
+    /// while one is live the row reads `running: <action>` linking at the pane
+    /// it runs in, and offers nothing to press — never a button beside it.
+    #[test]
+    fn bee_hub_run_row_reads_a_live_run_instead_of_its_button() {
+        let mut project = sample_project();
+        project.orchestration_enabled = true;
+        let data = BeeHubFinishedData {
+            feature: "feat-a".to_string(),
+            docs: None,
+        };
+        let mut live_runs = BeeHubLiveRuns::new();
+        live_runs.insert(
+            "feat-a".to_string(),
+            BeeHubLiveRun {
+                action: "review".to_string(),
+                pane_id: "%7".to_string(),
+            },
+        );
+
+        let row = bee_hub_run_row(&project, "review", &data, None, None, &live_runs);
+        assert!(
+            row.contains(r#"<p class="bee-hub__running">running: "#)
+                && row.contains(r#"href="/p/proj-1/_terminal/pane/%7""#)
+                && row.contains(">review</a>"),
+            "a locked row names the action and links at its pane: {row}"
+        );
+        assert!(
+            !row.contains("bee-hub__action"),
+            "a locked row offers nothing to press: {row}"
+        );
+        let anchor_end = row.find("</a>").expect("the dense row is still an anchor");
+        let running_at = row.find("bee-hub__running").expect("running line");
+        assert!(anchor_end < running_at, "{row}");
+
+        // Another feature's live run locks nothing here.
+        let other = BeeHubFinishedData {
+            feature: "feat-b".to_string(),
+            docs: None,
+        };
+        let row = bee_hub_run_row(&project, "review", &other, None, None, &live_runs);
+        assert!(
+            !row.contains("bee-hub__running") && row.contains(r#"data-action-kind="review""#),
+            "the lock is per feature, never per column: {row}"
+        );
+    }
+
+    /// (board-run-actions, inheriting board-approve-actions D3) The
+    /// per-project opt-in gates the run buttons exactly as it gates the
+    /// approve pair: without it these three columns render the bare rows they
+    /// rendered before this feature — no button, and no run state either,
+    /// since a project the board cannot start a run on has no board run to
+    /// report.
+    #[test]
+    fn bee_hub_run_row_renders_nothing_to_press_without_the_project_opt_in() {
+        let project = sample_project();
+        assert!(!project.orchestration_enabled);
+        let data = BeeHubFinishedData {
+            feature: "feat-a".to_string(),
+            docs: None,
+        };
+        let mut live_runs = BeeHubLiveRuns::new();
+        live_runs.insert(
+            "feat-a".to_string(),
+            BeeHubLiveRun {
+                action: "start".to_string(),
+                pane_id: "%7".to_string(),
+            },
+        );
+        for group in ["todo", "review", "compound"] {
+            let row = bee_hub_run_row(&project, group, &data, None, None, &live_runs);
+            assert!(
+                !row.contains("bee-hub__actions") && !row.contains("bee-hub__running"),
+                "a project without the opt-in renders the bare {group} row: {row}"
+            );
+        }
+    }
+
+    /// (board-run-actions D3) The liveness rule the board's lock reads, on
+    /// plain values: `working` plus a named pane that is still in the herdr
+    /// snapshot. A run with no feature, a finished run, and a `working` run
+    /// whose pane is gone all fail it — the last one is the clause that keeps
+    /// a crashed session from locking a card forever.
+    #[test]
+    fn bee_hub_live_run_entry_counts_only_a_working_run_whose_pane_still_exists() {
+        let live = bee_hub_live_run_entry(
+            Some("feat-a"),
+            "working",
+            "/bee-reviewing review feature feat-a",
+            "%7",
+            true,
+        );
+        assert_eq!(
+            live,
+            Some((
+                "feat-a".to_string(),
+                BeeHubLiveRun {
+                    action: "review".to_string(),
+                    pane_id: "%7".to_string(),
+                },
+            ))
+        );
+
+        let task = "/bee-reviewing review feature feat-a";
+        assert!(bee_hub_live_run_entry(None, "working", task, "%7", true).is_none());
+        assert!(bee_hub_live_run_entry(Some(""), "working", task, "%7", true).is_none());
+        assert!(bee_hub_live_run_entry(Some("feat-a"), "done", task, "%7", true).is_none());
+        assert!(bee_hub_live_run_entry(Some("feat-a"), "working", task, "", true).is_none());
+        assert!(bee_hub_live_run_entry(Some("feat-a"), "working", task, "%7", false).is_none());
+    }
+
+    /// (board-run-actions D3) Which word the running line says, read off the
+    /// task that was actually sent: D1's two slash lines name themselves, and
+    /// anything else a board click recorded is D2's Start dispatch, whose task
+    /// is a brief.
+    #[test]
+    fn bee_hub_live_run_action_reads_the_slash_line_the_click_sent() {
+        assert_eq!(
+            bee_hub_live_run_action("/bee-reviewing review feature feat-a"),
+            "review"
+        );
+        assert_eq!(
+            bee_hub_live_run_action("/bee-capturing flush the capture queue"),
+            "compound"
+        );
+        assert_eq!(
+            bee_hub_live_run_action("Run `bee orient`, then take feature feat-a through bee-hive"),
+            "start"
+        );
+    }
+
+    /// (board-run-actions D1/D2/D3) The run button and the running line each
+    /// own a rule in the board's one stylesheet — the button reusing
+    /// `.bee-hub__action` rather than re-declaring a control, the line reading
+    /// as the same dense muted second line the merge line already is.
+    #[test]
+    fn bee_hub_style_carries_the_run_button_and_running_line_rules() {
+        let css = bee_hub_style();
+        assert!(css.contains(".bee-hub__action--run {"), "{css}");
+        assert!(css.contains(".bee-hub__running {"), "{css}");
     }
 
     /// (board-approve-actions D3) The per-project `orchestration.enabled`
@@ -16841,6 +17264,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(
@@ -16934,6 +17358,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         let groups_open = html
@@ -17141,6 +17566,7 @@ mod tests {
             &snapshot,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
         );
 
         assert!(

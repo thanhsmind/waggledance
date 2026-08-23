@@ -954,6 +954,7 @@
     // cannot say which feature in the board's own voice.
     var overlay = null;
     var titleEl = null;
+    var subEl = null;
     var okBtn = null;
     var cancelBtn = null;
     var pending = null;
@@ -971,13 +972,14 @@
       overlay.innerHTML =
         '<div class="task-box" role="dialog" aria-modal="true">' +
         '<h2 class="task-box__title" data-confirm-title></h2>' +
-        '<p class="task-box__sub">This answers the stop the feature is waiting on.</p>' +
+        '<p class="task-box__sub" data-confirm-sub></p>' +
         '<div class="task-box__actions">' +
         '<button type="button" class="fg-btn fg-btn--ghost" data-confirm-cancel>Cancel</button>' +
         '<button type="button" class="fg-btn fg-btn--primary" data-confirm-ok>Confirm</button>' +
         "</div></div>";
       document.body.appendChild(overlay);
       titleEl = overlay.querySelector("[data-confirm-title]");
+      subEl = overlay.querySelector("[data-confirm-sub]");
       okBtn = overlay.querySelector("[data-confirm-ok]");
       cancelBtn = overlay.querySelector("[data-confirm-cancel]");
       cancelBtn.addEventListener("click", closeConfirm);
@@ -996,9 +998,15 @@
       });
     }
 
-    function askConfirm(question, run) {
+    // `sub` is the one line under the question. A gate answer keeps the
+    // wording it has always had; a run (board-run-actions D1/D2) says what
+    // the click costs instead, because starting an agent answers no stop.
+    var GATE_SUB = "This answers the stop the feature is waiting on.";
+
+    function askConfirm(question, sub, run) {
       if (!overlay) buildConfirm();
       titleEl.textContent = question;
+      subEl.textContent = sub || GATE_SUB;
       pending = run;
       overlay.hidden = false;
       okBtn.focus();
@@ -1024,10 +1032,9 @@
     // above), which is what puts the card's new state on screen. Only a
     // refusal hands the pair back, with the server's own words beside it:
     // bee is the only party that knows why it said no.
-    function fire(box, kind, approved, btn) {
-      var feature = box.getAttribute("data-action-feature") || "";
+    function sendAction(box, btn, doneLabel, body) {
       var project = box.getAttribute("data-action-project") || "";
-      if (!feature || !project) return;
+      if (!project || !body.feature) return;
       box.setAttribute("data-fired", "1");
       clearError(box);
       var pair = Array.prototype.slice.call(
@@ -1044,12 +1051,15 @@
         showError(box, message);
       }
 
-      postJson("/p/" + encodeURIComponent(project) + "/_bee/actions", {
-        kind: kind + (approved ? "-approve" : "-reject"),
-        feature: feature,
-      })
+      postJson("/p/" + encodeURIComponent(project) + "/_bee/actions", body)
         .then(function (res) {
-          if (res.ok) return null; // the reload is the confirmation
+          if (res.ok) {
+            // The reload is the confirmation either way. A run has a longer
+            // wait than a gate answer, so its button says what it is doing
+            // meanwhile and stays locked until that reload replaces it.
+            if (doneLabel) btn.textContent = doneLabel;
+            return null;
+          }
           return res
             .json()
             .catch(function () { return null; })
@@ -1064,6 +1074,44 @@
         });
     }
 
+    // The approve pair's own body shape (bap-1), unchanged: one kind word
+    // plus the half that was clicked.
+    function fire(box, kind, approved, btn) {
+      sendAction(box, btn, null, {
+        kind: kind + (approved ? "-approve" : "-reject"),
+        feature: box.getAttribute("data-action-feature") || "",
+      });
+    }
+
+    // board-run-actions (D1/D2): the run buttons Start / Run review / Run
+    // compound, rendered by `bee_hub_run_button` into the SAME
+    // `.bee-hub__actions` container the approve pair uses, so they arrive at
+    // this same handler. Each one starts an agent, which costs money and
+    // takes a worktree, so every one of them asks first (CONTEXT.md's
+    // agent's-discretion note resolved to the gate default) and names the
+    // feature in the board's own voice.
+    var RUN_CONFIRM = {
+      start: function (f) { return "Start feature " + f + " in a new agent?"; },
+      review: function (f) { return "Run an independent review of " + f + "?"; },
+      compound: function (f) {
+        return "Run the capture flush and compound for " + f + "?";
+      },
+    };
+    // The card's `data-action-kind` word -> the kind the bra-1 route parses.
+    var RUN_KIND = {
+      start: "start-todo",
+      review: "run-review",
+      compound: "run-compound",
+    };
+    var RUN_SUB = "This starts an agent — it costs a run and a pane.";
+
+    function fireRun(box, kind, btn) {
+      sendAction(box, btn, "starting…", {
+        kind: RUN_KIND[kind],
+        feature: box.getAttribute("data-action-feature") || "",
+      });
+    }
+
     document.addEventListener("click", function (e) {
       var btn = e.target.closest && e.target.closest(".bee-hub__action");
       if (!btn) return;
@@ -1074,6 +1122,16 @@
       if (box.getAttribute("data-fired")) return;
       var kind = box.getAttribute("data-action-kind") || "";
       var feature = box.getAttribute("data-action-feature") || "";
+      // D3's lock is the server's, not this handler's: a locked row renders
+      // `running: <action>` INSTEAD of a button, so a run click can only
+      // reach here while the board believes nothing is live. A 409 that says
+      // otherwise lands in the container's error span like any refusal.
+      if (btn.classList.contains("bee-hub__action--run") && RUN_KIND[kind]) {
+        askConfirm(RUN_CONFIRM[kind](feature), RUN_SUB, function () {
+          fireRun(box, kind, btn);
+        });
+        return;
+      }
       var approved = btn.classList.contains("bee-hub__action--approve");
       var words = CONFIRM[kind];
       if (!words) {
@@ -1082,9 +1140,13 @@
         fire(box, kind, approved, btn);
         return;
       }
-      askConfirm((approved ? words.approve : words.reject)(feature), function () {
-        fire(box, kind, approved, btn);
-      });
+      askConfirm(
+        (approved ? words.approve : words.reject)(feature),
+        null,
+        function () {
+          fire(box, kind, approved, btn);
+        }
+      );
     });
   })();
 

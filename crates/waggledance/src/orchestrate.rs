@@ -81,6 +81,48 @@ pub enum DispatchRefusal {
     NoSuchPane(String),
     #[error("pane {pane_id} is not inside project {project_id}'s own root -- refusing to dispatch across project boundaries")]
     OutsideBoundary { pane_id: String, project_id: String },
+    /// herdr could not be read at all, so nothing about the destination is
+    /// verifiable. Carries the transport error's own words, never a
+    /// generic failure -- the caller shows them.
+    #[error("herdr snapshot failed: {0}")]
+    SnapshotFailed(String),
+    /// No herdr workspace resolves inside the project's own root, so there
+    /// is nowhere this project may legally start an agent. Never a fallback
+    /// to some other directory.
+    #[error("project {project_id} destination unresolved: {reason}")]
+    DestinationUnresolved { project_id: String, reason: String },
+    #[error("agent start failed: {0}")]
+    AgentStartFailed(String),
+    #[error("herdr read failed: {0}")]
+    BaselineFailed(String),
+    #[error("herdr send failed: {0}")]
+    SendFailed(String),
+    #[error("run persistence failed: {0}")]
+    PersistenceFailed(String),
+}
+
+/// Where [`dispatch_run`] puts a task: into a pane that already exists, or
+/// into one it starts for this run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchTarget {
+    /// An existing pane, ALREADY contained to the caller's own project by
+    /// the caller ([`verify_pane_in_boundary`] for a caller-supplied id,
+    /// or a pane list that was itself built from a validated boundary).
+    /// [`dispatch_run`] still preflights its status; containment is the one
+    /// thing it trusts the caller for, because the two callers contain
+    /// differently -- the MCP tool against the project root, the board
+    /// against the feature's own granted worktree, which is a sibling
+    /// directory OUTSIDE that root.
+    Pane(String),
+    /// Start a fresh agent pane. `argv` is the whole command (a preset's,
+    /// or the project's own `.bee/config.json` `herding` default) and `cwd`
+    /// the directory to start it in -- `None` means the project's own
+    /// resolved workspace anchor, which is the only directory this module
+    /// will ever choose on a caller's behalf.
+    Spawn {
+        argv: Vec<String>,
+        cwd: Option<String>,
+    },
 }
 
 /// Confirm `pane_id` names a pane whose own folder resolves **inside**
@@ -224,6 +266,98 @@ pub async fn send_task(
 ) -> herdr::Result<()> {
     let text = format!("{task}\n\n{}", marker.instruction());
     herdr.send_input(pane_id, &text, true).await
+}
+
+/// Dispatch one task and record the run it started (D5's whole sequence in
+/// one call): resolve the destination pane, preflight it, capture the
+/// pre-send baseline, mint a fresh split marker, send, and persist a
+/// `working` [`Run`]. Returns that run.
+///
+/// The ONE dispatch path in this process. Both callers -- the MCP
+/// `waggledance_dispatch` tool and the board's run actions
+/// (board-run-actions D1/D2) -- go through here, so a run started from a
+/// card is the same kind of object, with the same baseline and marker
+/// discipline, as one started from the tool; `await_run` cannot tell them
+/// apart, which is exactly the point.
+///
+/// What each caller keeps for itself is what it alone knows: which pane or
+/// argv to use (`target`), how the run is labelled (`preset_label`), and
+/// which bee feature it belongs to (`feature`, the board's per-feature run
+/// lock, `Engine::list_live_runs_for_feature`).
+///
+/// Nothing is persisted before the send succeeds: a refused or failed
+/// dispatch leaves no run row behind to lock a feature forever.
+pub async fn dispatch_run(
+    herdr: &dyn Herdr,
+    engine: &Engine,
+    project: &waggledance_core::domain::Project,
+    target: DispatchTarget,
+    task: &str,
+    feature: Option<&str>,
+    preset_label: Option<String>,
+) -> Result<Run, DispatchRefusal> {
+    let pane_id = match target {
+        DispatchTarget::Pane(pane_id) => {
+            preflight(herdr, &pane_id).await?;
+            pane_id
+        }
+        DispatchTarget::Spawn { argv, cwd } => {
+            let snapshot = herdr
+                .snapshot()
+                .await
+                .map_err(|e| DispatchRefusal::SnapshotFailed(e.to_string()))?;
+            let boundary = Boundary::new(vec![project.root_path.clone()]).map_err(|e| {
+                DispatchRefusal::DestinationUnresolved {
+                    project_id: project.id.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            let (workspace_id, anchor) = resolve_spawn_destination(&snapshot, &boundary)
+                .ok_or_else(|| DispatchRefusal::DestinationUnresolved {
+                    project_id: project.id.clone(),
+                    reason: "no herdr workspace has a resolved working directory under this \
+                             project's own root; refusing to start an agent in an arbitrary \
+                             directory"
+                        .to_string(),
+                })?;
+            // The workspace is the placement anchor; the cwd is where the
+            // agent actually lands. They differ for a board spawn into a
+            // feature's granted worktree, which is a sibling of the root
+            // the workspace resolved under.
+            let dir = cwd.unwrap_or(anchor);
+            let started = herdr
+                .agent_start(&workspace_id, Some(&dir), &argv)
+                .await
+                .map_err(|e| DispatchRefusal::AgentStartFailed(e.to_string()))?;
+            started.pane_id
+        }
+    };
+
+    let baseline = capture_baseline(herdr, &pane_id)
+        .await
+        .map_err(|e| DispatchRefusal::BaselineFailed(e.to_string()))?;
+    let marker = mint_marker();
+    send_task(herdr, &pane_id, task, &marker)
+        .await
+        .map_err(|e| DispatchRefusal::SendFailed(e.to_string()))?;
+
+    let now = now_rfc3339();
+    let run = Run {
+        id: format!("run-{:016x}", rand::random::<u64>()),
+        project_id: project.id.clone(),
+        pane_id,
+        preset_label,
+        task: task.to_string(),
+        baseline,
+        marker: marker.joined(),
+        status: "working".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    engine
+        .insert_run(&run, feature)
+        .map_err(|e| DispatchRefusal::PersistenceFailed(e.to_string()))?;
+    Ok(run)
 }
 
 /// The transcript delta versus baseline — everything a `Recent` read has
@@ -525,7 +659,7 @@ mod tests {
         let baseline = capture_baseline(&herdr, pane).await.unwrap();
         let marker = mint_marker();
         let run = build_run("run-fresh", pane, &baseline, &marker.joined());
-        engine.insert_run(&run).unwrap();
+        engine.insert_run(&run, None).unwrap();
 
         send_task(&herdr, pane, &run.task, &marker).await.unwrap();
         // The agent's own later output prints the joined marker -- the only
@@ -571,7 +705,7 @@ mod tests {
         let baseline = format!("earlier output\n{joined}\nmore earlier output");
         herdr.seed_scroll_pane(pane, &baseline, &baseline, None);
         let run = build_run("run-stale", pane, &baseline, &joined);
-        engine.insert_run(&run).unwrap();
+        engine.insert_run(&run, None).unwrap();
 
         let outcome = await_run_with_poll_interval(
             &herdr,
@@ -599,7 +733,7 @@ mod tests {
         let baseline = capture_baseline(&herdr, pane).await.unwrap();
         let marker = mint_marker(); // never sent/printed -- no completion signal.
         let run = build_run("run-timeout", pane, &baseline, &marker.joined());
-        engine.insert_run(&run).unwrap();
+        engine.insert_run(&run, None).unwrap();
 
         let store = NotifyStore::open_in_memory().unwrap();
         let outcome = await_run_with_poll_interval(
@@ -635,7 +769,7 @@ mod tests {
         let baseline = capture_baseline(&herdr, pane).await.unwrap();
         let marker = mint_marker();
         let run = build_run("run-blocked", pane, &baseline, &marker.joined());
-        engine.insert_run(&run).unwrap();
+        engine.insert_run(&run, None).unwrap();
 
         let flipper = herdr.clone();
         let flip_pane = pane.to_string();
@@ -685,7 +819,7 @@ mod tests {
         let baseline = capture_baseline(&herdr, pane).await.unwrap();
         let marker = mint_marker();
         let run = build_run("run-blocked-twice", pane, &baseline, &marker.joined());
-        engine.insert_run(&run).unwrap();
+        engine.insert_run(&run, None).unwrap();
 
         for _ in 0..2 {
             let outcome = await_run_with_poll_interval(
@@ -723,7 +857,7 @@ mod tests {
         let baseline = capture_baseline(&herdr, pane).await.unwrap();
         let marker = mint_marker(); // never printed -- content stays put.
         let run = build_run("run-timeout-alert", pane, &baseline, &marker.joined());
-        engine.insert_run(&run).unwrap();
+        engine.insert_run(&run, None).unwrap();
 
         // poll_interval > timeout so the loop's own `remaining` cap makes
         // the very first sleep land exactly on the deadline -- the second
@@ -761,7 +895,7 @@ mod tests {
         let baseline = capture_baseline(&herdr, pane).await.unwrap();
         let marker = mint_marker(); // never printed -- only stability proves completion.
         let run = build_run("run-unknown-stable", pane, &baseline, &marker.joined());
-        engine.insert_run(&run).unwrap();
+        engine.insert_run(&run, None).unwrap();
 
         let outcome = await_run_with_poll_interval(
             &herdr,

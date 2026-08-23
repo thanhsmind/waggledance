@@ -384,8 +384,10 @@ impl Engine {
 
     // ---- runs (D7) ----
 
-    pub fn insert_run(&self, run: &Run) -> Result<()> {
-        self.store.insert_run(run)
+    /// Persist one run, stamped with the bee feature it was started for
+    /// (board-run-actions D3) — `None` for a run with no feature behind it.
+    pub fn insert_run(&self, run: &Run, feature: Option<&str>) -> Result<()> {
+        self.store.insert_run(run, feature)
     }
 
     pub fn update_run_status(
@@ -406,6 +408,19 @@ impl Engine {
 
     pub fn list_runs(&self, project_id: &str, limit: usize) -> Result<Vec<Run>> {
         self.store.list_runs(project_id, limit)
+    }
+
+    /// The still-`working` runs this project started for `feature` — the
+    /// store half of the board's per-feature run lock (board-run-actions
+    /// D3). A caller decides whether each one's pane is still alive; this
+    /// answers only what the ledger holds.
+    pub fn list_live_runs_for_feature(&self, project_id: &str, feature: &str) -> Result<Vec<Run>> {
+        self.store.list_live_runs_for_feature(project_id, feature)
+    }
+
+    /// The feature a run was started for, read back off its own row.
+    pub fn run_feature(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_feature(id)
     }
 
     pub fn list_files(&self, project_id: &str) -> Result<Vec<IndexedFile>> {
@@ -962,7 +977,7 @@ mod tests {
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
         let project = engine.register(&dir, None).unwrap();
 
-        engine.insert_run(&sample_run(&project.id)).unwrap();
+        engine.insert_run(&sample_run(&project.id), None).unwrap();
         let got = engine.get_run("r1").unwrap().unwrap();
         assert_eq!(got.status, "pending");
 

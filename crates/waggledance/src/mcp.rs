@@ -755,39 +755,29 @@ async fn run_dispatch(
     pane_id_arg: Option<String>,
     task: &str,
 ) -> std::result::Result<String, String> {
-    let (pane_id, preset_label) = match (preset, pane_id_arg) {
-        (Some(preset), None) => {
-            let snapshot = herdr
-                .snapshot()
-                .await
-                .map_err(|e| format!("herdr snapshot failed: {e}"))?;
-            let boundary =
-                waggledance_core::paths_boundary::Boundary::new(vec![project.root_path.clone()])
-                    .map_err(|e| format!("project {} destination unresolved: {e}", project.id))?;
-            let (workspace_id, cwd) = orchestrate::resolve_spawn_destination(&snapshot, &boundary)
-                .ok_or_else(|| {
-                    format!(
-                        "project {} has no herdr workspace with a resolved working directory \
-                         under its own root; refusing to start an agent in an arbitrary \
-                         directory",
-                        project.id
-                    )
-                })?;
-            let started = herdr
-                .agent_start(&workspace_id, Some(&cwd), &preset.argv)
-                .await
-                .map_err(|e| format!("agent start failed: {e}"))?;
-            (started.pane_id, Some(preset.label))
-        }
+    // This tool's own half: which destination the two argument shapes mean,
+    // and how a run started here is labelled. Everything after it -- the
+    // preflight, baseline, marker, send and the persisted run -- is the one
+    // shared dispatch path (`orchestrate::dispatch_run`), the same one the
+    // board's run actions use.
+    let (target, preset_label) = match (preset, pane_id_arg) {
+        (Some(preset), None) => (
+            orchestrate::DispatchTarget::Spawn {
+                argv: preset.argv,
+                cwd: None,
+            },
+            Some(preset.label),
+        ),
         (None, Some(pane_id)) => {
             // D6 containment: a caller-supplied pane_id must belong to THIS
             // project's own root before any send. Without this, an opted-in
             // project could dispatch into any pane on the host (pane ids are
             // enumerable off GET /api/agents) -- the same boundary every
             // sibling pane-scoped write route enforces via
-            // `project_and_verify_pane_in_boundary`. The spawn branch above
-            // needs no equivalent: it creates the pane under a
-            // boundary-validated workspace anchor.
+            // `project_and_verify_pane_in_boundary`. It stays HERE rather
+            // than inside the shared path because the board contains its
+            // panes differently: a feature's granted worktree is a sibling
+            // directory outside this very boundary.
             let snapshot = herdr
                 .snapshot()
                 .await
@@ -797,42 +787,19 @@ async fn run_dispatch(
                     .map_err(|e| format!("project {} destination unresolved: {e}", project.id))?;
             orchestrate::verify_pane_in_boundary(&snapshot, &boundary, &pane_id, &project.id)
                 .map_err(|e| e.to_string())?;
-            orchestrate::preflight(herdr, &pane_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            (pane_id, None)
+            (orchestrate::DispatchTarget::Pane(pane_id), None)
         }
         (Some(_), Some(_)) | (None, None) => {
             unreachable!("handle_dispatch already validated exactly one of preset/pane_id")
         }
     };
 
-    let baseline = orchestrate::capture_baseline(herdr, &pane_id)
+    // No feature: a run started from this tool belongs to whoever called it,
+    // not to a board card, and must never hold a card's per-feature lock.
+    let run = orchestrate::dispatch_run(herdr, engine, project, target, task, None, preset_label)
         .await
-        .map_err(|e| format!("herdr read failed: {e}"))?;
-    let marker = orchestrate::mint_marker();
-    orchestrate::send_task(herdr, &pane_id, task, &marker)
-        .await
-        .map_err(|e| format!("herdr send failed: {e}"))?;
-
-    let now = waggledance_core::indexer::now_rfc3339();
-    let run = Run {
-        id: format!("run-{:016x}", rand::random::<u64>()),
-        project_id: project.id.clone(),
-        pane_id,
-        preset_label,
-        task: task.to_string(),
-        baseline,
-        marker: marker.joined(),
-        status: "working".to_string(),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let run_id = run.id.clone();
-    engine
-        .insert_run(&run)
-        .map_err(|e| format!("run persistence failed: {e}"))?;
-    Ok(run_id)
+        .map_err(|e| e.to_string())?;
+    Ok(run.id)
 }
 
 /// `waggledance_await`: bounded poll for a run's completion (D4/D5).
@@ -1579,8 +1546,12 @@ mod tests {
     #[test]
     fn runs_filtered_lists_only_that_projects_rows() {
         let (engine, pa, pb) = two_project_engine("runs-filtered");
-        engine.insert_run(&seeded_run(&pa.id, "run-a")).unwrap();
-        engine.insert_run(&seeded_run(&pb.id, "run-b")).unwrap();
+        engine
+            .insert_run(&seeded_run(&pa.id, "run-a"), None)
+            .unwrap();
+        engine
+            .insert_run(&seeded_run(&pb.id, "run-b"), None)
+            .unwrap();
 
         let resp = call_tool(&engine, "waggledance_runs", json!({ "project": pa.id }));
         let rows = resp["result"]["structuredContent"]["runs"]
@@ -1596,8 +1567,12 @@ mod tests {
     #[test]
     fn runs_unfiltered_spans_every_project() {
         let (engine, pa, pb) = two_project_engine("runs-unfiltered");
-        engine.insert_run(&seeded_run(&pa.id, "run-a")).unwrap();
-        engine.insert_run(&seeded_run(&pb.id, "run-b")).unwrap();
+        engine
+            .insert_run(&seeded_run(&pa.id, "run-a"), None)
+            .unwrap();
+        engine
+            .insert_run(&seeded_run(&pb.id, "run-b"), None)
+            .unwrap();
 
         let resp = call_tool(&engine, "waggledance_runs", json!({}));
         let rows = resp["result"]["structuredContent"]["runs"]
@@ -1687,7 +1662,7 @@ mod tests {
     fn await_tool_call_arms_notify_store_under_opt_in_switch() {
         let (engine_off, pa) = dispatch_engine("await-tool-off");
         engine_off
-            .insert_run(&seeded_run(&pa.id, "run-tool-off"))
+            .insert_run(&seeded_run(&pa.id, "run-tool-off"), None)
             .unwrap();
         let mut orch_off: Option<Orchestration> = None;
         let _ = call_tool_with_orchestration(
@@ -1716,7 +1691,7 @@ mod tests {
         let engine_on = Engine::new(SqliteStore::open_in_memory().unwrap(), config_on);
         let pb = engine_on.register(&dir, None).unwrap();
         engine_on
-            .insert_run(&seeded_run(&pb.id, "run-tool-on"))
+            .insert_run(&seeded_run(&pb.id, "run-tool-on"), None)
             .unwrap();
 
         let mut orch_on: Option<Orchestration> = None;

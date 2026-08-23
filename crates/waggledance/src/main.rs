@@ -696,7 +696,7 @@ mod terminal_background_tests {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        engine.insert_run(&run).unwrap();
+        engine.insert_run(&run, None).unwrap();
         assert!(is_pane_owned_by_run(&engine, "w2:p4"));
         assert!(!is_pane_owned_by_run(&engine, "w1:p1"));
 
