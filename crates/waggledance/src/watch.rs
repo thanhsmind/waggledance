@@ -54,18 +54,39 @@ pub fn spawn_watchers(
 /// a touch / byte-identical rewrite reindexes but reports no change, so it
 /// broadcasts no reload. Deletions and brand-new paths always count as
 /// changed, unchanged from before.
+///
+/// Two kinds of path get here. Markdown is *indexed and* reported: it is the
+/// content the daemon serves. The bee state files named by [`is_bee_signal`]
+/// are reported only — they never enter the markdown index (they are not
+/// documents and would pollute search), they exist in this list because a
+/// board card's text is derived from them (board-approve-actions D4: a gate
+/// approval writes `.bee/lanes/<feature>.json`, and without a broadcast the
+/// card a human just approved keeps showing the stop they cleared until a
+/// manual reload). Every other path — session heartbeats, cells, logs,
+/// reservations — is still dropped here.
 fn reindex_paths(engine: &Engine, paths: &[std::path::PathBuf]) -> Vec<String> {
     let projects = engine.list_projects().unwrap_or_default();
     let mut changed = Vec::new();
 
     for path in paths {
-        if !is_markdown(path) {
+        // Report-only paths skip the indexer entirely; anything that is
+        // neither markdown nor a bee signal never reaches the socket.
+        let report_only = if is_markdown(path) {
+            false
+        } else if is_bee_signal(path) {
+            true
+        } else {
             continue;
-        }
+        };
         let Some(project) = projects.iter().find(|p| path.starts_with(&p.root_path)) else {
             continue;
         };
-        let content_changed = if path.exists() {
+        let content_changed = if report_only {
+            // No stored copy to diff against (the engine indexes markdown
+            // only), so every write reports. The client debounces the burst
+            // bee emits when it rewrites a lane and its projections together.
+            true
+        } else if path.exists() {
             // Reindex the file and refresh its outgoing links (keeps backlinks
             // live). Only a genuine content change reports true.
             engine
@@ -99,6 +120,34 @@ fn is_markdown(p: &Path) -> bool {
             .as_deref(),
         Some("md") | Some("markdown")
     )
+}
+
+/// The bee state files a board card's text is derived from, and nothing else.
+/// Exactly two shapes are accepted:
+///
+/// - `<root>/.bee/state.json` — the gate record of an unlaned feature.
+/// - `<root>/.bee/lanes/<feature>.json` — the gate record of a laned one.
+///
+/// Session heartbeats (`.bee/sessions/*.json`) are deliberately excluded:
+/// they rewrite on a timer and would turn a push channel into a metronome.
+/// Cells, logs, reservations and every other `.bee/` path are excluded for
+/// the same reason — they do not decide what a card says.
+fn is_bee_signal(p: &Path) -> bool {
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let parent = p.parent();
+    let parent_name = parent.and_then(|d| d.file_name()).and_then(|n| n.to_str());
+    if name == "state.json" && parent_name == Some(".bee") {
+        return true;
+    }
+    let grandparent_name = parent
+        .and_then(|d| d.parent())
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str());
+    parent_name == Some("lanes")
+        && grandparent_name == Some(".bee")
+        && p.extension().and_then(|e| e.to_str()) == Some("json")
 }
 
 #[cfg(test)]
@@ -169,6 +218,69 @@ mod tests {
 
         let changed = reindex_paths(&engine, &[a]);
         assert_eq!(changed, vec![format!("{}/docs/a.md", project.id)]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// board-approve-actions (D4, `bap-5`): a gate approval writes bee state,
+    /// not markdown, so the two paths a card's stop is read from have to reach
+    /// the socket — and the noisy rest of `.bee/` must not follow them.
+    #[test]
+    fn reindex_paths_broadcasts_bee_gate_state_but_not_session_heartbeats() {
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-watch-bee-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# A\ncontent");
+
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&dir, None).unwrap();
+
+        // `bee gate --lane <feature>` writes here; the card reads its stop
+        // from it, so it is broadcast.
+        write(&dir, ".bee/lanes/board-approve-actions.json", "{\"gates\":{}}");
+        let lane = dir.join(".bee/lanes/board-approve-actions.json");
+        assert_eq!(
+            reindex_paths(&engine, std::slice::from_ref(&lane)),
+            vec![format!(
+                "{}/.bee/lanes/board-approve-actions.json",
+                project.id
+            )],
+            "a lane gate write must reach /ws or the approved card stays stale"
+        );
+
+        // The unlaned spelling of the same record.
+        write(&dir, ".bee/state.json", "{\"phase\":\"execute\"}");
+        let state = dir.join(".bee/state.json");
+        assert_eq!(
+            reindex_paths(&engine, std::slice::from_ref(&state)),
+            vec![format!("{}/.bee/state.json", project.id)]
+        );
+
+        // Session heartbeats rewrite on a timer and decide nothing a card
+        // says — broadcasting them would reload every open board on a clock.
+        write(&dir, ".bee/sessions/abc123.json", "{\"heartbeat\":1}");
+        let session = dir.join(".bee/sessions/abc123.json");
+        assert!(
+            reindex_paths(&engine, std::slice::from_ref(&session)).is_empty(),
+            "a session heartbeat must never be broadcast"
+        );
+
+        // The rest of `.bee/` stays dropped too — the widening is exactly two
+        // shapes, never "the whole `.bee/` directory".
+        for other in [
+            ".bee/cells.jsonl",
+            ".bee/holds.json",
+            ".bee/decisions.jsonl",
+            ".bee/lanes/nested/deep.json",
+            ".bee/logs/run.json",
+        ] {
+            write(&dir, other, "x");
+            let other_path = dir.join(other);
+            assert!(
+                reindex_paths(&engine, std::slice::from_ref(&other_path)).is_empty(),
+                "{other} must not be broadcast"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

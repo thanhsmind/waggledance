@@ -1507,6 +1507,19 @@
   // to either refreshes the home board exactly as a `docs/history/` edit
   // does; without this the card a human just answered would keep showing the
   // stop they already cleared.
+  // board-approve-actions (bap-5): `watch.rs` now broadcasts those two bee
+  // state paths (it used to drop every non-markdown path, which is why an
+  // approved card kept reading its old stop). They say something only a
+  // board renders, so they are recognised by name here and steered — a lane
+  // write must not force-reload a code page or a file page that cannot show
+  // it.
+  function isBeeSignal(rel) {
+    return rel === ".bee/state.json" || rel.indexOf(".bee/lanes/") === 0;
+  }
+  // The same two rules are spelled out again below rather than called: the
+  // board's relevance filter is pinned literally by a server-side test
+  // (bap-3), because it is the board's own contract with the watcher and
+  // has to stay readable as one list beside the `docs/history/` rule.
   function isBoardRelevant(changedEntry) {
     var slash = changedEntry.indexOf("/");
     if (slash === -1) return false;
@@ -1530,19 +1543,60 @@
     }
     if (/^_(terminal|transcript)(\/|$)/.test(rest)) return false;
     if (!rest || rest.charAt(0) === "_") {
-      return changed.some(function (c) { return c.indexOf(pid + "/") === 0; });
+      var onBeeBoard = /^_bee(\/|$)/.test(rest);
+      return changed.some(function (c) {
+        if (c.indexOf(pid + "/") !== 0) return false;
+        // A bee state write is news for a board and for nothing else: the
+        // project home, search, runs and code pages render none of it, so
+        // outside `/p/<id>/_bee` it is not a reason to throw their page away.
+        if (isBeeSignal(c.slice(pid.length + 1))) return onBeeBoard;
+        return true;
+      });
     }
+    // A single-document page still reloads only on its own document —
+    // including the rare case of reading one of those JSON files directly.
     return changed.indexOf(pid + "/" + rest) !== -1;
+  }
+
+  // Every reload goes through one trailing 1500 ms timer. bee rewrites a
+  // lane and its projections inside a single command, so one approval lands
+  // as a burst of change events; without the timer that is a burst of
+  // reloads, each one throwing away the page mid-paint. The timer is also
+  // where the dialog rule lives (D2's confirm is a real modal the human is
+  // mid-answer in) — a reload that would pull it out from under them waits
+  // for it to close instead of firing. No network happens on this timer; it
+  // is the push signal waiting its turn, never a poll.
+  var RELOAD_DEBOUNCE_MS = 1500;
+  var reloadTimer = null;
+  function modalOpen() {
+    var els = document.querySelectorAll(
+      "dialog[open], .task-overlay, [role=dialog]"
+    );
+    for (var i = 0; i < els.length; i++) {
+      // `.task-overlay` hides with the `hidden` attribute; a `<dialog>`
+      // without `open` never matches. `getClientRects` is what tells a
+      // display:none box from a visible fixed-position one.
+      if (!els[i].hidden && els[i].getClientRects().length > 0) return true;
+    }
+    return false;
+  }
+  function scheduleReload() {
+    if (reloadTimer !== null) clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(function () {
+      reloadTimer = null;
+      if (modalOpen()) { scheduleReload(); return; }
+      location.reload();
+    }, RELOAD_DEBOUNCE_MS);
   }
   function connect() {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
     var ws = new WebSocket(proto + "//" + location.host + "/ws");
     ws.onmessage = function (ev) {
-      if (ev.data === "reload") { location.reload(); return; }
+      if (ev.data === "reload") { scheduleReload(); return; }
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg && Array.isArray(msg.changed) && shouldReload(msg.changed)) {
-        location.reload();
+        scheduleReload();
       }
     };
     ws.onclose = function () { setTimeout(connect, 3000); };
