@@ -61,6 +61,13 @@ pub struct Agent {
     /// Human-readable terminal title (herdr `terminal_title_stripped`).
     #[serde(rename = "terminal_title_stripped", default)]
     pub title: String,
+    /// The agent's own session id as herdr detected it (`agent_session.value`,
+    /// a Claude Code session id for `claude` panes). `None` when herdr
+    /// carries no `agent_session` or an empty value. This is process-level
+    /// proof the session is still hosted: a bee session record whose
+    /// heartbeat has aged out is still LIVE while herdr lists this id, so
+    /// `server::project_bee_activity` keeps it joined to its pane.
+    pub session_id: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Agent {
@@ -81,9 +88,20 @@ impl<'de> Deserialize<'de> for Agent {
             status: AgentStatus,
             #[serde(rename = "terminal_title_stripped", default)]
             title: String,
+            #[serde(default)]
+            agent_session: Option<RawAgentSession>,
+        }
+        #[derive(Deserialize)]
+        struct RawAgentSession {
+            #[serde(default)]
+            value: String,
         }
 
         let raw = RawAgent::deserialize(deserializer)?;
+        let session_id = raw
+            .agent_session
+            .map(|s| s.value)
+            .filter(|v| !v.trim().is_empty());
         // The Windows fallback (raw.agent empty -> raw.name) is unchanged;
         // `name` is additionally kept in full as its own field below, so a
         // clone is taken here rather than moving raw.name into `kind`.
@@ -100,6 +118,7 @@ impl<'de> Deserialize<'de> for Agent {
             name: raw.name,
             status: raw.status,
             title: raw.title,
+            session_id,
         })
     }
 }
@@ -349,6 +368,29 @@ mod tests {
         assert_eq!(a.kind, "claude");
         assert_eq!(a.status, AgentStatus::Idle);
         assert_eq!(a.title, "Kiểm tra plan");
+        assert_eq!(a.session_id, None);
+    }
+
+    #[test]
+    fn agent_session_value_parses_into_session_id_and_empty_reads_none() {
+        // Shape captured live from `herdr agent list` (herdr 0.7.x): the
+        // detected Claude Code session rides `agent_session.value`.
+        let json = r#"{
+          "agents": [
+            {"agent":"claude","agent_status":"idle","pane_id":"w4:p6","workspace_id":"w4","tab_id":"w4:t6",
+             "agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"5bb39669-45a1-475c-b613-f3b0c7499d2c"}},
+            {"agent":"claude","agent_status":"idle","pane_id":"w4:p7","workspace_id":"w4","tab_id":"w4:t7",
+             "agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":""}},
+            {"agent":"codex","agent_status":"working","pane_id":"w4:p8","workspace_id":"w4","tab_id":"w4:t8"}
+          ]
+        }"#;
+        let snap: Snapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            snap.agents[0].session_id.as_deref(),
+            Some("5bb39669-45a1-475c-b613-f3b0c7499d2c")
+        );
+        assert_eq!(snap.agents[1].session_id, None);
+        assert_eq!(snap.agents[2].session_id, None);
     }
 
     #[test]
@@ -447,6 +489,7 @@ mod tests {
             name: String::new(),
             status: AgentStatus::Idle,
             title: String::new(),
+            session_id: None,
         };
         assert_eq!(snap.workspace_status_for(&a), AgentStatus::Unknown);
     }
@@ -467,6 +510,7 @@ mod tests {
             name: String::new(),
             status: AgentStatus::Idle,
             title: String::new(),
+            session_id: None,
         };
         assert_eq!(snap.workspace_label_for(&a), "");
         assert_eq!(snap.tab_label_for(&a), "");
