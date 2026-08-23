@@ -3053,7 +3053,7 @@ fn bee_hub_style() -> String {
 .bee-hub__agent-state { color: var(--color-text-muted); }
 .bee-hub__agent-state--working { color: var(--color-warning); }
 .bee-hub__agent-state--needs-you { color: var(--color-danger); }
-.bee-hub__agent-cell { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bee-hub__agent-cell { min-width: 0; flex: 1 1 auto; white-space: normal; overflow-wrap: anywhere; }
 .bee-hub__agent-quiet { color: var(--color-text-subtle); }
 .bee-hub__agent-signal { color: var(--color-text-subtle); font-style: italic; }
 /* (bee-agent-activity R1) The Ready to merge row's own second line — the
@@ -15823,6 +15823,26 @@ mod tests {
         assert!(
             css.contains(".bee-hub__agent { flex: 1 0 100%; order: 10;"),
             "the agent line must claim the whole width and sit last: {css}"
+        );
+    }
+
+    /// The agent line's cell title wraps inside the card instead of running
+    /// past its edge on one line: a long cell title used to be `nowrap` and
+    /// overflow the board card.
+    #[test]
+    fn bee_hub_agent_cell_title_wraps_inside_the_card() {
+        let css = bee_hub_style();
+        let rule = css
+            .lines()
+            .find(|l| l.starts_with(".bee-hub__agent-cell {"))
+            .expect("agent-cell rule present");
+        assert!(
+            rule.contains("white-space: normal") && rule.contains("overflow-wrap: anywhere"),
+            "the cell title must wrap: {rule}"
+        );
+        assert!(
+            !rule.contains("nowrap") && !rule.contains("text-overflow"),
+            "the cell title must not clip to one line: {rule}"
         );
     }
 
