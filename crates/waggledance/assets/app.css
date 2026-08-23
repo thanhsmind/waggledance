@@ -198,14 +198,10 @@ html[data-scheme="dark"] .topbar .home {
 .agent-drawer__item { flex-direction: column; align-items: flex-start; gap: 2px; min-height: 44px; }
 .agent-drawer__head { display: flex; align-items: center; gap: var(--space-2); }
 .agent-drawer__suffix { color: var(--color-text-muted); font-size: var(--type-caption-size); }
-/* A3/A6: bee's own reading of the row — the state word, and the feature
-   lane the session is bound to. Muted mono beside herdr's own status pill,
-   so the row reads "what bee knows" without competing with it; the
-   need-you modifier takes the same blocked tone `.fg-status--blocked`
-   already uses, since these two states are exactly what the drawer sorts
-   to the top. */
-.agent-drawer__state, .agent-drawer__feature { font-family: var(--font-mono, monospace); font-size: var(--type-caption-size); color: var(--color-text-muted); }
-.agent-drawer__state--needs-you { color: var(--color-danger); }
+/* A6: the feature lane the session is bound to, muted mono beside the
+   status pill (bee's own state word rides the pill itself — one status per
+   row, never two). */
+.agent-drawer__feature { font-family: var(--font-mono, monospace); font-size: var(--type-caption-size); color: var(--color-text-muted); }
 /* ── Pane bar menu ───────────────────────────────────────────────────
    Same shape as the bar menu above, applied to the row over a terminal
    pane: wide, the strip and the creation controls lay out as they always

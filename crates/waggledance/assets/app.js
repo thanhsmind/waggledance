@@ -2572,6 +2572,15 @@
       return state;
     }
 
+    // The tone the single pill takes: bee's state mapped onto herdr's
+    // vocabulary (`pane_tone`), else herdr's status as-is.
+    function pillStatus(agent) {
+      if (!agent.bee_state) return agent.status;
+      if (agent.bee_state === "blocked" || agent.bee_state === "waiting_input") return "blocked";
+      if (agent.bee_state === "working") return "working";
+      return "idle";
+    }
+
     function agentRow(agent) {
       var item = document.createElement("a");
       item.className = "fg-menu__item agent-drawer__item";
@@ -2585,12 +2594,17 @@
       var head = document.createElement("span");
       head.className = "agent-drawer__head";
 
+      // One status pill, one word: bee's own state wins over herdr's
+      // screen-derived status wherever both exist — the same precedence
+      // `views::pane_tone` / `pane_status_word` apply server-side — so a
+      // pane never reads "working … working" or "done … idle" twice on
+      // one line. The two need-you states take the blocked tone.
       var pill = document.createElement("span");
-      pill.className = "fg-status" + pillModifier(agent.status);
+      pill.className = "fg-status" + pillModifier(pillStatus(agent));
       var dot = document.createElement("span");
       dot.className = "fg-status__dot";
       pill.appendChild(dot);
-      pill.appendChild(document.createTextNode(agent.status));
+      pill.appendChild(document.createTextNode(agent.bee_state ? beeStateWord(agent.bee_state) : agent.status));
       head.appendChild(pill);
 
       var name = document.createElement("span");
@@ -2604,18 +2618,9 @@
       suffix.textContent = agent.workspace + ":" + agent.tab;
       head.appendChild(suffix);
 
-      // A6: bee's own reading of this pane, beside herdr's status pill —
-      // the state word (in the blocked tone for the two need-you states)
-      // and the feature lane the session is bound to. Absent for a pane no
+      // A6: the feature lane the session is bound to. Absent for a pane no
       // live bee session claims, in which case the row renders exactly as
-      // it did before.
-      if (agent.bee_state) {
-        var beeState = document.createElement("span");
-        var needsYou = agent.bee_state === "blocked" || agent.bee_state === "waiting_input";
-        beeState.className = "agent-drawer__state" + (needsYou ? " agent-drawer__state--needs-you" : "");
-        beeState.textContent = beeStateWord(agent.bee_state);
-        head.appendChild(beeState);
-      }
+      // it did before. (bee's state word already rides the pill above.)
       if (agent.feature) {
         var beeFeature = document.createElement("span");
         beeFeature.className = "agent-drawer__feature";
