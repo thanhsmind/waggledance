@@ -1,6 +1,3 @@
----
-okf_version: 0.1
----
 <!--
 GENERATED FILE — do not hand-edit.
 Rendered by `bee knowledge index` from concept frontmatter inside docs/knowledge/ (okf-foundation D21).
@@ -9,13 +6,8 @@ Deterministic: byte-identical for the same bundle contents — path-sorted entri
 never a generation timestamp or any other wall-clock value.
 -->
 
-# Knowledge Bundle
+# work/board-run-actions/
 
-## Sections
+## Concepts
 
-- [patterns/](patterns/index.md) — 1 concept(s)
-- [work/](work/index.md) — 78 concept(s)
-
-## Critical patterns
-
-None.
+- [board-run-actions — delivery](delivery.md) — Delivery record for work item board-run-actions: the board's run path — Start, Run review and Run compound on a feature card start an agent, in the feature's live pane or in a fresh pane in its worktree, one live run per feature.

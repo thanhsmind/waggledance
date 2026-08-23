@@ -129,8 +129,12 @@ and link straight to it.
 project's own `bee` CLI, or as one line into a herdr pane — and only on an explicit human
 click, in a project where you switched board actions on in settings. Three answers live on
 a feature card: approve or reject the UAT gate, the merged shape+execution gate, or an
-agent's permission prompt. The board carries your decision there and mirrors what came
-back; it originates none of its own. A project without the switch shows only the badge
+agent's permission prompt. Three more start work: **Start** on a Todo card,
+**Run review**, and **Run compound** — each starts an agent, in the feature's own live
+pane when one exists, and otherwise in a fresh pane opened in the feature's worktree with
+the project's default bee preset. One board-started run per feature is live at a time; while
+it runs, that card's buttons stand down and the card says what is running. The board
+carries your decision there and mirrors what came back; it originates none of its own. A project without the switch shows only the badge
 that says something is waiting on you.
 
 ---
