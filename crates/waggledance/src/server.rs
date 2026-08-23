@@ -18736,7 +18736,7 @@ mod bee_route_tests {
 
         fn tabbar_of(body: &str) -> &str {
             let open = body
-                .find(r#"<nav class="home-tabbar" aria-label="Sections">"#)
+                .find(r#"<nav class="home-tabbar" id="home-tabbar" aria-label="Sections">"#)
                 .expect("the handset tab bar must render");
             let close = body[open..]
                 .find("</nav>")
@@ -18832,6 +18832,47 @@ mod bee_route_tests {
             assert!(
                 !bar.contains("onclick") && !bar.contains("<script"),
                 "the tab bar must need no script: {bar}"
+            );
+
+            // tabbar-collapse (75a5b463): the handle that shows the bar
+            // again is the bar's *sibling*, never a fifth item inside it —
+            // the four destinations and their order are untouched.
+            assert!(
+                !bar.contains("home-tabbar__toggle"),
+                "the collapse handle must not sit inside the bar: {bar}"
+            );
+            assert_eq!(
+                body.matches(r#"class="home-tabbar__toggle""#).count(),
+                1,
+                "{path} must render exactly one collapse handle: {body}"
+            );
+            let toggle_at = body
+                .find(r#"<button type="button" class="home-tabbar__toggle""#)
+                .expect("the collapse handle must be a button");
+            let toggle_end = body[toggle_at..]
+                .find('>')
+                .map(|i| toggle_at + i)
+                .expect("the handle's open tag must be closed");
+            let toggle = &body[toggle_at..toggle_end];
+            // Shipped `hidden`: collapsing is a client-side act with no
+            // server route behind it, so with scripting off the bar stays
+            // visible and this control is not there to promise otherwise.
+            // `assets/app.js` unhides it, after painting the stored state.
+            assert!(
+                toggle.contains(" hidden"),
+                "the handle must ship hidden for the no-script page: {toggle}"
+            );
+            // And it points at the bar it controls, by the id the bar now
+            // carries — an `aria-controls` naming nothing is worse than none.
+            assert!(
+                toggle.contains(r#"aria-controls="home-tabbar""#)
+                    && toggle.contains(r#"aria-expanded="false""#),
+                "the handle must name the bar it controls: {toggle}"
+            );
+            assert_eq!(
+                body.matches(r#"id="home-tabbar""#).count(),
+                1,
+                "{path} must carry exactly one bar for that handle: {body}"
             );
         }
     }
