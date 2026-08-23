@@ -503,6 +503,67 @@
     });
   })();
 
+  // Tab bar collapse (home page, phone, tabbar-collapse 75a5b463): the
+  // bottom bar took 56px off every reload of a 390px screen, so it hides
+  // by default and a small pill on the bottom edge brings it back. The
+  // choice is remembered per browser in
+  // `localStorage["waggledance-tabbar-open"]` ("1" when the bar is showing,
+  // absent otherwise) — the same shape, and for the same reason, as the
+  // rail collapse above: this script reloads the whole page on any watched
+  // change, and nothing that lives only in memory survives that.
+  //
+  // ABSENT MEANS HIDDEN, which inverts the rail's key: the stored value
+  // marks the state the reader asked for, and here that is the bar being
+  // out. First visit therefore opens with the bar away and the pill
+  // showing it.
+  //
+  // The button ships `hidden` from the server and is unhidden here, after
+  // the stored state is painted — so the bar never flashes in for a frame
+  // and then leaves, and with scripting off there is no pill promising a
+  // fold that would never happen. The bar itself ships visible for that
+  // same no-script case: all four destinations stay reachable.
+  //
+  // Two classes, because the two things that move are not in the same
+  // subtree — the `<nav>` and its handle are siblings of `.home-shell`,
+  // not children of it. The nav carries its own state class (which is what
+  // the adjacent handle's CSS reads), and the shell carries the marker
+  // that lets `<main>` and the terminal's Live button reclaim the space.
+  (function () {
+    var bar = document.querySelector(".home-tabbar");
+    var btn = document.querySelector(".home-tabbar__toggle");
+    if (!bar || !btn) return;
+    var shell = document.querySelector(".home-shell");
+    var KEY = "waggledance-tabbar-open";
+    var BAR_CLASS = "home-tabbar--hidden";
+    var SHELL_CLASS = "home-shell--tabbar-hidden";
+
+    function paint(shown) {
+      bar.classList.toggle(BAR_CLASS, !shown);
+      if (shell) shell.classList.toggle(SHELL_CLASS, !shown);
+      btn.setAttribute("aria-expanded", shown ? "true" : "false");
+      var label = shown ? "Hide navigation" : "Show navigation";
+      btn.setAttribute("aria-label", label);
+      btn.title = label;
+    }
+
+    // Storage is a hostile input like any other: a disabled or
+    // quota-blocked `localStorage` throws on read, and anything but the
+    // literal "1" reads as "hidden" rather than second-guessing it.
+    var stored = false;
+    try { stored = localStorage.getItem(KEY) === "1"; } catch (e) {}
+    paint(stored);
+    btn.hidden = false;
+
+    btn.addEventListener("click", function () {
+      var next = bar.classList.contains(BAR_CLASS);
+      paint(next);
+      try {
+        if (next) localStorage.setItem(KEY, "1");
+        else localStorage.removeItem(KEY);
+      } catch (e) {}
+    });
+  })();
+
   // Project row menus (home page rail, rail-collapse-menu f4999b27): each
   // row's actions live in a native `<details class="proj-menu">`, so the
   // menu opens, closes and reaches Docs or Remove with this script absent.

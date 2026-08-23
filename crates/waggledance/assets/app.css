@@ -971,6 +971,12 @@ html[data-scheme="dark"] .topbar .home {
 .home-tabbar {
   display: none;
 }
+/* tabbar-collapse: the handle that shows the bar again is bar-shaped
+   furniture, so it leaves with the bar above the breakpoint — a wide screen
+   has a rail and a topbar and no bottom edge to hang a pill on. */
+.home-tabbar__toggle {
+  display: none;
+}
 .home-rail__backdrop {
   display: none;
 }
@@ -1088,6 +1094,69 @@ html[data-scheme="dark"] .topbar .home {
   }
   .home-tabbar__label {
     line-height: 1;
+  }
+  /* ── The bar folds away ────────────────────────────────────────────
+     tabbar-collapse (75a5b463). 56px of a 390px-tall terminal is a lot to
+     spend on four destinations the reader is not currently going to, so
+     the bar hides and a pill on the bottom edge brings it back. Which
+     state the page opens in is `app.js`'s to paint from
+     `localStorage["waggledance-tabbar-open"]` — everything here is the
+     two looks, never the choice between them. */
+  .home-tabbar--hidden {
+    display: none;
+  }
+  /* The handle is fixed to the viewport rather than parked in the flow:
+     the bar it controls is fixed too, and the pill has to sit on its top
+     edge when the bar is out and on the screen's own edge when it is
+     away. `--z-nav` puts it in the bar's own layer — over the page, under
+     the drawer that covers both. */
+  .home-tabbar__toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: calc(56px + env(safe-area-inset-bottom));
+    width: 44px;
+    height: 28px;
+    padding: 0;
+    background: var(--color-surface-sunken);
+    border: var(--border-width-hairline) solid var(--color-border);
+    border-radius: 999px;
+    color: var(--color-text-muted);
+    z-index: var(--z-nav);
+    cursor: pointer;
+  }
+  /* With the bar gone the pill drops to the edge it was riding on, and
+     the chevron turns over: down means "put it away", up means "bring it
+     back". The nav is `display: none` but still in the flow's markup, so
+     its own state class is what the adjacent handle reads — the handle is
+     the nav's next sibling, not a descendant of the shell. */
+  .home-tabbar--hidden + .home-tabbar__toggle {
+    bottom: env(safe-area-inset-bottom);
+  }
+  .home-tabbar__toggle-icon--show {
+    display: none;
+  }
+  .home-tabbar--hidden + .home-tabbar__toggle .home-tabbar__toggle-icon--show {
+    display: block;
+  }
+  .home-tabbar--hidden + .home-tabbar__toggle .home-tabbar__toggle-icon--hide {
+    display: none;
+  }
+  /* What the page wins back. The 72px above buys clearance for a 56px bar;
+     with the bar away only the 28px pill is left to clear, and the
+     terminal's Live button follows it down by the same amount. Both sit
+     after the rules they override inside this one block — the `> main`
+     pair also outranks it on specificity, the `term-scroll__stack` pair
+     ties and is carried by source order, which is why these two stay at
+     the foot of the handset block. */
+  .home-shell--tabbar-hidden > main {
+    padding-bottom: 36px;
+  }
+  .home-shell--tabbar-hidden .term-scroll__stack {
+    bottom: calc(var(--space-3) + 28px + env(safe-area-inset-bottom));
   }
 }
 /* console-rail-orchestrator (D2): `.home-sidebar__nav`, `.home-sidebar__row`

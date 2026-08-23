@@ -491,6 +491,23 @@ const HOME_RAIL_BACKDROP: &str =
 /// item is not marked by colour alone: it also carries a heavier top rule
 /// (`.home-tabbar__item--on` in app.css). Each glyph is decorative and the
 /// visible label beside it is the accessible name.
+///
+/// tabbar-collapse (75a5b463): the bar folds away, and the `<button
+/// class="home-tabbar__toggle">` rendered as its next sibling is the handle
+/// that brings it back — a pill on the bottom edge, `aria-controls` pointing
+/// at the `<nav>`'s own `id`. Hidden-by-default is a *client* default: the
+/// server never learns what this browser last chose (the choice lives in
+/// `localStorage["waggledance-tabbar-open"]`), so the markup ships the bar
+/// visible and `assets/app.js` paints the stored state before it unhides the
+/// handle — the same order, and for the same reason, as
+/// [`rail_collapse_button`].
+///
+/// That order is also the whole scripting-off fallback: with no script the
+/// bar stays visible and the handle stays `hidden`, so a phone without
+/// JavaScript keeps all four destinations and is never offered a control
+/// that does nothing. Both chevrons ride in the markup and CSS shows exactly
+/// one, so a flip is a class on the `<nav>`, never a script rewriting an
+/// icon.
 fn home_tabbar(tab: HomeTab) -> String {
     let mark = |on: bool| {
         if on {
@@ -504,12 +521,13 @@ fn home_tabbar(tab: HomeTab) -> String {
         HomeTab::Terminals => (mark(false), mark(true)),
     };
     format!(
-        r#"<nav class="home-tabbar" aria-label="Sections">
+        r#"<nav class="home-tabbar" id="home-tabbar" aria-label="Sections">
 <a class="home-tabbar__item{board_class}" href="/?tab=kanban"{board_aria}>{board_icon}<span class="home-tabbar__label">Board</span></a>
 <a class="home-tabbar__item{agents_class}" href="/?tab=terminals"{agents_aria}>{agents_icon}<span class="home-tabbar__label">Agents</span></a>
 <label class="home-tabbar__item" for="rail-toggle">{projects_icon}<span class="home-tabbar__label">Projects</span></label>
 <a class="home-tabbar__item" href="/settings">{settings_icon}<span class="home-tabbar__label">Settings</span></a>
-</nav>"#,
+</nav>
+<button type="button" class="home-tabbar__toggle" hidden aria-controls="home-tabbar" aria-expanded="false">{show_icon}{hide_icon}</button>"#,
         board_class = board_on.0,
         board_aria = board_on.1,
         agents_class = agents_on.0,
@@ -518,6 +536,8 @@ fn home_tabbar(tab: HomeTab) -> String {
         agents_icon = TABBAR_ICON_AGENTS,
         projects_icon = TABBAR_ICON_PROJECTS,
         settings_icon = TABBAR_ICON_SETTINGS,
+        show_icon = TABBAR_ICON_SHOW,
+        hide_icon = TABBAR_ICON_HIDE,
     )
 }
 
@@ -534,6 +554,14 @@ const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 
 /// The topbar gear's own outline, so Settings is the same mark wherever the
 /// reader meets it.
 const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>"#;
+
+/// The handle's two chevrons, drawn to the same recipe as the four tab
+/// glyphs and as [`rail_collapse_button`]'s pair: only one of them is ever
+/// visible, and which one is CSS's business — the class on the `<nav>` picks
+/// it, so the script never touches the glyphs. Up means "show the bar",
+/// down means "hide it".
+const TABBAR_ICON_SHOW: &str = r#"<svg class="home-tabbar__toggle-icon home-tabbar__toggle-icon--show" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 15 12 9 18 15"></polyline></svg>"#;
+const TABBAR_ICON_HIDE: &str = r#"<svg class="home-tabbar__toggle-icon home-tabbar__toggle-icon--hide" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>"#;
 
 /// Rail-icons: the leading glyphs the rail and the board cards carry so a
 /// row reads by shape before by word — a pin on the Agents eyebrow, a
