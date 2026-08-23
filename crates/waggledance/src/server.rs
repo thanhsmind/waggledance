@@ -1528,11 +1528,14 @@ struct BeeActionBody {
     feature: String,
 }
 
-/// The six answers a card's one Approve+Reject pair can send (D1): the UAT
-/// gate, the merged shape+execution gate, and the agent's own permission
-/// prompt, each with its refusal half. Any other string is a `400` — this
-/// route never grows into a generic "run any bee verb" door, which is
-/// exactly what plan.md rejected.
+/// Every answer a card's buttons can send. Six of them are the
+/// Approve+Reject pairs (board-approve-actions D1): the UAT gate, the merged
+/// shape+execution gate, and the agent's own permission prompt, each with
+/// its refusal half. The last three START work (board-run-actions D1/D2) —
+/// Run review, Run compound, and Start on a Todo card. Any other string is a
+/// `400`: this route never grows into a generic "run any bee verb" door,
+/// which is exactly what plan.md rejected, and the three run kinds are named
+/// verbs with fixed task text, not a command channel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BeeActionKind {
     UatApprove,
@@ -1541,6 +1544,43 @@ enum BeeActionKind {
     GateReject,
     PermissionApprove,
     PermissionReject,
+    RunReview,
+    RunCompound,
+    StartTodo,
+}
+
+/// The three kinds that start an agent (board-run-actions D1/D2), split out
+/// of [`BeeActionKind`] so the run half of the route can never be handed one
+/// of the six approve kinds by accident.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BeeRunKind {
+    Review,
+    Compound,
+    StartTodo,
+}
+
+impl BeeRunKind {
+    /// The ONE line this kind sends into an agent. Fixed text per kind, with
+    /// nothing from the request body in it but the feature name (itself
+    /// already shape-checked by [`valid_feature_name`]) — the board carries a
+    /// click, never a command somebody typed.
+    ///
+    /// Review and Compound are slash commands because the target is a live
+    /// session that already has the repo's skills loaded; Start is a brief
+    /// because its target is an agent that has just opened its eyes in a
+    /// fresh worktree and has to orient before it can do anything (D2).
+    fn task_line(self, feature: &str) -> String {
+        match self {
+            Self::Review => format!("/bee-reviewing review feature {feature}"),
+            Self::Compound => {
+                format!("/bee-capturing flush the capture queue and compound feature {feature}")
+            }
+            Self::StartTodo => format!(
+                "Run .bee/bin/bee orient, then take feature {feature} through bee-hive to done \
+                 — gates stop per this repo's gate_bypass."
+            ),
+        }
+    }
 }
 
 /// Which gate a gate kind answers — the `bee gate` selector and the word the
@@ -1582,6 +1622,23 @@ impl BeeActionKind {
             "gate-reject" => Self::GateReject,
             "permission-approve" => Self::PermissionApprove,
             "permission-reject" => Self::PermissionReject,
+            "run-review" => Self::RunReview,
+            "run-compound" => Self::RunCompound,
+            "start-todo" => Self::StartTodo,
+            _ => return None,
+        })
+    }
+
+    /// `Some(kind)` for the three kinds that START an agent
+    /// (board-run-actions D1/D2), `None` for the six that answer a stop.
+    /// [`bee_action`] checks this FIRST, so the run half and the approve
+    /// half never share a code path — the six approve kinds behave exactly
+    /// as they did before this feature.
+    fn run(self) -> Option<BeeRunKind> {
+        Some(match self {
+            Self::RunReview => BeeRunKind::Review,
+            Self::RunCompound => BeeRunKind::Compound,
+            Self::StartTodo => BeeRunKind::StartTodo,
             _ => return None,
         })
     }
@@ -1595,7 +1652,11 @@ impl BeeActionKind {
             Self::UatReject => Some((BeeGate::Uat, false)),
             Self::GateApprove => Some((BeeGate::Merged, true)),
             Self::GateReject => Some((BeeGate::Merged, false)),
-            Self::PermissionApprove | Self::PermissionReject => None,
+            Self::PermissionApprove
+            | Self::PermissionReject
+            | Self::RunReview
+            | Self::RunCompound
+            | Self::StartTodo => None,
         }
     }
 }
@@ -1664,7 +1725,14 @@ async fn feature_bound_panes(
     else {
         return Vec::new();
     };
-    let bee = project_bee_activity(project, &rollup);
+    // The second witness (`herdr_session_ids`) is not optional here: without
+    // it a heartbeat-stale but herdr-hosted session drops off its own pane,
+    // and this join is what decides which pane a board WRITE reaches.
+    let bee = project_bee_activity(
+        project,
+        &rollup,
+        &herdr_session_ids(herdr_snapshot.as_ref()),
+    );
     let mut panes = project_feature_panes(herdr_snapshot.as_ref(), project, &rollup, &bee);
     panes.remove(feature).unwrap_or_default()
 }
@@ -1856,6 +1924,400 @@ async fn bee_action_permission(
     }
 }
 
+/// The label every board-started run is recorded under (`Run::preset_label`).
+/// Not a waggledance agent preset — the argv came from the project's own
+/// `.bee/config.json` (D4) — so the label names the source rather than
+/// borrowing a preset name that does not exist on this side.
+const BOARD_RUN_PRESET_LABEL: &str = "bee:herding";
+
+/// The feature's own granted worktree directory, when bee's rollup names one
+/// that actually exists on disk. Read through exactly the join
+/// [`project_feature_panes`] uses for the same feature's panes —
+/// `BeeWorktree.id` is the sibling directory's own name beside the project
+/// root — so the directory a card badges is the directory a spawn lands in.
+///
+/// `None` covers a feature with no grant AND a grant whose directory is
+/// gone: both mean "no worktree to work in", and the caller decides what
+/// that costs (Review/Compound fall back to the project root; Start opens
+/// one).
+fn feature_worktree_dir(
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+    feature: &str,
+) -> Option<PathBuf> {
+    let parent = project.root_path.parent()?;
+    rollup
+        .snapshot
+        .worktrees
+        .iter()
+        .filter(|w| w.feature.as_deref() == Some(feature))
+        .map(|w| parent.join(&w.id))
+        .find(|dir| dir.is_dir())
+}
+
+/// bee's own naming rule for a feature worktree — `../<repo-basename>--wt--<feature>`,
+/// straight from `bee worktree new`'s own contract. Used ONLY as the fallback
+/// when that command's JSON does not name the path in a key this reader
+/// knows; it is never guessed at without the directory being there.
+fn conventional_worktree_dir(
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+) -> Option<PathBuf> {
+    let parent = project.root_path.parent()?;
+    let base = project
+        .root_path
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    let dir = parent.join(format!("{base}--wt--{feature}"));
+    dir.is_dir().then_some(dir)
+}
+
+/// The first balanced `{...}` block in a bee `--json` stdout, parsed.
+/// bee prints its JSON object and then a trailing `[bee] <verb> 1ms` timing
+/// line on the same stream, so the whole stdout is not itself parseable —
+/// this is the same framing [`parse_pbi_id`] already walks for the backlog
+/// route, lifted so a second bee verb can reuse it.
+fn first_json_object(stdout: &str) -> Option<serde_json::Value> {
+    let start = stdout.find('{')?;
+    let mut depth = 0usize;
+    for (i, ch) in stdout[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let block = &stdout[start..start + i + ch.len_utf8()];
+                    return serde_json::from_str(block).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where `bee worktree new --json` says it put the worktree.
+///
+/// The key is read defensively across the spellings bee's own records use
+/// for this one value rather than pinned to a single one, because the value
+/// — a directory an agent is about to be started in — is worth more than the
+/// tidiness of assuming: a rename in bee would otherwise silently spawn an
+/// agent in the wrong repository. When none of them is present, bee's own
+/// documented naming rule ([`conventional_worktree_dir`]) answers, and only
+/// if that directory really exists.
+fn parse_worktree_root(
+    stdout: &str,
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+) -> Option<PathBuf> {
+    let value = first_json_object(stdout);
+    let named = value.as_ref().and_then(|v| {
+        [
+            "worktreeRoot",
+            "worktree_root",
+            "worktreePath",
+            "worktree_path",
+            "path",
+            "root",
+        ]
+        .iter()
+        .find_map(|key| v.get(key)?.as_str())
+        .map(PathBuf::from)
+    });
+    match named {
+        Some(dir) if dir.is_dir() => Some(dir),
+        _ => conventional_worktree_dir(project, feature),
+    }
+}
+
+/// D2's first step: open the feature's own worktree through the project's
+/// OWN `.bee/bin/bee`, in the project's own root (the one cwd bee's
+/// control-plane verbs accept — they refuse from inside another worktree).
+/// Same spawn shape, same refusal mapping as [`bee_action_gate`]: bee is the
+/// only party that knows why it said no, so its own stderr tail is what
+/// reaches the card.
+async fn bee_worktree_new(
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+) -> std::result::Result<PathBuf, Response> {
+    let Some(bee) = project_bee_binary(&project.root_path) else {
+        return Err(action_error(
+            StatusCode::CONFLICT,
+            "this project is not set up with bee, so it cannot open a worktree for this feature",
+        ));
+    };
+    let out = tokio::process::Command::new(&bee)
+        .arg("worktree")
+        .arg("new")
+        .arg("--feature")
+        .arg(feature)
+        .arg("--json")
+        .current_dir(&project.root_path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(action_error(
+                StatusCode::BAD_GATEWAY,
+                format!("could not run this project's bee: {e}"),
+            ))
+        }
+    };
+    if !out.status.success() {
+        return Err(action_error(
+            StatusCode::BAD_GATEWAY,
+            stderr_tail(&out.stderr),
+        ));
+    }
+    parse_worktree_root(&String::from_utf8_lossy(&out.stdout), project, feature).ok_or_else(|| {
+        action_error(
+            StatusCode::BAD_GATEWAY,
+            "this project's bee reported no worktree directory to start the agent in",
+        )
+    })
+}
+
+/// D2's last step: tell bee about the pane that was just started, so its own
+/// occupancy read sees this worker on the very next iteration. Best-effort by
+/// design — the agent is already running, and nothing here may undo that, so
+/// every failure answers `false` and rides back on the response as
+/// `recorded: false` rather than as an error.
+async fn bee_record_worker(
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+    pane_id: &str,
+    worktree: &std::path::Path,
+) -> bool {
+    let Some(bee) = project_bee_binary(&project.root_path) else {
+        return false;
+    };
+    tokio::process::Command::new(&bee)
+        .arg("herding")
+        .arg("record-worker")
+        .arg("--name")
+        .arg(format!("board-{feature}"))
+        .arg("--pane-id")
+        .arg(pane_id)
+        .arg("--path")
+        .arg(worktree)
+        .arg("--task")
+        .arg(feature)
+        .arg("--json")
+        .current_dir(&project.root_path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Every way the shared dispatch path can refuse, in the card's own JSON
+/// shape. A refusal ABOUT the destination (busy, blocked, gone, out of
+/// bounds) is a `409` — the human can look and click again; anything that
+/// failed on the way (herdr unreachable, agent start, persistence) is a
+/// `502`, the same reading `herdr_down_response` gives.
+fn dispatch_refusal_response(refusal: crate::orchestrate::DispatchRefusal) -> Response {
+    use crate::orchestrate::DispatchRefusal as R;
+    let status = match refusal {
+        R::Working(_) | R::Blocked(_) | R::NoSuchPane(_) | R::OutsideBoundary { .. } => {
+            StatusCode::CONFLICT
+        }
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    action_error(status, refusal.to_string())
+}
+
+/// D4's refusal: this project records no default preset, so there is no argv
+/// to start anything with. Names the file, because that is where the remedy
+/// is — and the board will never invent an argv of its own.
+fn no_herding_preset_response() -> Response {
+    action_error(
+        StatusCode::CONFLICT,
+        "this project's .bee/config.json records no herding.agent_command, so the board has no \
+         agent to start",
+    )
+}
+
+/// Start one run and answer the card (board-run-actions D1/D2). The run is
+/// stamped with its feature — that stamp IS the lock every later click reads
+/// (D3) — and with the board's own label.
+async fn dispatch_board_run(
+    st: &AppState,
+    project: &waggledance_core::domain::Project,
+    target: crate::orchestrate::DispatchTarget,
+    task: &str,
+    feature: &str,
+) -> std::result::Result<waggledance_core::domain::Run, Response> {
+    crate::orchestrate::dispatch_run(
+        st.herdr.as_ref(),
+        &st.engine,
+        project,
+        target,
+        task,
+        Some(feature),
+        Some(BOARD_RUN_PRESET_LABEL.to_string()),
+    )
+    .await
+    .map_err(dispatch_refusal_response)
+}
+
+/// The run half of [`bee_action`] (board-run-actions D1/D2/D3/D4) — the
+/// board's only path that STARTS work rather than answering a stop.
+///
+/// The order is the whole design:
+///
+/// 1. **The family switch.** Every one of these three ends in a write into
+///    somebody's terminal, so it answers the D7 terminal switch exactly as
+///    [`bee_action_permission`] does — the board cannot become a second,
+///    unswitched way to start an agent on this host.
+/// 2. **The lock (D3).** One board-triggered run per feature at a time,
+///    never a queue. Truth is bee's own ledger — a `working` [`Run`] row
+///    carrying this feature — JOINED with a live herdr snapshot: a run whose
+///    pane is gone has no session left to interrupt, so it locks nothing.
+///    Without that second half a crashed agent would lock its card forever.
+/// 3. **The destination.** Review/Compound prefer the feature's own live
+///    pane (D1: reuse the session that already holds the context) and spawn
+///    only when nothing is live. Start always spawns, into a worktree it
+///    opens first when the feature has none (D2).
+///
+/// Nothing here takes an argv, a cwd or a pane id from the request: the argv
+/// is the project's own recorded preset (D4), the directory is the feature's
+/// own worktree, and the pane is the one this board already badges that card
+/// with.
+async fn bee_action_run(
+    st: &AppState,
+    project: &waggledance_core::domain::Project,
+    feature: &str,
+    kind: BeeRunKind,
+) -> Response {
+    if !terminal_family_enabled(st) {
+        return terminal_disabled_json_404();
+    }
+    let Ok(snapshot) = st.herdr.snapshot().await else {
+        return herdr_down_response();
+    };
+
+    // (1) D3's lock, read before anything is started or created.
+    match st.engine.list_live_runs_for_feature(&project.id, feature) {
+        Ok(live) => {
+            if let Some(run) = live
+                .iter()
+                .find(|r| snapshot.panes.iter().any(|p| p.pane_id == r.pane_id))
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!(
+                            "a board run is already working on {feature} — open its pane to watch it, \
+                             or wait for it to finish"
+                        ),
+                        "pane_id": run.pane_id,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            return action_error(
+                StatusCode::BAD_GATEWAY,
+                format!("could not read this project's runs: {e}"),
+            )
+        }
+    }
+
+    let root = project.root_path.clone();
+    let cache = st.bee_cache.clone();
+    let Ok(rollup) = tokio::task::spawn_blocking(move || cached_read_rollup(&cache, &root)).await
+    else {
+        return action_error(
+            StatusCode::BAD_GATEWAY,
+            "could not read this project's bee state",
+        );
+    };
+
+    let task = kind.task_line(feature);
+    match kind {
+        // (2) D1: the feature's own live pane first, a fresh agent second.
+        BeeRunKind::Review | BeeRunKind::Compound => {
+            let bee = project_bee_activity(project, &rollup, &herdr_session_ids(Some(&snapshot)));
+            let panes = project_feature_panes(Some(&snapshot), project, &rollup, &bee)
+                .remove(feature)
+                .unwrap_or_default();
+            if let Some(pane) = panes.iter().find(|p| pane_is_bound_to_feature(p, feature)) {
+                let target = crate::orchestrate::DispatchTarget::Pane(pane.pane_id.clone());
+                return match dispatch_board_run(st, project, target, &task, feature).await {
+                    Ok(run) => Json(json!({
+                        "ok": true,
+                        "run_id": run.id,
+                        "pane_id": run.pane_id,
+                        "mode": "pane",
+                    }))
+                    .into_response(),
+                    Err(resp) => resp,
+                };
+            }
+            let Some(argv) = waggledance_core::bee::herding_agent_argv(&project.root_path) else {
+                return no_herding_preset_response();
+            };
+            // A feature with no worktree of its own is worked from the main
+            // checkout — the same "Main" reading the card itself shows.
+            let cwd = feature_worktree_dir(project, &rollup, feature)
+                .unwrap_or_else(|| project.root_path.clone());
+            let target = crate::orchestrate::DispatchTarget::Spawn {
+                argv,
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+            };
+            match dispatch_board_run(st, project, target, &task, feature).await {
+                Ok(run) => Json(json!({
+                    "ok": true,
+                    "run_id": run.id,
+                    "pane_id": run.pane_id,
+                    "mode": "spawned",
+                }))
+                .into_response(),
+                Err(resp) => resp,
+            }
+        }
+        // (3) D2: worktree, agent, ledger — in that order.
+        BeeRunKind::StartTodo => {
+            // The argv is resolved BEFORE the worktree is opened: a project
+            // with no preset must not be left holding a fresh worktree no
+            // agent was ever started in.
+            let Some(argv) = waggledance_core::bee::herding_agent_argv(&project.root_path) else {
+                return no_herding_preset_response();
+            };
+            let worktree = match feature_worktree_dir(project, &rollup, feature) {
+                Some(dir) => dir,
+                None => match bee_worktree_new(project, feature).await {
+                    Ok(dir) => dir,
+                    Err(resp) => return resp,
+                },
+            };
+            let target = crate::orchestrate::DispatchTarget::Spawn {
+                argv,
+                cwd: Some(worktree.to_string_lossy().into_owned()),
+            };
+            let run = match dispatch_board_run(st, project, target, &task, feature).await {
+                Ok(run) => run,
+                Err(resp) => return resp,
+            };
+            // The agent is up; nothing below may take that back.
+            let recorded = bee_record_worker(project, feature, &run.pane_id, &worktree).await;
+            Json(json!({
+                "ok": true,
+                "run_id": run.id,
+                "pane_id": run.pane_id,
+                "mode": "spawned",
+                "recorded": recorded,
+            }))
+            .into_response()
+        }
+    }
+}
+
 /// `POST /p/:id/_bee/actions` (board-approve-actions D1/D3/D4) — the board's
 /// one write path: a human's click on a feature card's Approve or Reject,
 /// relayed into bee or into the waiting pane.
@@ -1898,6 +2360,9 @@ async fn bee_action(
             StatusCode::FORBIDDEN,
             "this project does not take board actions — enable orchestration for this project on the settings page",
         );
+    }
+    if let Some(run) = kind.run() {
+        return bee_action_run(&st, &project, &body.feature, run).await;
     }
     match kind.gate() {
         Some((gate, approved)) => {
@@ -12180,18 +12645,21 @@ mod bee_route_tests {
         let project = register(&st, &dir, "runs-proj");
 
         st.engine
-            .insert_run(&waggledance_core::domain::Run {
-                id: "run-1".into(),
-                project_id: project.id.clone(),
-                pane_id: "w1:p1".into(),
-                preset_label: Some("claude".into()),
-                task: "fix the flaky test".into(),
-                baseline: String::new(),
-                marker: "HERDR_DONE_abc123".into(),
-                status: "done".into(),
-                created_at: "2026-08-16T00:00:00Z".into(),
-                updated_at: "2026-08-16T00:05:00Z".into(),
-            })
+            .insert_run(
+                &waggledance_core::domain::Run {
+                    id: "run-1".into(),
+                    project_id: project.id.clone(),
+                    pane_id: "w1:p1".into(),
+                    preset_label: Some("claude".into()),
+                    task: "fix the flaky test".into(),
+                    baseline: String::new(),
+                    marker: "HERDR_DONE_abc123".into(),
+                    status: "done".into(),
+                    created_at: "2026-08-16T00:00:00Z".into(),
+                    updated_at: "2026-08-16T00:05:00Z".into(),
+                },
+                None,
+            )
             .unwrap();
 
         let app = router(st);
@@ -26533,7 +27001,11 @@ mod bee_route_tests {
         ))
         .unwrap();
         record["last_heartbeat"] = serde_json::Value::String(rfc3339_minutes_ago(45));
-        write(&root, ".bee/sessions/stale-blocked.json", &record.to_string());
+        write(
+            &root,
+            ".bee/sessions/stale-blocked.json",
+            &record.to_string(),
+        );
 
         let mut st = build_state_with_dir(&dir);
         let mut snap = one_agent_snapshot(&root, "w1:p1", herdr::AgentStatus::Idle);
@@ -26577,7 +27049,11 @@ mod bee_route_tests {
         ))
         .unwrap();
         record["last_heartbeat"] = serde_json::Value::String(rfc3339_minutes_ago(45));
-        write(&root, ".bee/sessions/stale-blocked.json", &record.to_string());
+        write(
+            &root,
+            ".bee/sessions/stale-blocked.json",
+            &record.to_string(),
+        );
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = std::sync::Arc::new(StaticSnapshotHerdr {
@@ -28036,6 +28512,627 @@ mod bee_route_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── board-run-actions: the three kinds that START work ──────────────
+    //
+    // These use a purpose-built herdr double rather than `FakeHerdr`: the
+    // spawn path's whole point is WHICH argv and WHICH directory reach
+    // `agent_start`, and the fake records neither (it keeps only the
+    // resulting pane). `RunHerdr` wraps a hand-built snapshot -- the same
+    // `one_agent_snapshot` every board test anchors on, so the workspace
+    // anchor resolves inside the project's own root exactly as production
+    // requires -- and writes down every start and every line sent.
+
+    #[derive(Default)]
+    struct RunHerdrLog {
+        /// `(workspace_id, cwd, argv)` per `agent_start`, in order.
+        starts: Vec<(String, Option<String>, Vec<String>)>,
+        /// `(pane_id, text)` per `send_input`, in order.
+        inputs: Vec<(String, String)>,
+    }
+
+    struct RunHerdr {
+        snap: herdr::Snapshot,
+        spawned_pane: String,
+        log: std::sync::Mutex<RunHerdrLog>,
+    }
+
+    impl RunHerdr {
+        fn new(snap: herdr::Snapshot) -> Self {
+            Self {
+                snap,
+                spawned_pane: "w1:spawned".to_string(),
+                log: std::sync::Mutex::new(RunHerdrLog::default()),
+            }
+        }
+
+        fn starts(&self) -> Vec<(String, Option<String>, Vec<String>)> {
+            self.log.lock().unwrap().starts.clone()
+        }
+
+        fn inputs(&self) -> Vec<(String, String)> {
+            self.log.lock().unwrap().inputs.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl herdr::Herdr for RunHerdr {
+        async fn snapshot(&self) -> herdr::Result<herdr::Snapshot> {
+            Ok(self.snap.clone())
+        }
+        async fn ping(&self) -> herdr::Result<herdr::ProtocolInfo> {
+            unreachable!("the run actions never ping")
+        }
+        async fn read_pane(
+            &self,
+            _pane_id: &str,
+            _source: herdr::ReadSource,
+            _lines: usize,
+        ) -> herdr::Result<herdr::ScreenRead> {
+            Ok(herdr::ScreenRead {
+                text: "baseline".into(),
+                revision: 1,
+            })
+        }
+        async fn send_input(&self, pane_id: &str, text: &str, _submit: bool) -> herdr::Result<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .inputs
+                .push((pane_id.to_string(), text.to_string()));
+            Ok(())
+        }
+        async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
+            unreachable!("the run actions never send raw bytes")
+        }
+        async fn send_keys(&self, _pane_id: &str, _keys: &[String]) -> herdr::Result<()> {
+            unreachable!("the run actions never send keys")
+        }
+        async fn tab_create(
+            &self,
+            _workspace_id: &str,
+            _cwd: Option<&str>,
+        ) -> herdr::Result<herdr::TabCreated> {
+            unreachable!("the run actions never create a tab")
+        }
+        async fn agent_start(
+            &self,
+            workspace_id: &str,
+            cwd: Option<&str>,
+            argv: &[String],
+        ) -> herdr::Result<herdr::AgentStarted> {
+            self.log.lock().unwrap().starts.push((
+                workspace_id.to_string(),
+                cwd.map(str::to_string),
+                argv.to_vec(),
+            ));
+            Ok(herdr::AgentStarted {
+                tab_id: "w1:t1".into(),
+                pane_id: self.spawned_pane.clone(),
+                name: "board-agent".into(),
+            })
+        }
+    }
+
+    /// A project whose own `.bee/config.json` records the default preset
+    /// (D4) in this repo's own shape: a NAME resolved through
+    /// `herding.agents`.
+    fn write_herding_config(root: &Path) {
+        write(
+            root,
+            ".bee/config.json",
+            r#"{
+                "gate_bypass": false,
+                "herding": {
+                    "agent_command": "claude-sonnet",
+                    "agents": {"claude-sonnet": ["claude", "--model", "sonnet"]}
+                }
+            }"#,
+        );
+    }
+
+    /// [`fake_bee`]'s multi-call sibling: APPENDS each invocation to `log`
+    /// instead of overwriting it, so a test can prove that two bee verbs ran
+    /// and in which ORDER (D2 runs `worktree new` before
+    /// `herding record-worker`, and the order is the contract).
+    #[cfg(unix)]
+    fn fake_bee_appending(root: &Path, log: &Path, stdout: &str, code: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join(".bee").join("bin").join("bee");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             {{ echo '--'; pwd; for a in \"$@\"; do printf '%s\\n' \"$a\"; done; }} >> '{log}'\n\
+             printf '%s' '{stdout}'\n\
+             exit {code}\n",
+            log = log.display(),
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Every recorded call as `(cwd, argv)`, in the order they ran.
+    #[cfg(unix)]
+    fn recorded_calls(log: &Path) -> Vec<(String, Vec<String>)> {
+        let text = std::fs::read_to_string(log)
+            .unwrap_or_else(|e| panic!("the project's bee was never run: {e}"));
+        text.split("--\n")
+            .filter(|block| !block.trim().is_empty())
+            .map(|block| {
+                let mut lines = block.lines();
+                let cwd = lines.next().unwrap_or_default().to_string();
+                (cwd, lines.map(str::to_string).collect())
+            })
+            .collect()
+    }
+
+    /// D1, first half (must-have): a feature whose own live pane is right
+    /// there gets ONE slash line in that pane — no spawn at all — and the
+    /// run is recorded against the feature, which is what locks the card
+    /// for the next click (D3).
+    #[tokio::test]
+    async fn bee_action_run_review_sends_the_slash_line_into_the_features_live_pane() {
+        let dir = fresh_root("action-run-pane-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-run-pane-root");
+        write_cross_project_live_feature(&root, "feat-rev", "live-rev");
+        write(
+            &root,
+            ".bee/sessions/live-rev-bound.json",
+            &activity_session_json(
+                "live-rev-bound",
+                "working",
+                &rfc3339_seconds_ago(3),
+                Some("w1:p1"),
+                &root,
+                Some("feat-rev"),
+                None,
+            ),
+        );
+
+        let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
+            &root,
+            "w1:p1",
+            herdr::AgentStatus::Idle,
+        )));
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = herdr_double.clone();
+        let project = register(&st, &root, "action-run-pane");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "run-review", "feat-rev"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = action_json(resp).await;
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(json["mode"], "pane", "a live bound pane is reused: {json}");
+        assert_eq!(json["pane_id"], "w1:p1", "{json}");
+
+        let inputs = herdr_double.inputs();
+        assert_eq!(inputs.len(), 1, "exactly one line goes in: {inputs:?}");
+        assert_eq!(inputs[0].0, "w1:p1");
+        assert!(
+            inputs[0]
+                .1
+                .starts_with("/bee-reviewing review feature feat-rev"),
+            "the review command names the feature: {:?}",
+            inputs[0].1
+        );
+        assert!(
+            herdr_double.starts().is_empty(),
+            "a feature with a live pane must never spawn a second agent"
+        );
+
+        let live = st
+            .engine
+            .list_live_runs_for_feature(&project.id, "feat-rev")
+            .unwrap();
+        assert_eq!(live.len(), 1, "the run is recorded against the feature");
+        assert_eq!(live[0].pane_id, "w1:p1");
+        assert_eq!(live[0].status, "working");
+        assert_eq!(live[0].preset_label.as_deref(), Some("bee:herding"));
+        assert_eq!(
+            json["run_id"], live[0].id,
+            "the answer names the run it recorded: {json}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D1's second half and D4 (must-have): with no live pane for the
+    /// feature, the daemon starts a fresh agent — with the argv the
+    /// PROJECT's own `.bee/config.json` records, in the feature's own
+    /// granted worktree. Neither of those comes from the request.
+    #[tokio::test]
+    async fn bee_action_run_compound_with_no_live_pane_spawns_the_config_argv_in_the_worktree() {
+        let dir = fresh_root("action-run-spawn-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-run-spawn-root");
+        write_herding_config(&root);
+        write_cross_project_live_feature(&root, "feat-wt", "live-wt");
+        let sibling = make_worktree_sibling("action-run-spawn-wt");
+        write(
+            &sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"feat-wt","mode":"standard"}"#,
+        );
+        write(
+            &root,
+            ".bee/runtime/worktree-grants.json",
+            &grants_json(&["action-run-spawn-wt"]),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/w.json",
+            &workspace_json(
+                "action-run-spawn-wt",
+                &sibling.to_string_lossy(),
+                "wt/feat-wt",
+                &[],
+            ),
+        );
+
+        let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
+            &root,
+            "w1:p1",
+            herdr::AgentStatus::Idle,
+        )));
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = herdr_double.clone();
+        let project = register(&st, &root, "action-run-spawn");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "run-compound", "feat-wt"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = action_json(resp).await;
+        assert_eq!(json["mode"], "spawned", "{json}");
+        assert_eq!(json["pane_id"], "w1:spawned", "{json}");
+
+        let starts = herdr_double.starts();
+        assert_eq!(starts.len(), 1, "exactly one agent is started: {starts:?}");
+        assert_eq!(
+            starts[0].2,
+            vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string()
+            ],
+            "the argv is the project's own recorded preset (D4)"
+        );
+        assert_eq!(
+            starts[0].1.as_deref().map(std::path::Path::new),
+            Some(sibling.as_path()),
+            "the agent starts in the feature's own worktree"
+        );
+
+        let inputs = herdr_double.inputs();
+        assert!(
+            inputs[0]
+                .1
+                .starts_with("/bee-capturing flush the capture queue and compound feature feat-wt"),
+            "the spawned agent gets the same task text: {:?}",
+            inputs[0].1
+        );
+        assert_eq!(
+            st.engine
+                .list_live_runs_for_feature(&project.id, "feat-wt")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&sibling).ok();
+    }
+
+    /// D2 (must-have), in the order that IS the contract: a Todo card with
+    /// no worktree of its own runs the project's own bee `worktree new`
+    /// first, starts the agent in what that reported, and only then records
+    /// the worker with bee so its occupancy read sees the spawn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_start_todo_opens_a_worktree_then_spawns_then_records_the_worker() {
+        let dir = fresh_root("action-run-start-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-run-start-root");
+        let log = fresh_root("action-run-start-log").join("argv");
+        let sibling = make_worktree_sibling("action-run-start-wt");
+        write_herding_config(&root);
+        write_cross_project_live_feature(&root, "feat-start", "live-start");
+        fake_bee_appending(
+            &root,
+            &log,
+            &format!(
+                "{{\"worktreeRoot\": \"{}\"}}\n[bee] worktree new 2ms\n",
+                sibling.to_string_lossy()
+            ),
+            0,
+        );
+
+        let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
+            &root,
+            "w1:p1",
+            herdr::AgentStatus::Idle,
+        )));
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = herdr_double.clone();
+        let project = register(&st, &root, "action-run-start");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "start-todo", "feat-start"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = action_json(resp).await;
+        assert_eq!(json["mode"], "spawned", "{json}");
+        assert_eq!(json["recorded"], true, "{json}");
+
+        let calls = recorded_calls(&log);
+        assert_eq!(calls.len(), 2, "two bee verbs, in order: {calls:?}");
+        assert_eq!(
+            std::fs::canonicalize(&calls[0].0).unwrap(),
+            std::fs::canonicalize(&project.root_path).unwrap(),
+            "bee's control-plane verbs only run in the main checkout"
+        );
+        assert_eq!(
+            calls[0].1,
+            vec!["worktree", "new", "--feature", "feat-start", "--json"],
+            "the worktree is opened first"
+        );
+        assert_eq!(
+            calls[1].1,
+            vec![
+                "herding",
+                "record-worker",
+                "--name",
+                "board-feat-start",
+                "--pane-id",
+                "w1:spawned",
+                "--path",
+                &sibling.to_string_lossy(),
+                "--task",
+                "feat-start",
+                "--json",
+            ],
+            "the spawn is recorded with bee last, naming the pane it made"
+        );
+
+        let starts = herdr_double.starts();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            starts[0].1.as_deref().map(std::path::Path::new),
+            Some(sibling.as_path()),
+            "the agent starts in the worktree bee just made"
+        );
+        assert!(
+            herdr_double.inputs()[0].1.starts_with(
+                "Run .bee/bin/bee orient, then take feature feat-start through bee-hive to done"
+            ),
+            "the brief takes the feature through bee-hive (D2): {:?}",
+            herdr_double.inputs()[0].1
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&sibling).ok();
+    }
+
+    /// D3 (must-have), both halves: while a working run's pane is still
+    /// there the card's next click is refused with the pane to look at —
+    /// never a queue, never a second agent. A working run whose pane is
+    /// GONE is not a lock: an agent that died must not hold its card
+    /// forever.
+    #[tokio::test]
+    async fn bee_action_run_locks_a_feature_only_while_its_runs_pane_still_exists() {
+        let dir = fresh_root("action-run-lock-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-run-lock-root");
+        write_herding_config(&root);
+        write_cross_project_live_feature(&root, "feat-held", "live-held");
+        write_cross_project_live_feature(&root, "feat-freed", "live-freed");
+
+        let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
+            &root,
+            "w1:p1",
+            herdr::AgentStatus::Idle,
+        )));
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = herdr_double.clone();
+        let project = register(&st, &root, "action-run-lock");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let now = waggledance_core::indexer::now_rfc3339();
+        let seed = |id: &str, pane: &str| waggledance_core::domain::Run {
+            id: id.into(),
+            project_id: project.id.clone(),
+            pane_id: pane.into(),
+            preset_label: Some("bee:herding".into()),
+            task: "/bee-reviewing review feature x".into(),
+            baseline: String::new(),
+            marker: "HERDR_DONE_abc".into(),
+            status: "working".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        // One run whose pane is in the snapshot, one whose pane is gone.
+        st.engine
+            .insert_run(&seed("run-held", "w1:p1"), Some("feat-held"))
+            .unwrap();
+        st.engine
+            .insert_run(&seed("run-freed", "w1:vanished"), Some("feat-freed"))
+            .unwrap();
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "run-review", "feat-held"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = action_json(resp).await;
+        assert_eq!(
+            json["pane_id"], "w1:p1",
+            "the refusal names the pane to look at: {json}"
+        );
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("feat-held"),
+            "the refusal says which feature is busy: {json}"
+        );
+        assert!(
+            herdr_double.starts().is_empty() && herdr_double.inputs().is_empty(),
+            "a locked feature starts nothing and types nothing"
+        );
+
+        // The same click on the feature whose pane has since gone: allowed.
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "run-review", "feat-freed"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a working run whose pane is gone locks nothing"
+        );
+        assert_eq!(action_json(resp).await["mode"], "spawned");
+        assert_eq!(herdr_double.starts().len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D4's refusal: a project whose bee store records no default preset has
+    /// nothing the board may start, and the answer names the file to fix —
+    /// the board never invents an argv, and nothing is spawned.
+    #[tokio::test]
+    async fn bee_action_run_refuses_a_project_with_no_herding_preset() {
+        let dir = fresh_root("action-run-nocfg-cfg");
+        enable_terminal(&dir);
+        let root = fresh_root("action-run-nocfg-root");
+        write(&root, ".bee/config.json", r#"{"gate_bypass": false}"#);
+        write_cross_project_live_feature(&root, "feat-nocfg", "live-nocfg");
+
+        let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
+            &root,
+            "w1:p1",
+            herdr::AgentStatus::Idle,
+        )));
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = herdr_double.clone();
+        let project = register(&st, &root, "action-run-nocfg");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "run-review", "feat-nocfg"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = action_json(resp).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(".bee/config.json"),
+            "the refusal names where the preset belongs: {json}"
+        );
+        assert!(
+            herdr_double.starts().is_empty(),
+            "nothing is started without a recorded preset"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The two switches every run kind answers before it does anything at
+    /// all: board-approve-actions D3's per-project opt-in (403, and no run
+    /// row, no spawn), and D7's terminal family switch — these three kinds
+    /// all END in a write into somebody's terminal, so with the family off
+    /// they answer the input route's own reasoned 404, exactly like the
+    /// permission half.
+    #[tokio::test]
+    async fn bee_action_run_answers_the_opt_in_and_the_terminal_switch_before_anything_starts() {
+        let root = fresh_root("action-run-switch-root");
+        write_herding_config(&root);
+        write_cross_project_live_feature(&root, "feat-switch", "live-switch");
+
+        // Terminal family ON, project opted OUT.
+        let dir = fresh_root("action-run-switch-on-cfg");
+        enable_terminal(&dir);
+        let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
+            &root,
+            "w1:p1",
+            herdr::AgentStatus::Idle,
+        )));
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = herdr_double.clone();
+        let project = register(&st, &root, "action-run-switch-off");
+        for kind in ["run-review", "run-compound", "start-todo"] {
+            let resp = router(st.clone())
+                .oneshot(action_req(&project.id, kind, "feat-switch"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{kind} on a project that never opted in"
+            );
+        }
+
+        // Project opted IN, terminal family OFF.
+        let dir_off = fresh_root("action-run-switch-off-cfg");
+        let herdr_off = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
+            &root,
+            "w1:p1",
+            herdr::AgentStatus::Idle,
+        )));
+        let mut st_off = build_state_with_dir(&dir_off);
+        st_off.herdr = herdr_off.clone();
+        let project_off = register(&st_off, &root, "action-run-switch-on");
+        st_off
+            .engine
+            .set_orchestration_enabled(&project_off.id, true)
+            .unwrap();
+        for kind in ["run-review", "run-compound", "start-todo"] {
+            let resp = router(st_off.clone())
+                .oneshot(action_req(&project_off.id, kind, "feat-switch"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{kind} with the terminal family off"
+            );
+        }
+
+        assert!(
+            herdr_double.starts().is_empty() && herdr_off.starts().is_empty(),
+            "neither switch may let an agent start"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir_off).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -111,11 +111,20 @@ impl SqliteStore {
 
     // ---- runs (D7) ----
 
-    pub fn insert_run(&self, r: &Run) -> Result<()> {
+    /// Persist one run. `feature` is the bee feature the run was started
+    /// for (board-run-actions D3) — `None` for every run that is not a
+    /// board-triggered one (the MCP dispatch tool's own runs), which is
+    /// also what every row written before the `feature` column existed
+    /// reads back as.
+    ///
+    /// It is a separate argument rather than a `Run` field because
+    /// [`Run`] is constructed by literal in several places this cell may
+    /// not touch; see `Run`'s own doc for the note.
+    pub fn insert_run(&self, r: &Run, feature: Option<&str>) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 r.id,
                 r.project_id,
@@ -126,7 +135,8 @@ impl SqliteStore {
                 r.marker,
                 r.status,
                 r.created_at,
-                r.updated_at
+                r.updated_at,
+                feature
             ],
         )?;
         Ok(())
@@ -171,6 +181,40 @@ impl SqliteStore {
         )?;
         let rows = stmt.query_map(params![project_id, limit as i64], |r| Ok(row_to_run(r)))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Every run this project started for `feature` that is still `working`
+    /// (board-run-actions D3, the per-feature run lock). Newest first.
+    ///
+    /// Deliberately only the `working` rows: a run that reached any terminal
+    /// status has released the feature, and a run whose pane has since
+    /// vanished is filtered out by the caller against a live herdr snapshot
+    /// — this store cannot know that, so it never guesses. Rows written
+    /// before the `feature` column existed carry SQL NULL and match no
+    /// feature at all, which is the right answer: they were never board
+    /// runs.
+    pub fn list_live_runs_for_feature(&self, project_id: &str, feature: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE project_id=?1 AND feature=?2 AND status='working'
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id, feature], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// The `feature` column of one run row, for the round-trip proof and for
+    /// any caller that holds a [`Run`] and needs the column the struct does
+    /// not carry. `Ok(None)` for both an unknown id and a NULL column.
+    pub fn run_feature(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT feature FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
     }
 
     // ---- files ----
@@ -432,10 +476,11 @@ type MigrationStep = (i64, fn(&Connection) -> Result<()>);
 const MIGRATIONS: &[MigrationStep] = &[
     (1, migration_1_path_hash),
     (2, migration_2_orchestration_enabled),
+    (3, migration_3_runs_feature),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -487,6 +532,18 @@ fn migration_2_orchestration_enabled(conn: &Connection) -> Result<()> {
             "ALTER TABLE projects ADD COLUMN orchestration_enabled INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// v3 (board-run-actions D3) — which bee feature a run was started for. The
+/// per-feature run lock reads it, so it has to be a column the store can
+/// filter on rather than something inferred from the task text. Nullable
+/// with no default: a run that is not a board run genuinely has no feature,
+/// and every row written before this column existed is exactly that.
+fn migration_3_runs_feature(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "runs", "feature")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN feature TEXT", [])?;
     }
     Ok(())
 }
@@ -575,7 +632,8 @@ CREATE TABLE IF NOT EXISTS runs (
     marker TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    feature TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
 "#;
@@ -937,7 +995,7 @@ mod tests {
         let s = SqliteStore::open_in_memory().unwrap();
         s.upsert_project(&sample_project()).unwrap();
         let run = sample_run();
-        s.insert_run(&run).unwrap();
+        s.insert_run(&run, None).unwrap();
 
         let got = s.get_run("r1").unwrap().unwrap();
         assert_eq!(got.id, run.id);
@@ -968,12 +1026,12 @@ mod tests {
             let mut r = sample_run();
             r.id = format!("r{i}");
             r.created_at = format!("2026-08-16T00:0{i}:00Z");
-            s.insert_run(&r).unwrap();
+            s.insert_run(&r, None).unwrap();
         }
         let mut other_run = sample_run();
         other_run.id = "r-other".into();
         other_run.project_id = "p2".into();
-        s.insert_run(&other_run).unwrap();
+        s.insert_run(&other_run, None).unwrap();
 
         assert_eq!(s.list_runs("p1", 10).unwrap().len(), 3);
         assert_eq!(s.list_runs("p1", 2).unwrap().len(), 2);
@@ -984,7 +1042,7 @@ mod tests {
     fn update_run_status_bumps_status_and_timestamp_and_can_replace_baseline_marker() {
         let s = SqliteStore::open_in_memory().unwrap();
         s.upsert_project(&sample_project()).unwrap();
-        s.insert_run(&sample_run()).unwrap();
+        s.insert_run(&sample_run(), None).unwrap();
 
         s.update_run_status("r1", "working", "2026-08-16T00:05:00Z", None, None)
             .unwrap();
@@ -1006,6 +1064,127 @@ mod tests {
         let got = s.get_run("r1").unwrap().unwrap();
         assert_eq!(got.baseline, "new baseline");
         assert_eq!(got.marker, "HERDR_DONE_xyz789");
+    }
+
+    /// board-run-actions D3: a run remembers which feature it was started
+    /// for, and the lock's own query reads exactly the rows that still hold
+    /// it — this feature's `working` rows and nothing else. A run for
+    /// another feature, a finished run, and a featureless (MCP) run all fail
+    /// to lock, which is the whole point of filtering here rather than in
+    /// the caller.
+    #[test]
+    fn a_runs_feature_round_trips_and_only_working_rows_hold_the_lock() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+
+        let mut working = sample_run();
+        working.id = "r-working".into();
+        working.status = "working".into();
+        s.insert_run(&working, Some("board-run-actions")).unwrap();
+
+        let mut done = sample_run();
+        done.id = "r-done".into();
+        done.status = "done".into();
+        s.insert_run(&done, Some("board-run-actions")).unwrap();
+
+        let mut other = sample_run();
+        other.id = "r-other-feature".into();
+        other.status = "working".into();
+        s.insert_run(&other, Some("something-else")).unwrap();
+
+        let mut featureless = sample_run();
+        featureless.id = "r-mcp".into();
+        featureless.status = "working".into();
+        s.insert_run(&featureless, None).unwrap();
+
+        assert_eq!(
+            s.run_feature("r-working").unwrap().as_deref(),
+            Some("board-run-actions"),
+            "the feature a run was started for must survive the round trip"
+        );
+        assert_eq!(
+            s.run_feature("r-mcp").unwrap(),
+            None,
+            "a run started with no feature reads back with none"
+        );
+
+        let live = s
+            .list_live_runs_for_feature("p1", "board-run-actions")
+            .unwrap();
+        assert_eq!(
+            live.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-working"],
+            "only this feature's still-working run holds the lock: {live:?}"
+        );
+        assert!(
+            s.list_live_runs_for_feature("p2", "board-run-actions")
+                .unwrap()
+                .is_empty(),
+            "the lock is per project as well as per feature"
+        );
+    }
+
+    /// A database whose `runs` table predates the `feature` column: SCHEMA's
+    /// `CREATE TABLE IF NOT EXISTS` leaves it exactly as it was, so the
+    /// migration step is the only thing that can add the column. The old row
+    /// survives and reads back with no feature, which is true — it was never
+    /// a board run.
+    #[test]
+    fn migrate_adds_the_runs_feature_column_to_an_older_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO runs VALUES('r-old','p1','pane-1',NULL,'t','','m','working','t','t');",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            let version: i64 = c
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            assert!(
+                has_column(&c, "runs", "feature").unwrap(),
+                "the migration must add the column an older build never had"
+            );
+        }
+
+        assert_eq!(
+            s.get_run("r-old").unwrap().unwrap().status,
+            "working",
+            "the legacy row survives the migration"
+        );
+        assert_eq!(s.run_feature("r-old").unwrap(), None);
+        assert!(
+            s.list_live_runs_for_feature("p1", "anything")
+                .unwrap()
+                .is_empty(),
+            "a legacy run locks no feature"
+        );
+
+        let mut fresh = sample_run();
+        fresh.id = "r-new".into();
+        fresh.project_id = "p1".into();
+        fresh.status = "working".into();
+        s.insert_run(&fresh, Some("feat-x")).unwrap();
+        assert_eq!(
+            s.list_live_runs_for_feature("p1", "feat-x").unwrap().len(),
+            1,
+            "the migrated database takes a feature-carrying run"
+        );
     }
 
     #[test]

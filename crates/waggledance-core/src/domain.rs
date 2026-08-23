@@ -80,6 +80,13 @@ pub struct Run {
     pub marker: String,
     /// Protocol status enum string: pending/working/done/blocked/failed/timeout.
     pub status: String,
+    // The bee feature a run was started for (board-run-actions D3) lives on
+    // the `runs.feature` COLUMN, not on this struct: it is written by
+    // `SqliteStore::insert_run`'s own `feature` argument and read back by
+    // `list_live_runs_for_feature` / `run_feature`. It is not a field here
+    // yet only because this struct is built by literal in a file that cell
+    // could not reserve; folding it in is a mechanical follow-up, and every
+    // caller that needs the value already has a store method for it.
     /// RFC3339 timestamps.
     pub created_at: String,
     pub updated_at: String,
