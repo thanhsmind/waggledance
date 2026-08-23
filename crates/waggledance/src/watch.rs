@@ -237,7 +237,11 @@ mod tests {
 
         // `bee gate --lane <feature>` writes here; the card reads its stop
         // from it, so it is broadcast.
-        write(&dir, ".bee/lanes/board-approve-actions.json", "{\"gates\":{}}");
+        write(
+            &dir,
+            ".bee/lanes/board-approve-actions.json",
+            "{\"gates\":{}}",
+        );
         let lane = dir.join(".bee/lanes/board-approve-actions.json");
         assert_eq!(
             reindex_paths(&engine, std::slice::from_ref(&lane)),
