@@ -2990,6 +2990,21 @@ fn bee_hub_style() -> String {
    the hub-fallbacks shrink chain still requires from every level between
    the grid track and the clamped description. */
 .bee-hub__card { min-width: 0; }
+/* board-approve-actions D1: the card's (and the Ready to merge row's) own
+   Approve + Reject pair, sitting on the closing line of the shell where it
+   is answerable without expanding the card. The buttons reuse the terminal
+   reply row's own control tokens verbatim (`.term-reply__approve` above --
+   same padding, hairline border, raised surface and 44px touch target), so
+   an Approve on the board reads as the same control as the Approve under a
+   terminal, which is exactly what it is. Approve takes the action accent
+   the reply row gives its primary; Reject stays the quiet one beside it. */
+.bee-hub__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); padding: 0 14px 12px; }
+.bee-hub__action { padding: var(--space-1) var(--space-3); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; }
+.bee-hub__action--approve { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); }
+/* In flight (assets/app.js): the pair stays in place at the same size so
+   the card never reflows mid-answer -- only its weight drops, the same
+   withheld-Approve reading `.term-reply__approve:disabled` already uses. */
+.bee-hub__action:disabled { opacity: .5; cursor: not-allowed; }
 /* card-collapse-inprogress D1/D3/D6: the collapsed header row -- name plus
    chevron -- is the details element's own `<summary>`, native to the
    `<details>`/`<summary>` disclosure this card now uses (no JS, no
@@ -3859,6 +3874,18 @@ struct BeeHubCardData {
     waiting_on_live: bool,
     last_tool_call: Option<String>,
     deferred: Vec<BeeDeferredEntry>,
+    /// (board-approve-actions D1) [`bee_gate_current_stop`]'s own key for
+    /// this feature — `context`, `shape` or `execution`; `None` when no
+    /// gate is the next stop. Carried onto the card rather than re-derived
+    /// there because `approved_gates` never reaches [`bee_hub_card`], and
+    /// the classifier has already run exactly this walk to build `reason`
+    /// above — one read of the gates, two readers.
+    ///
+    /// The full key rides here, unfiltered: which of the three keys earns
+    /// an Approve/Reject pair is the ACTION rule's call
+    /// ([`bee_hub_action_kind`]), not the classifier's, and narrowing it
+    /// here would put half that rule in a second place.
+    gate_stop: Option<String>,
 }
 
 /// [`bee_hub_finished_row`]'s render inputs for one Todo, Review, Compound
@@ -4174,6 +4201,7 @@ fn bee_classify_features(
                 waiting_on_live,
                 last_tool_call,
                 deferred,
+                gate_stop: gate_stop.map(|(key, _)| key.to_string()),
             }));
         } else if is_finished {
             let docs = snapshot.feature_docs.get(f.feature.as_str()).cloned();
@@ -4353,16 +4381,7 @@ fn bee_render_hub_section(
                 // produce.
                 ready_to_merge_entries.push((
                     bee_hub_ready_to_merge_key(merge, &data.feature),
-                    bee_hub_finished_row_with_extra(
-                        "ready-to-merge",
-                        &bee_hub_feature_href(&project.id, &data.feature),
-                        &data.feature,
-                        data.docs.as_ref(),
-                        None,
-                        None,
-                        None,
-                        Some(&bee_hub_ready_to_merge_extra(merge)),
-                    ),
+                    bee_hub_ready_to_merge_row(project, data, merge, None, None),
                 ));
             }
             BeeHubPlacement::InProgress(data) => {
@@ -4412,6 +4431,8 @@ fn bee_render_hub_section(
                     last_tool_call: data.last_tool_call.as_deref(),
                     deferred: &data.deferred,
                     agent: agent.as_ref(),
+                    orchestration_enabled: project.orchestration_enabled,
+                    gate_stop: data.gate_stop.as_deref(),
                 });
                 in_progress_entries.push((key, html));
             }
@@ -4717,15 +4738,12 @@ pub fn bee_cross_project_features_section(
                     ready_to_merge_count += 1;
                     ready_to_merge_entries.push((
                         bee_hub_ready_to_merge_key(merge, &data.feature),
-                        bee_hub_finished_row_with_extra(
-                            "ready-to-merge",
-                            &bee_hub_feature_href(&project.id, &data.feature),
-                            &data.feature,
-                            data.docs.as_ref(),
+                        bee_hub_ready_to_merge_row(
+                            project,
+                            data,
+                            merge,
                             Some(&project.name),
                             project_color,
-                            None,
-                            Some(&bee_hub_ready_to_merge_extra(merge)),
                         ),
                     ));
                 }
@@ -4771,6 +4789,8 @@ pub fn bee_cross_project_features_section(
                         last_tool_call: data.last_tool_call.as_deref(),
                         deferred: &data.deferred,
                         agent: agent.as_ref(),
+                        orchestration_enabled: project.orchestration_enabled,
+                        gate_stop: data.gate_stop.as_deref(),
                     });
                     in_progress_entries.push((key, html));
                 }
@@ -5316,6 +5336,16 @@ struct BeeCardAgent {
     /// A1/A3: the record stopped speaking (90 s on `activity.at`). Renders
     /// as a muted marker beside the state; never a need-you.
     no_signal: bool,
+    /// (board-approve-actions D1) The state is `blocked` exactly — the
+    /// agent is sitting at a permission prompt and the human's answer is
+    /// the one thing it waits on. Narrower than `tone == "needs-you"`,
+    /// which is `blocked ∪ waiting_input` ([`BeeActivityEntry::needs_you`]):
+    /// only a permission prompt has an Approve/Reject to relay, so only
+    /// `blocked` earns the card's action pair. Paired with `no_signal` at
+    /// the read site, never folded into it, for the same reason the tone
+    /// keeps them apart: the state still reads once the record goes quiet,
+    /// it just stops being a live call.
+    blocked: bool,
 }
 
 /// A6/A2: the card agent line for one feature, from every live bee session
@@ -5355,6 +5385,7 @@ fn bee_card_agent(entries: &[BeeActivityEntry]) -> Option<BeeCardAgent> {
         cell_label,
         quiet_age: bee_quiet_age(freshest.activity.age_seconds),
         no_signal: freshest.signal == BeeSignal::NoSignal,
+        blocked: matches!(state, BeeActivityState::Blocked),
     })
 }
 
@@ -5395,6 +5426,77 @@ fn bee_hub_agent_line(agent: &BeeCardAgent) -> String {
     )
 }
 
+/// (board-approve-actions D1/D3) The ONE stop a feature is waiting on a
+/// human for right now, as the `data-action-kind` the board's wiring reads
+/// — or `None` when this feature owes the human nothing it can relay.
+///
+/// D1 says one pair per card, so this answers with one kind, never a set,
+/// and the order below IS the decision:
+///
+/// 1. `permission` — a bound agent sitting at a permission prompt with a
+///    live signal. A live human call outranks a gate: the agent is stopped
+///    right now, mid-run, and its own Approve is one click (D2), while a
+///    gate will still be there a minute later. `blocked_live` is the
+///    caller's read of [`BeeCardAgent::blocked`] AND a live signal — a
+///    record that has stopped speaking still says what it last said, but
+///    it is no longer a call for the human ([`BeeActivityEntry::needs_you`]
+///    draws the same line for the same reason).
+/// 2. `uat` — a Ready to merge row whose `uat` gate is still pending
+///    ([`BeeHubMergeData::uat_approved`]). uat is deliberately absent from
+///    [`bee_gate_current_stop`]'s walk and stays absent (that exclusion is
+///    load-bearing for the `Waiting on you` line); this rule reads the
+///    column's own `uat_approved` instead, which is exactly where
+///    bee-agent-activity R1 already put that fact.
+/// 3. `gate` — an In Progress card stopped on the merged shape+execution
+///    gate. `context` is NOT a stop this pair answers: the context gate is
+///    approved in conversation during exploration, not by a board click,
+///    and D1 names only the merged shape+execution gate.
+///
+/// `orchestration_enabled` gates all three (D3): a project without the
+/// existing per-project opt-in shows only the waiting-on badge, never a
+/// button, and this is the single place that rule is enforced — both the
+/// card and the Ready to merge row come through here.
+fn bee_hub_action_kind(
+    orchestration_enabled: bool,
+    blocked_live: bool,
+    uat_pending: bool,
+    gate_stop: Option<&str>,
+) -> Option<&'static str> {
+    if !orchestration_enabled {
+        return None;
+    }
+    if blocked_live {
+        return Some("permission");
+    }
+    if uat_pending {
+        return Some("uat");
+    }
+    match gate_stop {
+        Some("shape") | Some("execution") => Some("gate"),
+        _ => None,
+    }
+}
+
+/// (board-approve-actions D1) The Approve + Reject pair itself, the one
+/// spelling of it for every surface that carries one — the In Progress card
+/// and the Ready to merge row both render exactly this, so the wiring in
+/// `assets/app.js` has one selector to bind and the two surfaces can never
+/// drift into two shapes of the same control.
+///
+/// The three data attributes carry everything the click needs and nothing
+/// it does not: which project, which feature, which stop. No inline
+/// `<script>` and no href — the element is inert markup until `app.js`
+/// binds it, which is what keeps the board a relay (D5) rather than a
+/// second place that decides what a click means.
+fn bee_hub_action_pair(project_id: &str, feature: &str, kind: &str) -> String {
+    format!(
+        r#"<div class="bee-hub__actions" data-action-feature="{feature}" data-action-kind="{kind}" data-action-project="{pid}"><button type="button" class="bee-hub__action bee-hub__action--approve">Approve</button><button type="button" class="bee-hub__action bee-hub__action--reject">Reject</button></div>"#,
+        feature = esc(feature),
+        kind = esc(kind),
+        pid = esc(project_id),
+    )
+}
+
 struct BeeHubCardArgs<'a> {
     project_id: &'a str,
     feature: &'a str,
@@ -5419,6 +5521,21 @@ struct BeeHubCardArgs<'a> {
     /// bound to this feature — in which case the card renders exactly as it
     /// did before this feature.
     agent: Option<&'a BeeCardAgent>,
+    /// (board-approve-actions D3) The owning project's own
+    /// `orchestration.enabled` opt-in — the existing per-project switch,
+    /// never a new config key. `false` renders no action pair at all, so a
+    /// project that has not opted in reads exactly as it did before this
+    /// feature: the waiting-on badge and nothing to press.
+    ///
+    /// Both boards hold the `Project` row already
+    /// ([`bee_render_hub_section`] takes one, and
+    /// [`bee_cross_project_features_section`] iterates them), so this
+    /// threads straight off that row with no new server-side plumbing.
+    orchestration_enabled: bool,
+    /// (board-approve-actions D1) [`BeeHubCardData::gate_stop`]'s key for
+    /// this card — the merged shape+execution gate the feature is stopped
+    /// on, when it is stopped on one.
+    gate_stop: Option<&'a str>,
 }
 
 /// The branch row a card or a Ready to merge row carries under its name
@@ -5472,6 +5589,8 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         last_tool_call,
         deferred,
         agent,
+        orchestration_enabled,
+        gate_stop,
     } = *args;
     let title = docs
         .and_then(|d| d.title.as_deref())
@@ -5667,6 +5786,34 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // understates how many sessions its checkout carries.
     let (terminal_badges_html, quiet_badges_html, quiet_note_html) =
         bee_hub_terminal_badge_groups(project_id, panes);
+    // (board-approve-actions D1/D3) The card's own Approve + Reject pair,
+    // for the one stop it is waiting on ([`bee_hub_action_kind`] decides
+    // which, and answers `None` for every card that owes the human nothing
+    // it can relay — that card renders no `.bee-hub__actions` element at
+    // all, exactly as it did before this feature).
+    //
+    // A card never carries the `uat` stop: uat lives on the Ready to merge
+    // column, which is a dense row rather than a card
+    // (bee-agent-activity R1), so `uat_pending: false` here is the shape of
+    // the board, not a narrowing of the rule — the row passes its own
+    // `uat_pending` through the same function.
+    //
+    // Placed as a sibling AFTER the `</details>`, beside the terminal
+    // badges, rather than inside the card body: the whole point of the
+    // pair is to be answered without expanding the card, the same reason
+    // the agent line and the run-state badge ride in the collapsed
+    // `<summary>`. It cannot ride in the `<summary>` itself — a click on a
+    // summary is the browser's own disclosure toggle, so a button in there
+    // would collapse the card out from under the answer.
+    let actions_html = match bee_hub_action_kind(
+        orchestration_enabled,
+        agent.is_some_and(|a| a.blocked && !a.no_signal),
+        false,
+        gate_stop,
+    ) {
+        Some(kind) => bee_hub_action_pair(project_id, feature, kind),
+        None => String::new(),
+    };
     // card-collapse-inprogress D1/D3/D6: a native `<details>` with no
     // `open` attribute renders every card collapsed on every page load,
     // with no persisted state and no JavaScript -- clicking the
@@ -5675,7 +5822,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // the top of the expandable body, since a `<details>`/`<summary>`
     // pair, unlike the old whole-card `<a>`, cannot itself be a link.
     format!(
-        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{terminal_badges_html}{quiet_note_html}</div>"#,
+        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{actions_html}{terminal_badges_html}{quiet_note_html}</div>"#,
         shell_class = shell_class,
         group_key = group_key,
         title_html = title_html,
@@ -5691,6 +5838,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         deferred_html = deferred_html,
         quiet_badges_html = quiet_badges_html,
         footer_html = footer_html,
+        actions_html = actions_html,
         terminal_badges_html = terminal_badges_html,
         quiet_note_html = quiet_note_html,
     )
@@ -5855,6 +6003,58 @@ fn bee_hub_ready_to_merge_extra(merge: &BeeHubMergeData) -> String {
         branch = bee_hub_branch_line(&merge.worktree_label),
         line = bee_hub_merge_line(merge),
     )
+}
+
+/// (board-approve-actions D1/D3) One whole Ready to merge entry: the dense
+/// row itself ([`bee_hub_finished_row_with_extra`]) and, when this project
+/// has opted in and its `uat` gate is still pending, the Approve + Reject
+/// pair for that stop — the ONE place both boards build this column's
+/// markup, so the per-project board and the homepage can never grow two
+/// spellings of the same row (the same one-source rule the `extra` half
+/// already follows).
+///
+/// The pair is a SIBLING of the row, not part of its `extra`: the row is an
+/// `<a>`, and a `<button>` inside an anchor is invalid markup that no
+/// browser agrees on — the click would be the anchor's navigation as often
+/// as the button's. Rendering it after the anchor keeps both controls
+/// honest and leaves [`bee_hub_finished_row_with_extra`]'s own output
+/// byte-identical for every other column.
+///
+/// This is also why the `uat` stop is not decided inside [`bee_hub_card`]:
+/// Ready to merge is a dense-row column (bee-agent-activity R1), never a
+/// card, so the card would never see it. The rule itself is still one
+/// function ([`bee_hub_action_kind`]) — only the render site differs.
+fn bee_hub_ready_to_merge_row(
+    project: &Project,
+    data: &BeeHubFinishedData,
+    merge: &BeeHubMergeData,
+    project_label: Option<&str>,
+    project_color: Option<u8>,
+) -> String {
+    let row = bee_hub_finished_row_with_extra(
+        "ready-to-merge",
+        &bee_hub_feature_href(&project.id, &data.feature),
+        &data.feature,
+        data.docs.as_ref(),
+        project_label,
+        project_color,
+        None,
+        Some(&bee_hub_ready_to_merge_extra(merge)),
+    );
+    // No agent line reaches this column (its rows carry no activity join),
+    // so `blocked_live` is `false` here and `uat` is the only stop a Ready
+    // to merge row can answer — the permission rule still outranks it
+    // wherever both are readable, which is the card.
+    let actions = match bee_hub_action_kind(
+        project.orchestration_enabled,
+        false,
+        !merge.uat_approved,
+        None,
+    ) {
+        Some(kind) => bee_hub_action_pair(&project.id, &data.feature, kind),
+        None => String::new(),
+    };
+    format!("{row}{actions}")
 }
 
 /// The Ready to merge row's own summary line (bee-agent-activity R1): which
@@ -8829,6 +9029,7 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: Vec::new(),
+            gate_stop: None,
         })
     }
 
@@ -13990,6 +14191,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         // project_badges' own markup, with only its aria-label swapped for
         // the checkout-naming one this card must carry and its own
@@ -14202,6 +14405,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             !card_html.contains("proj-row__badges"),
@@ -14268,6 +14473,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         let details_end = card_html
             .find("</details>")
@@ -14346,6 +14553,8 @@ mod tests {
                 waiting_on_live: false,
                 last_tool_call: None,
                 deferred: &[],
+                orchestration_enabled: false,
+                gate_stop: None,
             })
         };
 
@@ -14445,6 +14654,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — a terminal is blocked</p>"#),
@@ -14477,6 +14688,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         let gate_at = card_html.find(gate_reason).unwrap_or_else(|| {
             panic!("the existing gate reason line must still render: {card_html}")
@@ -14515,6 +14728,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             !card_html.contains("bee-hub__reason"),
@@ -14546,6 +14761,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(r#"<details class="bee-hub__card" data-hub-group="in-progress">"#),
@@ -14585,6 +14802,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(
@@ -14670,6 +14889,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: Some(&recent),
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(r#"<span class="bee-hub__pulse""#),
@@ -14702,6 +14923,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: Some(&old),
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             !card_html.contains("bee-hub__pulse"),
@@ -14732,6 +14955,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             !card_html.contains("bee-hub__pulse"),
@@ -14762,6 +14987,8 @@ mod tests {
             waiting_on_live: true,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(r#"<span class="fg-chip fg-chip--danger bee-hub__run-state">Awaiting approval</span>"#),
@@ -14801,6 +15028,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(
@@ -14836,6 +15065,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(r#"<span class="fg-chip fg-chip--accent bee-hub__run-state">Running</span>"#),
@@ -14866,6 +15097,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             !card_html.contains("bee-hub__run-state"),
@@ -14910,6 +15143,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &deferred,
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(r#"<summary class="fg-badge">2 deferred</summary>"#),
@@ -14947,6 +15182,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             !card_html.contains("bee-hub__deferred") && !card_html.contains("deferred"),
@@ -15158,6 +15395,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(r#"<div class="bee-hub__project">Project A</div>"#),
@@ -15214,6 +15453,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         // card-collapse-inprogress: the title (now in the collapsed
         // `<summary>`) and the subtitle (now in the expandable body) are no
@@ -15264,6 +15505,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert_eq!(
             card_html,
@@ -15330,6 +15573,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(r#"<span class="bee-hub__branch-name">merged</span>"#),
@@ -15373,6 +15618,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             !card_html.contains("bee-hub__branch"),
@@ -15409,6 +15656,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             !card_html.contains("0/0"),
@@ -15459,6 +15708,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: None,
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         let expected_time = bee_fmt_trace_time(&ten_minutes_ago);
         assert!(
@@ -15503,6 +15754,8 @@ mod tests {
                 waiting_on_live: false,
                 last_tool_call: None,
                 deferred: &[],
+                orchestration_enabled: false,
+                gate_stop: None,
             })
         };
         for (done, total, fill) in [(2usize, 2usize, "done"), (1, 2, "partial"), (0, 3, "none")] {
@@ -15542,6 +15795,8 @@ mod tests {
             waiting_on_live: false,
             last_tool_call: Some(just_now.as_str()),
             deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: None,
         });
         assert!(
             card_html.contains(&format!(
@@ -15596,6 +15851,8 @@ mod tests {
                 waiting_on_live: false,
                 last_tool_call: None,
                 deferred: &[],
+                orchestration_enabled: false,
+                gate_stop: None,
             });
             let expected = format!(r#"<span class="bee-hub__branch-name">{worktree_label}</span>"#);
             assert_eq!(
@@ -16007,6 +16264,251 @@ mod tests {
                 !plain.contains("bee-hub__branch") && !plain.contains("bee-hub__merge"),
                 "a {group} row carries neither a branch nor a merge line: {plain}"
             );
+        }
+    }
+
+    /// (board-approve-actions D1/D3) A Ready to merge row whose uat gate is
+    /// still pending carries the Approve + Reject pair for that stop, on an
+    /// opted-in project. The pair is a SIBLING of the row's anchor, never
+    /// inside it: a `<button>` nested in an `<a>` is markup no browser
+    /// agrees on, so the assertion pins the order rather than containment.
+    ///
+    /// An already-approved uat is not a stop — that row is waiting on the
+    /// merge command, not on the human — so it carries no pair at all.
+    #[test]
+    fn bee_hub_ready_to_merge_row_carries_the_uat_pair_when_uat_is_pending() {
+        let mut project = sample_project();
+        project.orchestration_enabled = true;
+        let data = BeeHubFinishedData {
+            feature: "feat-a".to_string(),
+            docs: None,
+        };
+        let pending = BeeHubMergeData {
+            uat_approved: false,
+            since: None,
+            worktree_label: "wt/feat-a".to_string(),
+        };
+        let row = bee_hub_ready_to_merge_row(&project, &data, &pending, None, None);
+        assert!(
+            row.contains(r#"data-action-kind="uat""#)
+                && row.contains(r#"data-action-feature="feat-a""#)
+                && row.contains(r#"data-action-project="proj-1""#),
+            "a pending-uat Ready to merge row must carry the uat action pair: {row}"
+        );
+        assert!(
+            row.contains(
+                r#"<button type="button" class="bee-hub__action bee-hub__action--approve">Approve</button>"#
+            ) && row.contains(
+                r#"<button type="button" class="bee-hub__action bee-hub__action--reject">Reject</button>"#
+            ),
+            "the pair is both buttons, never one: {row}"
+        );
+        let anchor_end = row.find("</a>").expect("the dense row is still an anchor");
+        let actions_at = row.find("bee-hub__actions").expect("action pair");
+        assert!(
+            anchor_end < actions_at,
+            "the pair must sit outside the row's anchor, never nested in it: {row}"
+        );
+
+        let approved = BeeHubMergeData {
+            uat_approved: true,
+            since: None,
+            worktree_label: "wt/feat-a".to_string(),
+        };
+        let row = bee_hub_ready_to_merge_row(&project, &data, &approved, None, None);
+        assert!(
+            !row.contains("bee-hub__actions"),
+            "an approved uat is no longer a stop and owes no pair: {row}"
+        );
+    }
+
+    /// (board-approve-actions D3) The per-project `orchestration.enabled`
+    /// opt-in gates every button on the board: without it a card and a row
+    /// alike render exactly as they did before this feature — the
+    /// waiting-on reading, and nothing to press.
+    #[test]
+    fn bee_hub_renders_no_action_pair_without_the_project_opt_in() {
+        let project = sample_project();
+        assert!(!project.orchestration_enabled);
+        let data = BeeHubFinishedData {
+            feature: "feat-a".to_string(),
+            docs: None,
+        };
+        let merge = BeeHubMergeData {
+            uat_approved: false,
+            since: None,
+            worktree_label: "wt/feat-a".to_string(),
+        };
+        let row = bee_hub_ready_to_merge_row(&project, &data, &merge, None, None);
+        assert!(
+            !row.contains("bee-hub__actions"),
+            "a project without the opt-in never renders a button: {row}"
+        );
+
+        // The card side of the same rule, with a stop on every input that
+        // could otherwise produce one.
+        let agent = blocked_card_agent();
+        let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: Some(&agent),
+            project_id: "proj-1",
+            feature: "feat-a",
+            group_key: "in-progress",
+            done: 1,
+            total: 2,
+            last_activity: None,
+            worktree_label: "wt/feat-a",
+            reason: None,
+            docs: None,
+            project_label: None,
+            project_color: None,
+            panes: &[],
+            run_state: None,
+            waiting_on_live: false,
+            last_tool_call: None,
+            deferred: &[],
+            orchestration_enabled: false,
+            gate_stop: Some("execution"),
+        });
+        assert!(
+            !card_html.contains("bee-hub__actions"),
+            "a card on a project without the opt-in never renders a button: {card_html}"
+        );
+    }
+
+    /// (board-approve-actions D1) One pair per card, and the order that
+    /// picks it: a live blocked agent is a human call happening right now,
+    /// so it outranks the gate the same feature is also stopped on. The
+    /// same card with its agent gone quiet (`no_signal`) falls back to the
+    /// gate — a record that stopped speaking still says what it last said,
+    /// but it is no longer a call to answer.
+    #[test]
+    fn bee_hub_card_reads_a_live_blocked_agent_as_the_permission_stop_over_a_gate() {
+        let card = |agent: Option<&BeeCardAgent>, gate_stop: Option<&str>| {
+            bee_hub_card(&BeeHubCardArgs {
+                agent,
+                project_id: "proj-1",
+                feature: "feat-a",
+                group_key: "in-progress",
+                done: 1,
+                total: 2,
+                last_activity: None,
+                worktree_label: "wt/feat-a",
+                reason: None,
+                docs: None,
+                project_label: None,
+                project_color: None,
+                panes: &[],
+                run_state: None,
+                waiting_on_live: false,
+                last_tool_call: None,
+                deferred: &[],
+                orchestration_enabled: true,
+                gate_stop,
+            })
+        };
+
+        let blocked = blocked_card_agent();
+        let html = card(Some(&blocked), Some("execution"));
+        assert!(
+            html.contains(r#"data-action-kind="permission""#),
+            "a live blocked agent outranks the gate on the same card: {html}"
+        );
+        assert_eq!(
+            html.matches("bee-hub__actions").count(),
+            1,
+            "exactly one pair per card, never one per stop: {html}"
+        );
+
+        let quiet = BeeCardAgent {
+            no_signal: true,
+            ..blocked_card_agent()
+        };
+        let html = card(Some(&quiet), Some("execution"));
+        assert!(
+            html.contains(r#"data-action-kind="gate""#),
+            "an agent that stopped speaking is no live call, so the gate is the stop: {html}"
+        );
+
+        // `shape` is the merged gate's other spelling and reads the same;
+        // `context` is approved in conversation, never by a board click,
+        // and a card with no stop at all carries no pair.
+        let html = card(None, Some("shape"));
+        assert!(html.contains(r#"data-action-kind="gate""#), "{html}");
+        let html = card(None, Some("context"));
+        assert!(!html.contains("bee-hub__actions"), "{html}");
+        let html = card(None, None);
+        assert!(!html.contains("bee-hub__actions"), "{html}");
+    }
+
+    /// (board-approve-actions D1) The pair sits outside the card's own
+    /// `<details>`, so a human answers it without expanding the card —
+    /// the same reason the agent line and the run-state badge ride in the
+    /// collapsed summary. It cannot ride IN the summary: a click there is
+    /// the browser's own disclosure toggle.
+    #[test]
+    fn bee_hub_card_action_pair_is_readable_without_expanding_the_card() {
+        let card_html = bee_hub_card(&BeeHubCardArgs {
+            agent: None,
+            project_id: "proj-1",
+            feature: "feat-a",
+            group_key: "in-progress",
+            done: 1,
+            total: 2,
+            last_activity: None,
+            worktree_label: "wt/feat-a",
+            reason: None,
+            docs: None,
+            project_label: None,
+            project_color: None,
+            panes: &[],
+            run_state: None,
+            waiting_on_live: false,
+            last_tool_call: None,
+            deferred: &[],
+            orchestration_enabled: true,
+            gate_stop: Some("execution"),
+        });
+        let details_end = card_html.find("</details>").expect("the card is a details");
+        let actions_at = card_html
+            .find("bee-hub__actions")
+            .expect("the gate card carries its pair");
+        assert!(
+            details_end < actions_at,
+            "the pair must sit after the card's collapsed body, not inside it: {card_html}"
+        );
+        assert!(
+            !card_html.contains("<script"),
+            "the pair is inert markup — the wiring belongs to assets/app.js: {card_html}"
+        );
+    }
+
+    /// (board-approve-actions D1) The board's buttons reuse the terminal
+    /// reply row's own control tokens, so an Approve on a card reads as the
+    /// same control as the Approve under a terminal — which is exactly what
+    /// it is.
+    #[test]
+    fn bee_hub_style_carries_the_action_pair_beside_the_card_rules() {
+        let css = bee_hub_style();
+        assert!(
+            css.contains(".bee-hub__actions {") && css.contains(".bee-hub__action {"),
+            "the pair's rules live beside the card's own: {css}"
+        );
+        assert!(
+            css.contains(".bee-hub__action:disabled { opacity: .5; cursor: not-allowed; }"),
+            "the in-flight reading is the withheld-Approve reading already in use: {css}"
+        );
+    }
+
+    /// A blocked, still-speaking card agent — the permission-prompt shape
+    /// the action tests above vary from.
+    fn blocked_card_agent() -> BeeCardAgent {
+        BeeCardAgent {
+            tone: "needs-you",
+            state_word: "needs approval".to_string(),
+            cell_label: "bap-2".to_string(),
+            quiet_age: "3s".to_string(),
+            no_signal: false,
+            blocked: true,
         }
     }
 
