@@ -88,6 +88,16 @@ Rules that settled while the cells ran, each a capture stub merged here:
   one 1.5 s trailing reload timer that re-arms instead of firing while a
   dialog is open, so a burst of lane writes is one reload and a confirm never
   vanishes under the user.
+- **Pane join follows the session, not the directory.** A wake line or a
+  permission keystroke reaches only a pane whose session `activity.feature`
+  equals the requested feature (`TerminalPaneView.bee_feature`) — the same
+  join that pins a main-checkout pane to one card (decision `3daa1ea7`,
+  board-pane-lane-pin). A pane with no live bee session is never a target,
+  so two lanes sharing the main checkout can never receive each other's
+  Approve. `state.json` is broadcast only when its `{feature, phase,
+  approved_gates}` projection changes, and the 1.5 s debounce applies only
+  to those bee-signal bursts on board surfaces; a reload blocked by an open
+  modal flushes once on the next click, key-up or close.
 - **Permission reject (unverified).** Rejecting a permission prompt sends the
   herdr key `escape`; no live blocked Claude pane was available to verify that
   it dismisses the prompt. Text `No` + submit is the named fallback — a
