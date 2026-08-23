@@ -32,7 +32,7 @@ three approvals, per that feature's D5.
 
 | ID | Decision |
 |----|----------|
-| D1 (3971c768) | Run review / Run compound send one slash-command line into the feature's live bound pane when one exists; with no live pane the daemon spawns a fresh agent in the feature's worktree. Reuse the session that already holds the context; spawn only when nothing is live. |
+| D1 (3971c768, spawn clause superseded) | Run review / Run compound send one slash-command line into the feature's live bound pane when one exists; with no live pane the daemon spawns a fresh agent in the feature's worktree. As locked, D1 named `bee herding run` as the spawner; planning rejected it because its brief forbids the bee workflow D2 needs, and the spawn is waggledance's own `agent_start` through `orchestrate::dispatch_run` — the supersession is logged in the decision store (2026-08-23). Reuse the session that already holds the context; spawn only when nothing is live. |
 | D2 (d864ae40) | Start on a Todo card is one full dispatch: new feature worktree, new pane, the project's default agent preset started with a brief to take the PBI through bee-hive; gates still stop per `gate_bypass` as in any session. The card moves to In Progress on the session's own activity signal, not on the click. |
 | D3 (4c366c35) | One board-triggered run per feature at a time: while one is live the card's action buttons lock and the card reads "running: <action>" with a link to the pane; truth is bee's dispatch ledger plus session activity. Never a queue. |
 | D4 (6b7f34aa) | Board-spawned agents always use the project's default preset (`herding.agent_command` resolved through `herding.agents` in `.bee/config.json`); the board offers no agent picker. |
@@ -61,8 +61,13 @@ kind ∈ run-review | run-compound | start-todo
 - **Preset (D4).** Spawn argv comes from `.bee/config.json` `herding` —
   `agent_command` resolved through `herding.agents`, in both its string and array forms.
   A project with no `herding` config answers `409` naming the file.
-- Response `{ok, run_id, pane_id, mode}`; the board re-renders on the existing `/ws`
-  `{"changed":[…]}` event, never on a second refresh channel.
+- Response `{ok, run_id, pane_id, mode}`; `start-todo` adds `recorded` (whether
+  `bee herding record-worker` succeeded — a failure there never undoes the spawn).
+  With the terminal-family switch off every run kind answers the pane routes' `404`,
+  while the gate halves of the approve kinds still write. The board re-renders on the
+  existing `/ws` `{"changed":[…]}` event, never on a second refresh channel.
+- Review / compound with no live pane spawn in the feature's granted worktree, or in
+  the project root when the feature has no worktree; Start always spawns (D2).
 
 **Slash lines sent** — the exact text the daemon writes into the pane or hands the
 spawned agent:
