@@ -1,6 +1,3 @@
----
-okf_version: 0.1
----
 <!--
 GENERATED FILE — do not hand-edit.
 Rendered by `bee knowledge index` from concept frontmatter inside docs/knowledge/ (okf-foundation D21).
@@ -9,13 +6,8 @@ Deterministic: byte-identical for the same bundle contents — path-sorted entri
 never a generation timestamp or any other wall-clock value.
 -->
 
-# Knowledge Bundle
+# work/board-topbar-polish/
 
-## Sections
+## Concepts
 
-- [patterns/](patterns/index.md) — 1 concept(s)
-- [work/](work/index.md) — 49 concept(s)
-
-## Critical patterns
-
-None.
+- [board-topbar-polish — delivery](delivery.md) — Delivery record for work item board-topbar-polish: 1 capped cell quieting the active Orchestrator pill on the home topbar and turning the New task box into a real textarea.
