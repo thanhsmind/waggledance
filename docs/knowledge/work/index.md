@@ -21,6 +21,7 @@ never a generation timestamp or any other wall-clock value.
 - [badge-title/](badge-title/index.md) — 1 concept(s)
 - [bee-agent-activity/](bee-agent-activity/index.md) — 1 concept(s)
 - [bee-artifact-rename/](bee-artifact-rename/index.md) — 1 concept(s)
+- [board-approve-actions/](board-approve-actions/index.md) — 1 concept(s)
 - [board-declutter/](board-declutter/index.md) — 1 concept(s)
 - [board-new-task/](board-new-task/index.md) — 1 concept(s)
 - [board-topbar-polish/](board-topbar-polish/index.md) — 1 concept(s)
