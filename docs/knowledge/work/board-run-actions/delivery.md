@@ -98,6 +98,21 @@ and reads `running: <action>` with a link to `/p/<id>/_terminal/<pane>`. `app.js
 the approve feature's confirm dialog and one-shot in-flight guard: these clicks cost an
 agent, so they confirm like a gate.
 
+## Settled in execution
+
+- **Spawner.** Every board-started run goes through `orchestrate::dispatch_run`
+  (shared with the MCP `waggledance_dispatch` tool) and herdr `agent_start` —
+  never `bee herding run`, whose brief forbids the bee workflow the run must
+  follow (decision `4b743b19`, supersedes D1's spawn clause).
+- **Run ledger.** `runs.feature` is a nullable column added by a
+  `PRAGMA user_version` step; legacy rows stay `NULL` and lock nothing. The
+  lock is one `working` Run per feature whose pane still exists in the herdr
+  snapshot; a run whose pane is gone never locks.
+- **Switch.** With the terminal-family switch off the three run kinds answer
+  the pane routes' `404`; the gate halves of the approve kinds still write.
+- **Start always spawns** (a fresh worktree and pane); review and compound
+  prefer the feature's live pane, then its worktree, then the project root.
+
 ## Boundary
 
 Judging or merging what the spawned run produces is the session's own bee chain, not the
