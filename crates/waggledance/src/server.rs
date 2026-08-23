@@ -3949,14 +3949,78 @@ impl ProjectBeeActivity {
     }
 }
 
+/// afr-1: which feature a live session is actually working on, in one
+/// place, ordered most-specific first. `activity.feature` is bee's own
+/// self-report and it goes stale — a session that switched lanes or was
+/// dispatched a cell from another feature keeps reporting the lane it
+/// started under — so the record it wrote LAST is the last thing trusted,
+/// never the first:
+///
+/// 1. **the claim** — the session holds cell `X`, and the live buckets say
+///    `X` belongs to feature `F`. A claim is the narrowest, freshest
+///    statement of what this session is doing; nothing overrides it.
+/// 2. **the worktree it stands in** — `activity.cwd` resolves inside the
+///    sibling directory `parent_dir/<worktree id>` of a granted worktree
+///    naming a feature. Code-touching work lives in its feature's own
+///    worktree, so the directory is a strong claim when no cell is held.
+/// 3. **the bound lane** — `session.lane`, the feature this session bound
+///    itself to.
+/// 4. **the activity record's own `feature`** — the fallback, and `None`
+///    when even that is absent: an unbound session, rendered as "—".
+///
+/// Pure: no filesystem call, no canonicalization. Containment is
+/// [`waggledance_core::paths_boundary::is_contained_in_root`]'s
+/// component-wise rule, never a text prefix, so a session in
+/// `…/wd--wt--agent-board-extra` is not claimed by the worktree
+/// `wd--wt--agent-board`. `parent_dir` is `None` only for a project root
+/// with no parent, which simply skips step 2 rather than failing.
+///
+/// A worktree directory that matches but names no feature falls THROUGH to
+/// the next candidate rather than resolving to nothing — a dangling grant
+/// should not erase a session's lane.
+fn resolve_session_feature(
+    cell_feature_by_id: &std::collections::HashMap<&str, &str>,
+    worktrees: &[waggledance_core::bee::BeeWorktree],
+    parent_dir: Option<&std::path::Path>,
+    session: &waggledance_core::bee::BeeSession,
+) -> Option<String> {
+    let activity = session.activity.as_ref();
+
+    if let Some(feature) = activity
+        .and_then(|a| a.cell.as_deref())
+        .and_then(|id| cell_feature_by_id.get(id).copied())
+    {
+        return Some(feature.to_string());
+    }
+
+    if let (Some(parent), Some(cwd)) = (parent_dir, activity.and_then(|a| a.cwd.as_deref())) {
+        let cwd = std::path::Path::new(cwd);
+        for w in worktrees {
+            let Some(feature) = w.feature.as_deref() else {
+                continue;
+            };
+            if waggledance_core::paths_boundary::is_contained_in_root(cwd, &parent.join(&w.id)) {
+                return Some(feature.to_string());
+            }
+        }
+    }
+
+    if let Some(lane) = session.lane.as_deref() {
+        return Some(lane.to_string());
+    }
+
+    activity.and_then(|a| a.feature.clone())
+}
+
 /// A2's session-to-project join: a session attaches to this project when
 /// `activity.cwd` validates through the SAME `Boundary` rule panes use
 /// ([`project_panes`]) — the project root plus each granted worktree's own
 /// sibling directory beside it, exactly the set
 /// [`project_feature_panes`] resolves for its own per-feature boundaries.
 /// One `Boundary` over all of them rather than one per worktree: this join
-/// only decides membership, and `activity.feature` — not the directory —
-/// is what says which feature a session belongs to.
+/// only decides membership; WHICH feature a session belongs to is then
+/// resolved by [`resolve_session_feature`], for which the worktree
+/// directory is one input among four.
 ///
 /// Only LIVE sessions carrying an `activity` object are joined: a dead
 /// session's record is history, and A1 already derives
@@ -3965,7 +4029,8 @@ impl ProjectBeeActivity {
 /// rendering rule, never a filter.
 ///
 /// `cwd` is an unscrubbed absolute path and is used here for nothing but
-/// this boundary check; it never reaches a view.
+/// this boundary check and [`resolve_session_feature`]'s worktree match;
+/// it never reaches a view.
 fn project_bee_activity(
     project: &waggledance_core::domain::Project,
     rollup: &waggledance_core::bee::BeeProjectRollup,
@@ -3987,7 +4052,10 @@ fn project_bee_activity(
     // live buckets are the whole live cell store, so one pass over them is
     // the map — an archived cell simply is not here, and the card falls
     // back to the bare id.
+    // afr-1 rides the same pass for the same reason: a cell's `feature` is
+    // the first and strongest answer to which feature its holder is on.
     let mut cell_titles: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut cell_features: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for bucket in [
         &snapshot.buckets.doing,
         &snapshot.buckets.waiting,
@@ -3996,6 +4064,9 @@ fn project_bee_activity(
     ] {
         for cell in bucket {
             cell_titles.entry(cell.id.as_str()).or_insert(&cell.title);
+            cell_features
+                .entry(cell.id.as_str())
+                .or_insert(&cell.feature);
         }
     }
 
@@ -4016,12 +4087,23 @@ fn project_bee_activity(
         {
             continue;
         }
+        // afr-1: the resolved feature replaces the session's own self-report
+        // on the carried clone, so the pane stamp, the feature bucket below
+        // and every reader of this entry (the cards, `/api/agents`) see one
+        // answer instead of three.
+        let mut resolved = activity.clone();
+        resolved.feature = resolve_session_feature(
+            &cell_features,
+            &snapshot.worktrees,
+            project.root_path.parent(),
+            session,
+        );
         let entry = views::BeeActivityEntry {
             cell_title: activity
                 .cell
                 .as_deref()
                 .and_then(|id| cell_titles.get(id).map(|t| (*t).to_string())),
-            activity: activity.clone(),
+            activity: resolved,
             signal: session.signal,
         };
         if let Some(pane) = activity.pane.as_deref() {
@@ -4035,11 +4117,8 @@ fn project_bee_activity(
                 }
             }
         }
-        if let Some(feature) = activity.feature.as_deref() {
-            out.feature
-                .entry(feature.to_string())
-                .or_default()
-                .push(entry);
+        if let Some(feature) = entry.activity.feature.clone() {
+            out.feature.entry(feature).or_default().push(entry);
         }
     }
     out
@@ -4081,11 +4160,13 @@ fn apply_bee_activity(
 /// feature out of the "no worktree" bucket below) rather than failing the
 /// whole page. Every remaining pane — inside the project root but inside no
 /// worktree directory, i.e. exactly [`project_panes`] over the project's own
-/// boundary — belongs to every phase-board feature that has no worktree of
-/// its own (the cards that carry the "Main" chip,
-/// `views::bee_hub_worktree_chip`'s own rule). Only phase-board features are
-/// keyed here: Finished rows never render badges, so an archive-only
-/// feature needs no entry.
+/// boundary — is keyed by [`key_main_panes_by_feature`]
+/// (board-pane-lane-pin): a pane whose bee session names a feature goes to
+/// that one card; only a session-less pane belongs to every phase-board
+/// feature that has no worktree of its own (the cards that carry the "Main"
+/// chip, `views::bee_hub_worktree_chip`'s own rule). Only phase-board
+/// features are fanned to: Finished rows never render badges, so an
+/// archive-only feature needs no entry.
 ///
 /// `snapshot: None` (the terminal switch off, or herdr unreachable) returns
 /// an empty map with no boundary resolution and no herdr read at all — the
@@ -4130,12 +4211,140 @@ fn project_feature_panes(
     if main_panes.is_empty() {
         return out;
     }
-    for f in &rollup.snapshot.phase_board {
-        if !worktree_features.contains(f.feature.as_str()) {
-            out.insert(f.feature.clone(), main_panes.clone());
+    let main_features: Vec<&str> = rollup
+        .snapshot
+        .phase_board
+        .iter()
+        .map(|f| f.feature.as_str())
+        .filter(|f| !worktree_features.contains(f))
+        .collect();
+    for (feature, panes) in key_main_panes_by_feature(main_panes, &main_features) {
+        merge_panes_once(out.entry(feature).or_default(), panes);
+    }
+    out
+}
+
+/// board-pane-dedupe: append `incoming` onto a feature's pane list, skipping
+/// any pane whose id the list already holds. One pane can validate into BOTH
+/// a worktree bucket and the main bucket -- its shell sits in the main
+/// checkout while its foreground process runs inside the feature's worktree
+/// (`project_panes` accepts either directory) -- and after
+/// board-pane-lane-pin the main bucket keys that pane by its session's
+/// feature, which is the same feature the worktree bucket already gave it.
+/// A card never shows the same pane twice; the worktree bucket's copy,
+/// already in `existing`, wins.
+fn merge_panes_once(
+    existing: &mut Vec<views::TerminalPaneView>,
+    incoming: Vec<views::TerminalPaneView>,
+) {
+    for pane in incoming {
+        if !existing.iter().any(|p| p.pane_id == pane.pane_id) {
+            existing.push(pane);
+        }
+    }
+}
+
+/// board-pane-lane-pin: how the main checkout's panes are handed to feature
+/// cards. A pane whose bee session names a feature (`bee_feature`, i.e.
+/// `activity.feature` -- the bound lane, else the active feature) belongs to
+/// that ONE card, even when the feature is not in `main_features` (a
+/// lane-bound session working from main still lands on its own card rather
+/// than vanishing). Only a pane with no bee session behind it
+/// (`bee_feature == None`) keeps the older fan-out to every `main_features`
+/// entry -- the checkout directory is then the only thing known about it.
+/// Before this cell every main pane fanned out to every Main feature, so
+/// three Main features in one checkout each showed the same three agents.
+/// Pane order within a feature follows the input order.
+fn key_main_panes_by_feature(
+    main_panes: Vec<views::TerminalPaneView>,
+    main_features: &[&str],
+) -> std::collections::HashMap<String, Vec<views::TerminalPaneView>> {
+    let mut out: std::collections::HashMap<String, Vec<views::TerminalPaneView>> =
+        std::collections::HashMap::new();
+    for pane in main_panes {
+        match pane.bee_feature.as_deref() {
+            Some(feature) => out.entry(feature.to_string()).or_default().push(pane),
+            None => {
+                for feature in main_features {
+                    out.entry((*feature).to_string())
+                        .or_default()
+                        .push(pane.clone());
+                }
+            }
         }
     }
     out
+}
+
+#[cfg(test)]
+mod key_main_panes_by_feature_tests {
+    use super::*;
+
+    fn pane(id: &str, bee_feature: Option<&str>) -> views::TerminalPaneView {
+        views::TerminalPaneView {
+            pane_id: id.to_string(),
+            kind: "claude".to_string(),
+            name: "Claude Code".to_string(),
+            status: "idle".to_string(),
+            cwd: "/repo".to_string(),
+            workspace: "w1".to_string(),
+            tab: "t1".to_string(),
+            title: String::new(),
+            bee_state: None,
+            bee_feature: bee_feature.map(str::to_string),
+            bee_no_signal: false,
+        }
+    }
+
+    fn ids(
+        m: &std::collections::HashMap<String, Vec<views::TerminalPaneView>>,
+        f: &str,
+    ) -> Vec<String> {
+        m.get(f)
+            .map(|v| v.iter().map(|p| p.pane_id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn bound_pane_lands_on_its_own_feature_only_unbound_fans_out() {
+        let panes = vec![
+            pane("w1:p1", Some("alpha")),
+            pane("w1:p2", Some("beta")),
+            pane("w1:p3", None),
+        ];
+        let out = key_main_panes_by_feature(panes, &["alpha", "beta", "gamma"]);
+        assert_eq!(ids(&out, "alpha"), vec!["w1:p1", "w1:p3"]);
+        assert_eq!(ids(&out, "beta"), vec!["w1:p2", "w1:p3"]);
+        assert_eq!(ids(&out, "gamma"), vec!["w1:p3"]);
+    }
+
+    #[test]
+    fn bound_pane_off_the_main_set_still_keys_its_own_feature() {
+        let out = key_main_panes_by_feature(vec![pane("w1:p1", Some("lane-x"))], &["alpha"]);
+        assert_eq!(ids(&out, "lane-x"), vec!["w1:p1"]);
+        assert!(!out.contains_key("alpha"));
+    }
+
+    #[test]
+    fn merge_panes_once_skips_a_pane_the_feature_already_holds() {
+        let mut existing = vec![pane("w5:pA", Some("alpha"))];
+        merge_panes_once(
+            &mut existing,
+            vec![pane("w5:pA", Some("alpha")), pane("w5:pB", Some("alpha"))],
+        );
+        let ids: Vec<&str> = existing.iter().map(|p| p.pane_id.as_str()).collect();
+        assert_eq!(ids, vec!["w5:pA", "w5:pB"]);
+    }
+
+    #[test]
+    fn all_bound_panes_never_fan_out() {
+        let out = key_main_panes_by_feature(
+            vec![pane("w1:p1", Some("alpha")), pane("w1:p2", Some("alpha"))],
+            &["alpha", "beta"],
+        );
+        assert_eq!(ids(&out, "alpha"), vec!["w1:p1", "w1:p2"]);
+        assert!(!out.contains_key("beta"));
+    }
 }
 
 /// D5's partition: every herdr pane whose working directory sits under **no**
@@ -27776,5 +27985,239 @@ mod bee_route_tests {
                 && block.contains("function flushPendingReload()"),
             "a reload blocked by a modal becomes one pending reload"
         );
+    }
+}
+
+/// afr-1: the precedence ladder in [`resolve_session_feature`], one test per
+/// rung plus the fallback. Pure inputs only — no store on disk, no `Boundary`
+/// — because the rule under test is the ORDER, and a fixture that needed real
+/// directories would prove the filesystem instead.
+#[cfg(test)]
+mod session_feature_resolution_tests {
+    use super::*;
+    use waggledance_core::bee::{
+        BeeActivity, BeeActivityState, BeeSession, BeeSignal, BeeWorktree,
+    };
+
+    fn activity(cwd: Option<&str>, cell: Option<&str>, feature: Option<&str>) -> BeeActivity {
+        BeeActivity {
+            state: BeeActivityState::Working,
+            event: "PreToolUse".to_string(),
+            tool_name: None,
+            tool_use_id: None,
+            at: "2026-08-23T06:00:00Z".to_string(),
+            age_seconds: Some(3.0),
+            pane: Some("%1".to_string()),
+            cwd: cwd.map(str::to_string),
+            feature: feature.map(str::to_string),
+            cell: cell.map(str::to_string),
+        }
+    }
+
+    fn session(lane: Option<&str>, activity: Option<BeeActivity>) -> BeeSession {
+        BeeSession {
+            id: "s1".to_string(),
+            started_at: None,
+            heartbeat_age_minutes: 0.5,
+            live: true,
+            workspace_id: None,
+            source: None,
+            lane: lane.map(str::to_string),
+            activity,
+            signal: BeeSignal::Live,
+        }
+    }
+
+    fn worktree(id: &str, feature: Option<&str>) -> BeeWorktree {
+        BeeWorktree {
+            id: id.to_string(),
+            resolved: true,
+            unresolved_reason: None,
+            feature: feature.map(str::to_string),
+            phase: None,
+            mode: None,
+            branch: None,
+            created_at: None,
+            live: true,
+            heartbeat_age_minutes: Some(0.5),
+            merged_pending: false,
+        }
+    }
+
+    fn cells<'a>(pairs: &[(&'a str, &'a str)]) -> std::collections::HashMap<&'a str, &'a str> {
+        pairs.iter().copied().collect()
+    }
+
+    fn parent() -> &'static std::path::Path {
+        std::path::Path::new("/home/dev/projects")
+    }
+
+    #[test]
+    fn held_cell_outranks_worktree_lane_and_self_report() {
+        let s = session(
+            Some("board-trim"),
+            Some(activity(
+                Some("/home/dev/projects/wd--wt--agent-board/crates"),
+                Some("afr-1"),
+                Some("stale-lane"),
+            )),
+        );
+        let out = resolve_session_feature(
+            &cells(&[("afr-1", "agent-feature-resolution")]),
+            &[worktree("wd--wt--agent-board", Some("agent-board"))],
+            Some(parent()),
+            &s,
+        );
+        assert_eq!(out.as_deref(), Some("agent-feature-resolution"));
+    }
+
+    #[test]
+    fn worktree_directory_outranks_lane_and_self_report() {
+        let s = session(
+            Some("board-trim"),
+            Some(activity(
+                Some("/home/dev/projects/wd--wt--agent-board/crates/waggledance"),
+                None,
+                Some("stale-lane"),
+            )),
+        );
+        let out = resolve_session_feature(
+            &cells(&[]),
+            &[worktree("wd--wt--agent-board", Some("agent-board"))],
+            Some(parent()),
+            &s,
+        );
+        assert_eq!(out.as_deref(), Some("agent-board"));
+    }
+
+    #[test]
+    fn lane_outranks_self_report_when_no_cell_and_no_worktree() {
+        // cwd is the main checkout: it is inside no worktree's sibling dir.
+        let s = session(
+            Some("board-trim"),
+            Some(activity(
+                Some("/home/dev/projects/wd/crates"),
+                None,
+                Some("stale-lane"),
+            )),
+        );
+        let out = resolve_session_feature(
+            &cells(&[]),
+            &[worktree("wd--wt--agent-board", Some("agent-board"))],
+            Some(parent()),
+            &s,
+        );
+        assert_eq!(out.as_deref(), Some("board-trim"));
+    }
+
+    #[test]
+    fn activity_feature_is_the_fallback() {
+        let s = session(
+            None,
+            Some(activity(
+                Some("/home/dev/projects/wd/crates"),
+                None,
+                Some("self-reported"),
+            )),
+        );
+        let out = resolve_session_feature(&cells(&[]), &[], Some(parent()), &s);
+        assert_eq!(out.as_deref(), Some("self-reported"));
+    }
+
+    #[test]
+    fn nothing_to_go_on_resolves_to_none() {
+        let s = session(
+            None,
+            Some(activity(Some("/home/dev/projects/wd"), None, None)),
+        );
+        assert_eq!(
+            resolve_session_feature(&cells(&[]), &[], Some(parent()), &s),
+            None
+        );
+        // No activity at all is the same answer, not a panic.
+        assert_eq!(
+            resolve_session_feature(&cells(&[]), &[], Some(parent()), &session(None, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_cell_id_falls_through_instead_of_erasing_the_feature() {
+        // The claim archived out of the live buckets: the id still resolves
+        // nothing, so the ladder continues rather than reporting no feature.
+        let s = session(
+            Some("board-trim"),
+            Some(activity(
+                Some("/home/dev/projects/wd/crates"),
+                Some("archived-9"),
+                None,
+            )),
+        );
+        let out = resolve_session_feature(
+            &cells(&[("afr-1", "agent-feature-resolution")]),
+            &[],
+            Some(parent()),
+            &s,
+        );
+        assert_eq!(out.as_deref(), Some("board-trim"));
+    }
+
+    #[test]
+    fn featureless_worktree_does_not_swallow_the_lane() {
+        let s = session(
+            Some("board-trim"),
+            Some(activity(
+                Some("/home/dev/projects/wd--wt--dangling/crates"),
+                None,
+                None,
+            )),
+        );
+        let out = resolve_session_feature(
+            &cells(&[]),
+            &[worktree("wd--wt--dangling", None)],
+            Some(parent()),
+            &s,
+        );
+        assert_eq!(out.as_deref(), Some("board-trim"));
+    }
+
+    #[test]
+    fn sibling_prefix_directory_is_not_inside_the_worktree() {
+        // Component-wise containment: `…--agent-board-extra` merely starts
+        // with the worktree's name as text.
+        let s = session(
+            Some("board-trim"),
+            Some(activity(
+                Some("/home/dev/projects/wd--wt--agent-board-extra/crates"),
+                None,
+                None,
+            )),
+        );
+        let out = resolve_session_feature(
+            &cells(&[]),
+            &[worktree("wd--wt--agent-board", Some("agent-board"))],
+            Some(parent()),
+            &s,
+        );
+        assert_eq!(out.as_deref(), Some("board-trim"));
+    }
+
+    #[test]
+    fn no_parent_directory_skips_the_worktree_rung() {
+        let s = session(
+            Some("board-trim"),
+            Some(activity(
+                Some("/home/dev/projects/wd--wt--agent-board/crates"),
+                None,
+                None,
+            )),
+        );
+        let out = resolve_session_feature(
+            &cells(&[]),
+            &[worktree("wd--wt--agent-board", Some("agent-board"))],
+            None,
+            &s,
+        );
+        assert_eq!(out.as_deref(), Some("board-trim"));
     }
 }

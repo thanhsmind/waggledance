@@ -29,6 +29,10 @@ main checkout the markers are shared with every other main-checkout feature,
 and are labelled as the terminals of *this checkout* rather than the feature's
 own.
 
+Since board-pane-lane-pin (2026-08-23) a session that names its feature is
+marked on that one card only; the checkout rule above now applies just to
+terminals no session claims.
+
 ## Verify
 
 `cargo test --workspace` green at 843, up from 837. Six new tests: two on the

@@ -79,5 +79,7 @@ Backlog row "Read bee agent activity … render it in the cockpit"
 (2026-08-22); decision `eecb8505`. *Reconciled 2026-08-23:* the reader side
 is no longer queued — it was settled by decisions `77320e44` (read the
 session record and activity log directly), `3d631a7a` (pane/cwd/feature
-joins), `110d9120` (Approve only on `blocked`) and `893039ae` (transition
+joins; its feature join extended to card markers by `3daa1ea7` — *Reconciled
+2026-08-23 (board-approve-actions):* and to the pane a board Approve/Reject
+reaches), `110d9120` (Approve only on `blocked`) and `893039ae` (transition
 notifier).

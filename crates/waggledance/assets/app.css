@@ -197,10 +197,14 @@ html[data-scheme="dark"] .topbar .home {
 .agent-drawer__section:first-child { padding-top: 0; }
 .agent-drawer__item { align-items: center; gap: var(--space-2); min-height: 44px; min-width: 0; }
 .agent-drawer__item .fg-status { flex: none; }
-/* One line per row: the status pill, then what the agent is doing, clipped
-   with an ellipsis — the pane address and feature lane live on the tab the
-   row leads to (and in the row's hover title), not repeated here. */
-.agent-drawer__title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Line one: the status pill, then what the agent is doing, clipped with an
+   ellipsis. Line two, present only when bee names a feature for the pane,
+   is that feature lane in the same monospace caption the terminal tab's
+   pinned row uses — a hover title never shows on touch. The pane address
+   still lives on the tab the row leads to. */
+.agent-drawer__text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.agent-drawer__title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-drawer__feature { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono, monospace); font-size: var(--type-caption-size); line-height: var(--type-caption-leading); color: var(--color-text-subtle); }
 /* ── Pane bar menu ───────────────────────────────────────────────────
    Same shape as the bar menu above, applied to the row over a terminal
    pane: wide, the strip and the creation controls lay out as they always
