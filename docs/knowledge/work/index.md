@@ -47,6 +47,7 @@ never a generation timestamp or any other wall-clock value.
 - [projects-tab-ordering/](projects-tab-ordering/index.md) — 1 concept(s)
 - [review-p1-fixes/](review-p1-fixes/index.md) — 1 concept(s)
 - [settle-test-gaps/](settle-test-gaps/index.md) — 1 concept(s)
+- [status-wildcard-host/](status-wildcard-host/index.md) — 1 concept(s)
 - [term-url-links/](term-url-links/index.md) — 1 concept(s)
 - [terminal-approve-button/](terminal-approve-button/index.md) — 1 concept(s)
 - [terminal-attach-submit-race/](terminal-attach-submit-race/index.md) — 1 concept(s)
