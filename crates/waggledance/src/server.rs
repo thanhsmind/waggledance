@@ -3676,11 +3676,13 @@ fn apply_bee_activity(
 /// feature out of the "no worktree" bucket below) rather than failing the
 /// whole page. Every remaining pane — inside the project root but inside no
 /// worktree directory, i.e. exactly [`project_panes`] over the project's own
-/// boundary — belongs to every phase-board feature that has no worktree of
-/// its own (the cards that carry the "Main" chip,
-/// `views::bee_hub_worktree_chip`'s own rule). Only phase-board features are
-/// keyed here: Finished rows never render badges, so an archive-only
-/// feature needs no entry.
+/// boundary — is keyed by [`key_main_panes_by_feature`]
+/// (board-pane-lane-pin): a pane whose bee session names a feature goes to
+/// that one card; only a session-less pane belongs to every phase-board
+/// feature that has no worktree of its own (the cards that carry the "Main"
+/// chip, `views::bee_hub_worktree_chip`'s own rule). Only phase-board
+/// features are fanned to: Finished rows never render badges, so an
+/// archive-only feature needs no entry.
 ///
 /// `snapshot: None` (the terminal switch off, or herdr unreachable) returns
 /// an empty map with no boundary resolution and no herdr read at all — the
@@ -3725,12 +3727,109 @@ fn project_feature_panes(
     if main_panes.is_empty() {
         return out;
     }
-    for f in &rollup.snapshot.phase_board {
-        if !worktree_features.contains(f.feature.as_str()) {
-            out.insert(f.feature.clone(), main_panes.clone());
+    let main_features: Vec<&str> = rollup
+        .snapshot
+        .phase_board
+        .iter()
+        .map(|f| f.feature.as_str())
+        .filter(|f| !worktree_features.contains(f))
+        .collect();
+    for (feature, panes) in key_main_panes_by_feature(main_panes, &main_features) {
+        out.entry(feature).or_default().extend(panes);
+    }
+    out
+}
+
+/// board-pane-lane-pin: how the main checkout's panes are handed to feature
+/// cards. A pane whose bee session names a feature (`bee_feature`, i.e.
+/// `activity.feature` -- the bound lane, else the active feature) belongs to
+/// that ONE card, even when the feature is not in `main_features` (a
+/// lane-bound session working from main still lands on its own card rather
+/// than vanishing). Only a pane with no bee session behind it
+/// (`bee_feature == None`) keeps the older fan-out to every `main_features`
+/// entry -- the checkout directory is then the only thing known about it.
+/// Before this cell every main pane fanned out to every Main feature, so
+/// three Main features in one checkout each showed the same three agents.
+/// Pane order within a feature follows the input order.
+fn key_main_panes_by_feature(
+    main_panes: Vec<views::TerminalPaneView>,
+    main_features: &[&str],
+) -> std::collections::HashMap<String, Vec<views::TerminalPaneView>> {
+    let mut out: std::collections::HashMap<String, Vec<views::TerminalPaneView>> =
+        std::collections::HashMap::new();
+    for pane in main_panes {
+        match pane.bee_feature.as_deref() {
+            Some(feature) => out.entry(feature.to_string()).or_default().push(pane),
+            None => {
+                for feature in main_features {
+                    out.entry((*feature).to_string())
+                        .or_default()
+                        .push(pane.clone());
+                }
+            }
         }
     }
     out
+}
+
+#[cfg(test)]
+mod key_main_panes_by_feature_tests {
+    use super::*;
+
+    fn pane(id: &str, bee_feature: Option<&str>) -> views::TerminalPaneView {
+        views::TerminalPaneView {
+            pane_id: id.to_string(),
+            kind: "claude".to_string(),
+            name: "Claude Code".to_string(),
+            status: "idle".to_string(),
+            cwd: "/repo".to_string(),
+            workspace: "w1".to_string(),
+            tab: "t1".to_string(),
+            title: String::new(),
+            bee_state: None,
+            bee_feature: bee_feature.map(str::to_string),
+            bee_no_signal: false,
+        }
+    }
+
+    fn ids(
+        m: &std::collections::HashMap<String, Vec<views::TerminalPaneView>>,
+        f: &str,
+    ) -> Vec<String> {
+        m.get(f)
+            .map(|v| v.iter().map(|p| p.pane_id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn bound_pane_lands_on_its_own_feature_only_unbound_fans_out() {
+        let panes = vec![
+            pane("w1:p1", Some("alpha")),
+            pane("w1:p2", Some("beta")),
+            pane("w1:p3", None),
+        ];
+        let out = key_main_panes_by_feature(panes, &["alpha", "beta", "gamma"]);
+        assert_eq!(ids(&out, "alpha"), vec!["w1:p1", "w1:p3"]);
+        assert_eq!(ids(&out, "beta"), vec!["w1:p2", "w1:p3"]);
+        assert_eq!(ids(&out, "gamma"), vec!["w1:p3"]);
+    }
+
+    #[test]
+    fn bound_pane_off_the_main_set_still_keys_its_own_feature() {
+        let out = key_main_panes_by_feature(vec![pane("w1:p1", Some("lane-x"))], &["alpha"]);
+        assert_eq!(ids(&out, "lane-x"), vec!["w1:p1"]);
+        assert!(!out.contains_key("alpha"));
+    }
+
+    #[test]
+    fn all_bound_panes_never_fan_out() {
+        let out = key_main_panes_by_feature(
+            vec![pane("w1:p1", Some("alpha")), pane("w1:p2", Some("alpha"))],
+            &["alpha", "beta"],
+        );
+        assert_eq!(ids(&out, "alpha"), vec!["w1:p1", "w1:p2"]);
+        assert!(!out.contains_key("beta"));
+    }
 }
 
 /// D5's partition: every herdr pane whose working directory sits under **no**

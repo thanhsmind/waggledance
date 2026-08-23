@@ -410,20 +410,22 @@ blocked; the quiet ones move inside the card's expandable body, and the card
 states how many it folded away so a closed card never understates what is
 behind it. Finished rows carry none.
 
-Which sessions those are is decided by the checkout, not by the feature, because
-nothing in the record ties a session to a feature: a session knows which feature
-it is working, but not which terminal it occupies, and a terminal knows which
-directory it sits in, but not which feature. The directory is the only thing both
-sides share. So:
+Which sessions those are is decided first by the session, then by the checkout.
+A session's own activity record names the feature it is working (its bound lane,
+else the project's active feature) and the terminal it occupies, so a session
+that speaks is marked on that one feature's card and on no other — even when it
+runs in the project's main checkout beside sessions working other features. Only
+a terminal no session claims — a shell, an agent bee never saw — falls back to
+the checkout directory, the one thing both sides share. So:
 
 - A feature with its own branch checkout is marked with the sessions running
   inside that checkout, and with no others. For such a feature the marking is
   exact.
 - A feature working in the project's main checkout is marked with the sessions
-  running there and in no branch checkout — which every other main-checkout
-  feature of that project shares. The markers are therefore labelled as the
-  terminals of *this checkout*, never as the feature's own; claiming otherwise
-  would be a lie the reader could not check.
+  there that name it, plus the unclaimed terminals of that checkout — which
+  every other main-checkout feature of that project shares. The markers are
+  therefore still labelled as the terminals of *this checkout*, never as the
+  feature's own; the unclaimed share keeps that label honest.
 
 A feature with no session in its checkout shows no marker and no empty frame for
 them. When the terminal switch is off, or the session host cannot be reached or
