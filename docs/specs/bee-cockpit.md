@@ -80,7 +80,10 @@ project.
    it appears. A refusal — nothing typed, an unknown project, a project not set
    up with bee, or bee itself refusing — shows inline under the task box and
    keeps the typed text. On a handset both buttons hide; the bottom tab bar
-   carries the board instead.
+   carries the board instead. That bar is folded away by default — a small
+   handle on the bottom edge shows or hides it, and the choice is remembered
+   per browser (`localStorage["waggledance-tabbar-open"]`); with scripting
+   off the bar stays visible and the handle never appears.
 2. The **left rail**, described below. It is the same rail on the board and on
    the terminals view, so reaching another agent, or another project, never
    depends on which of the two a reader happens to be looking at.
