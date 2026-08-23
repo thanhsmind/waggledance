@@ -855,9 +855,10 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
             } else {
                 cross_project_rollup(st.bee_cache.clone(), bee_projects).await
             };
+            let herdr_sessions = herdr_session_ids(snapshot.as_ref());
             let bee_by_project: std::collections::HashMap<String, ProjectBeeActivity> = rollups
                 .iter()
-                .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r)))
+                .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r, &herdr_sessions)))
                 .collect();
             // A3: every pane list this page already built from herdr now
             // carries bee's own reading where a live session claims the
@@ -1191,19 +1192,25 @@ async fn api_agents(State(st): State<AppState>) -> Response {
         .filter(|p| is_bee_project(p))
         .cloned()
         .collect();
+    // herdr first: its hosted session ids are the second liveness witness
+    // `project_bee_activity` joins on, so the snapshot has to exist before
+    // the bee join runs. herdr down still answers `herdr_down_response`
+    // with no rollup read at all.
+    let snapshot = match st.herdr.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return herdr_down_response(),
+    };
+    let herdr_sessions = herdr_session_ids(Some(&snapshot));
     let bee: std::collections::HashMap<String, ProjectBeeActivity> = if bee_projects.is_empty() {
         std::collections::HashMap::new()
     } else {
         cross_project_rollup(st.bee_cache.clone(), bee_projects)
             .await
             .iter()
-            .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r)))
+            .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r, &herdr_sessions)))
             .collect()
     };
-    match st.herdr.snapshot().await {
-        Ok(snapshot) => Json(json!(agent_pane_rows(&snapshot, &projects, &bee))).into_response(),
-        Err(_) => herdr_down_response(),
-    }
+    Json(json!(agent_pane_rows(&snapshot, &projects, &bee))).into_response()
 }
 
 async fn api_config(State(st): State<AppState>) -> impl IntoResponse {
@@ -2051,7 +2058,11 @@ async fn bee_board(State(st): State<AppState>, Path(id): Path<String>) -> Respon
     // every badge this board draws, and the feature map is what a card's own
     // agent line and the widened need-you count read (A3/A6). Both come off
     // the rollup this route already has, so the board makes no extra read.
-    let bee = project_bee_activity(&project, &rollup);
+    let bee = project_bee_activity(
+        &project,
+        &rollup,
+        &herdr_session_ids(herdr_snapshot.as_ref()),
+    );
     let feature_panes = project_feature_panes(herdr_snapshot.as_ref(), &project, &rollup, &bee);
     Html(views::bee_board_page(
         &project,
@@ -3612,6 +3623,21 @@ fn resolve_session_feature(
 /// ([`project_panes`]) — the project root plus each granted worktree's own
 /// sibling directory beside it, exactly the set
 /// [`project_feature_panes`] resolves for its own per-feature boundaries.
+/// The session ids herdr currently hosts — every `agents[]` entry carrying
+/// an `agent_session.value` — for [`project_bee_activity`]'s second
+/// liveness witness. No snapshot (herdr down, badges off) is an empty set:
+/// the heartbeat then decides alone, exactly as before.
+fn herdr_session_ids(snapshot: Option<&herdr::Snapshot>) -> std::collections::HashSet<String> {
+    snapshot
+        .map(|s| {
+            s.agents
+                .iter()
+                .filter_map(|a| a.session_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One `Boundary` over all of them rather than one per worktree: this join
 /// only decides membership; WHICH feature a session belongs to is then
 /// resolved by [`resolve_session_feature`], for which the worktree
@@ -3623,12 +3649,23 @@ fn resolve_session_feature(
 /// IS joined — its state still reads, muted — since A3 makes the muting a
 /// rendering rule, never a filter.
 ///
+/// Live has TWO witnesses, and either suffices. The heartbeat is bee's own
+/// (`SESSION_LIVE_MINUTES`); `herdr_sessions` is herdr's — the session ids
+/// herdr's `agents[]` currently hosts (`Agent::session_id`). A session
+/// blocked on a gate question fires no hook event for as long as the human
+/// is away, so its heartbeat alone ages out inside the hour and the pane
+/// would fall back to herdr's screen status, which reads that dialog as
+/// `idle`. herdr still listing the session id is process-level proof the
+/// agent is there, so the record keeps speaking — its `blocked` stays on
+/// the pane until the answer lands.
+///
 /// `cwd` is an unscrubbed absolute path and is used here for nothing but
 /// this boundary check and [`resolve_session_feature`]'s worktree match;
 /// it never reaches a view.
 fn project_bee_activity(
     project: &waggledance_core::domain::Project,
     rollup: &waggledance_core::bee::BeeProjectRollup,
+    herdr_sessions: &std::collections::HashSet<String>,
 ) -> ProjectBeeActivity {
     let snapshot = &rollup.snapshot;
     let mut roots = vec![project.root_path.clone()];
@@ -3667,7 +3704,7 @@ fn project_bee_activity(
 
     let mut out = ProjectBeeActivity::empty();
     for session in &snapshot.sessions {
-        if !session.live {
+        if !session.live && !herdr_sessions.contains(&session.id) {
             continue;
         }
         let Some(activity) = session.activity.as_ref() else {
@@ -26030,6 +26067,89 @@ mod bee_route_tests {
         .to_string()
     }
 
+    /// A session blocked on a gate question fires no hook event while the
+    /// human is away, so its heartbeat alone ages past `SESSION_LIVE_MINUTES`
+    /// inside the hour. herdr still listing the session id
+    /// (`agent_session.value`) is the second liveness witness: the record
+    /// keeps speaking and its `blocked` stays on the pane, instead of the
+    /// pane falling back to herdr's own `idle` reading of that dialog.
+    #[tokio::test]
+    async fn bee_agent_activity_heartbeat_stale_session_stays_blocked_while_herdr_hosts_it() {
+        let dir = fresh_root("bee-activity-hosted-data");
+        enable_terminal(&dir);
+        let root = fresh_root("bee-activity-hosted-project");
+        quiet_in_progress_lane(&root, "hosted-feat", "hf-1");
+        let mut record: serde_json::Value = serde_json::from_str(&activity_session_json(
+            "stale-blocked",
+            "blocked",
+            &rfc3339_minutes_ago(45),
+            Some("w1:p1"),
+            &root,
+            Some("hosted-feat"),
+            Some("hf-1"),
+        ))
+        .unwrap();
+        record["last_heartbeat"] = serde_json::Value::String(rfc3339_minutes_ago(45));
+        write(&root, ".bee/sessions/stale-blocked.json", &record.to_string());
+
+        let mut st = build_state_with_dir(&dir);
+        let mut snap = one_agent_snapshot(&root, "w1:p1", herdr::AgentStatus::Idle);
+        snap.agents[0].session_id = Some("stale-blocked".to_string());
+        st.herdr = std::sync::Arc::new(StaticSnapshotHerdr { snap });
+        let project = register(&st, &root, "bee-activity-hosted");
+        let app = router(st);
+
+        let board = get_body(&app, &format!("/p/{}/_bee", project.id)).await;
+        assert!(
+            board.contains(
+                r#"<span class="fg-status fg-status--blocked"><span class="fg-status__dot"></span>needs approval</span>"#
+            ),
+            "herdr hosting the session id keeps a heartbeat-stale blocked record on its pane: {board}"
+        );
+        assert!(
+            board.contains(
+                r#"<span class="bee-hub__stat-num">1</span><span class="bee-hub__stat-label">need you</span>"#
+            ),
+            "the hosted session still counts as need-you: {board}"
+        );
+    }
+
+    /// The heartbeat-only reading, unchanged: the same stale record with NO
+    /// herdr agent carrying its session id is history, and the pane reads
+    /// herdr's own status.
+    #[tokio::test]
+    async fn bee_agent_activity_heartbeat_stale_session_herdr_does_not_host_falls_back_to_herdr() {
+        let dir = fresh_root("bee-activity-unhosted-data");
+        enable_terminal(&dir);
+        let root = fresh_root("bee-activity-unhosted-project");
+        quiet_in_progress_lane(&root, "unhosted-feat", "uf-1");
+        let mut record: serde_json::Value = serde_json::from_str(&activity_session_json(
+            "stale-blocked",
+            "blocked",
+            &rfc3339_minutes_ago(45),
+            Some("w1:p1"),
+            &root,
+            Some("unhosted-feat"),
+            Some("uf-1"),
+        ))
+        .unwrap();
+        record["last_heartbeat"] = serde_json::Value::String(rfc3339_minutes_ago(45));
+        write(&root, ".bee/sessions/stale-blocked.json", &record.to_string());
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = std::sync::Arc::new(StaticSnapshotHerdr {
+            snap: one_agent_snapshot(&root, "w1:p1", herdr::AgentStatus::Idle),
+        });
+        let project = register(&st, &root, "bee-activity-unhosted");
+        let app = router(st);
+
+        let board = get_body(&app, &format!("/p/{}/_bee", project.id)).await;
+        assert!(
+            !board.contains("needs approval"),
+            "a heartbeat-stale session nobody hosts is history, never need-you: {board}"
+        );
+    }
+
     /// One herdr pane in `root`, backed by an agent whose own screen-derived
     /// status is `status` — deliberately settable, so a test can hand herdr
     /// a status bee's own record must override (A3).
@@ -26070,6 +26190,7 @@ mod bee_route_tests {
                 name: "agent-1".into(),
                 status,
                 title: "reading views.rs".into(),
+                session_id: None,
             }],
             focused_pane_id: Some(pane_id.to_string()),
             ..herdr::Snapshot::default()

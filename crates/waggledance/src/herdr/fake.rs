@@ -504,6 +504,7 @@ impl FakeHerdr {
             // that it finished starting.
             status: AgentStatus::Idle,
             title: String::new(),
+            session_id: None,
         });
         snap.panes.push(Pane {
             pane_id: pane_id.clone(),
@@ -540,6 +541,7 @@ fn agent(pane_id: &str, kind: &str, name: &str, status: AgentStatus, title: &str
         name: name.into(),
         status,
         title: title.into(),
+        session_id: None,
     }
 }
 
