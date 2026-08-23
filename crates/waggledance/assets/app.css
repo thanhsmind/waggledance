@@ -416,13 +416,18 @@ html[data-scheme="dark"] .topbar .home {
   white-space: nowrap;
 }
 .topbar__orchestrator--on {
-  background: var(--color-action);
-  color: var(--color-on-action);
+  /* board-topbar-polish: a quiet filled pill — an ink wash on the bar's own
+     surface, not the chalk action fill, which glared against the dark
+     console next to the ghost buttons beside it. The shape still says
+     "you are here"; the colour no longer shouts it. */
+  background: color-mix(in srgb, var(--color-text) 10%, transparent);
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
   font-weight: var(--weight-semibold);
 }
 .topbar__orchestrator--on:hover {
-  background: var(--color-action-hover);
-  color: var(--color-on-action);
+  background: color-mix(in srgb, var(--color-text) 14%, transparent);
+  color: var(--color-text);
 }
 
 /* agents-toggle-circle: circular icon button that opens the global agent
@@ -1946,6 +1951,10 @@ html[data-scheme="dark"] .topbar .home {
 .task-box__input {
   width: 100%;
   box-sizing: border-box;
+  /* A writing area, not a one-line field: `.fg-input--area` lifts the
+     fixed input height; this floor keeps several lines visible before
+     the reader has to drag the corner. */
+  min-height: 7.5rem;
   resize: vertical;
 }
 .task-box__hint {
