@@ -1646,12 +1646,22 @@ async fn feature_bound_panes(
 ///
 /// Never a shell pane: this line is a message to an agent, and a shell would
 /// execute it as a command.
+///
+/// bap-3: the D7 family switch is checked first, the same rule every other
+/// pane write in this file follows (`terminal_input`,`terminal_keys`). With
+/// the switch off there is no pane channel at all, so there is nobody to
+/// wake — `false`, and no herdr call is made. The gate above is already
+/// written and stays written: turning the terminal off must not cost a
+/// human their gate answer, it only costs the wake-up line.
 async fn wake_feature_pane(
     st: &AppState,
     project: &waggledance_core::domain::Project,
     feature: &str,
     line: &str,
 ) -> bool {
+    if !terminal_family_enabled(st) {
+        return false;
+    }
     let panes = feature_bound_panes(st, project, feature).await;
     let Some(pane) = panes.iter().find(|p| p.kind != "shell") else {
         return false;
@@ -1746,12 +1756,23 @@ async fn bee_action_gate(
 /// byte what `assets/app.js`'s terminal Approve button posts. Reject sends
 /// the herdr key `escape` — the dismissal a human presses at the prompt —
 /// through the same channel `/keys` uses.
+///
+/// bap-3: because the answer IS a keystroke into a pane, this half is a
+/// terminal route in everything but its path, and it answers the D7 family
+/// switch exactly as `POST /p/:id/_terminal/:pane_id/input` does — the same
+/// reasoned JSON 404 ([`terminal_disabled_json_404`]), so the board cannot
+/// become a second, unswitched way to type into somebody's agent. Unlike
+/// the gate half there is nothing to keep: with no pane channel there is no
+/// answer to give at all.
 async fn bee_action_permission(
     st: &AppState,
     project: &waggledance_core::domain::Project,
     feature: &str,
     approve: bool,
 ) -> Response {
+    if !terminal_family_enabled(st) {
+        return terminal_disabled_json_404();
+    }
     let panes = feature_bound_panes(st, project, feature).await;
     let Some(pane) = panes.iter().find(|p| {
         p.kind != "shell"
@@ -18531,6 +18552,13 @@ mod bee_route_tests {
             "the row itself must still render when herdr is down: {body}"
         );
         let page = without_new_task_dialog(&body);
+        // bap-3: `.bee-hub__actions-error` is a CSS selector in the page's
+        // inlined stylesheet — the rule for the span a refusal WOULD be
+        // written into, never a refusal itself. Dropped before the substring
+        // check for the same reason the New task dialog is dropped above:
+        // this assertion reads what a human would see on the page, not the
+        // sheet that styles what they might one day see.
+        let page = page.replace(".bee-hub__actions-error", "");
         assert!(
             !page.to_lowercase().contains("error"),
             "a down herdr must never surface a raw error on the home page: {page}"
@@ -26793,7 +26821,10 @@ mod bee_route_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(!error_of(resp).await.is_empty(), "the 400 must say something");
+        assert!(
+            !error_of(resp).await.is_empty(),
+            "the 400 must say something"
+        );
         assert!(
             !log.exists(),
             "an unknown kind must never reach the project's bee at all"
@@ -27003,5 +27034,397 @@ mod bee_route_tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// bap-3, the must-have: with the D7 terminal family switched OFF, a
+    /// gate click still writes the gate — the human's answer is bee's to
+    /// keep, not the terminal's — and honestly reports that nobody was
+    /// woken. The pane is right there and live; what is off is the channel,
+    /// so nothing is sent through it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bee_action_gate_writes_the_gate_and_wakes_nobody_with_the_terminal_family_off() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("action-off-wake-cfg");
+        // Deliberately NO `enable_terminal(&dir)`: this is the switch-off
+        // twin of `bee_action_gate_wakes_the_features_own_agent_pane`.
+        let root = fresh_root("action-off-wake-root");
+        let log = fresh_root("action-off-wake-log").join("argv");
+        write_cross_project_live_feature(&root, "feat-off", "live-off");
+        fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        let pane = fake
+            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .await
+            .unwrap();
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "action-off-wake");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let before = pane_screen(&st, &pane.pane_id).await;
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "uat-approve", "feat-off"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = action_json(resp).await;
+        assert_eq!(
+            json["ok"], true,
+            "the gate answer is bee's, and the terminal switch never withholds it: {json}"
+        );
+        assert_eq!(
+            json["woke"], false,
+            "with no pane channel there is nobody to wake, and the answer must say so: {json}"
+        );
+
+        let (_, argv) = recorded(&log);
+        assert_eq!(
+            argv,
+            vec![
+                "gate",
+                "--name",
+                "uat",
+                "--approved",
+                "true",
+                "--lane",
+                "feat-off",
+                "--json",
+            ],
+            "the gate is written exactly as it is with the terminal on"
+        );
+        assert_eq!(
+            pane_screen(&st, &pane.pane_id).await,
+            before,
+            "the switch is off: not one byte may reach the pane"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// bap-3, the must-have's other half: a permission answer IS a keystroke
+    /// into somebody's agent, so with the D7 family switched off the board
+    /// gives the very same refusal `POST …/_terminal/:pane_id/input` gives —
+    /// a JSON 404 naming the reason — rather than becoming a second,
+    /// unswitched way to type into a pane. The agent is blocked and waiting,
+    /// which is exactly the case that would otherwise have gone through.
+    #[tokio::test]
+    async fn bee_action_permission_answers_the_input_routes_404_with_the_terminal_family_off() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("action-off-perm-cfg");
+        // No `enable_terminal(&dir)` — the switch-off twin of
+        // `bee_action_permission_answers_the_blocked_pane_the_card_shows`.
+        let root = fresh_root("action-off-perm-root");
+        write_cross_project_live_feature(&root, "feat-off-perm", "live-off-perm");
+
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        let pane = fake
+            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .await
+            .unwrap();
+        write(
+            &root,
+            ".bee/sessions/live-off-blocked.json",
+            &activity_session_json(
+                "live-off-blocked",
+                "blocked",
+                &rfc3339_seconds_ago(3),
+                Some(&pane.pane_id),
+                &root,
+                Some("feat-off-perm"),
+                None,
+            ),
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "action-off-perm");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let before = pane_screen(&st, &pane.pane_id).await;
+        let resp = router(st.clone())
+            .oneshot(action_req(
+                &project.id,
+                "permission-approve",
+                "feat-off-perm",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "the pane half must refuse exactly as the /input route does"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("the agent terminal is disabled"),
+            "the refusal must carry the /input route's own reason, as JSON: {body}"
+        );
+        assert_eq!(
+            pane_screen(&st, &pane.pane_id).await,
+            before,
+            "a blocked agent's pane must be left untouched while the switch is off"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// bap-3, over the vendored client source `views::APP_JS` (the same
+    /// grep-based proof shape the terminal poller tests above use — the card
+    /// handler has no test runtime of its own): D2's split is what this
+    /// pins. A `uat`/`gate` pair must reach a confirm naming the feature
+    /// before anything is posted; a `permission` pair must not. Swapping the
+    /// two branches — or reaching for `window.confirm`, which cannot name
+    /// the feature in the board's own voice — fails here.
+    #[test]
+    fn the_card_action_handler_confirms_a_gate_and_posts_a_permission_at_once() {
+        let js = views::APP_JS;
+        let start = js
+            .find("if (!document.querySelector(\".bee-hub__actions\")) return;")
+            .expect("the card-action handler must bind only where a pair renders");
+        // Bounded to this handler's own source: the blocks that follow it in
+        // this file poll on timers, and an unbounded slice would let their
+        // `setInterval` satisfy the no-new-poll assertion below.
+        let end = js[start..]
+            .find("// Terminal settings (Settings page")
+            .map(|i| start + i)
+            .expect("the handler is followed by the terminal settings block");
+        let block = &js[start..end];
+
+        assert!(
+            block.contains("\"Approve UAT for \" + f + \"?\"")
+                && block.contains("\"Unapprove the shape+execution gate for \" + f + \"?\""),
+            "D2: the confirm must name the feature and the gate it answers"
+        );
+        assert!(
+            !block.contains("window.confirm(") && !block.contains("alert("),
+            "D2's dialog is the board's own, never a native modal: {block}"
+        );
+
+        // The one dispatch point: a kind with confirm words asks first, a
+        // kind without them (the permission prompt) posts immediately.
+        let dispatch_at = block
+            .find("var words = CONFIRM[kind];")
+            .expect("the click handler must decide by kind");
+        let dispatch = &block[dispatch_at..];
+        let immediate = dispatch
+            .find("if (!words) {")
+            .expect("the no-confirm branch must exist");
+        let asks = dispatch
+            .find("askConfirm(")
+            .expect("the confirm branch must exist");
+        assert!(
+            immediate < asks,
+            "the permission (no-confirm) branch must be the one that fires without asking"
+        );
+        assert!(
+            dispatch[immediate..asks].contains("fire(box, kind, approved, btn);"),
+            "a permission click posts at once: {}",
+            &dispatch[immediate..asks]
+        );
+
+        // The post itself: the bap-1 route, the bap-1 body shape, the bap-2
+        // data attributes, and the in-flight lock that outlives it.
+        assert!(
+            block.contains("\"/p/\" + encodeURIComponent(project) + \"/_bee/actions\""),
+            "the handler must post to the board-action route"
+        );
+        assert!(
+            block.contains("kind: kind + (approved ? \"-approve\" : \"-reject\")"),
+            "the body must carry the route's own kind spelling"
+        );
+        assert!(
+            block.contains("box.getAttribute(\"data-action-feature\")")
+                && block.contains("box.getAttribute(\"data-action-project\")")
+                && block.contains("box.getAttribute(\"data-action-kind\")"),
+            "the click must read the three attributes bee_hub_action_pair renders"
+        );
+        assert!(
+            block.contains("b.disabled = true;") && block.contains("btn.textContent = \"…\";"),
+            "both buttons lock and the clicked one says it is in flight"
+        );
+        assert!(
+            block.contains("box.setAttribute(\"data-fired\", \"1\");")
+                && block.contains("if (box.getAttribute(\"data-fired\")) return;"),
+            "a card answers at most once per page load"
+        );
+        assert!(
+            block.contains("bee-hub__actions-error"),
+            "a refusal surfaces the server's own words in the container's error span"
+        );
+        assert!(
+            !block.contains("setInterval") && !block.contains("setTimeout"),
+            "the card's answer arrives on the existing /ws reload, never a new poll"
+        );
+    }
+
+    /// bap-3: an approval writes `.bee/lanes/<feature>.json` (and the
+    /// session record in `.bee/state.json`) — never markdown — so the home
+    /// board's reload filter must count those as board-relevant, or the card
+    /// a human just answered keeps showing the stop they cleared.
+    #[test]
+    fn the_home_board_reload_filter_counts_bee_state_as_board_relevant() {
+        let js = views::APP_JS;
+        let start = js
+            .find("function isBoardRelevant(changedEntry) {")
+            .expect("the home board's reload filter must exist");
+        let end = js[start..]
+            .find("function shouldReload(")
+            .map(|i| start + i)
+            .expect("the filter is followed by shouldReload");
+        let filter = &js[start..end];
+        assert!(
+            filter.contains("rel.indexOf(\"docs/history/\") === 0"),
+            "the docs/history rule stays: {filter}"
+        );
+        assert!(
+            filter.contains("rel.indexOf(\".bee/lanes/\") === 0"),
+            "a lane file is what a gate approval moves: {filter}"
+        );
+        assert!(
+            filter.contains("rel === \".bee/state.json\""),
+            "the session/waiting-on record decides what a card badges: {filter}"
+        );
+    }
+
+    /// Write `<root>/.bee/bin/bee` as an executable script that does what a
+    /// `bee gate --name uat --approved true --lane <f>` actually does: flip
+    /// that lane file's own `approved_gates`. `fake_bee` above records argv
+    /// and writes nothing, which is right for proving the spawn — this one
+    /// exists for the one test that has to see the BOARD change afterwards,
+    /// and it is the only writer of that lane file in the run.
+    #[cfg(unix)]
+    fn gate_writing_bee(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join(".bee").join("bin").join("bee");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        let script = "#!/bin/sh\n\
+             lane=''\n\
+             prev=''\n\
+             for a in \"$@\"; do\n\
+               if [ \"$prev\" = '--lane' ]; then lane=\"$a\"; fi\n\
+               prev=\"$a\"\n\
+             done\n\
+             f=\".bee/lanes/$lane.json\"\n\
+             if [ -n \"$lane\" ] && [ -f \"$f\" ]; then\n\
+               sed 's/\"execution\": true/\"execution\": true, \"uat\": true/' \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"\n\
+             fi\n\
+             printf '{\"ok\":true}\\n'\n";
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// bap-3's own verify, end to end over the board a human actually reads:
+    /// a Ready to merge row saying `uat pending` carries the pair; the click
+    /// that pair posts reaches the project's own bee; and the very next
+    /// render of the same board says `uat approved` and offers nothing more
+    /// to press. Nothing is stubbed between the POST and the second read —
+    /// the lane file the first render read is the file bee rewrote.
+    ///
+    /// This is the daemon-and-browser run expressed at the HTTP layer: the
+    /// same axum router the daemon serves, the same store files on disk, the
+    /// same route the button posts to. What it deliberately does not cover
+    /// is the click itself (`assets/app.js` has no test runtime in this
+    /// crate) — that path is pinned by the grep tests above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approving_uat_from_the_board_re_renders_the_card_as_uat_approved() {
+        let root = fresh_root("board-uat-round-trip");
+        write(
+            &root,
+            ".bee/lanes/bap-demo.json",
+            &lane_json(
+                "bap-demo",
+                "swarming",
+                "standard",
+                "merge the worktree",
+                Some(r#""context": true, "shape": true, "execution": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/c1.json",
+            &merge_cell_json("c1", "bap-demo", "capped", Some("2026-08-22T10:00:00Z")),
+        );
+        let sibling = make_worktree_sibling("board-uat-round-trip-wt");
+        write(
+            &sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"bap-demo","mode":"standard"}"#,
+        );
+        write(
+            &root,
+            ".bee/runtime/worktree-grants.json",
+            &grants_json(&["board-uat-round-trip-wt"]),
+        );
+        write(
+            &root,
+            ".bee/runtime/workspaces/bap.json",
+            &workspace_json(
+                "board-uat-round-trip-wt",
+                &sibling.to_string_lossy(),
+                "wt/bap-demo",
+                &[],
+            ),
+        );
+        gate_writing_bee(&root);
+
+        let st = build_state();
+        let project = register(&st, &root, "board-uat-round-trip");
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
+
+        let before =
+            body_string(get(router(st.clone()), &format!("/p/{}/_bee", project.id)).await).await;
+        // The rendered span, never the bare words: the page's own inlined
+        // stylesheet names both readings in a comment, so a substring test
+        // on "uat pending" is green whatever the row actually says.
+        assert!(
+            before.contains(r#"bee-hub__merge-uat--pending">uat pending"#),
+            "the fixture must start on the uat stop: {before}"
+        );
+        assert!(
+            before.contains(r#"data-action-feature="bap-demo" data-action-kind="uat""#),
+            "a uat-pending row must carry the pair, keyed to its own feature: {before}"
+        );
+
+        let resp = router(st.clone())
+            .oneshot(action_req(&project.id, "uat-approve", "bap-demo"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(action_json(resp).await["ok"], true);
+        assert!(
+            std::fs::read_to_string(root.join(".bee/lanes/bap-demo.json"))
+                .unwrap()
+                .contains(r#""uat": true"#),
+            "the project's own bee is what wrote the gate"
+        );
+
+        let after = body_string(get(router(st), &format!("/p/{}/_bee", project.id)).await).await;
+        assert!(
+            after.contains(r#"bee-hub__merge-uat--approved">uat approved"#)
+                && !after.contains(r#"bee-hub__merge-uat--pending">uat pending"#),
+            "the next render of the same board must read the gate the click wrote: {after}"
+        );
+        assert!(
+            !after.contains("data-action-feature="),
+            "with the stop cleared there is nothing left to press: {after}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&sibling).ok();
     }
 }

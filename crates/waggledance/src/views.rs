@@ -3005,6 +3005,14 @@ fn bee_hub_style() -> String {
    the card never reflows mid-answer -- only its weight drops, the same
    withheld-Approve reading `.term-reply__approve:disabled` already uses. */
 .bee-hub__action:disabled { opacity: .5; cursor: not-allowed; }
+/* The refusal the server sent back, in bee's own words (assets/app.js
+   appends this span on a non-2xx, and the pair comes back enabled beside
+   it). `flex-basis: 100%` gives it its own line under the buttons instead
+   of squeezing them, and it lives inside the container so the message sits
+   with the card it belongs to -- never a page-level banner a reader has to
+   connect back to a feature. Same two tokens the New task dialog's own
+   refusal line uses (app.css), for the same reason. */
+.bee-hub__actions-error { flex-basis: 100%; color: var(--color-danger); font-size: var(--type-caption-size); }
 /* card-collapse-inprogress D1/D3/D6: the collapsed header row -- name plus
    chevron -- is the details element's own `<summary>`, native to the
    `<details>`/`<summary>` disclosure this card now uses (no JS, no
@@ -16496,6 +16504,27 @@ mod tests {
         assert!(
             css.contains(".bee-hub__action:disabled { opacity: .5; cursor: not-allowed; }"),
             "the in-flight reading is the withheld-Approve reading already in use: {css}"
+        );
+    }
+
+    /// bap-3: the refusal `assets/app.js` appends when the route says no
+    /// needs a rule of its own beside the pair's, or bee's own words render
+    /// as unstyled body text squeezed between the two buttons.
+    #[test]
+    fn bee_hub_style_carries_the_action_refusal_span() {
+        let css = bee_hub_style();
+        let rule = css
+            .split(".bee-hub__actions-error {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the pair's stylesheet must carry a .bee-hub__actions-error rule");
+        assert!(
+            rule.contains("flex-basis: 100%"),
+            "the message takes its own line rather than squeezing the pair: {rule}"
+        );
+        assert!(
+            rule.contains("color: var(--color-danger)"),
+            "a refusal reads as one: {rule}"
         );
     }
 
