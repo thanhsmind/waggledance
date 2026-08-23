@@ -125,10 +125,13 @@ project that carries a `.bee/` store, so you see the whole colony before you pic
 Cross-project cards mark which features have a terminal session running in their checkout,
 and link straight to it.
 
-**The board never writes.** It approves no gate, claims no cell, edits no backlog item,
-ends no session — and the daemon verifies that by comparing each project's store
-byte-for-byte before and after every request. Approving a gate is still something you do
-where the agent is, deliberately. The board only makes sure you know it's waiting.
+**The board relays; it never decides.** It writes in exactly two ways — through the
+project's own `bee` CLI, or as one line into a herdr pane — and only on an explicit human
+click, in a project where you switched board actions on in settings. Three answers live on
+a feature card: approve or reject the UAT gate, the merged shape+execution gate, or an
+agent's permission prompt. The board carries your decision there and mirrors what came
+back; it originates none of its own. A project without the switch shows only the badge
+that says something is waiting on you.
 
 ---
 

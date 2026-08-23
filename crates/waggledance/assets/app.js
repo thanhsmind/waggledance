@@ -897,6 +897,197 @@
     });
   })();
 
+  // board-approve-actions (D1/D2/D4): the Approve + Reject pair a feature
+  // card carries for its current human stop. `views.rs`
+  // (`bee_hub_action_pair`) renders it as inert markup — two buttons under a
+  // `.bee-hub__actions` container carrying `data-action-feature`,
+  // `data-action-kind` and `data-action-project` — so everything a click
+  // MEANS lives here, in one delegated handler both boards share.
+  //
+  // Delegated on `document` rather than bound per container: the home board
+  // renders one pair per stopped feature across every project, and both
+  // boards reload wholesale on a `/ws` change, so a per-element bind would
+  // be re-done on every render for no gain.
+  //
+  // The board decides nothing (D5). It posts the click to
+  // `/p/<project>/_bee/actions` and waits for the page's own reload to show
+  // what came of it — there is no second refresh channel here, no poll.
+  (function () {
+    if (!document.querySelector(".bee-hub__actions")) return;
+
+    function postJson(url, body) {
+      return fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
+
+    // D2: a gate is an irreversible stop, so approving or rejecting one asks
+    // first, naming the feature and the gate; a permission prompt is the
+    // one-click answer the terminal's own Approve button already is.
+    var CONFIRM = {
+      uat: {
+        approve: function (f) { return "Approve UAT for " + f + "?"; },
+        reject: function (f) { return "Unapprove the UAT gate for " + f + "?"; },
+      },
+      gate: {
+        approve: function (f) {
+          return "Approve the shape+execution gate for " + f + "?";
+        },
+        reject: function (f) {
+          return "Unapprove the shape+execution gate for " + f + "?";
+        },
+      },
+    };
+
+    // The dialog is built once, on the first gate click, rather than
+    // server-rendered like the New task overlay. That one is markup-always
+    // because the server knows something the client cannot (the project
+    // list); this one's only variable is the feature name the clicked card
+    // is already carrying, so there is nothing to render ahead of time. It
+    // reuses that dialog's own classes and keying verbatim
+    // (`.task-overlay`/`.task-box`, scrim mousedown, Escape, Cancel), so a
+    // confirm on the board reads as the same surface as the New task box.
+    // Never `window.confirm`: a native modal blocks the whole page and
+    // cannot say which feature in the board's own voice.
+    var overlay = null;
+    var titleEl = null;
+    var okBtn = null;
+    var cancelBtn = null;
+    var pending = null;
+
+    function closeConfirm() {
+      if (overlay) overlay.hidden = true;
+      pending = null;
+    }
+
+    function buildConfirm() {
+      overlay = document.createElement("div");
+      overlay.className = "task-overlay";
+      overlay.setAttribute("data-bee-action-confirm", "");
+      overlay.hidden = true;
+      overlay.innerHTML =
+        '<div class="task-box" role="dialog" aria-modal="true">' +
+        '<h2 class="task-box__title" data-confirm-title></h2>' +
+        '<p class="task-box__sub">This answers the stop the feature is waiting on.</p>' +
+        '<div class="task-box__actions">' +
+        '<button type="button" class="fg-btn fg-btn--ghost" data-confirm-cancel>Cancel</button>' +
+        '<button type="button" class="fg-btn fg-btn--primary" data-confirm-ok>Confirm</button>' +
+        "</div></div>";
+      document.body.appendChild(overlay);
+      titleEl = overlay.querySelector("[data-confirm-title]");
+      okBtn = overlay.querySelector("[data-confirm-ok]");
+      cancelBtn = overlay.querySelector("[data-confirm-cancel]");
+      cancelBtn.addEventListener("click", closeConfirm);
+      okBtn.addEventListener("click", function () {
+        var go = pending;
+        closeConfirm();
+        if (go) go();
+      });
+      // The scrim itself, never a press that started inside the box — the
+      // same identity check the New task overlay uses.
+      overlay.addEventListener("mousedown", function (e) {
+        if (e.target === overlay) closeConfirm();
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && overlay && !overlay.hidden) closeConfirm();
+      });
+    }
+
+    function askConfirm(question, run) {
+      if (!overlay) buildConfirm();
+      titleEl.textContent = question;
+      pending = run;
+      overlay.hidden = false;
+      okBtn.focus();
+    }
+
+    function showError(box, message) {
+      var err = box.querySelector(".bee-hub__actions-error");
+      if (!err) {
+        err = document.createElement("span");
+        err.className = "bee-hub__actions-error";
+        box.appendChild(err);
+      }
+      err.textContent = message;
+    }
+    function clearError(box) {
+      var err = box.querySelector(".bee-hub__actions-error");
+      if (err) err.textContent = "";
+    }
+
+    // The in-flight lock, and the whole of the double-fire guard: the pair
+    // goes disabled the moment one of them is posted and STAYS disabled —
+    // the answer arrives as the page's own reload (the `/ws` change event
+    // above), which is what puts the card's new state on screen. Only a
+    // refusal hands the pair back, with the server's own words beside it:
+    // bee is the only party that knows why it said no.
+    function fire(box, kind, approved, btn) {
+      var feature = box.getAttribute("data-action-feature") || "";
+      var project = box.getAttribute("data-action-project") || "";
+      if (!feature || !project) return;
+      box.setAttribute("data-fired", "1");
+      clearError(box);
+      var pair = Array.prototype.slice.call(
+        box.querySelectorAll(".bee-hub__action")
+      );
+      var label = btn.textContent;
+      pair.forEach(function (b) { b.disabled = true; });
+      btn.textContent = "…";
+
+      function release(message) {
+        box.removeAttribute("data-fired");
+        pair.forEach(function (b) { b.disabled = false; });
+        btn.textContent = label;
+        showError(box, message);
+      }
+
+      postJson("/p/" + encodeURIComponent(project) + "/_bee/actions", {
+        kind: kind + (approved ? "-approve" : "-reject"),
+        feature: feature,
+      })
+        .then(function (res) {
+          if (res.ok) return null; // the reload is the confirmation
+          return res
+            .json()
+            .catch(function () { return null; })
+            .then(function (b) {
+              release(
+                (b && b.error) || res.statusText || "That did not go through."
+              );
+            });
+        })
+        .catch(function () {
+          release("Could not reach the server.");
+        });
+    }
+
+    document.addEventListener("click", function (e) {
+      var btn = e.target.closest && e.target.closest(".bee-hub__action");
+      if (!btn) return;
+      var box = btn.closest(".bee-hub__actions");
+      if (!box) return;
+      // One answer per card per page load. The card's next render (after the
+      // reload) is a fresh element and may be answered again.
+      if (box.getAttribute("data-fired")) return;
+      var kind = box.getAttribute("data-action-kind") || "";
+      var feature = box.getAttribute("data-action-feature") || "";
+      var approved = btn.classList.contains("bee-hub__action--approve");
+      var words = CONFIRM[kind];
+      if (!words) {
+        // D2's other half: the permission prompt posts at once, matching the
+        // terminal's own Approve button click for click.
+        fire(box, kind, approved, btn);
+        return;
+      }
+      askConfirm((approved ? words.approve : words.reject)(feature), function () {
+        fire(box, kind, approved, btn);
+      });
+    });
+  })();
+
   // Terminal settings (Settings page, `/api/terminal-config`): D10 requires
   // a JSON body — a plain form POST is a CORS *simple* request (no
   // preflight, no CORS layer on this server), so a page the owner happens
@@ -1309,10 +1500,35 @@
   // CONTEXT.md` markdown (via read_snapshot); a changed entry elsewhere in a
   // project's tree cannot affect what `/` shows, so the home/no-match branch
   // below reloads only when at least one changed entry is board-relevant.
+  // board-approve-actions (bap-3): a card's Approve moves bee's own state,
+  // not markdown — `bee gate` writes `.bee/lanes/<feature>.json`, and the
+  // waiting session's own record lives in `.bee/state.json`. Both decide
+  // what a card says (its current stop, its waiting-on badge), so a change
+  // to either refreshes the home board exactly as a `docs/history/` edit
+  // does; without this the card a human just answered would keep showing the
+  // stop they already cleared.
+  // board-approve-actions (bap-5): `watch.rs` now broadcasts those two bee
+  // state paths (it used to drop every non-markdown path, which is why an
+  // approved card kept reading its old stop). They say something only a
+  // board renders, so they are recognised by name here and steered — a lane
+  // write must not force-reload a code page or a file page that cannot show
+  // it.
+  function isBeeSignal(rel) {
+    return rel === ".bee/state.json" || rel.indexOf(".bee/lanes/") === 0;
+  }
+  // The same two rules are spelled out again below rather than called: the
+  // board's relevance filter is pinned literally by a server-side test
+  // (bap-3), because it is the board's own contract with the watcher and
+  // has to stay readable as one list beside the `docs/history/` rule.
   function isBoardRelevant(changedEntry) {
     var slash = changedEntry.indexOf("/");
     if (slash === -1) return false;
-    return changedEntry.slice(slash + 1).indexOf("docs/history/") === 0;
+    var rel = changedEntry.slice(slash + 1);
+    return (
+      rel.indexOf("docs/history/") === 0 ||
+      rel.indexOf(".bee/lanes/") === 0 ||
+      rel === ".bee/state.json"
+    );
   }
   function shouldReload(changed) {
     if (document.querySelector(".term-screen")) return false;
@@ -1327,20 +1543,111 @@
     }
     if (/^_(terminal|transcript)(\/|$)/.test(rest)) return false;
     if (!rest || rest.charAt(0) === "_") {
-      return changed.some(function (c) { return c.indexOf(pid + "/") === 0; });
+      var onBeeBoard = /^_bee(\/|$)/.test(rest);
+      return changed.some(function (c) {
+        if (c.indexOf(pid + "/") !== 0) return false;
+        // A bee state write is news for a board and for nothing else: the
+        // project home, search, runs and code pages render none of it, so
+        // outside `/p/<id>/_bee` it is not a reason to throw their page away.
+        if (isBeeSignal(c.slice(pid.length + 1))) return onBeeBoard;
+        return true;
+      });
     }
+    // A single-document page still reloads only on its own document —
+    // including the rare case of reading one of those JSON files directly.
     return changed.indexOf(pid + "/" + rest) !== -1;
+  }
+
+  // The trailing 1500 ms timer exists for exactly ONE burst: bee rewrites a
+  // lane and its projections inside a single command, so one board approval
+  // lands as several change events, and reloading on each throws the page
+  // away mid-paint. bap-6 scopes the timer to that burst — a bee signal seen
+  // from a surface that renders bee state. Everything else (a markdown
+  // document page, the dev `"reload"` frame) reloads the moment its own
+  // change arrives, the behaviour those pages had before the timer existed:
+  // a 1.5 s wait there buys nothing and only makes editing feel laggy.
+  // No network happens on this timer; it is the push signal waiting its
+  // turn, never a poll.
+  var RELOAD_DEBOUNCE_MS = 1500;
+  var reloadTimer = null;
+  var reloadPending = false;
+  function modalOpen() {
+    var els = document.querySelectorAll(
+      "dialog[open], .task-overlay, [role=dialog]"
+    );
+    for (var i = 0; i < els.length; i++) {
+      // `.task-overlay` hides with the `hidden` attribute; a `<dialog>`
+      // without `open` never matches. `getClientRects` is what tells a
+      // display:none box from a visible fixed-position one.
+      if (!els[i].hidden && els[i].getClientRects().length > 0) return true;
+    }
+    return false;
+  }
+  // The one place a reload actually happens, and the one place the dialog
+  // rule lives (D2's confirm is a real modal the human is mid-answer in): a
+  // reload that would pull it out from under them becomes ONE pending
+  // reload, never a fresh 1.5 s timer armed over and over behind a dialog
+  // nobody has closed yet. The flag is flushed by the events that close a
+  // modal, so the reload lands as soon as the dialog is gone instead of up
+  // to a second and a half later.
+  function reloadNow() {
+    if (modalOpen()) { reloadPending = true; return; }
+    location.reload();
+  }
+  function flushPendingReload() {
+    if (!reloadPending || modalOpen()) return;
+    reloadPending = false;
+    location.reload();
+  }
+  // A modal closes on a click (its own button, or the backdrop), on a key
+  // (Escape), or — for a real `<dialog>` — by firing `close`, which does not
+  // bubble and so is caught in the capture phase. The deferred check runs
+  // after the current task so the DOM has already settled; this is a
+  // one-shot flush of a flag, never a timer that re-arms itself.
+  ["click", "keyup", "close"].forEach(function (type) {
+    document.addEventListener(
+      type,
+      function () { setTimeout(flushPendingReload, 0); },
+      true
+    );
+  });
+  function scheduleReload() {
+    if (reloadTimer !== null) clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(function () {
+      reloadTimer = null;
+      reloadNow();
+    }, RELOAD_DEBOUNCE_MS);
+  }
+  // Is this reload the bee-signal burst the timer exists for? Only on a
+  // surface that renders bee state — the home board and `/p/<id>/_bee…`,
+  // the same two branches `shouldReload` splits on. On a document or code
+  // page a bee signal is not a reload at all, so the question never gets
+  // here; when it does, the answer decides debounced versus immediate.
+  function isBeeSignalBurst(changed) {
+    var m = location.pathname.match(/^\/p\/([^\/]+)\/(.*)$/);
+    if (m) {
+      var rest;
+      try { rest = decodeURIComponent(m[2]); } catch (e) { return false; }
+      if (!/^_bee(\/|$)/.test(rest)) return false;
+    }
+    return changed.some(function (c) {
+      var slash = c.indexOf("/");
+      return slash !== -1 && isBeeSignal(c.slice(slash + 1));
+    });
   }
   function connect() {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
     var ws = new WebSocket(proto + "//" + location.host + "/ws");
     ws.onmessage = function (ev) {
-      if (ev.data === "reload") { location.reload(); return; }
+      // The dev-reload frame says the served assets changed: there is no
+      // burst behind it and no board state to settle, so it reloads at once.
+      if (ev.data === "reload") { reloadNow(); return; }
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg && Array.isArray(msg.changed) && shouldReload(msg.changed)) {
-        location.reload();
-      }
+      if (!msg || !Array.isArray(msg.changed)) return;
+      if (!shouldReload(msg.changed)) return;
+      if (isBeeSignalBurst(msg.changed)) { scheduleReload(); return; }
+      reloadNow();
     };
     ws.onclose = function () { setTimeout(connect, 3000); };
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
