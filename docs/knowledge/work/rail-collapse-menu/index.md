@@ -1,6 +1,3 @@
----
-okf_version: 0.1
----
 <!--
 GENERATED FILE — do not hand-edit.
 Rendered by `bee knowledge index` from concept frontmatter inside docs/knowledge/ (okf-foundation D21).
@@ -9,13 +6,8 @@ Deterministic: byte-identical for the same bundle contents — path-sorted entri
 never a generation timestamp or any other wall-clock value.
 -->
 
-# Knowledge Bundle
+# work/rail-collapse-menu/
 
-## Sections
+## Concepts
 
-- [patterns/](patterns/index.md) — 1 concept(s)
-- [work/](work/index.md) — 56 concept(s)
-
-## Critical patterns
-
-None.
+- [rail-collapse-menu — delivery](delivery.md) — Delivery record for work item rail-collapse-menu: 1 capped cell folding the home rail to a 44px strip on wide screens and turning each project row's remove control into a Docs / Remove menu.

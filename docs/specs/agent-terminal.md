@@ -198,6 +198,13 @@ implementation. Code entry points are listed in `reading-map.md`.
   record for why), under a hard cap of 1.5 seconds from the text write. On
   the cap, or on any failure to read the screen, the Enter is sent anyway:
   the worst case is the old racy behaviour, never a silently dropped reply.
+- **Text sent to a plain shell pane is flattened to one line.** The pane host
+  treats every line break in sent text as a press of Enter, so a shell would
+  run each fragment of a multi-line message as its own command (a copy lost
+  its destination this way). When the target pane has no agent joined to it,
+  the text is split on line breaks, each line trimmed, empties dropped, and the
+  rest joined with single spaces before it is sent. An agent's pane keeps its
+  text verbatim — a multi-line prompt to an agent is legitimate.
   Staging waits for nothing. A submit carrying no text at all sends only
   its Enter, immediately — though no current page produces that shape: the
   Approve control submits the literal word "Approve" as its text, so it
