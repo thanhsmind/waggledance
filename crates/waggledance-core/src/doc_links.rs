@@ -260,21 +260,43 @@ pub fn linkify_urls(html: &str) -> String {
     out
 }
 
+/// The absolute origin a configured display hostname stands for, or `None`
+/// when none is configured (blank and whitespace-only count as none).
+///
+/// A configured hostname is a PUBLIC name — that is the whole reason to set
+/// one — so a bare name is assumed to be reached over https on the default
+/// port, and this process's own bind port is never glued on: the daemon
+/// commonly listens on `127.0.0.1:7700` behind a tunnel or proxy that
+/// terminates the public name, and the local port means nothing out there.
+/// A name carrying its own `http://` or `https://` is taken exactly as
+/// given, port and all, which is the escape hatch for a host that really is
+/// served over plain http on a nonstandard port.
+///
+/// This is the ONE reading of `server.hostname`. Both producers of a
+/// viewable URL go through it — [`link_base`] here and
+/// `runtime::build_display_urls` in the binary — because they used to read
+/// the same config value two different ways, and the display side emitted a
+/// dead link (`http://<public-name>:<local-port>`) for every configured
+/// hostname while this side emitted the reachable one.
+pub fn display_origin(hostname: Option<&str>) -> Option<String> {
+    let h = hostname?.trim().trim_end_matches('/');
+    if h.is_empty() {
+        return None;
+    }
+    if h.starts_with("http://") || h.starts_with("https://") {
+        Some(h.to_string())
+    } else {
+        Some(format!("https://{h}"))
+    }
+}
+
 /// The link prefix for `project_id`: absolute when a display hostname is
-/// configured, same-origin otherwise. A hostname carrying its own scheme is
-/// taken as given; a bare one is assumed to be reached over https, which is
-/// what a configured public hostname is for.
+/// configured (see [`display_origin`] for how the name is read),
+/// same-origin otherwise.
 pub fn link_base(project_id: &str, hostname: Option<&str>) -> String {
-    match hostname {
-        Some(h) if !h.trim().is_empty() => {
-            let h = h.trim().trim_end_matches('/');
-            if h.starts_with("http://") || h.starts_with("https://") {
-                format!("{h}/p/{project_id}/")
-            } else {
-                format!("https://{h}/p/{project_id}/")
-            }
-        }
-        _ => format!("/p/{project_id}/"),
+    match display_origin(hostname) {
+        Some(origin) => format!("{origin}/p/{project_id}/"),
+        None => format!("/p/{project_id}/"),
     }
 }
 

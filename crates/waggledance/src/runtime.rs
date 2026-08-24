@@ -208,8 +208,14 @@ fn build_display_urls(
     machine_ips: &[String],
 ) -> Vec<String> {
     let url = |h: &str| format!("http://{h}:{port}");
-    if let Some(name) = host_name.map(str::trim).filter(|h| !h.is_empty()) {
-        return vec![url(name)];
+    // A configured display hostname is read by `doc_links::display_origin` —
+    // the one shared reading of `server.hostname`, which `link_base` uses
+    // too. It is deliberately NOT `url(...)`: gluing this process's bind
+    // port (and a bare `http://`) onto a public name produced a URL that
+    // could not be reached, from the same config value that `link_base`
+    // rendered correctly.
+    if let Some(origin) = waggledance_core::doc_links::display_origin(host_name) {
+        return vec![origin];
     }
     if is_wildcard(bind_host) {
         if machine_ips.is_empty() {
@@ -331,10 +337,45 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A configured display hostname is a PUBLIC name, and it is read by
+    /// exactly the same rule as `doc_links::link_base` — one origin, no bind
+    /// port, `https` unless the name carries its own scheme. Gluing this
+    /// process's local port onto a public name produced a URL that could not
+    /// be reached (`waggle.gogl.be:7700` behind a tunnel terminating at
+    /// `127.0.0.1:7700`), while `link_base` emitted the reachable one from
+    /// the very same config value.
     #[test]
     fn host_name_override_wins_even_over_wildcard() {
         let urls = build_display_urls(Some("my.local"), "0.0.0.0", 7700, &ips(&["192.168.1.5"]));
-        assert_eq!(urls, vec!["http://my.local:7700"]);
+        assert_eq!(urls, vec!["https://my.local"]);
+    }
+
+    /// The escape hatch for a hostname that really is served over plain http
+    /// on a nonstandard port: spell the scheme and it passes through whole,
+    /// port included. Same rule as `link_base`'s own pass-through.
+    #[test]
+    fn host_name_carrying_its_own_scheme_passes_through() {
+        assert_eq!(
+            build_display_urls(Some("http://box.local:7700/"), "0.0.0.0", 7700, &[]),
+            vec!["http://box.local:7700"]
+        );
+        assert_eq!(
+            build_display_urls(Some("https://waggle.gogl.be"), "127.0.0.1", 7700, &[]),
+            vec!["https://waggle.gogl.be"]
+        );
+    }
+
+    /// The two producers of a viewable base must not drift again: this is
+    /// the shared rule, checked from both sides against the same input.
+    #[test]
+    fn display_urls_and_link_base_agree_on_a_configured_hostname() {
+        let urls = build_display_urls(Some("waggle.gogl.be"), "127.0.0.1", 7700, &[]);
+        let base = waggledance_core::doc_links::link_base("bee", Some("waggle.gogl.be"));
+        assert_eq!(
+            format!("{}/p/bee/", urls[0]),
+            base,
+            "the display URL and the doc link must share one origin"
+        );
     }
 
     #[test]
