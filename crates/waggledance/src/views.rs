@@ -1211,6 +1211,23 @@ fn project_add_form() -> &'static str {
 </form>"#
 }
 
+/// The escape hatch the two capacity refusals carry (`too_large`,
+/// `too_slow`). Those two are the only D10 codes that refuse a path which
+/// is otherwise perfectly registerable: `cli.rs::cmd_register` calls the
+/// same `engine.register` with no pre-flight at all, so the browser is the
+/// only surface where the cap exists. Without this sentence the UI is a
+/// dead end while the command next to it does the identical job.
+///
+/// A macro rather than a `const` so `register_error_message` can keep
+/// returning `&'static str` through `concat!`, and so the sentence itself
+/// exists once — the two refusals cannot drift apart. It stays fixed text
+/// with a placeholder path: D10's no-echo rule (below) is untouched.
+macro_rules! register_cli_hint {
+    () => {
+        " Register it from a terminal instead: waggledance register /absolute/path/to/project"
+    };
+}
+
 /// D10's fixed refusal messages, keyed by `register_project`'s own fixed
 /// error codes (`server.rs::validate_register_path`, plus its own generic
 /// `"failed"`). Every branch is static text — nothing user-supplied reaches
@@ -1226,8 +1243,14 @@ fn register_error_message(code: &str) -> Option<&'static str> {
         "not_directory" => "That path is not a directory.",
         "denied" => "That path cannot be registered.",
         "duplicate" => "That project is already registered.",
-        "too_large" => "That directory has too many markdown files to register.",
-        "too_slow" => "That directory took too long to scan to register.",
+        "too_large" => concat!(
+            "That directory has too many markdown files to register from the browser.",
+            register_cli_hint!()
+        ),
+        "too_slow" => concat!(
+            "That directory took too long to scan to register from the browser.",
+            register_cli_hint!()
+        ),
         "failed" => "That project could not be registered. Try again.",
         _ => return None,
     })

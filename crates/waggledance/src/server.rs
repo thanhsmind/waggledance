@@ -26227,6 +26227,39 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&scratch).ok();
     }
 
+    /// A capacity refusal must not dead-end. `cli.rs::cmd_register` runs the
+    /// same `engine.register` with no pre-flight at all, so the escape hatch
+    /// always exists — the browser is the only surface that hides it, which
+    /// is what turns a defensible cap into a wall. The hint is fixed text
+    /// like every other D10 message (`views::register_error_message`): it
+    /// names the verb and a placeholder path, never the submitted one, so
+    /// the no-echo rule below still holds.
+    #[tokio::test]
+    async fn register_capacity_refusals_carry_the_cli_escape_hatch() {
+        let dir = fresh_root("register-escape-hatch");
+        let st = build_state_with_dir(&dir);
+        let app = router(st);
+
+        for code in ["too_large", "too_slow"] {
+            let body =
+                body_string(get(app.clone(), &format!("/?register_error={code}")).await).await;
+            // Assert on the banner itself, not the whole page: the
+            // empty-projects rail (`views.rs`'s `fg-empty`) already names the
+            // same verb, so a page-wide `contains` passes whether or not the
+            // refusal says anything at all.
+            let at = body
+                .find(r#"id="register-error""#)
+                .unwrap_or_else(|| panic!("the {code} refusal must render a banner: {body}"));
+            let banner = &body[at..at + body[at..].find("</div>").unwrap()];
+            assert!(
+                banner.contains("waggledance register"),
+                "the {code} refusal banner must name the CLI escape hatch: {banner}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// D10/P1: the rejected path string must never appear in the response
     /// body of the page a refusal redirects to — a fixed code carries the
     /// same information without anything to inject on this unauthenticated
