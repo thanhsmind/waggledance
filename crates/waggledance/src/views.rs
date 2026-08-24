@@ -3151,6 +3151,13 @@ fn bee_hub_style() -> String {
    after the title, state badge and chevron have filled row one, and
    `order` keeps it last however those three wrap. It inherits the
    summary's horizontal padding, so it carries none of its own. */
+/* card-project-first: the project/slug line rides in the collapsed
+   `<summary>`, directly under the card's own name -- the project a card
+   belongs to is the first thing the board is read by, so it must not
+   need an expand. Same `flex: 1 0 100%` second-row idiom as the agent
+   line below it, with a lower `order` so project reads above agent
+   however row one wraps. */
+.bee-hub__summary .bee-hub__project, .bee-hub__summary .bee-hub__slug { flex: 1 0 100%; order: 5; margin: 0; line-height: var(--type-micro-leading); }
 .bee-hub__agent { flex: 1 0 100%; order: 10; display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: 0; padding: 0; font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
 .bee-hub__agent-state { color: var(--color-text-muted); }
 .bee-hub__agent-state--working { color: var(--color-warning); }
@@ -5817,11 +5824,15 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // is [`bee_hub_branch_line`]'s, the one source of that markup for both
     // the card and the Ready to merge dense row.
     let branch_html = bee_hub_branch_line(worktree_label);
-    // card-collapse-inprogress D1/D2: the card's own name alone (its
-    // CONTEXT title, or the slug fallback) is all the collapsed header
-    // shows -- `subtitle_html` above now moves into the expandable body
-    // below instead of riding along with the title the way the old
-    // `name_html` bundled them.
+    // card-collapse-inprogress D1/D2 gave the collapsed header the card's
+    // own name alone (its CONTEXT title, or the slug fallback) and pushed
+    // `subtitle_html` into the expandable body. card-project-first puts
+    // that one line back in the `<summary>`, on its own second row under
+    // the title: which project a card belongs to is how a cross-project
+    // board is read at all, so it must not cost an expand. Only the
+    // project/slug line came back -- the description, branch row and the
+    // rest stay in the body, so the collapsed header is still a name and
+    // its owner, not the old bundled block.
     // A6: the agent line rides in the collapsed `<summary>`, directly under
     // the card's own name and before the badges — the whole point of the
     // line is to be read without expanding the card, the same reason
@@ -5992,7 +6003,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // the top of the expandable body, since a `<details>`/`<summary>`
     // pair, unlike the old whole-card `<a>`, cannot itself be a link.
     format!(
-        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{subtitle_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{actions_html}{terminal_badges_html}{quiet_note_html}</div>"#,
+        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{subtitle_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{actions_html}{terminal_badges_html}{quiet_note_html}</div>"#,
         shell_class = shell_class,
         group_key = group_key,
         title_html = title_html,
@@ -15770,7 +15781,7 @@ mod tests {
         });
         assert_eq!(
             card_html,
-            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><span class="bee-hub__kind bee-hub__kind--in-progress" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span><div class="fg-card__title">Human Title</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__slug">feat-a</div><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
+            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><span class="bee-hub__kind bee-hub__kind--in-progress" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span><div class="fg-card__title">Human Title</div><div class="bee-hub__slug">feat-a</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
             "a card with no project label must keep the byte-identical shell/colour and now carry its worktree state on its own branch row: {card_html}"
         );
         // console-theme-kanban ctk-6 (D2): the five things the console
