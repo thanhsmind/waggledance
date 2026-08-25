@@ -97,13 +97,26 @@ launcher — CLI, MCP, future desktop — coordinates through `~/.waggledance/da
     empty with a stated reason when the session host cannot be reached — never
     silently missing.
   - **A dispatch caller may name any agent kind the target project declares.**
-    Both the human clicking Start and an agent calling dispatch resolve a label
-    against the *target project's own* configuration, through one shared
-    resolver — so the two can never disagree about what a label means. Before
-    this, dispatch resolved labels against a global list that was empty in
-    practice, and an agent could not spawn by kind into another project while a
-    human on the same machine could. A project that has not opted into
-    orchestration still refuses the dispatch, before any label is resolved.
+    A label is looked for in the operator's own configured list first, and only
+    then in the target project's own declarations — so a name the operator has
+    already claimed never re-aims itself at a different project's command, and
+    the project's list only ever fills a gap. That second half is what the board's
+    **Start** button has always read, so the two agree by construction about what
+    a label means. Before this, dispatch searched the operator's list alone,
+    which is empty in practice — an agent could not spawn by kind into another
+    project while a human on the same machine could.
+
+    Two refusals, deliberately not one. A label nobody declares is *unknown*,
+    and says which project it searched, because with two registries in play the
+    bare word no longer says where to look. A label the project **does** declare
+    but that cannot be started is refused in those terms instead — calling it
+    unknown would send a caller hunting a typo that does not exist. That second
+    line is drawn by the same rule that decides which labels the state rollup
+    publishes as startable, so the tool can never advertise a label and then
+    reject it.
+
+    A project that has not opted into orchestration still refuses the dispatch,
+    before any label is resolved.
 - **CLI** — `serve` (daemon), plus `register / open / list / search / status /
   refresh / unregister / stop`, `doctor`, and `version` (prints the single-source
   app version, same as `--version`).
