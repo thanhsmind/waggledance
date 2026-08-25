@@ -543,10 +543,15 @@ fn handle_ask_state(
             let Some(p) = engine.get_project(project_id).ok().flatten() else {
                 return tool_error(id, &format!("no such project: {project_id}"));
             };
-            let snapshot = bee::read_snapshot(&p.root_path);
+            // A rollup rather than a bare snapshot: the pane join reads the
+            // project's worktree list off it, and `rollup.snapshot` is the
+            // same read `read_snapshot` would have done.
+            let mut rollups = bee::read_rollup(std::slice::from_ref(&p.root_path));
+            let rollup = rollups.pop().expect("one root in, one rollup out");
+            let snapshot = &rollup.snapshot;
             let fleet = read_fleet_panes(engine, orchestration);
-            let mut digest = ask_state_digest(&p.id, &snapshot);
-            attach_panes(&mut digest, &p.root_path, &fleet);
+            let mut digest = ask_state_digest(&p.id, snapshot);
+            attach_panes(&mut digest, &p, &rollup, &fleet);
             let text = if !snapshot.present {
                 format!("{}: no .bee/ directory (absent)", p.id)
             } else {
@@ -588,7 +593,7 @@ fn handle_ask_state(
                 .zip(rollups.iter())
                 .map(|(p, rollup)| {
                     let mut digest = ask_state_digest(&p.id, &rollup.snapshot);
-                    attach_panes(&mut digest, &p.root_path, &fleet);
+                    attach_panes(&mut digest, p, rollup, &fleet);
                     digest
                 })
                 .collect();
@@ -719,14 +724,28 @@ fn read_fleet_panes(engine: &Engine, orchestration: &mut Option<Orchestration>) 
 ///
 /// Containment is [`server::project_panes`]'s, not a second copy: the panes a
 /// project may see are exactly the ones its own board surface shows.
-fn project_panes_value(snapshot: &crate::herdr::Snapshot, root: &std::path::Path) -> Value {
+fn project_panes_value(
+    snapshot: &crate::herdr::Snapshot,
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+    herdr_sessions: &std::collections::HashSet<String>,
+) -> Value {
+    let root = &project.root_path;
     let Ok(boundary) = waggledance_core::paths_boundary::Boundary::new(vec![root.to_path_buf()])
     else {
         // A root that will not resolve into a boundary can own no pane. That
         // is an empty inventory, not a failure of the whole answer.
         return json!([]);
     };
-    let panes = crate::server::project_panes(snapshot, &boundary);
+    let mut panes = crate::server::project_panes(snapshot, &boundary);
+    // `project_panes` deliberately returns bee_state/bee_feature empty and
+    // leaves the join to each caller. Applying it here is what makes the two
+    // fields worth publishing at all: herdr's `status` is derived from the
+    // screen, bee's is what its own hook runtime recorded, and an
+    // orchestrator asking "is this pane really idle?" is asking for the
+    // second one. Never a policy — the answer is reported, not acted on (D8).
+    let activity = crate::server::project_bee_activity(project, rollup, herdr_sessions);
+    crate::server::apply_bee_activity(&mut panes, &activity.pane);
     Value::Array(
         panes
             .iter()
@@ -749,7 +768,12 @@ fn project_panes_value(snapshot: &crate::herdr::Snapshot, root: &std::path::Path
 ///
 /// D6 omits, D5 nulls-with-a-reason, and only the third case carries an
 /// inventory — see [`FleetPanes`] for why those stay three separate answers.
-fn attach_panes(digest: &mut Value, root: &std::path::Path, fleet: &FleetPanes) {
+fn attach_panes(
+    digest: &mut Value,
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+    fleet: &FleetPanes,
+) {
     let Some(object) = digest.as_object_mut() else {
         return;
     };
@@ -760,7 +784,13 @@ fn attach_panes(digest: &mut Value, root: &std::path::Path, fleet: &FleetPanes) 
             object.insert("panes_error".to_string(), json!(reason));
         }
         FleetPanes::Snapshot(snapshot) => {
-            object.insert("panes".to_string(), project_panes_value(snapshot, root));
+            // The session set is derived from this call's ONE snapshot (D4),
+            // so it is built here rather than per project.
+            let sessions = crate::server::herdr_session_ids(Some(snapshot));
+            object.insert(
+                "panes".to_string(),
+                project_panes_value(snapshot, project, rollup, &sessions),
+            );
         }
     }
 }
@@ -1508,8 +1538,29 @@ mod tests {
     fn panes_keep_what_the_project_owns_and_publish_no_name_or_title() {
         let inside = std::env::temp_dir().join(format!("wd-panes-in-{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!("wd-panes-out-{}", std::process::id()));
-        std::fs::create_dir_all(&inside).unwrap();
+        let _ = std::fs::remove_dir_all(&inside);
+        let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
+        write(&inside, "docs/a.md", "# Project");
+        // A live bee session claiming w1:p1 — the join's whole input. Its
+        // heartbeat is stamped now so the session reads live.
+        let now = waggledance_core::indexer::now_rfc3339();
+        write(
+            &inside,
+            ".bee/sessions/s1.json",
+            &format!(
+                r#"{{"id": "s1", "started_at": "{now}", "last_heartbeat": "{now}",
+                     "activity": {{"state": "blocked", "event": "PermissionRequest",
+                                   "tool_name": "Bash", "at": "{now}", "pane": "w1:p1",
+                                   "cwd": "{cwd}", "feature": "widget-polish"}}}}"#,
+                cwd = inside.display()
+            ),
+        );
+
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&inside, None).unwrap();
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = rollups.pop().unwrap();
 
         let agent = |pane_id: &str| crate::herdr::wire::Agent {
             pane_id: pane_id.to_string(),
@@ -1529,17 +1580,19 @@ mod tests {
             foreground_cwd: None,
         };
         let snapshot = crate::herdr::wire::Snapshot {
-            agents: vec![agent("w1:p1"), agent("w1:p9")],
-            panes: vec![pane("w1:p1", &inside), pane("w1:p9", &outside)],
+            agents: vec![agent("w1:p1"), agent("w1:p2"), agent("w1:p9")],
+            panes: vec![
+                pane("w1:p1", &inside),
+                pane("w1:p2", &inside),
+                pane("w1:p9", &outside),
+            ],
             ..Default::default()
         };
 
-        let value = project_panes_value(&snapshot, &inside);
+        let sessions = crate::server::herdr_session_ids(Some(&snapshot));
+        let value = project_panes_value(&snapshot, &project, &rollup, &sessions);
         let rows = value.as_array().expect("panes is an array");
-        assert_eq!(rows.len(), 1, "only the in-boundary pane survives: {value}");
-        assert_eq!(rows[0]["pane_id"], "w1:p1");
-        assert_eq!(rows[0]["kind"], "claude");
-        assert_eq!(rows[0]["status"], "idle");
+        assert_eq!(rows.len(), 2, "only the in-boundary panes survive: {value}");
 
         let fields: Vec<&str> = rows[0]
             .as_object()
@@ -1560,6 +1613,21 @@ mod tests {
             ],
             "D3 pins the field set exactly"
         );
+
+        // The pane bee claims carries bee's own reading, which is the half an
+        // orchestrator needs: herdr says `idle` for both panes, bee says this
+        // one is blocked on a human.
+        let claimed = rows.iter().find(|r| r["pane_id"] == "w1:p1").unwrap();
+        assert_eq!(claimed["status"], "idle", "herdr's screen-derived reading");
+        assert_eq!(claimed["bee_state"], "Blocked", "{claimed}");
+        assert_eq!(claimed["bee_feature"], "widget-polish", "{claimed}");
+
+        // A pane no session claims reports nothing rather than borrowing its
+        // neighbour's state.
+        let unclaimed = rows.iter().find(|r| r["pane_id"] == "w1:p2").unwrap();
+        assert!(unclaimed["bee_state"].is_null(), "{unclaimed}");
+        assert!(unclaimed["bee_feature"].is_null(), "{unclaimed}");
+
         let published = value.to_string();
         for leaked in ["surly-otter", "editing bee.rs"] {
             assert!(
@@ -1617,9 +1685,21 @@ mod tests {
             "feature": "widget-polish",
             "phase": "execution"
         });
+        // The project and rollup are inert on this branch — an unreachable
+        // transport is answered without ever looking at either — but the
+        // function takes them, so a real pair is cheaper than a fake one.
+        let dir = std::env::temp_dir().join(format!("wd-panes-down-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# Project");
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&dir, None).unwrap();
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = rollups.pop().unwrap();
+
         attach_panes(
             &mut digest,
-            std::path::Path::new("/nonexistent"),
+            &project,
+            &rollup,
             &FleetPanes::Unreachable("herdr snapshot failed: connection refused".to_string()),
         );
 
@@ -1633,6 +1713,8 @@ mod tests {
             "the bee half of the answer is untouched: {digest}"
         );
         assert_eq!(digest["phase"], "execution");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

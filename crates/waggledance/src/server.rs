@@ -4479,11 +4479,11 @@ pub(crate) fn project_panes(
 
 /// A2's two joins for one project, built once from that project's own
 /// `.bee/sessions/*.json` and handed to every surface that needs either.
-struct ProjectBeeActivity {
+pub(crate) struct ProjectBeeActivity {
     /// `activity.pane == pane_id` — the bridge to the terminal view. Keyed
     /// by herdr pane id; at most one session per pane (the freshest wins a
     /// tie, see [`project_bee_activity`]).
-    pane: std::collections::HashMap<String, views::BeeActivityEntry>,
+    pub(crate) pane: std::collections::HashMap<String, views::BeeActivityEntry>,
     /// `activity.feature` — every live session on a feature, which is how a
     /// board card finds its agent even when that session runs in no herdr
     /// pane at all.
@@ -4571,7 +4571,9 @@ fn resolve_session_feature(
 /// an `agent_session.value` — for [`project_bee_activity`]'s second
 /// liveness witness. No snapshot (herdr down, badges off) is an empty set:
 /// the heartbeat then decides alone, exactly as before.
-fn herdr_session_ids(snapshot: Option<&herdr::Snapshot>) -> std::collections::HashSet<String> {
+pub(crate) fn herdr_session_ids(
+    snapshot: Option<&herdr::Snapshot>,
+) -> std::collections::HashSet<String> {
     snapshot
         .map(|s| {
             s.agents
@@ -4606,7 +4608,7 @@ fn herdr_session_ids(snapshot: Option<&herdr::Snapshot>) -> std::collections::Ha
 /// `cwd` is an unscrubbed absolute path and is used here for nothing but
 /// this boundary check and [`resolve_session_feature`]'s worktree match;
 /// it never reaches a view.
-fn project_bee_activity(
+pub(crate) fn project_bee_activity(
     project: &waggledance_core::domain::Project,
     rollup: &waggledance_core::bee::BeeProjectRollup,
     herdr_sessions: &std::collections::HashSet<String>,
@@ -4705,7 +4707,7 @@ fn project_bee_activity(
 /// it, so the pane resolver stays a pure herdr-plus-boundary function and
 /// the surfaces with no bee store in reach (the terminal page's own pane
 /// list, the Unassigned group) keep herdr's status untouched.
-fn apply_bee_activity(
+pub(crate) fn apply_bee_activity(
     panes: &mut [views::TerminalPaneView],
     by_pane: &std::collections::HashMap<String, views::BeeActivityEntry>,
 ) {
