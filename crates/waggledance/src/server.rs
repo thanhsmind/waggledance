@@ -29607,6 +29607,7 @@ mod session_feature_resolution_tests {
             lane: lane.map(str::to_string),
             activity,
             signal: BeeSignal::Live,
+            work: None,
         }
     }
 
