@@ -29570,6 +29570,89 @@ mod bee_route_tests {
             "a reload blocked by a modal becomes one pending reload"
         );
     }
+
+    /// board-live-morph D1 (docs/history/board-live-morph/CONTEXT.md):
+    /// reloadNow()/flushPendingReload() are the only two places this
+    /// feature changes -- pinned literally so a future edit cannot quietly
+    /// put a bare `location.reload()` back on the board path this cell
+    /// exists to route through the in-place patch instead.
+    #[test]
+    fn the_board_reload_path_goes_through_apply_update_not_a_bare_reload() {
+        let js = views::APP_JS;
+        let reload_now_at = js
+            .find("function reloadNow() {")
+            .expect("reloadNow must exist");
+        let reload_now_end = js[reload_now_at..]
+            .find("\n  function flushPendingReload()")
+            .map(|i| reload_now_at + i)
+            .expect("reloadNow is followed by flushPendingReload");
+        let reload_now = &js[reload_now_at..reload_now_end];
+        assert!(
+            reload_now.contains("applyUpdate();") && !reload_now.contains("location.reload();"),
+            "reloadNow must patch, not reload, on its own success path: {reload_now}"
+        );
+
+        let flush_at = js
+            .find("function flushPendingReload() {")
+            .expect("flushPendingReload must exist");
+        let flush_end = js[flush_at..]
+            .find("\n  [\"click\"")
+            .map(|i| flush_at + i)
+            .expect("flushPendingReload is followed by the modal-close listeners");
+        let flush = &js[flush_at..flush_end];
+        assert!(
+            flush.contains("applyUpdate();") && !flush.contains("location.reload();"),
+            "flushPendingReload must patch, not reload, once the modal clears: {flush}"
+        );
+
+        assert!(
+            js.contains("function applyUpdate() {"),
+            "the patch entry point itself must exist"
+        );
+    }
+
+    /// board-live-morph D1: every failure this patch can hit -- no board
+    /// section on the page, the fetch itself, a non-ok status, a fetched
+    /// page with no section of its own -- falls back to
+    /// `location.reload()`, never a half-applied patch left on screen.
+    #[test]
+    fn apply_update_falls_back_to_reload_on_every_failure_branch() {
+        let js = views::APP_JS;
+        let start = js
+            .find("function applyUpdate() {")
+            .expect("applyUpdate must exist");
+        let end = js[start..]
+            .find("\n  function reloadNow()")
+            .map(|i| start + i)
+            .expect("applyUpdate is followed by reloadNow");
+        let block = &js[start..end];
+
+        assert!(
+            block.contains("if (!section) { location.reload(); return; }"),
+            "no [data-feature-hub] on this page falls back at once: {block}"
+        );
+        assert!(
+            block.contains("if (!res.ok) throw new Error("),
+            "a non-ok fetch status must throw into the catch below: {block}"
+        );
+        assert!(
+            block.contains("if (!next) throw new Error("),
+            "a fetched page with no section of its own must throw into the catch below: {block}"
+        );
+        assert_eq!(
+            block.matches(".catch(function () {").count(),
+            1,
+            "exactly one catch carries every thrown failure to the same reload: {block}"
+        );
+        let catch_at = block
+            .find(".catch(function () {")
+            .expect("the catch above was just counted");
+        let catch_body = &block[catch_at..];
+        assert!(
+            catch_body.contains("location.reload();"),
+            "the one catch is where every failure actually reloads: {catch_body}"
+        );
+    }
 }
 
 /// afr-1: the precedence ladder in [`resolve_session_feature`], one test per

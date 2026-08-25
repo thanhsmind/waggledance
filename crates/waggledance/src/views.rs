@@ -3751,6 +3751,27 @@ fn bee_hub_style() -> String {
    right edge for a floated corner to anchor to. */
 .bee-hub__row { display: block; min-width: 0; overflow-wrap: anywhere; color: var(--color-text); font-size: var(--type-body-sm-size); text-decoration: none; padding: var(--density-row-pad-y) var(--space-2); border-bottom: var(--border-width-hairline) solid var(--color-border); }
 .bee-hub__row:hover { color: var(--color-action); }
+/* board-live-morph D2 (docs/history/board-live-morph/CONTEXT.md): motion is
+   spent on the card, not on its contents. The shell (a full card, above)
+   and this row (a dense row) are the only two keyed elements `app.js`'s
+   in-place patch ever moves or fades -- everything a card or row draws
+   inside itself swaps with no animation, so this transition never reaches
+   past the shell/row boundary. `transform` is what the patch's FLIP step
+   sets inline for a card/row that changed column or order; `opacity` is
+   what `.bee-hub__enter`/`.bee-hub__leave` below animate for one that
+   appeared or is leaving. A fresh page load sets neither inline style, so
+   this transition is inert until the first patch runs. */
+.bee-hub__shell, .bee-hub__row { transition: transform var(--motion-settle) var(--ease-standard), opacity var(--motion-settle) var(--ease-standard); }
+.bee-hub__enter { opacity: 0; }
+.bee-hub__leave { opacity: 0; }
+@media (prefers-reduced-motion: reduce) {
+  /* The patch itself still runs -- a card still lands in its new column,
+     still appears, still leaves -- only the movement is removed, so this
+     zeroes the duration rather than dropping the rule. */
+  .bee-hub__shell, .bee-hub__row {
+    transition-duration: 0.01ms !important;
+  }
+}
 /* cross-board D5/D10: the cross-project board's own project label and ship
    time on a Finished row — absent on every per-project board row, which
    passes neither and renders unchanged.
@@ -6308,6 +6329,11 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         orchestration_enabled,
         gate_stop,
     } = *args;
+    // board-live-morph: the card's own detail href, hoisted once so the
+    // `data-hub-key` identity attribute below and the `bee-hub__detail-link`
+    // inside the body can never drift apart -- the same string
+    // `bee_hub_feature_href` builds for every dense-row caller.
+    let detail_href = bee_hub_feature_href(project_id, feature);
     let title = docs
         .and_then(|d| d.title.as_deref())
         .filter(|t| !t.is_empty());
@@ -6558,14 +6584,13 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // the top of the expandable body, since a `<details>`/`<summary>`
     // pair, unlike the old whole-card `<a>`, cannot itself be a link.
     format!(
-        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{owner_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{agent_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{actions_html}{terminal_badges_html}{quiet_note_html}</div>"#,
+        r#"<div class="{shell_class}" data-hub-key="{detail_href}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{owner_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="{detail_href}">Feature detail<span aria-hidden="true"> →</span></a>{agent_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{actions_html}{terminal_badges_html}{quiet_note_html}</div>"#,
         shell_class = shell_class,
+        detail_href = detail_href,
         group_key = group_key,
         title_html = title_html,
         agent_html = agent_html,
         run_state_html = run_state_html,
-        pid = esc(project_id),
-        feature_href = esc(feature),
         owner_html = owner_html,
         desc_html = desc_html,
         branch_html = branch_html,
@@ -6715,7 +6740,7 @@ fn bee_hub_finished_row_with_extra(
         None => String::new(),
     };
     format!(
-        r#"<a class="bee-hub__row" data-hub-group="{group_key}" href="{href}" title="{full}">{project_html}<span class="bee-hub__row-name">{name}</span>{time_html}{extra_html}</a>"#,
+        r#"<a class="bee-hub__row" data-hub-group="{group_key}" href="{href}" data-hub-key="{href}" title="{full}">{project_html}<span class="bee-hub__row-name">{name}</span>{time_html}{extra_html}</a>"#,
         group_key = group_key,
         href = href,
         full = esc(name),
@@ -14027,7 +14052,7 @@ mod tests {
         );
         assert_eq!(
             row,
-            r#"<a class="bee-hub__row" data-hub-group="finished" href="/p/proj-1/_bee/feature/shipped-feat" title="shipped-feat"><span class="bee-hub__row-name">shipped-feat</span></a>"#
+            r#"<a class="bee-hub__row" data-hub-group="finished" href="/p/proj-1/_bee/feature/shipped-feat" data-hub-key="/p/proj-1/_bee/feature/shipped-feat" title="shipped-feat"><span class="bee-hub__row-name">shipped-feat</span></a>"#
         );
         assert!(
             !row.contains("bee-hub__chips")
@@ -14058,7 +14083,7 @@ mod tests {
         );
         assert_eq!(
             row,
-            r#"<a class="bee-hub__row" data-hub-group="todo" href="/p/proj-1/_bee/feature/todo-feat" title="todo-feat"><span class="bee-hub__row-name">todo-feat</span></a>"#
+            r#"<a class="bee-hub__row" data-hub-group="todo" href="/p/proj-1/_bee/feature/todo-feat" data-hub-key="/p/proj-1/_bee/feature/todo-feat" title="todo-feat"><span class="bee-hub__row-name">todo-feat</span></a>"#
         );
     }
 
@@ -15091,7 +15116,7 @@ mod tests {
         let card_slot = (1..=10)
             .find(|n| {
                 html.contains(&format!(
-                    "bee-hub__shell--p{n}\"><details class=\"bee-hub__card\" data-hub-group=\"in-progress\">"
+                    "bee-hub__shell--p{n}\" data-hub-key=\""
                 ))
             })
             .unwrap_or_else(|| panic!("proj-a's own In Progress card must carry a colour modifier: {html}"));
@@ -15181,7 +15206,7 @@ mod tests {
             "the badge nav must close immediately before the shared shell's own closing </div>: {card_html}"
         );
         assert!(
-            card_html.starts_with(r#"<div class="fg-card bee-hub__shell">"#),
+            card_html.starts_with(r#"<div class="fg-card bee-hub__shell" data-hub-key="/p/proj-a/_bee/feature/feat-a">"#),
             "the card anchor and its badge nav must share one fg-card bee-hub__shell wrapper: {card_html}"
         );
         assert!(
@@ -15659,7 +15684,7 @@ mod tests {
             "an empty pane list must render no badge nav, including its extra class: {card_html}"
         );
         assert!(
-            card_html.starts_with(r#"<div class="fg-card bee-hub__shell">"#),
+            card_html.starts_with(r#"<div class="fg-card bee-hub__shell" data-hub-key="/p/proj-a/_bee/feature/feat-a">"#),
             "the shell must still wrap the bare card anchor: {card_html}"
         );
         assert!(
@@ -16753,7 +16778,7 @@ mod tests {
         });
         assert_eq!(
             card_html,
-            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><span class="bee-hub__kind bee-hub__kind--in-progress" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span><div class="fg-card__title">Human Title</div><div class="bee-hub__owner"><div class="bee-hub__slug">feat-a</div></div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
+            r#"<div class="fg-card bee-hub__shell" data-hub-key="/p/proj-a/_bee/feature/feat-a"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><span class="bee-hub__kind bee-hub__kind--in-progress" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span><div class="fg-card__title">Human Title</div><div class="bee-hub__owner"><div class="bee-hub__slug">feat-a</div></div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
             "a card with no project label must keep the byte-identical shell/colour and now carry its worktree state on its own branch row: {card_html}"
         );
         // console-theme-kanban ctk-6 (D2): the five things the console
