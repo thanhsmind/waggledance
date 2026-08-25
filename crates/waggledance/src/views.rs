@@ -11532,6 +11532,43 @@ mod tests {
         );
     }
 
+    /// (board-action-dupes) The board's action pair and run button render as
+    /// SIBLINGS of their row inside `.bee-hub__cards`, carrying no
+    /// `data-hub-key` of their own — deliberately, since a `<button>` inside
+    /// an `<a>` is invalid markup ([`bee_hub_ready_to_merge_row`]). That puts
+    /// them out of reach of the leaves pass in `assets/app.js`, which only
+    /// ever removes keyed nodes, so `hubReconcileCards` has to remove its own
+    /// unkeyed leftovers or every board patch imports one more copy beside
+    /// the last. It must also withhold the enter fade from them:
+    /// board-live-morph D2 spends motion on the card/row itself and nothing
+    /// else, and an unkeyed sibling arrives with the row it belongs to.
+    ///
+    /// Both halves are pinned here rather than in the reconcile's own
+    /// neighbourhood because the duplication is invisible to every
+    /// render-side assertion in this file — the server's markup was never
+    /// wrong.
+    #[test]
+    fn app_js_reconcile_drops_its_unkeyed_leftovers() {
+        let script = include_str!("../assets/app.js");
+        let start = script
+            .find("function hubReconcileCards(")
+            .expect("app.js must still define hubReconcileCards");
+        let end = script[start..]
+            .find("function hubPatchGroup(")
+            .expect("hubPatchGroup must still follow hubReconcileCards")
+            + start;
+        let reconcile = &script[start..end];
+        assert!(
+            reconcile.contains(r#"if (leftover.nodeType !== 1 || !leftover.getAttribute("data-hub-key")) {"#)
+                && reconcile.contains("container.removeChild(leftover);"),
+            "hubReconcileCards must remove every unkeyed leftover trailing the placed prefix, or the action pair piles up one copy per patch: {reconcile}"
+        );
+        assert!(
+            reconcile.contains("if (key) {\n          freshEl.classList.add(\"bee-hub__enter\");"),
+            "only a keyed fresh insert may take the enter fade (board-live-morph D2): {reconcile}"
+        );
+    }
+
     /// D2/D4: `assets/app.js` wires the Approve button the same way it
     /// wires Stage — posting through the existing `postJson`/`inputUrl`
     /// helpers, never a new fetch — so the project page and the homepage

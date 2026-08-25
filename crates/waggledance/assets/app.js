@@ -1772,11 +1772,36 @@
         prev = liveEl;
       } else {
         freshEl = document.importNode(newChild, true);
-        freshEl.classList.add("bee-hub__enter");
+        // Only a KEYED insert is a card/row arriving, and D2 spends motion
+        // on the card/row itself and nothing else. An unkeyed sibling is
+        // that row's furniture -- it appears with its row, so a fade of its
+        // own is one flicker per patch and no information.
+        if (key) {
+          freshEl.classList.add("bee-hub__enter");
+          enters.push(freshEl);
+        }
         container.insertBefore(freshEl, wantPos);
-        enters.push(freshEl);
         prev = freshEl;
       }
+    }
+    // Everything the loop above did not place trails the wanted prefix, and
+    // the two kinds of leftover leave by different doors. A KEYED one may
+    // still be claimed by another group later in this same pass, so it is
+    // left alone for hubPatchSection's leaves pass to fade and remove. An
+    // UNKEYED one -- the `.bee-hub__actions` pair or run button that
+    // views.rs renders as a SIBLING of its row, never inside it -- has no
+    // key for that pass to reach it by, so this is the only place that can
+    // remove it. Without this walk each patch imports one more copy beside
+    // the last, a column that emptied keeps the buttons of rows that left,
+    // and the empty-state check below never sees a childless container.
+    var leftover = prev ? prev.nextSibling : container.firstChild;
+    var nextLeftover;
+    while (leftover) {
+      nextLeftover = leftover.nextSibling;
+      if (leftover.nodeType !== 1 || !leftover.getAttribute("data-hub-key")) {
+        container.removeChild(leftover);
+      }
+      leftover = nextLeftover;
     }
   }
   // Everything in one group/archive pair OUTSIDE its `.bee-hub__cards`
