@@ -280,7 +280,42 @@ pub async fn start_agent_in_new_tab(
             workspace_id: workspace_id.to_string(),
         }
     })?;
-    herdr.agent_start(&pane_id, argv).await
+
+    // A pane exists the moment the tab does, but it is not immediately able
+    // to host an agent — herdr answers `agent_pane_busy: … is not an
+    // available shell` for the first fraction of a second while the shell
+    // comes up. Observed live on 2026-08-25, one step past the protocol port.
+    // So: try, and on THAT refusal only, wait and try again, a small fixed
+    // number of times.
+    //
+    // Only that code is retried. A retry loop that swallowed other failures
+    // would be worse than the race it fixes — a name collision, an
+    // unreachable socket or a refusal from the agent itself must surface at
+    // once. And when the attempts run out, herdr's own last words come back:
+    // never a summary, and never another pane.
+    let mut attempt = 0;
+    loop {
+        match herdr.agent_start(&pane_id, argv).await {
+            Err(e) if attempt + 1 < PANE_READY_ATTEMPTS && is_pane_not_ready(&e) => {
+                attempt += 1;
+                tokio::time::sleep(PANE_READY_INTERVAL).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// How many times [`start_agent_in_new_tab`] will re-offer a freshly created
+/// pane that herdr says is not ready yet, and how long it waits between
+/// offers. Deliberately small: a pane that is genuinely unusable should fail
+/// in about a second, not hold a caller for minutes.
+const PANE_READY_ATTEMPTS: u32 = 6;
+const PANE_READY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// herdr's "that pane cannot host an agent yet" refusal — the startup race,
+/// and the only error [`start_agent_in_new_tab`] retries.
+fn is_pane_not_ready(e: &HerdrError) -> bool {
+    matches!(e, HerdrError::Remote { code, .. } if code == "agent_pane_busy")
 }
 
 /// The pane belonging to `tab_id`, read from a fresh snapshot. `None` when
@@ -297,6 +332,152 @@ pub async fn pane_of_tab(herdr: &dyn Herdr, tab_id: &str) -> Result<Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A herdr whose `agent_start` refuses `agent_pane_busy` a fixed number
+    /// of times before succeeding — the startup race, made deterministic.
+    /// Every other method answers the minimum `start_agent_in_new_tab` needs.
+    struct FlakyPane {
+        refusals: std::sync::Mutex<u32>,
+        other_error: Option<&'static str>,
+        starts: std::sync::Mutex<u32>,
+        snapshots: std::sync::Mutex<u32>,
+    }
+
+    impl FlakyPane {
+        fn refusing(n: u32) -> Self {
+            Self {
+                refusals: std::sync::Mutex::new(n),
+                other_error: None,
+                starts: std::sync::Mutex::new(0),
+                snapshots: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn failing_with(code: &'static str) -> Self {
+            Self {
+                refusals: std::sync::Mutex::new(u32::MAX),
+                other_error: Some(code),
+                starts: std::sync::Mutex::new(0),
+                snapshots: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Herdr for FlakyPane {
+        async fn snapshot(&self) -> Result<Snapshot> {
+            *self.snapshots.lock().unwrap() += 1;
+            Ok(Snapshot {
+                panes: vec![wire::Pane {
+                    pane_id: "w1:new".into(),
+                    workspace_id: "w1".into(),
+                    tab_id: "w1:new-tab".into(),
+                    cwd: None,
+                    foreground_cwd: None,
+                }],
+                ..Default::default()
+            })
+        }
+        async fn ping(&self) -> Result<ProtocolInfo> {
+            unreachable!()
+        }
+        async fn read_pane(&self, _: &str, _: ReadSource, _: usize) -> Result<ScreenRead> {
+            unreachable!()
+        }
+        async fn send_input(&self, _: &str, _: &str, _: bool) -> Result<()> {
+            unreachable!()
+        }
+        async fn send_text(&self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn send_keys(&self, _: &str, _: &[String]) -> Result<()> {
+            unreachable!()
+        }
+        async fn tab_create(&self, _: &str, _: Option<&str>) -> Result<TabCreated> {
+            Ok(TabCreated {
+                tab_id: "w1:new-tab".into(),
+            })
+        }
+        async fn agent_start(&self, pane_id: &str, _: &[String]) -> Result<AgentStarted> {
+            *self.starts.lock().unwrap() += 1;
+            let mut left = self.refusals.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(HerdrError::Remote {
+                    code: self.other_error.unwrap_or("agent_pane_busy").into(),
+                    message: format!("agent target pane {pane_id} is not an available shell"),
+                });
+            }
+            Ok(AgentStarted {
+                tab_id: "w1:new-tab".into(),
+                pane_id: pane_id.to_string(),
+                name: "started".into(),
+            })
+        }
+    }
+
+    /// The race this exists for: herdr refuses the brand-new pane twice while
+    /// its shell comes up, and the third offer succeeds.
+    #[tokio::test]
+    async fn a_pane_that_is_not_ready_yet_is_offered_again_until_it_is() {
+        let h = FlakyPane::refusing(2);
+        let started = start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .expect("a pane that becomes ready must be started, not refused");
+
+        assert_eq!(started.pane_id, "w1:new");
+        assert_eq!(*h.starts.lock().unwrap(), 3, "two refusals, then success");
+    }
+
+    /// The bound is real, and giving up returns herdr's own last words rather
+    /// than a summary — and never another pane.
+    #[tokio::test]
+    async fn a_pane_that_never_becomes_ready_gives_up_with_herdrs_own_error() {
+        let h = FlakyPane::refusing(u32::MAX);
+        let err = start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .expect_err("a pane that never comes up must fail");
+
+        match err {
+            HerdrError::Remote { code, message } => {
+                assert_eq!(code, "agent_pane_busy");
+                assert!(message.contains("w1:new"), "{message}");
+            }
+            other => panic!("expected herdr's own refusal, got {other:?}"),
+        }
+        assert_eq!(
+            *h.starts.lock().unwrap(),
+            PANE_READY_ATTEMPTS,
+            "the bound is finite and is the one the constant names"
+        );
+    }
+
+    /// Only the not-ready refusal is retried. Anything else is a real failure
+    /// and must surface on the first attempt — a loop that swallowed those
+    /// would be worse than the race it fixes.
+    #[tokio::test]
+    async fn any_other_refusal_is_not_retried() {
+        let h = FlakyPane::failing_with("agent_name_taken");
+        let err = start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .expect_err("an unrelated refusal must not be retried");
+
+        assert!(matches!(err, HerdrError::Remote { ref code, .. } if code == "agent_name_taken"));
+        assert_eq!(*h.starts.lock().unwrap(), 1, "tried exactly once");
+    }
+
+    /// The common case pays nothing: a pane ready on the first offer costs one
+    /// start and the single snapshot the tab-to-pane hop already needs.
+    #[tokio::test]
+    async fn a_ready_pane_costs_no_extra_attempt() {
+        let h = FlakyPane::refusing(0);
+        start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(*h.starts.lock().unwrap(), 1);
+        assert_eq!(*h.snapshots.lock().unwrap(), 1);
+    }
 
     /// A synthetic "already used" set, standing in for a real snapshot's
     /// agents[] just for this pure retry logic -- proves the loop itself
