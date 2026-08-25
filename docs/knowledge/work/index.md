@@ -51,6 +51,7 @@ never a generation timestamp or any other wall-clock value.
 - [feature-hub/](feature-hub/index.md) — 1 concept(s)
 - [feature-titles/](feature-titles/index.md) — 1 concept(s)
 - [gate-stop-superseded/](gate-stop-superseded/index.md) — 1 concept(s)
+- [herding-entry-conditions/](herding-entry-conditions/index.md) — 1 concept(s)
 - [herdr-protocol-20/](herdr-protocol-20/index.md) — 1 concept(s)
 - [herdr-session-liveness/](herdr-session-liveness/index.md) — 1 concept(s)
 - [home-board-perf/](home-board-perf/index.md) — 1 concept(s)
