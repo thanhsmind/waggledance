@@ -676,6 +676,39 @@ pub struct BeeSession {
     /// [`BeeSignal`]. Never read from the file — bee's own `bee status
     /// --json` computes the same value the same way.
     pub signal: BeeSignal,
+    /// WHAT this session was asked to do, from the record's top-level
+    /// `"work"` key (W1) — as distinct from [`Self::activity`], which is what
+    /// it is doing about it. `None` when the record carries none (a bee older
+    /// than the prompt work record, or a session no prompt has reached) and
+    /// also when the object is malformed: a bad work block is dropped, never
+    /// allowed to fail the session parse.
+    pub work: Option<BeeWork>,
+}
+
+/// One session's `work` object — the prompt work record bee's activity hook
+/// opens and `bee work set` upgrades.
+///
+/// The record's own `text` — the whole conversation so far, capped at 8000
+/// characters per session — is deliberately NOT carried (W2). A row shows the
+/// title and a card shows the acceptance; putting every user's prose through
+/// every snapshot read would buy nothing a reader displays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BeeWork {
+    /// The first prompt's own words, path-scrubbed on the way in (W4).
+    pub title: String,
+    /// `open` / `active` / `done` / `dropped`, carried VERBATIM — an
+    /// unrecognised value included (W3), the same posture
+    /// [`BeeActivityState::Unknown`] takes, so a newer bee that adds a fifth
+    /// status cannot blank this row on an older viewer.
+    pub status: String,
+    /// How many prompts this one record has absorbed.
+    pub turns: u64,
+    /// What the agent said "done" means, path-scrubbed like the title (W4).
+    /// `None` until it has said so — and that absence is exactly the line
+    /// between a bare stub and a card worth showing.
+    pub acceptance: Option<String>,
+    /// `updated_at` verbatim, RFC 3339 exactly as read.
+    pub updated_at: Option<String>,
 }
 
 /// One `.bee/lanes/<feature>.json` per-feature lane record, mirroring the
@@ -2546,7 +2579,7 @@ fn read_sessions(
 
     let mut sessions = Vec::new();
     for path in entries {
-        match parse_session(&path, now) {
+        match parse_session(&path, root, now) {
             Ok(s) => sessions.push(s),
             Err(e) => read_errors.push(format!("{}: {e}", rel_str(&path, root))),
         }
@@ -2557,7 +2590,11 @@ fn read_sessions(
 /// Parse one `.bee/sessions/<uuid>.json` file. `transcript_path` is read
 /// from the source JSON only to be discarded — it never reaches
 /// [`BeeSession`], which has no field for it.
-fn parse_session(path: &Path, now: time::OffsetDateTime) -> Result<BeeSession, String> {
+fn parse_session(
+    path: &Path,
+    root: &Path,
+    now: time::OffsetDateTime,
+) -> Result<BeeSession, String> {
     let raw = fs::read_to_string(path).map_err(|e| format!("could not read ({e})"))?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| format!("could not parse ({e})"))?;
 
@@ -2587,6 +2624,7 @@ fn parse_session(path: &Path, now: time::OffsetDateTime) -> Result<BeeSession, S
     let live = heartbeat_age_minutes <= SESSION_LIVE_MINUTES;
 
     let activity = v.get("activity").and_then(|a| parse_activity(a, now));
+    let work = v.get("work").and_then(|w| parse_work(w, root));
     let signal = match (live, &activity) {
         (false, _) | (_, None) => BeeSignal::None,
         (true, Some(a)) => match a.age_seconds {
@@ -2605,6 +2643,7 @@ fn parse_session(path: &Path, now: time::OffsetDateTime) -> Result<BeeSession, S
         lane,
         activity,
         signal,
+        work,
     })
 }
 
@@ -2640,6 +2679,34 @@ fn parse_activity(v: &Value, now: time::OffsetDateTime) -> Option<BeeActivity> {
         cwd: str_field("cwd"),
         feature: str_field("feature"),
         cell: str_field("cell"),
+    })
+}
+
+/// Parse one session record's `"work"` object (W1). Every failure mode — not
+/// an object, no `title` string — returns `None`, so a session with a
+/// malformed work block still reads as a session, exactly as
+/// [`parse_activity`] does for its own.
+fn parse_work(v: &Value, root: &Path) -> Option<BeeWork> {
+    let obj = v.as_object()?;
+    let title = obj.get("title").and_then(Value::as_str)?;
+    Some(BeeWork {
+        title: scrub_paths(title, root),
+        // A record written before the status existed is an open one: the hook
+        // opens every record at `open` and only the agent moves it.
+        status: obj
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("open")
+            .to_string(),
+        turns: obj.get("turns").and_then(Value::as_u64).unwrap_or(0),
+        acceptance: obj
+            .get("acceptance")
+            .and_then(Value::as_str)
+            .map(|s| scrub_paths(s, root)),
+        updated_at: obj
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .map(String::from),
     })
 }
 
@@ -3025,7 +3092,7 @@ fn worktree_liveness(sibling_root: &Path, now: time::OffsetDateTime) -> (bool, O
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(session) = parse_session(&p, now) {
+        if let Ok(session) = parse_session(&p, sibling_root, now) {
             if session.live {
                 freshest = Some(match freshest {
                     Some(cur) => cur.min(session.heartbeat_age_minutes),
@@ -5371,6 +5438,159 @@ mod tests {
             stale.heartbeat_age_minutes
         );
         assert!(stale.heartbeat_age_minutes > 30.0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A live session record carrying whatever `work` value the caller wants.
+    fn write_session_with_work(root: &std::path::Path, id: &str, work: Value) {
+        let now = time::OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let stamp = (now - time::Duration::minutes(1)).format(fmt).unwrap();
+        let record = serde_json::json!({
+            "id": id,
+            "started_at": stamp,
+            "last_heartbeat": stamp,
+            "workspace_id": "main",
+            "source": "startup",
+            "work": work,
+        });
+        write(root, &format!(".bee/sessions/{id}.json"), &record.to_string());
+    }
+
+    fn only_session(root: &std::path::Path) -> BeeSession {
+        let snap = read_snapshot(root);
+        assert_eq!(snap.sessions.len(), 1, "one record, one session");
+        snap.sessions.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn a_work_object_reaches_the_session_snapshot() {
+        let root = fresh_root("work-present");
+        write_session_with_work(
+            &root,
+            "w1",
+            serde_json::json!({
+                "title": "make the board name the work",
+                "text": "make the board name the work\n\nand keep it green",
+                "status": "active",
+                "turns": 2,
+                "acceptance": "Every live session names its ask",
+                "opened_at": "2026-08-25T08:00:00.000Z",
+                "updated_at": "2026-08-25T08:30:00.000Z",
+            }),
+        );
+
+        let work = only_session(&root).work.expect("the work block is carried");
+        assert_eq!(work.title, "make the board name the work");
+        assert_eq!(work.status, "active");
+        assert_eq!(work.turns, 2);
+        assert_eq!(work.acceptance.as_deref(), Some("Every live session names its ask"));
+        assert_eq!(work.updated_at.as_deref(), Some("2026-08-25T08:30:00.000Z"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_malformed_or_absent_work_block_never_costs_the_session_its_row() {
+        // Each shape is its own root: the assertion is that the SESSION still
+        // parses, so one bad record must not be able to hide behind a good one.
+        for (name, work) in [
+            ("not-an-object", serde_json::json!("just a string")),
+            ("no-title", serde_json::json!({ "status": "open", "turns": 1 })),
+            ("title-not-a-string", serde_json::json!({ "title": 42 })),
+            ("null", Value::Null),
+        ] {
+            let root = fresh_root(&format!("work-bad-{name}"));
+            write_session_with_work(&root, "w1", work);
+            let session = only_session(&root);
+            assert!(session.work.is_none(), "{name}: a bad work block reads as None");
+            assert_eq!(session.id, "w1", "{name}: the session itself still parses");
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // And a record that never carried the key at all.
+        let root = fresh_root("work-absent");
+        let now = time::OffsetDateTime::now_utc();
+        let fmt = &time::format_description::well_known::Rfc3339;
+        let stamp = now.format(fmt).unwrap();
+        write(
+            &root,
+            ".bee/sessions/w1.json",
+            &format!(r#"{{"id":"w1","started_at":"{stamp}","last_heartbeat":"{stamp}"}}"#),
+        );
+        assert!(only_session(&root).work.is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_conversation_text_never_reaches_the_reader() {
+        let root = fresh_root("work-no-text");
+        write_session_with_work(
+            &root,
+            "w1",
+            serde_json::json!({
+                "title": "the short ask",
+                "text": "SENTINEL-the-whole-conversation-so-far",
+                "status": "open",
+                "turns": 7,
+            }),
+        );
+
+        let session = only_session(&root);
+        let rendered = serde_json::to_string(&session).unwrap();
+        assert!(
+            !rendered.contains("SENTINEL"),
+            "W2: the record's text must not survive into the snapshot: {rendered}"
+        );
+        assert_eq!(session.work.unwrap().turns, 7, "the turn count still comes through");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_unrecognised_status_is_carried_through_verbatim() {
+        let root = fresh_root("work-unknown-status");
+        write_session_with_work(
+            &root,
+            "w1",
+            serde_json::json!({ "title": "an ask", "status": "parked", "turns": 1 }),
+        );
+        assert_eq!(only_session(&root).work.unwrap().status, "parked");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_status_the_writer_omitted_reads_as_open() {
+        let root = fresh_root("work-no-status");
+        write_session_with_work(&root, "w1", serde_json::json!({ "title": "an ask" }));
+        let work = only_session(&root).work.unwrap();
+        assert_eq!(work.status, "open");
+        assert_eq!(work.turns, 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_absolute_path_in_the_title_or_the_acceptance_is_scrubbed() {
+        let root = fresh_root("work-scrub");
+        let inside = root.join("crates").join("bee.rs").to_string_lossy().into_owned();
+        write_session_with_work(
+            &root,
+            "w1",
+            serde_json::json!({
+                "title": format!("read {inside} first"),
+                "acceptance": format!("{inside} compiles"),
+                "status": "open",
+                "turns": 1,
+            }),
+        );
+
+        let work = only_session(&root).work.unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+        assert!(!work.title.contains(&root_str), "W4: {}", work.title);
+        assert!(work.title.contains("bee.rs"), "the file is still named: {}", work.title);
+        let acceptance = work.acceptance.unwrap();
+        assert!(!acceptance.contains(&root_str), "W4: {acceptance}");
 
         std::fs::remove_dir_all(&root).ok();
     }
