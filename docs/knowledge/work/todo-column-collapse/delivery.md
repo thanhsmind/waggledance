@@ -8,7 +8,7 @@ bee:
   lifecycle: active
   areas: [bee-cockpit, web-interface]
   required_context: [docs/specs/bee-cockpit.md, docs/specs/web-interface.md, .bee/lanes/todo-column-collapse.json]
-  sources: [.bee/lanes/todo-column-collapse.json, .bee/cells/tcc-1.json]
+  sources: [.bee/lanes/todo-column-collapse.json, .bee/cells/archive/todo-column-collapse/tcc-1.json]
 ---
 
 # todo-column-collapse — Delivery

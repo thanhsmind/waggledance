@@ -99,6 +99,7 @@ applied from here.
 - **(b) Area updates** — nothing proposed. The generator found no capped
   `behavior_change` cell for either `bee-cockpit` or `web-interface`, so there
   is no candidate bullet to sync.
+<!-- bee:not-a-deferral: this bullet names the already-active pattern "Deferring a commit on a contended file does not protect the boundary" and quotes its practice. The word "deferring" is that pattern's subject, not a promise to act later — the work it describes is done. -->
 - **(c) Pattern candidate** — already promoted, not from here. The three
   recorded deviations are one phenomenon, and it landed as
   `docs/knowledge/patterns/deferring-a-commit-on-a-contended-file.md`
@@ -106,3 +107,4 @@ applied from here.
   source and generalizes past this cell into a practice: prefer a path-scoped
   commit of your own paths over deferring. Saving the draft candidate beside it
   would duplicate it at a lower quality.
+<!-- /bee:not-a-deferral -->
