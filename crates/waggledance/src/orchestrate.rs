@@ -117,8 +117,8 @@ pub enum DispatchTarget {
     /// Start a fresh agent pane. `argv` is the whole command (a preset's,
     /// or the project's own `.bee/config.json` `herding` default) and `cwd`
     /// the directory to start it in -- `None` means the project's own
-    /// resolved workspace anchor, which is the only directory this module
-    /// will ever choose on a caller's behalf.
+    /// resolved destination ([`resolve_spawn_destination`]), which is the
+    /// only directory this module will ever choose on a caller's behalf.
     Spawn {
         argv: Vec<String>,
         cwd: Option<String>,
@@ -134,7 +134,7 @@ pub enum DispatchTarget {
 /// is the same check every sibling pane-scoped write route runs through
 /// `project_and_verify_pane_in_boundary`. The pane-spawn branch of
 /// [`run_dispatch`] never needs this: it *creates* the pane under a
-/// boundary-validated workspace anchor, so containment is structural there;
+/// boundary-validated destination, so containment is structural there;
 /// the caller-supplied-`pane_id` branch is the one that must prove it.
 ///
 /// `project_id` is carried only for the refusal message. A `pane_id` absent
@@ -386,11 +386,30 @@ fn delta_from_baseline(baseline: &str, current: &str) -> String {
 /// documented `cwd: None` fallback (herdr's own process directory) — every
 /// caller of this function passes the resolved `cwd` as `Some`, never
 /// `None`.
+/// # Why the anchor alone is not enough
+///
+/// That anchor is the pane a human happens to have FOCUSED right now
+/// (workspace → active tab → that tab's layout → its focused pane,
+/// `herdr/wire.rs`), so on its own it makes a project dispatchable or not
+/// depending on where the cursor sits. Observed live on 2026-08-25: beehive
+/// had two agent panes whose folders resolve under its own root — `ask_state`
+/// listed them for that project — while the workspace LABELLED `beehive` held
+/// panes belonging to waggledance, so no anchor landed inside beehive and a
+/// fully resolved preset label still refused with "destination unresolved".
+///
+/// So a second pass runs, and only when the first finds nothing: the first
+/// workspace holding ANY pane whose folder validates against `boundary`,
+/// using that pane's own resolved folder. Additive by construction — a
+/// project that resolves today keeps the exact destination it has, and only
+/// one that refuses today can begin resolving (spawn-destination-fallback
+/// D1). Fail-closed is untouched: both passes validate through the same
+/// `Boundary`, so a returned destination is always a directory this project
+/// owns, and `None` still means the caller refuses rather than picking one.
 pub fn resolve_spawn_destination(
     snapshot: &herdr::Snapshot,
     boundary: &Boundary,
 ) -> Option<(String, String)> {
-    snapshot.workspaces.iter().find_map(|w| {
+    let by_anchor = snapshot.workspaces.iter().find_map(|w| {
         let anchor = snapshot.anchor_cwd_for_workspace(&w.workspace_id)?;
         let resolved = boundary
             .validate_existing(std::path::Path::new(&anchor))
@@ -399,7 +418,40 @@ pub fn resolve_spawn_destination(
             w.workspace_id.clone(),
             resolved.to_string_lossy().into_owned(),
         ))
-    })
+    });
+    if by_anchor.is_some() {
+        return by_anchor;
+    }
+
+    // D2: the first workspace holding an in-boundary pane, and that pane's own
+    // folder. The snapshot's order is the order — picking a *better* pane
+    // (least busy, most recent, matching a feature) is ranking, a different
+    // decision that nothing here needs yet.
+    snapshot
+        .panes
+        .iter()
+        .find_map(|pane| Some((pane.workspace_id.clone(), pane_folder(pane, boundary)?)))
+}
+
+/// One pane's folder, validated against `boundary` — `cwd` first, then
+/// `foreground_cwd` (D4).
+///
+/// Deliberately the same two steps `server.rs`'s `project_panes` takes to
+/// decide which project a pane belongs to, so "where is this pane" has one
+/// answer: a pane this resolver would spawn beside is exactly a pane
+/// `ask_state` would list for that project. Two readers of that question
+/// would drift, and the drift would read as a project whose panes are
+/// visible but whose dispatch refuses.
+fn pane_folder(pane: &herdr::wire::Pane, boundary: &Boundary) -> Option<String> {
+    pane.cwd
+        .as_deref()
+        .and_then(|raw| boundary.validate_existing(std::path::Path::new(raw)).ok())
+        .or_else(|| {
+            pane.foreground_cwd
+                .as_deref()
+                .and_then(|raw| boundary.validate_existing(std::path::Path::new(raw)).ok())
+        })
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Clamp a caller-requested await timeout to [`MAX_AWAIT_TIMEOUT`] (D4) — a
@@ -1009,6 +1061,112 @@ mod tests {
             workspaces: vec![w_out],
             layouts: vec![l_out],
             panes: vec![p_out],
+            ..Default::default()
+        };
+
+        assert!(resolve_spawn_destination(&snapshot, &boundary).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// The shape that made this feature: every workspace ANCHOR sits outside
+    /// the project, yet the project plainly owns a pane. Observed live on
+    /// beehive, whose two agent panes resolve under its own root while the
+    /// workspace labelled `beehive` holds another project's panes — the
+    /// anchor is only whichever pane a human has focused, so without this
+    /// fallback dispatchability moved with the cursor.
+    #[test]
+    fn resolve_spawn_destination_falls_through_to_a_contained_pane_when_no_anchor_resolves() {
+        let pid = std::process::id();
+        let root =
+            std::env::temp_dir().join(format!("waggledance-orchestrate-destination-pane-in-{pid}"));
+        let elsewhere = std::env::temp_dir().join(format!(
+            "waggledance-orchestrate-destination-pane-out-{pid}"
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let boundary = Boundary::new(vec![root.clone()]).unwrap();
+
+        // The only anchored workspace points outside; the in-boundary pane is
+        // a plain member of another workspace and is nobody's focus.
+        let (w_out, l_out, p_out) = workspace_with_anchor("w-anchor-outside", &elsewhere);
+        let stray = herdr::wire::Pane {
+            pane_id: "w-other:p7".to_string(),
+            workspace_id: "w-other".to_string(),
+            tab_id: "w-other-tab".to_string(),
+            cwd: Some(root.to_string_lossy().into_owned()),
+            foreground_cwd: None,
+        };
+        let snapshot = herdr::Snapshot {
+            workspaces: vec![w_out],
+            layouts: vec![l_out],
+            panes: vec![p_out, stray],
+            ..Default::default()
+        };
+
+        let (workspace_id, cwd) = resolve_spawn_destination(&snapshot, &boundary)
+            .expect("a pane inside the project is a destination the project owns");
+        assert_eq!(workspace_id, "w-other");
+        assert_eq!(cwd, root.canonicalize().unwrap().to_string_lossy());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// D4: a pane carrying only `foreground_cwd` is found, because that is
+    /// the second step `project_panes` already takes — a pane `ask_state`
+    /// lists for a project must not be one this resolver cannot see.
+    #[test]
+    fn resolve_spawn_destination_reads_foreground_cwd_when_a_pane_has_no_cwd() {
+        let pid = std::process::id();
+        let root =
+            std::env::temp_dir().join(format!("waggledance-orchestrate-destination-fg-{pid}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let boundary = Boundary::new(vec![root.clone()]).unwrap();
+
+        let snapshot = herdr::Snapshot {
+            panes: vec![herdr::wire::Pane {
+                pane_id: "w9:p1".to_string(),
+                workspace_id: "w9".to_string(),
+                tab_id: "w9-tab".to_string(),
+                cwd: None,
+                foreground_cwd: Some(root.to_string_lossy().into_owned()),
+            }],
+            ..Default::default()
+        };
+
+        let (workspace_id, cwd) = resolve_spawn_destination(&snapshot, &boundary)
+            .expect("foreground_cwd is the documented second step");
+        assert_eq!(workspace_id, "w9");
+        assert_eq!(cwd, root.canonicalize().unwrap().to_string_lossy());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The fallback widens where a destination may be FOUND, never what
+    /// counts as one: a snapshot whose panes all sit outside still resolves
+    /// to nothing, so the caller's fail-closed refusal is unchanged.
+    #[test]
+    fn resolve_spawn_destination_still_refuses_when_no_pane_is_contained_either() {
+        let pid = std::process::id();
+        let root =
+            std::env::temp_dir().join(format!("waggledance-orchestrate-destination-nopane-{pid}"));
+        let elsewhere = std::env::temp_dir().join(format!(
+            "waggledance-orchestrate-destination-nopane-out-{pid}"
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let boundary = Boundary::new(vec![root.clone()]).unwrap();
+
+        let snapshot = herdr::Snapshot {
+            panes: vec![herdr::wire::Pane {
+                pane_id: "w9:p1".to_string(),
+                workspace_id: "w9".to_string(),
+                tab_id: "w9-tab".to_string(),
+                cwd: Some(elsewhere.to_string_lossy().into_owned()),
+                foreground_cwd: Some("/definitely/not/here".to_string()),
+            }],
             ..Default::default()
         };
 
