@@ -8079,14 +8079,20 @@ mod tests {
     fn a_project_with_no_herding_block_reads_the_same_as_one_with_no_bee_dir() {
         let bare = fresh_root("herding-registry-nothing");
         assert!(
-            read_snapshot(&bare).config.and_then(|c| c.herding).is_none(),
+            read_snapshot(&bare)
+                .config
+                .and_then(|c| c.herding)
+                .is_none(),
             "no .bee/ at all must report no registry"
         );
 
         let root = fresh_root("herding-registry-no-block");
         write(&root, ".bee/config.json", r#"{"gate_bypass": false}"#);
         assert!(
-            read_snapshot(&root).config.and_then(|c| c.herding).is_none(),
+            read_snapshot(&root)
+                .config
+                .and_then(|c| c.herding)
+                .is_none(),
             "a config with no herding block must report no registry"
         );
 

@@ -4416,7 +4416,7 @@ async fn terminal_create_agent(
 /// an agent's vocabulary. The boundary itself does the actual decision
 /// (symlink resolution, component-wise containment, fail-closed on any
 /// ambiguity) for both directories alike.
-fn project_panes(
+pub(crate) fn project_panes(
     snapshot: &herdr::Snapshot,
     boundary: &waggledance_core::paths_boundary::Boundary,
 ) -> Vec<views::TerminalPaneView> {
