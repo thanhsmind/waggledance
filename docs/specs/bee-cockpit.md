@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
 updated: 2026-08-25
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness, session-work-line, board-live-morph]
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness, session-work-line, board-live-morph, project-color-identity]
 decisions: []
 coverage: partial
 ---
@@ -352,6 +352,16 @@ text, then the most recent decision scoped to the feature, then the title of its
 cell. A long description wraps and is visually clamped — on the card, and on the
 feature's own detail page too — rather than overflowing or forcing either page to
 scroll sideways. A card links onward to the feature's own detail page.
+
+On the board that spans every project, a card's subtitle names its project rather
+than the feature's slug, and the card carries that project's own fixed accent
+colour — the same colour for the same project on every visit, so a reader
+scanning many projects groups the cards by eye before reading a word. That colour
+is the one coloured thing on the card. A project's own board does not repeat the
+project name it is already titled with: a card there keeps the feature's slug and
+keeps its worktree visible. A card with no recorded title names its worktree
+state in the subtitle instead of dropping the line, with no slug half and no
+separator left behind.
 
 ### Live signals on a card
 

@@ -1,7 +1,7 @@
 ---
 area: appearance
 updated: 2026-08-25
-sources: [adopt-atelier-design-system, console-theme-kanban, mark-state-tone, badge-mark-is-status, dots-off-marks-on, card-glyph-is-status]
+sources: [adopt-atelier-design-system, console-theme-kanban, mark-state-tone, badge-mark-is-status, dots-off-marks-on, card-glyph-is-status, no-input-zoom, project-color-identity]
 decisions: [D1, D2, D3, D4, D5, D6]
 coverage: full
 ---
@@ -150,6 +150,12 @@ authentication. The scheme choice is per-browser (local), not shared or synced.
 - **R9.** Colour never carries meaning alone. Where a surface prints the state
   word beside the mark, the word is the text alternative; where it prints none,
   the mark itself carries the state in its accessible name.
+- **R10.** No form field is small enough to make a touch device zoom into it.
+  Where a touch pointer is what focuses a field, fields render at the size such a
+  device treats as readable (16 pixels), so focusing the reply box or a settings
+  field never magnifies the page and leaves it stuck that way after the field is
+  left. A mouse pointer keeps the smaller desktop sizes, and the operator's own
+  pinch-zoom is untouched.
 
 ## Edge Cases Settled
 
