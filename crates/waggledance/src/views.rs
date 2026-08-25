@@ -3314,6 +3314,13 @@ fn bee_hub_style() -> String {
 .bee-strip__row:last-child { border-bottom: none; }
 .bee-strip__label { font-weight: var(--weight-strong); color: var(--color-text); }
 .bee-strip__meta { color: var(--color-text-muted); }
+/* session-work-line: what the session was ASKED to do, between the lane it is
+   bound to and the beat. It takes the row's remaining width and truncates — a
+   prompt is as long as the user felt like typing, and a strip row that reflows
+   onto three lines stops being a strip. */
+.bee-strip__work { flex: 1 1 12rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-text); }
+.bee-strip__row[data-work-status="done"] .bee-strip__work,
+.bee-strip__row[data-work-status="dropped"] .bee-strip__work { color: var(--color-text-muted); }
 .bee-strip__row--unresolved .bee-strip__meta { color: var(--color-danger); }
 /* kanban-columns D1/D12, kanban-columns-archive, console-theme-kanban
    ctk-8: five explicit tracks in the board's own left-to-right column
@@ -4092,9 +4099,37 @@ fn bee_live_strip_section(snapshot: &BeeSnapshot) -> String {
             Some(name) => format!(" · {}", esc(name)),
             None => String::new(),
         };
+        // session-work-line: WHAT this session was asked to do. A record with
+        // no work block renders exactly as it did before this feature — no
+        // empty span, no placeholder, no shifted layout — because most session
+        // records in the wild predate the field, and a strip that grew a blank
+        // column for them would read as a rendering bug.
+        let (work_attrs, work_html, status_html) = match &s.work {
+            Some(work) => {
+                // The reader already path-scrubbed this, but it is the user's
+                // own typing on its way into HTML: esc() decides that here,
+                // never the writer upstream.
+                let acceptance_attr = match work.acceptance.as_deref() {
+                    Some(acceptance) => format!(" title=\"{}\"", esc(acceptance)),
+                    None => String::new(),
+                };
+                (
+                    format!(" data-work-status=\"{}\"{}", esc(&work.status), acceptance_attr),
+                    format!(
+                        r#"<span class="bee-strip__work">“{}”</span>"#,
+                        esc(&work.title)
+                    ),
+                    format!("{} · ", esc(&work.status)),
+                )
+            }
+            None => (String::new(), String::new(), String::new()),
+        };
         rows.push_str(&format!(
-            r#"<div class="bee-strip__row" data-live-kind="session"><span class="bee-strip__label">{label}</span><span class="bee-strip__meta">{phase} · beat {heartbeat}{workspace_html}</span></div>"#,
+            r#"<div class="bee-strip__row" data-live-kind="session"{work_attrs}><span class="bee-strip__label">{label}</span>{work_html}<span class="bee-strip__meta">{status_html}{phase} · beat {heartbeat}{workspace_html}</span></div>"#,
+            work_attrs = work_attrs,
             label = esc(label),
+            work_html = work_html,
+            status_html = status_html,
             phase = esc(phase),
             heartbeat = esc(&heartbeat),
             workspace_html = workspace_html,
@@ -12919,6 +12954,154 @@ mod tests {
     /// close. A live session with a lane bound to a lane record names that
     /// lane, that lane's own phase, its heartbeat age
     /// (`bee_relative_minutes`), and its workspace's own `root`.
+    /// session-work-line: a root carrying one live session whose record has
+    /// whatever `work` value the case wants (`None` writes no key at all).
+    fn strip_root_with_work(name: &str, work: Option<serde_json::Value>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-strip-work-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let hb = (time::OffsetDateTime::now_utc() - time::Duration::minutes(2))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let mut record = serde_json::json!({
+            "id": "live",
+            "last_heartbeat": hb,
+            "lane": "strip-feat",
+        });
+        if let Some(work) = work {
+            record["work"] = work;
+        }
+        let p = root.join(".bee/sessions/live.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, record.to_string()).unwrap();
+        root
+    }
+
+    #[test]
+    fn live_strip_says_what_the_session_is_working_on_not_only_which_lane() {
+        let root = strip_root_with_work(
+            "present",
+            Some(serde_json::json!({
+                "title": "make the board name the work",
+                "text": "the whole conversation",
+                "status": "active",
+                "turns": 3,
+                "acceptance": "Every live session names its ask",
+            })),
+        );
+        let html = bee_live_strip_section(&waggledance_core::bee::read_snapshot(&root));
+
+        assert!(
+            html.contains("make the board name the work"),
+            "the row must say what the session was asked to do: {html}"
+        );
+        assert!(
+            html.contains(r#"data-work-status="active""#),
+            "the row must carry the status as an attribute: {html}"
+        );
+        assert!(
+            html.contains("active · "),
+            "and as text a reader sees beside the beat: {html}"
+        );
+        assert!(
+            html.contains(r#"title="Every live session names its ask""#),
+            "the acceptance rides the row's title attribute: {html}"
+        );
+        assert!(
+            html.contains("strip-feat"),
+            "the lane it is bound to is still named: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_session_with_no_work_record_renders_exactly_as_it_did_before() {
+        // Most session records in the wild predate the field. A blank column
+        // for them would read as a rendering bug, so the row must be
+        // byte-identical to the pre-feature one.
+        let root = strip_root_with_work("absent", None);
+        let html = bee_live_strip_section(&waggledance_core::bee::read_snapshot(&root));
+
+        assert!(
+            !html.contains("bee-strip__work"),
+            "no empty work span: {html}"
+        );
+        assert!(
+            !html.contains("data-work-status"),
+            "no status attribute with nothing behind it: {html}"
+        );
+        assert!(
+            html.contains(r#"<div class="bee-strip__row" data-live-kind="session"><span class="bee-strip__label">"#),
+            "the row opens exactly as it did before this feature: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_work_title_carrying_markup_is_escaped_rather_than_injected() {
+        // The title is the user's own typing. The reader path-scrubs it; only
+        // this renderer decides it is safe as HTML.
+        let root = strip_root_with_work(
+            "escape",
+            Some(serde_json::json!({
+                "title": "<img src=x onerror=alert(1)>",
+                "status": "open",
+                "turns": 1,
+                "acceptance": "</span><script>alert(2)</script>",
+            })),
+        );
+        let html = bee_live_strip_section(&waggledance_core::bee::read_snapshot(&root));
+
+        assert!(!html.contains("<img"), "the tag must not survive: {html}");
+        assert!(!html.contains("<script"), "nor the one in the acceptance: {html}");
+        assert!(html.contains("&lt;img"), "it must arrive escaped: {html}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_conversation_text_is_not_something_the_strip_can_leak() {
+        // W2 keeps `text` out of the reader; this pins that the renderer has
+        // nothing to leak even if a record carries a huge one.
+        let root = strip_root_with_work(
+            "no-text",
+            Some(serde_json::json!({
+                "title": "the short ask",
+                "text": "SENTINEL-the-whole-conversation-so-far",
+                "status": "open",
+                "turns": 9,
+            })),
+        );
+        let html = bee_live_strip_section(&waggledance_core::bee::read_snapshot(&root));
+        assert!(!html.contains("SENTINEL"), "{html}");
+        assert!(html.contains("the short ask"), "{html}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_work_title_truncates_instead_of_reflowing_the_strip() {
+        let style = bee_hub_style();
+        assert!(
+            style.contains(".bee-strip__work"),
+            "the work span needs its own rule"
+        );
+        let rule = style
+            .split(".bee-strip__work {")
+            .nth(1)
+            .expect("the rule body")
+            .split('}')
+            .next()
+            .unwrap();
+        for needed in ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap", "min-width: 0"] {
+            assert!(rule.contains(needed), "the work span must {needed}: {rule}");
+        }
+    }
+
     #[test]
     fn live_strip_names_a_live_sessions_lane_phase_and_heartbeat_age() {
         let root = std::env::temp_dir().join(format!(
