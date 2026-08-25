@@ -1533,7 +1533,8 @@ mod tests {
                     "agent_command": "claude-sonnet",
                     "agents": {
                         "claude-sonnet": ["claude", "--model", "sonnet"],
-                        "agy-flash": {"argv": ["agy", "--dangerously-skip-permissions"]}
+                        "agy-flash": {"argv": ["agy", "--dangerously-skip-permissions"]},
+                        "broken": {"env": {"K": "v"}}
                     }
                 }
             }"#,
@@ -1546,11 +1547,18 @@ mod tests {
         );
         let herding = &filtered["result"]["structuredContent"]["project"]["herding"];
         assert_eq!(herding["default"], "claude-sonnet", "{filtered}");
-        assert_eq!(herding["agents"], json!(["claude-sonnet", "agy-flash"]));
+        assert_eq!(
+            herding["agents"],
+            json!(["claude-sonnet", "agy-flash", "broken"])
+        );
+        // herding-entry-conditions D1: the object form is a bee shape, so
+        // `agy-flash` resolves. What still cannot start is an entry yielding no
+        // command at all — and it is listed, because a label a consumer cannot
+        // see is a label it cannot ask about.
         assert_eq!(
             herding["resolvable"],
-            json!(["claude-sonnet"]),
-            "bee's object form is listed but does not claim to resolve"
+            json!(["claude-sonnet", "agy-flash"]),
+            "an object entry with a usable argv resolves; one without does not"
         );
 
         let rollup = call_tool(&engine, "waggledance_ask_state", json!({}));
@@ -2054,6 +2062,12 @@ mod tests {
     /// refused in those terms, never as unknown — and the line it is refused
     /// on is exactly the line `ask_state` publishes as `resolvable`, so the
     /// tool cannot advertise a label and then reject it.
+    ///
+    /// *Updated by herding-entry-conditions D1:* the example moved. `agy-flash`
+    /// used to be the declared-but-unstartable case purely because this reader
+    /// did not understand its shape; it starts now. The rule is unchanged and
+    /// still needs a case, so the example is an entry that genuinely yields no
+    /// command — declared, and still unable to run.
     #[test]
     fn a_declared_but_unstartable_label_refuses_in_its_own_terms_and_matches_ask_state() {
         let (engine, pa) = dispatch_engine("dispatch-object-form");
@@ -2067,16 +2081,24 @@ mod tests {
                         "claude-sonnet": ["claude", "--model", "sonnet"],
                         "agy-flash": {
                             "argv": ["agy", "--dangerously-skip-permissions"],
-                            "workspace_trust": {"file": "~/.gemini/settings.json"}
-                        }
+                            "workspace_trust": {
+                                "file": "~/.gemini/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        },
+                        "no-command": {"env": {"K": "v"}}
                     }
                 }
             }"#,
         );
 
-        let refusal = resolve_preset(&engine, &pa, "agy-flash")
-            .expect_err("bee's object form does not resolve today");
-        assert!(refusal.contains("agy-flash"), "{refusal}");
+        // The object form now starts, which is this feature's whole point.
+        resolve_preset(&engine, &pa, "agy-flash")
+            .expect("an object entry with a usable argv resolves");
+
+        let refusal = resolve_preset(&engine, &pa, "no-command")
+            .expect_err("an entry that yields no command cannot start");
+        assert!(refusal.contains("no-command"), "{refusal}");
         assert!(
             !refusal.contains("unknown"),
             "the label exists — calling it unknown sends a caller hunting a typo: {refusal}"
