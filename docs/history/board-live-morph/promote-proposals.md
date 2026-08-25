@@ -104,3 +104,23 @@ In-place board patch replaces the reload: keyed reconcile + FLIP in app.js, boar
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 2 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 2 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed
+
+Reviewed in a sweep of the unapplied-proposal backlog.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/board-live-morph/delivery.md`
+  already exists as a curated record; the generated draft would replace it with a
+  list of cell ids and raw deviations.
+- **(b) Area updates** — nothing proposed by the generator.
+- **(c) Pattern candidates** — none promoted. All three recorded deviations are the
+  same phenomenon: tests that pin literal substring adjacency decide where new
+  markup and new CSS rules are allowed to go. That is already active as
+  `docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`, which cites
+  this feature. Recorded as a recurrence rather than promoted a second time.
+
+<!-- /bee:not-a-deferral -->

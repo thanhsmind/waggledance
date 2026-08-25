@@ -73,3 +73,23 @@ Live sessions resolve their feature from claim, worktree, lane, then record, and
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 1 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 1 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed
+
+Reviewed in a sweep of the unapplied-proposal backlog.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/agent-feature-resolution/delivery.md`
+  already exists as a curated record; the generated draft would replace it with a
+  list of cell ids and raw deviations.
+- **(b) Area updates** — nothing proposed by the generator.
+- **(c) Pattern candidates** — none promoted. The cell's two recorded deviations are
+  a cross-worktree hold that the hook classed advisory and the cell flagged for
+  merge-time coordination — already covered by
+  `docs/knowledge/patterns/the-lock-trail-names-the-owner.md` — and a doc-comment
+  correction, which is a cell doing its job rather than a trap anyone can fall into.
+
+<!-- /bee:not-a-deferral -->

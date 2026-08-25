@@ -110,3 +110,30 @@ A dispatch caller can now name any agent kind the target project declares, the s
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 2 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 2 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed
+
+Reviewed in a sweep of the unapplied-proposal backlog.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/dispatch-project-presets/delivery.md`
+  already exists as a curated record; the generated draft would replace it with a
+  list of cell ids and raw deviations.
+- **(b) Area updates** — nothing proposed by the generator.
+- **(c) Pattern candidates** — one of two promoted:
+  - *Promoted.* The live end-to-end run stopped at the target project's
+    orchestration opt-in, and the cell read that as the guard working rather than a
+    coverage gap. A terminal-protocol port hit the same wall days later and answered
+    it the other way — one dispatch with the switch flipped and restored. Two
+    features, one wall, two defensible answers: promoted as
+    `docs/knowledge/patterns/an-opt-in-that-blocks-the-live-proof.md`
+    (`lifecycle: active`, polarity practice).
+  - *Already active.* Committing through a temp index because the plan-freeze guard
+    reads a git path mention of an approved plan as an edit is
+    `docs/knowledge/patterns/the-first-commit-of-a-frozen-plan.md`, whose sources
+    already cite this feature's own cell.
+
+<!-- /bee:not-a-deferral -->
