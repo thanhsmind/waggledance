@@ -3053,16 +3053,22 @@
         item.appendChild(markBox);
       }
 
+      // drawer-row-stack: status and name are one cluster of stacked lines,
+      // not two things side by side — the state reads as a caption over the
+      // name it qualifies, and the name (the only part that differs between
+      // rows) is the largest thing in the row. The pill keeps its coloured
+      // dot: the state is never carried by the word alone.
+      var text = document.createElement("span");
+      text.className = "agent-drawer__text";
+
       var pill = document.createElement("span");
-      pill.className = "fg-status" + pillModifier(pillStatus(agent));
+      pill.className = "agent-drawer__status fg-status" + pillModifier(pillStatus(agent));
       var dot = document.createElement("span");
       dot.className = "fg-status__dot";
       pill.appendChild(dot);
       pill.appendChild(document.createTextNode(agent.bee_state ? beeStateWord(agent.bee_state) : agent.status));
-      item.appendChild(pill);
+      text.appendChild(pill);
 
-      var text = document.createElement("span");
-      text.className = "agent-drawer__text";
       var title = document.createElement("span");
       title.className = "agent-drawer__title";
       title.textContent = agent.title || agent.name;
