@@ -326,6 +326,45 @@ pub struct BeeHandoff {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeeConfig {
     pub gate_bypass: Option<String>,
+    /// `.bee/config.json`'s `herding` block, reduced to the labels a caller
+    /// may name — see [`BeeHerdingRegistry`]. `None` when the file carries no
+    /// `herding` block at all, which is the same shape a project with no
+    /// `.bee/` reports, so both absences read alike to a consumer
+    /// (ask-state-fleet-read D2).
+    pub herding: Option<BeeHerdingRegistry>,
+}
+
+/// A project's herding agent registry as every surface outside this module
+/// is allowed to see it: **labels only, never the argv behind them**
+/// (ask-state-fleet-read D2).
+///
+/// The argv exists one function away ([`herding_agent_argv`]) and is what
+/// actually starts a process. Publishing it — to an MCP consumer, to the
+/// board, to anything — would hand a caller the exact thing
+/// `orchestrator-dispatch` D3 refuses to accept *from* a caller, defeating
+/// that decision by convention instead of by code. So this type cannot
+/// carry an argv: there is no field for one.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BeeHerdingRegistry {
+    /// The label `herding.agent_command` names, when it names one.
+    ///
+    /// `None` covers two different shapes on purpose. Either there is no
+    /// `agent_command`, or it is the inline-argv form
+    /// (`["claude", "--model", "sonnet"]`) — which names no label at all and
+    /// whose tokens are exactly what D2 forbids publishing. A consumer that
+    /// needs to know whether a bare spawn would work asks the spawn path,
+    /// not this field.
+    pub default: Option<String>,
+    /// Every key of `herding.agents`, in the order the file wrote them —
+    /// including entries this reader cannot resolve, so a label that exists
+    /// is never invisible.
+    pub agents: Vec<String>,
+    /// The subset of `agents` [`herding_agent_argv`] can turn into an argv
+    /// today. A label in `agents` and absent here is bee's object form
+    /// (`{"argv": […], "workspace_trust": {…}}`), which this reader does not
+    /// understand — the gap declares itself here instead of surfacing later
+    /// as a board refusal with no explanation.
+    pub resolvable: Vec<String>,
 }
 
 /// One raw entry from `.bee/state.json`'s `workers[]`. `cell`, `tier` and
@@ -1973,6 +2012,7 @@ fn read_config(bee_dir: &Path, root: &Path, read_errors: &mut Vec<String>) -> Op
     match serde_json::from_str::<Value>(&raw) {
         Ok(v) => Some(BeeConfig {
             gate_bypass: normalize_gate_bypass(v.get("gate_bypass")),
+            herding: herding_registry_from_config(&v),
         }),
         Err(e) => {
             read_errors.push(format!("{}: could not parse ({e})", rel_str(&path, root)));
@@ -2026,6 +2066,42 @@ fn herding_agent_argv_from_config(config: &Value) -> Option<Vec<String>> {
         }
         _ => None,
     }
+}
+
+/// [`BeeHerdingRegistry`]'s pure reader, over an already-parsed
+/// `.bee/config.json` — the same seam shape [`herding_agent_argv_from_config`]
+/// uses, and deliberately the same file read: `read_config` already holds
+/// this `Value`, so the registry costs no second open.
+///
+/// `None` means the file carries no `herding` block. A `herding` block with
+/// no `agents` map is a real registry with no labels in it, which is a
+/// different fact and gets `Some` with empty vectors.
+fn herding_registry_from_config(config: &Value) -> Option<BeeHerdingRegistry> {
+    let herding = config.get("herding")?;
+    let default = match herding.get("agent_command") {
+        // Only the label form names something publishable; the inline-argv
+        // form is exactly what D2 keeps out of this type.
+        Some(Value::String(label)) => Some(label.clone()),
+        _ => None,
+    };
+    let mut agents = Vec::new();
+    let mut resolvable = Vec::new();
+    if let Some(Value::Object(entries)) = herding.get("agents") {
+        for (label, entry) in entries {
+            agents.push(label.clone());
+            // Resolvability is asked of the argv reader's own rule, never
+            // re-implemented here — a second copy would be free to drift
+            // into claiming a label works when the spawn path refuses it.
+            if matches!(entry, Value::Array(tokens) if argv_tokens(tokens).is_some()) {
+                resolvable.push(label.clone());
+            }
+        }
+    }
+    Some(BeeHerdingRegistry {
+        default,
+        agents,
+        resolvable,
+    })
 }
 
 /// A JSON array as an argv: every token a string, and at least one of them.
@@ -7895,6 +7971,132 @@ mod tests {
             assert_eq!(herding_agent_argv(&root), None, "{case} must yield no argv");
         }
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ask-state-fleet-read D2: the registry names every label a caller may
+    /// ask for, marks the ones that actually resolve, and carries no argv
+    /// anywhere. beehive's own store is the shape under test — three array
+    /// entries beside `agy-flash`, which bee writes as an OBJECT this reader
+    /// does not understand. That label must still be listed (it exists, and
+    /// a consumer that cannot see it cannot ask why it fails) while staying
+    /// out of `resolvable` (it does not work today).
+    #[test]
+    fn the_herding_registry_lists_every_label_and_marks_only_the_resolvable_ones() {
+        let root = fresh_root("herding-registry-labels");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agent_command": "claude-sonnet",
+                    "agents": {
+                        "claude-sonnet": ["claude", "--model", "sonnet"],
+                        "pi-agy-flash-3.7": ["pi", "-a", "--model", "agy/gemini-3.7-flash:high"],
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "workspace_trust": {"file": "~/.gemini/settings.json", "key": "trustedWorkspaces"}
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let registry = read_snapshot(&root)
+            .config
+            .and_then(|c| c.herding)
+            .expect("a config with a herding block must yield a registry");
+
+        assert_eq!(registry.default.as_deref(), Some("claude-sonnet"));
+        assert_eq!(
+            registry.agents,
+            vec!["claude-sonnet", "pi-agy-flash-3.7", "agy-flash"],
+            "every label the file declares must be listed, resolvable or not"
+        );
+        assert_eq!(
+            registry.resolvable,
+            vec!["claude-sonnet", "pi-agy-flash-3.7"],
+            "bee's object form does not resolve today and must not claim to"
+        );
+
+        // D2 is a property of the type, so prove it the way a consumer would
+        // see it: the serialized registry must not contain the argv tokens.
+        // Every probe below appears ONLY in an argv — a token that is also a
+        // substring of a label (`sonnet`, `pi`) would fail on the label and
+        // prove nothing about the argv.
+        let published = serde_json::to_string(&registry).expect("registry serializes");
+        for token in [
+            "--model",
+            "--dangerously-skip-permissions",
+            "agy/gemini-3.7-flash:high",
+            "workspace_trust",
+        ] {
+            assert!(
+                !published.contains(token),
+                "argv token {token:?} leaked into the published registry: {published}"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The inline-argv form of `agent_command` names no label, so `default`
+    /// is `None` — publishing the tokens instead would be exactly the leak
+    /// D2 exists to prevent. The registry itself is still `Some`: the block
+    /// is there, it simply declares no labels.
+    #[test]
+    fn an_inline_argv_default_names_no_label_and_publishes_no_tokens() {
+        let root = fresh_root("herding-registry-inline");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{"herding": {"agent_command": ["codex", "--full-auto"]}}"#,
+        );
+
+        let registry = read_snapshot(&root)
+            .config
+            .and_then(|c| c.herding)
+            .expect("a herding block with no agents map is still a registry");
+
+        assert_eq!(registry.default, None);
+        assert!(registry.agents.is_empty());
+        assert!(registry.resolvable.is_empty());
+
+        // The spawn path still resolves it — the argv is reachable, just not
+        // publishable. This is the line the two readers sit on either side of.
+        assert_eq!(
+            herding_agent_argv(&root),
+            Some(vec!["codex".to_string(), "--full-auto".to_string()])
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A project with no `herding` block and a project with no `.bee/` at
+    /// all report the same absence, so a consumer needs one branch, not two
+    /// (ask-state-fleet-read, Deferred To Planning).
+    #[test]
+    fn a_project_with_no_herding_block_reads_the_same_as_one_with_no_bee_dir() {
+        let bare = fresh_root("herding-registry-nothing");
+        assert!(
+            read_snapshot(&bare)
+                .config
+                .and_then(|c| c.herding)
+                .is_none(),
+            "no .bee/ at all must report no registry"
+        );
+
+        let root = fresh_root("herding-registry-no-block");
+        write(&root, ".bee/config.json", r#"{"gate_bypass": false}"#);
+        assert!(
+            read_snapshot(&root)
+                .config
+                .and_then(|c| c.herding)
+                .is_none(),
+            "a config with no herding block must report no registry"
+        );
+
+        std::fs::remove_dir_all(&bare).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 

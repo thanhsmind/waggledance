@@ -214,7 +214,16 @@ fn ask_state_schema() -> Value {
         "description": "Ask waggledance for a project's parsed bee state (active feature, \
     phase, open/blocked cells, recent decisions, sessions, handoff, attention) \
     without reading any .bee file yourself. Omit `project` to get a rollup across \
-    every registered project.",
+    every registered project. Two fields describe the fleet rather than the store: \
+    `herding` names the agent kinds this project offers — {default, agents, resolvable} \
+    as LABELS, never the argv behind them, and a label listed in `agents` but absent \
+    from `resolvable` is one that will not start today; `panes` is the project's own \
+    live pane inventory (pane_id, kind, status, bee_state, bee_feature, workspace, tab), \
+    which is how you find an idle pane to reuse instead of spawning a new one. `panes` \
+    is ABSENT when the terminal surface is switched off, `null` beside a `panes_error` \
+    reason when herdr cannot be read — the bee state is complete either way — and an \
+    array otherwise. Seeing a pane grants nothing: dispatching still requires the \
+    project's own orchestration opt-in.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -299,7 +308,7 @@ fn handle_tool_call(
         "waggledance_view_file" => handle_view_file(id, engine, &args),
         "waggledance_search" => handle_search(id, engine, &args),
         "waggledance_projects" => handle_projects(id, engine),
-        "waggledance_ask_state" => handle_ask_state(id, engine, &args),
+        "waggledance_ask_state" => handle_ask_state(id, engine, orchestration, &args),
         "waggledance_dispatch" => handle_dispatch(id, engine, orchestration, &args),
         "waggledance_await" => handle_await(id, engine, orchestration, &args),
         "waggledance_runs" => handle_runs(id, engine, &args),
@@ -518,7 +527,12 @@ fn handle_projects(id: Option<Value>, engine: &Engine) -> Value {
 /// registered project (D1), via `bee::read_rollup`; `BeeProjectRollup` carries
 /// no root/id of its own, so results are labeled by zipping the input roots'
 /// projects back in by index (plan.md Approach 4).
-fn handle_ask_state(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
+fn handle_ask_state(
+    id: Option<Value>,
+    engine: &Engine,
+    orchestration: &mut Option<Orchestration>,
+    args: &Value,
+) -> Value {
     let project = args
         .get("project")
         .and_then(|v| v.as_str())
@@ -529,8 +543,15 @@ fn handle_ask_state(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
             let Some(p) = engine.get_project(project_id).ok().flatten() else {
                 return tool_error(id, &format!("no such project: {project_id}"));
             };
-            let snapshot = bee::read_snapshot(&p.root_path);
-            let digest = ask_state_digest(&p.id, &snapshot);
+            // A rollup rather than a bare snapshot: the pane join reads the
+            // project's worktree list off it, and `rollup.snapshot` is the
+            // same read `read_snapshot` would have done.
+            let mut rollups = bee::read_rollup(std::slice::from_ref(&p.root_path));
+            let rollup = rollups.pop().expect("one root in, one rollup out");
+            let snapshot = &rollup.snapshot;
+            let fleet = read_fleet_panes(engine, orchestration);
+            let mut digest = ask_state_digest(&p.id, snapshot);
+            attach_panes(&mut digest, &p, &rollup, &fleet);
             let text = if !snapshot.present {
                 format!("{}: no .bee/ directory (absent)", p.id)
             } else {
@@ -564,10 +585,17 @@ fn handle_ask_state(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
             let roots: Vec<std::path::PathBuf> =
                 projects.iter().map(|p| p.root_path.clone()).collect();
             let rollups = bee::read_rollup(&roots);
+            // D4: one fleet read for the whole rollup, filtered per project
+            // below — never one herdr call per project.
+            let fleet = read_fleet_panes(engine, orchestration);
             let digests: Vec<Value> = projects
                 .iter()
                 .zip(rollups.iter())
-                .map(|(p, rollup)| ask_state_digest(&p.id, &rollup.snapshot))
+                .map(|(p, rollup)| {
+                    let mut digest = ask_state_digest(&p.id, &rollup.snapshot);
+                    attach_panes(&mut digest, p, rollup, &fleet);
+                    digest
+                })
                 .collect();
             let text = format!("bee state rollup across {} project(s).", digests.len());
             ok(
@@ -624,8 +652,147 @@ fn ask_state_digest(project_id: &str, snapshot: &bee::BeeSnapshot) -> Value {
             "severity": format!("{:?}", a.severity),
             "title": a.title,
             "detail": a.detail
-        })).collect::<Vec<_>>()
+        })).collect::<Vec<_>>(),
+        // ask-state-fleet-read D1/D2: which agent kinds this project offers,
+        // as labels. Serialized straight off `BeeHerdingRegistry` rather than
+        // re-spelled field by field here, so the type's own no-argv guarantee
+        // (and the test that proves it) covers these bytes too. `null` for a
+        // project with no `.bee/` and for one whose config has no `herding`
+        // block — one absence, one branch for the consumer.
+        "herding": snapshot.config.as_ref().and_then(|c| c.herding.clone())
     })
+}
+
+/// What ONE `ask_state` call learned about herdr, read once and reused for
+/// every project in the answer (ask-state-fleet-read D4).
+///
+/// herdr's snapshot is already the whole machine's flat pane list, so asking
+/// it once per project would cost N times as much for the same bytes. The
+/// three variants are the three things an answer can honestly say, and they
+/// are deliberately not collapsed: "the switch is off" and "the transport
+/// broke" are different facts and a consumer must be able to tell them apart.
+enum FleetPanes {
+    /// `terminal.enabled` is off, so nobody looked (D6). The key is omitted
+    /// entirely — an empty array here would claim there are no panes.
+    Off,
+    /// herdr could not be read at all (D5). Every project reports `null`
+    /// beside this reason; the bee half of the answer is unaffected.
+    Unreachable(String),
+    /// One snapshot, filtered per project on the way out (D4).
+    Snapshot(Box<crate::herdr::Snapshot>),
+}
+
+/// Read the fleet once for this tool call.
+///
+/// Ordered so the cheap refusal comes first: with the terminal family off
+/// there is no herdr client to ask, and `ask_state` must stay exactly the
+/// filesystem-only tool it is today for every caller that never set that
+/// switch (D6).
+fn read_fleet_panes(engine: &Engine, orchestration: &mut Option<Orchestration>) -> FleetPanes {
+    if !engine.config.terminal.enabled {
+        return FleetPanes::Off;
+    }
+    // Through the LAZY builder, never `orchestration.as_ref()`: in a session
+    // that only ever calls ask_state, nothing else builds the handle, so
+    // reading the slot directly answers "no client" on every call and the
+    // whole feature degrades to null forever. Caught by running the built
+    // binary against the real registry — the unit tests could not see it,
+    // because they hand this function the slot they want.
+    let orch = match orchestration_handle(orchestration, &engine.config.terminal) {
+        Ok(orch) => orch,
+        // A handle that will not build is D5 like any other unreachable
+        // transport, carrying the init error's own words.
+        Err(e) => return FleetPanes::Unreachable(e),
+    };
+    match orch.runtime.block_on(orch.herdr.snapshot()) {
+        Ok(snapshot) => FleetPanes::Snapshot(Box::new(snapshot)),
+        // The transport's own words, never a generic failure — a caller that
+        // loses the pane list still needs to know why.
+        Err(e) => FleetPanes::Unreachable(format!("herdr snapshot failed: {e}")),
+    }
+}
+
+/// One project's pane inventory as `ask_state` publishes it
+/// (ask-state-fleet-read D3).
+///
+/// Pure on purpose, and this is the whole testability story for this
+/// feature: `Orchestration` holds a concrete `SocketHerdr` rather than a
+/// trait object, so the herdr-touching path cannot be faked at the handler —
+/// the same reason `orchestrate.rs` is proved against `FakeHerdr` while
+/// `mcp.rs`'s own dispatch tests only reach the pre-herdr refusals. Handed a
+/// snapshot and a root, this function is provable with neither.
+///
+/// Containment is [`server::project_panes`]'s, not a second copy: the panes a
+/// project may see are exactly the ones its own board surface shows.
+fn project_panes_value(
+    snapshot: &crate::herdr::Snapshot,
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+    herdr_sessions: &std::collections::HashSet<String>,
+) -> Value {
+    let root = &project.root_path;
+    let Ok(boundary) = waggledance_core::paths_boundary::Boundary::new(vec![root.to_path_buf()])
+    else {
+        // A root that will not resolve into a boundary can own no pane. That
+        // is an empty inventory, not a failure of the whole answer.
+        return json!([]);
+    };
+    let mut panes = crate::server::project_panes(snapshot, &boundary);
+    // `project_panes` deliberately returns bee_state/bee_feature empty and
+    // leaves the join to each caller. Applying it here is what makes the two
+    // fields worth publishing at all: herdr's `status` is derived from the
+    // screen, bee's is what its own hook runtime recorded, and an
+    // orchestrator asking "is this pane really idle?" is asking for the
+    // second one. Never a policy — the answer is reported, not acted on (D8).
+    let activity = crate::server::project_bee_activity(project, rollup, herdr_sessions);
+    crate::server::apply_bee_activity(&mut panes, &activity.pane);
+    Value::Array(
+        panes
+            .iter()
+            .map(|p| {
+                json!({
+                    "pane_id": p.pane_id,
+                    "kind": p.kind,
+                    "status": p.status,
+                    "bee_state": p.bee_state.as_ref().map(|s| format!("{s:?}")),
+                    "bee_feature": p.bee_feature,
+                    "workspace": p.workspace,
+                    "tab": p.tab
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Fold this call's fleet read into one project's digest.
+///
+/// D6 omits, D5 nulls-with-a-reason, and only the third case carries an
+/// inventory — see [`FleetPanes`] for why those stay three separate answers.
+fn attach_panes(
+    digest: &mut Value,
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+    fleet: &FleetPanes,
+) {
+    let Some(object) = digest.as_object_mut() else {
+        return;
+    };
+    match fleet {
+        FleetPanes::Off => {}
+        FleetPanes::Unreachable(reason) => {
+            object.insert("panes".to_string(), Value::Null);
+            object.insert("panes_error".to_string(), json!(reason));
+        }
+        FleetPanes::Snapshot(snapshot) => {
+            // The session set is derived from this call's ONE snapshot (D4),
+            // so it is built here rather than per project.
+            let sessions = crate::server::herdr_session_ids(Some(snapshot));
+            object.insert(
+                "panes".to_string(),
+                project_panes_value(snapshot, project, rollup, &sessions),
+            );
+        }
+    }
 }
 
 /// The human-readable half of the tool result.
@@ -1037,6 +1204,31 @@ mod tests {
     }
 
     #[test]
+    /// A published field nobody can discover is not published: an agent
+    /// learns what `ask_state` answers with from this description and
+    /// nowhere else. Pinned so a later trim cannot quietly drop the two
+    /// fleet fields back out of the contract while the payload still
+    /// carries them.
+    #[test]
+    fn ask_state_description_names_both_fleet_fields_and_the_absent_panes_case() {
+        let description = ask_state_schema()["description"]
+            .as_str()
+            .expect("the tool carries a description")
+            .to_string();
+
+        for promised in ["herding", "resolvable", "panes", "panes_error"] {
+            assert!(
+                description.contains(promised),
+                "{promised:?} is answered but never described: {description}"
+            );
+        }
+        assert!(
+            description.contains("ABSENT"),
+            "the terminal-off case is the one a caller gets wrong by guessing: {description}"
+        );
+    }
+
+    #[test]
     fn tools_list_has_seven_schemas() {
         let tools = [
             view_file_schema(),
@@ -1272,6 +1464,257 @@ mod tests {
 
         std::fs::remove_dir_all(&pa.root_path).ok();
         std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    /// ask-state-fleet-read D1: the herding labels ride on BOTH answer
+    /// shapes, because the rollup is the cross-project view an orchestrator
+    /// leans on hardest — and D2: what rides is labels, never argv.
+    #[test]
+    fn ask_state_carries_the_projects_herding_labels_in_both_forms() {
+        let (engine, pa, pb) = two_project_engine("ask-state-herding");
+        write(
+            &pa.root_path,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agent_command": "claude-sonnet",
+                    "agents": {
+                        "claude-sonnet": ["claude", "--model", "sonnet"],
+                        "agy-flash": {"argv": ["agy", "--dangerously-skip-permissions"]}
+                    }
+                }
+            }"#,
+        );
+
+        let filtered = call_tool(
+            &engine,
+            "waggledance_ask_state",
+            json!({ "project": pa.id }),
+        );
+        let herding = &filtered["result"]["structuredContent"]["project"]["herding"];
+        assert_eq!(herding["default"], "claude-sonnet", "{filtered}");
+        assert_eq!(herding["agents"], json!(["claude-sonnet", "agy-flash"]));
+        assert_eq!(
+            herding["resolvable"],
+            json!(["claude-sonnet"]),
+            "bee's object form is listed but does not claim to resolve"
+        );
+
+        let rollup = call_tool(&engine, "waggledance_ask_state", json!({}));
+        let entries = rollup["result"]["structuredContent"]["projects"]
+            .as_array()
+            .unwrap();
+        let a = entries.iter().find(|e| e["project_id"] == pa.id).unwrap();
+        assert_eq!(a["herding"]["default"], "claude-sonnet", "{rollup}");
+        let b = entries.iter().find(|e| e["project_id"] == pb.id).unwrap();
+        assert!(
+            b["herding"].is_null(),
+            "a project with no .bee/ reports no registry, not an empty one: {b}"
+        );
+
+        // D2 at the wire: no argv token may appear in either answer. `sonnet`
+        // and `agy` are deliberately not probed — both are substrings of a
+        // label, so they would pass on the label and prove nothing.
+        for body in [filtered.to_string(), rollup.to_string()] {
+            for token in ["--model", "--dangerously-skip-permissions"] {
+                assert!(
+                    !body.contains(token),
+                    "argv token {token:?} reached an ask_state answer"
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+        std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    /// ask-state-fleet-read D3, proved at the pure seam because that is the
+    /// only place it CAN be proved: `Orchestration` holds a concrete
+    /// `SocketHerdr`, so a live-transport answer cannot be faked at the
+    /// handler. Handed a snapshot and a root, the projection stands on its
+    /// own — a pane inside the project is kept, one outside is dropped, and
+    /// neither the agent's name nor its terminal title comes along.
+    #[test]
+    fn panes_keep_what_the_project_owns_and_publish_no_name_or_title() {
+        let inside = std::env::temp_dir().join(format!("wd-panes-in-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("wd-panes-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&inside);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        write(&inside, "docs/a.md", "# Project");
+        // A live bee session claiming w1:p1 — the join's whole input. Its
+        // heartbeat is stamped now so the session reads live.
+        let now = waggledance_core::indexer::now_rfc3339();
+        write(
+            &inside,
+            ".bee/sessions/s1.json",
+            &format!(
+                r#"{{"id": "s1", "started_at": "{now}", "last_heartbeat": "{now}",
+                     "activity": {{"state": "blocked", "event": "PermissionRequest",
+                                   "tool_name": "Bash", "at": "{now}", "pane": "w1:p1",
+                                   "cwd": "{cwd}", "feature": "widget-polish"}}}}"#,
+                cwd = inside.display()
+            ),
+        );
+
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&inside, None).unwrap();
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = rollups.pop().unwrap();
+
+        let agent = |pane_id: &str| crate::herdr::wire::Agent {
+            pane_id: pane_id.to_string(),
+            workspace_id: "w1".to_string(),
+            tab_id: "t1".to_string(),
+            kind: "claude".to_string(),
+            name: "surly-otter".to_string(),
+            status: crate::herdr::wire::AgentStatus::Idle,
+            title: "editing bee.rs".to_string(),
+            session_id: None,
+        };
+        let pane = |pane_id: &str, cwd: &std::path::Path| crate::herdr::wire::Pane {
+            pane_id: pane_id.to_string(),
+            workspace_id: "w1".to_string(),
+            tab_id: "t1".to_string(),
+            cwd: Some(cwd.display().to_string()),
+            foreground_cwd: None,
+        };
+        let snapshot = crate::herdr::wire::Snapshot {
+            agents: vec![agent("w1:p1"), agent("w1:p2"), agent("w1:p9")],
+            panes: vec![
+                pane("w1:p1", &inside),
+                pane("w1:p2", &inside),
+                pane("w1:p9", &outside),
+            ],
+            ..Default::default()
+        };
+
+        let sessions = crate::server::herdr_session_ids(Some(&snapshot));
+        let value = project_panes_value(&snapshot, &project, &rollup, &sessions);
+        let rows = value.as_array().expect("panes is an array");
+        assert_eq!(rows.len(), 2, "only the in-boundary panes survive: {value}");
+
+        let fields: Vec<&str> = rows[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "pane_id",
+                "kind",
+                "status",
+                "bee_state",
+                "bee_feature",
+                "workspace",
+                "tab"
+            ],
+            "D3 pins the field set exactly"
+        );
+
+        // The pane bee claims carries bee's own reading, which is the half an
+        // orchestrator needs: herdr says `idle` for both panes, bee says this
+        // one is blocked on a human.
+        let claimed = rows.iter().find(|r| r["pane_id"] == "w1:p1").unwrap();
+        assert_eq!(claimed["status"], "idle", "herdr's screen-derived reading");
+        assert_eq!(claimed["bee_state"], "Blocked", "{claimed}");
+        assert_eq!(claimed["bee_feature"], "widget-polish", "{claimed}");
+
+        // A pane no session claims reports nothing rather than borrowing its
+        // neighbour's state.
+        let unclaimed = rows.iter().find(|r| r["pane_id"] == "w1:p2").unwrap();
+        assert!(unclaimed["bee_state"].is_null(), "{unclaimed}");
+        assert!(unclaimed["bee_feature"].is_null(), "{unclaimed}");
+
+        let published = value.to_string();
+        for leaked in ["surly-otter", "editing bee.rs"] {
+            assert!(
+                !published.contains(leaked),
+                "{leaked:?} is the agent's own name or title and must not be published: {published}"
+            );
+        }
+
+        std::fs::remove_dir_all(&inside).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// D6: with the terminal family off nobody looked, so the key is absent
+    /// — not null, not an empty array — and the answer is what every caller
+    /// that never set that switch already gets today.
+    #[test]
+    fn ask_state_omits_panes_entirely_when_the_terminal_family_is_off() {
+        let (engine, pa, pb) = two_project_engine("ask-state-panes-off");
+        assert!(
+            !engine.config.terminal.enabled,
+            "this test's premise is the default-off switch"
+        );
+
+        let resp = call_tool(
+            &engine,
+            "waggledance_ask_state",
+            json!({ "project": pa.id }),
+        );
+        let digest = &resp["result"]["structuredContent"]["project"];
+        assert!(
+            digest.get("panes").is_none(),
+            "an empty array would claim there are no panes: {digest}"
+        );
+        assert!(digest.get("panes_error").is_none(), "{digest}");
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+        std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    /// D5: an unreadable transport nulls the pane list and names why, and
+    /// leaves the bee half of the answer whole. Losing herdr must never cost
+    /// a caller the state it actually asked for.
+    ///
+    /// Proved on `attach_panes` rather than through the handler on purpose.
+    /// An earlier version drove the handler with an empty orchestration slot
+    /// and passed — but only because the code was reading that slot directly
+    /// instead of building the handle, which is exactly the bug asfr-4 fixed.
+    /// Now that the handler builds a real client, the same test would pass or
+    /// fail depending on whether a herdr socket happens to be alive on the
+    /// machine running it. The shape belongs here, where it depends on nothing.
+    #[test]
+    fn unreachable_herdr_nulls_panes_with_a_reason_and_leaves_bee_state_whole() {
+        let mut digest = json!({
+            "project_id": "widgets",
+            "feature": "widget-polish",
+            "phase": "execution"
+        });
+        // The project and rollup are inert on this branch — an unreachable
+        // transport is answered without ever looking at either — but the
+        // function takes them, so a real pair is cheaper than a fake one.
+        let dir = std::env::temp_dir().join(format!("wd-panes-down-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# Project");
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&dir, None).unwrap();
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = rollups.pop().unwrap();
+
+        attach_panes(
+            &mut digest,
+            &project,
+            &rollup,
+            &FleetPanes::Unreachable("herdr snapshot failed: connection refused".to_string()),
+        );
+
+        assert!(digest["panes"].is_null(), "{digest}");
+        assert_eq!(
+            digest["panes_error"], "herdr snapshot failed: connection refused",
+            "the transport's own words, never a bare null: {digest}"
+        );
+        assert_eq!(
+            digest["feature"], "widget-polish",
+            "the bee half of the answer is untouched: {digest}"
+        );
+        assert_eq!(digest["phase"], "execution");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
