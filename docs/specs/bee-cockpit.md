@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
 updated: 2026-08-25
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness, session-work-line, board-live-morph, project-color-identity]
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness, session-work-line, board-live-morph, bee-board-pm, backlog-groom-2, card-badge-inside, home-board-perf, homepage-tabs, kanban-live-signals, tabbar-collapse, project-color-identity]
 decisions: []
 coverage: partial
 ---
@@ -43,6 +43,15 @@ page for it returns not-found rather than an empty bee page. The absence of a st
 never rendered as an empty dashboard.
 
 A qualifying project gains an entry point on its home page leading to its board.
+
+The home page carries two of these surfaces rather than stacking them: a strip at
+its top offers the cross-project board and the list of registered projects, and only
+the chosen one is built, so the page never pays to render the half nobody asked for.
+Each choice is a real address of its own — copying the address shares the surface it
+was on, the browser's back button steps between them, and the choice survives the
+page reloading itself. The strip is always present, including when the chosen
+surface has nothing to show, so an empty board never strands the reader with no way
+to reach the other one.
 
 On a wide desktop screen the board pages — the home board and a project's own
 bee board — span the full width of the window instead of stopping at the reading
@@ -240,12 +249,15 @@ The board answers, top to bottom, in a fixed order:
 
 1. A top bar naming the project and the instant this snapshot was read.
 2. **Live** — a single dense strip of what is running at this moment, one line each.
-3. The **Feature Hub** — one card per feature, grouped by whether it is waiting on a
+3. The **headline numbers** — a single row of counts standing between the live strip
+   and the cards, so the size of each group is answered before the reader starts
+   reading cards to work it out.
+4. The **Feature Hub** — one card per feature, grouped by whether it is waiting on a
    person, still in progress, or finished.
-4. **Finished (shipped) list** — the complete, permanent record of every feature that
+5. **Finished (shipped) list** — the complete, permanent record of every feature that
    has fully shipped, collapsed by default so it never crowds out the live work above
    it.
-5. **Backlog & Review** — the backlog of proposed work and the state of every review
+6. **Backlog & Review** — the backlog of proposed work and the state of every review
    candidate, for the reader who wants to go one level deeper than the headline view.
 
 This order is not decoration; it is the feature. It mirrors the sequence a project
@@ -466,7 +478,12 @@ agent is doing and which cell it holds, never who it is.
 On the cross-project board, an In Progress card also carries one marker per
 terminal session running in that feature's own checkout, each showing that
 session's state and the program it runs, and each opening that session's own
-terminal view. A collapsed card badges only the sessions that are working or
+terminal view. Those markers sit inside the card's own frame, at its
+foot, divided from the card's lines by a hairline rule — they belong to the card
+that owns them, and hanging them below it on the page background read as though
+they belonged to the gap between two cards rather than to either one. The card's
+own text stays a single link to the feature and remains the whole reading surface;
+each marker is its own link to its terminal. A collapsed card badges only the sessions that are working or
 blocked; the quiet ones move inside the card's expandable body, and the card
 states how many it folded away so a closed card never understates what is
 behind it. Finished rows carry none.

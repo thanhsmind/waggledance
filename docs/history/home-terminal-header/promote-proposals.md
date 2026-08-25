@@ -56,3 +56,22 @@ area web-interface:
 None: no capped cell trace carries a deviation or a failure signature.
 
 knowledge promote: 2 capped cell(s) mined, 1 delivery draft, 4 area bullet(s), 0 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed against the spec
+
+Reviewed in a sweep of the unapplied-proposal backlog, checking each candidate
+bullet against what the spec already states rather than pasting it in.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/home-terminal-header/delivery.md`
+  already exists as a curated record.
+- **(b) Area updates** — the generated bullets are each cell's outcome in
+  implementation vocabulary (function and type names), which a spec never carries
+  outside its Pointers section, so none was applied as written. What the reader
+  actually gained: already stated in `docs/specs/agent-terminal.md` — the spec's "The pane's header" section already carries it.
+- **(c) Pattern candidates** — none proposed for this feature.
+
+<!-- /bee:not-a-deferral -->

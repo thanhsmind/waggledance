@@ -1,7 +1,7 @@
 ---
 area: doctor
 updated: 2026-07-17
-sources: [waggledance-hostname-doctor-fix, doctor-multi-agent-mcp]
+sources: [waggledance-hostname-doctor-fix, doctor-multi-agent-mcp, doctor-preserve-order]
 decisions: [864f6f00]
 coverage: partial
 ---
@@ -74,7 +74,13 @@ Codex — a `~/.codex/` directory or `codex` on PATH. Antigravity — a
     (Claude, Antigravity) merge into the `mcpServers` object; the Codex TOML
     target is edited format-preserving (`toml_edit`) so existing settings and
     comments survive, and a malformed `config.toml` is reported WARN and left
-    untouched rather than clobbered.
+    untouched rather than clobbered. Whatever the target's format, the file
+    comes back in the order the operator wrote it: registering waggledance changes
+    its own entry and nothing else, and every unrelated key keeps its position and
+    its grouping. The guarantee is structural rather than a rule someone has to
+    remember — the writer preserves insertion order by construction, so a later
+    change cannot quietly reintroduce an alphabetised rewrite that keeps every value
+    while destroying the arrangement the operator reads the file by.
   - Agent instruction, for each of AGENTS.md and CLAUDE.md whose managed block
     is missing or out of date: waggledance's instruction snippet is written as a
     marker-delimited block (`<!-- waggledance:START -->` … `<!-- waggledance:END -->`).

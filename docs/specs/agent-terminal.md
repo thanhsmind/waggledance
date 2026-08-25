@@ -1,7 +1,7 @@
 ---
 area: agent-terminal
 updated: 2026-08-25
-sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact, herdr-protocol-20]
+sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact, herdr-protocol-20, terminal-image-attach, terminal-button-surface, unassigned-poller-guard, scroll-keep-position, terminal-scroll-perf, scroll-fab, term-frame-blocks, bundle-mono-font, terminal-pane-scope, home-terminal-header, pane-bar-mobile-menu, screen-revision]
 decisions: [D1, D2, D3, D4, D5, D6, D7, D8, D9, D10]
 coverage: partial
 ---
@@ -81,6 +81,13 @@ implementation. Code entry points are listed in `reading-map.md`.
 - **Starting another session:** the control that starts one shares the strip's
   own row, at that row's right end, so the list of sessions and the way to add
   one read as a single band rather than two stacked controls.
+- **The strip on a narrow screen:** below the shared narrow-screen threshold the
+  strip is always exactly one line. It shows only the session being viewed, and a
+  single menu control holds everything else — every other session, and the controls
+  that start one. Above the threshold the strip is unchanged, because there the full
+  list fits and reading it is faster than opening a menu. The rule exists because a
+  wrapped strip pushes the screen itself down the page, and the screen is what the
+  operator opened the tab to read.
 - **Which one is shown:** the entry the address names. Opening the tab
   without naming one shows the session the operator is currently focused on
   when it belongs to this project, and otherwise the first in the strip, so
@@ -92,6 +99,13 @@ implementation. Code entry points are listed in `reading-map.md`.
   that way is left entirely alone by that page: its screen is not polled and no
   reply reaches it from there, so an open page never spends requests on, nor
   paints a false "reconnecting" state over, a pane that is not its own to drive.
+- **When the view repaints:** a shown screen is redrawn only when it reports a
+  revision different from the one already on the page, so an idle pane costs
+  nothing to keep open. That revision is derived from the rendered text itself —
+  same text, same revision; different text, different revision — and never from any
+  counter the terminal multiplexer keeps on its own behalf. A multiplexer's counter
+  can sit still while output scrolls, and a view that trusted it froze on its first
+  frame while the pane beneath it was plainly moving.
 - **How the screen renders:** a path to one of the project's own markdown
   docs, wherever it appears in the screen or the transcript, is shown as a
   clickable link to that doc. The monospaced type used for the screen ships
