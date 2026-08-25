@@ -624,7 +624,14 @@ fn ask_state_digest(project_id: &str, snapshot: &bee::BeeSnapshot) -> Value {
             "severity": format!("{:?}", a.severity),
             "title": a.title,
             "detail": a.detail
-        })).collect::<Vec<_>>()
+        })).collect::<Vec<_>>(),
+        // ask-state-fleet-read D1/D2: which agent kinds this project offers,
+        // as labels. Serialized straight off `BeeHerdingRegistry` rather than
+        // re-spelled field by field here, so the type's own no-argv guarantee
+        // (and the test that proves it) covers these bytes too. `null` for a
+        // project with no `.bee/` and for one whose config has no `herding`
+        // block — one absence, one branch for the consumer.
+        "herding": snapshot.config.as_ref().and_then(|c| c.herding.clone())
     })
 }
 
@@ -1269,6 +1276,68 @@ mod tests {
         assert_eq!(digest["phase"], "execution");
         assert_eq!(digest["mode"], "standard");
         assert_eq!(digest["cell_counts"]["doing"], 0);
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+        std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    /// ask-state-fleet-read D1: the herding labels ride on BOTH answer
+    /// shapes, because the rollup is the cross-project view an orchestrator
+    /// leans on hardest — and D2: what rides is labels, never argv.
+    #[test]
+    fn ask_state_carries_the_projects_herding_labels_in_both_forms() {
+        let (engine, pa, pb) = two_project_engine("ask-state-herding");
+        write(
+            &pa.root_path,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agent_command": "claude-sonnet",
+                    "agents": {
+                        "claude-sonnet": ["claude", "--model", "sonnet"],
+                        "agy-flash": {"argv": ["agy", "--dangerously-skip-permissions"]}
+                    }
+                }
+            }"#,
+        );
+
+        let filtered = call_tool(
+            &engine,
+            "waggledance_ask_state",
+            json!({ "project": pa.id }),
+        );
+        let herding = &filtered["result"]["structuredContent"]["project"]["herding"];
+        assert_eq!(herding["default"], "claude-sonnet", "{filtered}");
+        assert_eq!(herding["agents"], json!(["claude-sonnet", "agy-flash"]));
+        assert_eq!(
+            herding["resolvable"],
+            json!(["claude-sonnet"]),
+            "bee's object form is listed but does not claim to resolve"
+        );
+
+        let rollup = call_tool(&engine, "waggledance_ask_state", json!({}));
+        let entries = rollup["result"]["structuredContent"]["projects"]
+            .as_array()
+            .unwrap();
+        let a = entries.iter().find(|e| e["project_id"] == pa.id).unwrap();
+        assert_eq!(a["herding"]["default"], "claude-sonnet", "{rollup}");
+        let b = entries.iter().find(|e| e["project_id"] == pb.id).unwrap();
+        assert!(
+            b["herding"].is_null(),
+            "a project with no .bee/ reports no registry, not an empty one: {b}"
+        );
+
+        // D2 at the wire: no argv token may appear in either answer. `sonnet`
+        // and `agy` are deliberately not probed — both are substrings of a
+        // label, so they would pass on the label and prove nothing.
+        for body in [filtered.to_string(), rollup.to_string()] {
+            for token in ["--model", "--dangerously-skip-permissions"] {
+                assert!(
+                    !body.contains(token),
+                    "argv token {token:?} reached an ask_state answer"
+                );
+            }
+        }
 
         std::fs::remove_dir_all(&pa.root_path).ok();
         std::fs::remove_dir_all(&pb.root_path).ok();
