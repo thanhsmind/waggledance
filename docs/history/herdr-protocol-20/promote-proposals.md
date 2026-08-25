@@ -186,3 +186,36 @@ A real dispatch now starts a real agent: run-57f2ccff17effcb3, pi working in bee
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 4 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 4 pattern candidate(s), 0 file(s) written.
+---
+
+<!-- bee:not-a-deferral: this section records a completed review. Every item below is settled; nothing here promises later action. -->
+
+## Resolution — 2026-08-25, one pattern promoted
+
+Reviewed while draining the capture queue.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/herdr-protocol-20/delivery.md`
+  already exists as a curated record and carries what the draft's cell-by-cell
+  list cannot: what the port bought, and the visible placement change a spawned
+  agent now has.
+- **(b) Area updates** — nothing proposed. The work item declares no `bee.areas`,
+  so the generator had nothing to route (D19).
+- **(c) Pattern candidates** — one of four promoted, as
+  `docs/knowledge/patterns/a-breaking-interface-change-has-no-separable-cells.md`
+  (`lifecycle: active`). The candidates are four views of the same handful of
+  deviations, and only one clears the promotion bars:
+  - *Promoted.* Cells hp20-1..3 could not be capped separately because a trait
+    signature change leaves nothing compiling until every caller follows. That
+    recurs on any interface change, wastes real planning effort, and generalizes
+    past this port — it is the mirror of `prove-the-whole-path`.
+  - *Not promoted.* "Ran inline rather than through a dispatched execution
+    worker", on all four cells: a standing user instruction being honoured, not
+    a trap anyone can fall into.
+  - *Not promoted.* Committing through a temp index because the plan-freeze guard
+    reads a git path mention of an approved plan as an edit: already active as
+    `docs/knowledge/patterns/the-first-commit-of-a-frozen-plan.md`.
+  - *Not promoted.* A spawned agent landing in its own tab, recorded in the test
+    that pinned the old placement: the practice it demonstrates is already active
+    as `docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`.
+
+<!-- /bee:not-a-deferral -->

@@ -224,6 +224,16 @@ a card that arrives fades in, and nothing inside a card animates. Every failure 
 — an unreadable response, a shape the reconciler does not recognise — falls back to a
 full page reload, so the worst case is exactly the behaviour this replaced.
 
+Matching by key settles what happens to the things that have one; the reconcile owns
+what is left over too. Not everything the board draws carries a key of its own — a
+row's action controls sit beside the row rather than inside it, so no key ever claims
+them. Anything standing in the patched area without a key is the reconcile's own
+leftover and is removed on every pass. Without that rule each patch left one more copy
+of those controls beside the last, and a column that emptied still showed the controls
+of the rows that had left it. The arrival fade belongs to keyed things only, which is
+the same rule as before read from the other side: motion marks a card or a row
+appearing, never a control reappearing beside one.
+
 ## The reading order — and why it is the feature
 
 The board answers, top to bottom, in a fixed order:
