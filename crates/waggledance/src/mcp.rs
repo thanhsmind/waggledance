@@ -823,7 +823,13 @@ fn resolve_preset(
     engine: &Engine,
     project: &waggledance_core::domain::Project,
     label: &str,
-) -> std::result::Result<waggledance_core::config::AgentPreset, String> {
+) -> std::result::Result<
+    (
+        waggledance_core::config::AgentPreset,
+        waggledance_core::bee::BeeHerdingEntry,
+    ),
+    String,
+> {
     if let Some(global) = engine
         .config
         .terminal
@@ -831,13 +837,23 @@ fn resolve_preset(
         .iter()
         .find(|p| p.label == label)
     {
-        return Ok(global.clone());
+        // An operator's preset is a command and nothing else: the conditions
+        // are a project's declaration, and a global list declares none.
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: global.argv.clone(),
+            env: Vec::new(),
+            workspace_trust: None,
+        };
+        return Ok((global.clone(), entry));
     }
-    if let Some(argv) = waggledance_core::bee::herding_argv_for_label(&project.root_path, label) {
-        return Ok(waggledance_core::config::AgentPreset {
-            label: label.to_string(),
-            argv,
-        });
+    if let Some(entry) = waggledance_core::bee::herding_entry_for_label(&project.root_path, label) {
+        return Ok((
+            waggledance_core::config::AgentPreset {
+                label: label.to_string(),
+                argv: entry.argv.clone(),
+            },
+            entry,
+        ));
     }
     // D4: a label the project DECLARES but this reader cannot start is not
     // "unknown" — calling it that sends a caller hunting a typo that does not
@@ -932,7 +948,7 @@ fn handle_dispatch(
     // the socket at all.
     let preset = match preset_label {
         Some(label) => match resolve_preset(engine, &project, label) {
-            Ok(p) => Some(p),
+            Ok(resolved) => Some(resolved),
             Err(refusal) => return tool_error(id, &refusal),
         },
         None => None,
@@ -951,13 +967,24 @@ fn handle_dispatch(
         task,
     ));
     match outcome {
-        Ok(run_id) => ok(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": format!("dispatched run {run_id}") }],
-                "structuredContent": { "run_id": run_id }
-            }),
-        ),
+        // D9: a fail-open step that went wrong is named HERE, in the answer
+        // that says the agent started — not left in the daemon's log, where a
+        // warning is indistinguishable from no warning at the moment the
+        // operator is looking at a pane that will not move.
+        Ok((run_id, warnings)) => {
+            let text = if warnings.is_empty() {
+                format!("dispatched run {run_id}")
+            } else {
+                format!("dispatched run {run_id}; {}", warnings.join("; "))
+            };
+            ok(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": { "run_id": run_id, "warnings": warnings }
+                }),
+            )
+        }
         Err(msg) => tool_error(id, &msg),
     }
 }
@@ -971,21 +998,21 @@ async fn run_dispatch(
     herdr: &dyn Herdr,
     engine: &Engine,
     project: &Project,
-    preset: Option<waggledance_core::config::AgentPreset>,
+    preset: Option<(
+        waggledance_core::config::AgentPreset,
+        waggledance_core::bee::BeeHerdingEntry,
+    )>,
     pane_id_arg: Option<String>,
     task: &str,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<(String, Vec<String>), String> {
     // This tool's own half: which destination the two argument shapes mean,
     // and how a run started here is labelled. Everything after it -- the
     // preflight, baseline, marker, send and the persisted run -- is the one
     // shared dispatch path (`orchestrate::dispatch_run`), the same one the
     // board's run actions use.
     let (target, preset_label) = match (preset, pane_id_arg) {
-        (Some(preset), None) => (
-            orchestrate::DispatchTarget::Spawn {
-                argv: preset.argv,
-                cwd: None,
-            },
+        (Some((preset, entry)), None) => (
+            orchestrate::DispatchTarget::Spawn { entry, cwd: None },
             Some(preset.label),
         ),
         (None, Some(pane_id)) => {
@@ -1016,10 +1043,11 @@ async fn run_dispatch(
 
     // No feature: a run started from this tool belongs to whoever called it,
     // not to a board card, and must never hold a card's per-feature lock.
-    let run = orchestrate::dispatch_run(herdr, engine, project, target, task, None, preset_label)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(run.id)
+    let dispatched =
+        orchestrate::dispatch_run(herdr, engine, project, target, task, None, preset_label)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok((dispatched.run.id, dispatched.warnings))
 }
 
 /// `waggledance_await`: bounded poll for a run's completion (D4/D5).
@@ -1533,7 +1561,8 @@ mod tests {
                     "agent_command": "claude-sonnet",
                     "agents": {
                         "claude-sonnet": ["claude", "--model", "sonnet"],
-                        "agy-flash": {"argv": ["agy", "--dangerously-skip-permissions"]}
+                        "agy-flash": {"argv": ["agy", "--dangerously-skip-permissions"]},
+                        "broken": {"env": {"K": "v"}}
                     }
                 }
             }"#,
@@ -1546,11 +1575,18 @@ mod tests {
         );
         let herding = &filtered["result"]["structuredContent"]["project"]["herding"];
         assert_eq!(herding["default"], "claude-sonnet", "{filtered}");
-        assert_eq!(herding["agents"], json!(["claude-sonnet", "agy-flash"]));
+        assert_eq!(
+            herding["agents"],
+            json!(["claude-sonnet", "agy-flash", "broken"])
+        );
+        // herding-entry-conditions D1: the object form is a bee shape, so
+        // `agy-flash` resolves. What still cannot start is an entry yielding no
+        // command at all — and it is listed, because a label a consumer cannot
+        // see is a label it cannot ask about.
         assert_eq!(
             herding["resolvable"],
-            json!(["claude-sonnet"]),
-            "bee's object form is listed but does not claim to resolve"
+            json!(["claude-sonnet", "agy-flash"]),
+            "an object entry with a usable argv resolves; one without does not"
         );
 
         let rollup = call_tool(&engine, "waggledance_ask_state", json!({}));
@@ -2036,7 +2072,7 @@ mod tests {
 
         let resolved = resolve_preset(&engine, &pa, "shared").expect("both sources hold it");
         assert_eq!(
-            resolved.argv,
+            resolved.0.argv,
             vec!["from-global".to_string()],
             "the global list is searched first, so an existing label never re-aims"
         );
@@ -2045,7 +2081,7 @@ mod tests {
         // project — the fallback only ever fills a gap.
         engine.config.terminal.agent_presets.clear();
         let resolved = resolve_preset(&engine, &pa, "shared").expect("the project holds it");
-        assert_eq!(resolved.argv, vec!["from-project".to_string()]);
+        assert_eq!(resolved.0.argv, vec!["from-project".to_string()]);
 
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
@@ -2054,6 +2090,12 @@ mod tests {
     /// refused in those terms, never as unknown — and the line it is refused
     /// on is exactly the line `ask_state` publishes as `resolvable`, so the
     /// tool cannot advertise a label and then reject it.
+    ///
+    /// *Updated by herding-entry-conditions D1:* the example moved. `agy-flash`
+    /// used to be the declared-but-unstartable case purely because this reader
+    /// did not understand its shape; it starts now. The rule is unchanged and
+    /// still needs a case, so the example is an entry that genuinely yields no
+    /// command — declared, and still unable to run.
     #[test]
     fn a_declared_but_unstartable_label_refuses_in_its_own_terms_and_matches_ask_state() {
         let (engine, pa) = dispatch_engine("dispatch-object-form");
@@ -2067,16 +2109,24 @@ mod tests {
                         "claude-sonnet": ["claude", "--model", "sonnet"],
                         "agy-flash": {
                             "argv": ["agy", "--dangerously-skip-permissions"],
-                            "workspace_trust": {"file": "~/.gemini/settings.json"}
-                        }
+                            "workspace_trust": {
+                                "file": "~/.gemini/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        },
+                        "no-command": {"env": {"K": "v"}}
                     }
                 }
             }"#,
         );
 
-        let refusal = resolve_preset(&engine, &pa, "agy-flash")
-            .expect_err("bee's object form does not resolve today");
-        assert!(refusal.contains("agy-flash"), "{refusal}");
+        // The object form now starts, which is this feature's whole point.
+        resolve_preset(&engine, &pa, "agy-flash")
+            .expect("an object entry with a usable argv resolves");
+
+        let refusal = resolve_preset(&engine, &pa, "no-command")
+            .expect_err("an entry that yields no command cannot start");
+        assert!(refusal.contains("no-command"), "{refusal}");
         assert!(
             !refusal.contains("unknown"),
             "the label exists — calling it unknown sends a caller hunting a typo: {refusal}"

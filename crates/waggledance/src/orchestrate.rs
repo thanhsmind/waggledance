@@ -114,13 +114,16 @@ pub enum DispatchTarget {
     /// against the feature's own granted worktree, which is a sibling
     /// directory OUTSIDE that root.
     Pane(String),
-    /// Start a fresh agent pane. `argv` is the whole command (a preset's,
-    /// or the project's own `.bee/config.json` `herding` default) and `cwd`
-    /// the directory to start it in -- `None` means the project's own
-    /// resolved destination ([`resolve_spawn_destination`]), which is the
-    /// only directory this module will ever choose on a caller's behalf.
+    /// Start a fresh agent pane from a project's own declaration. `entry`
+    /// carries the command AND the conditions declared around it -- an `env`
+    /// map to export, a trust store to seed -- because a `herding.agents`
+    /// entry is more than an argv and honouring only the argv starts an agent
+    /// that then stalls at a prompt nobody sees. `cwd` is the directory to
+    /// start it in; `None` means the project's own resolved destination
+    /// ([`resolve_spawn_destination`]), the only directory this module will
+    /// ever choose on a caller's behalf.
     Spawn {
-        argv: Vec<String>,
+        entry: waggledance_core::bee::BeeHerdingEntry,
         cwd: Option<String>,
     },
 }
@@ -295,13 +298,14 @@ pub async fn dispatch_run(
     task: &str,
     feature: Option<&str>,
     preset_label: Option<String>,
-) -> Result<Run, DispatchRefusal> {
+) -> Result<Dispatched, DispatchRefusal> {
+    let mut warnings: Vec<String> = Vec::new();
     let pane_id = match target {
         DispatchTarget::Pane(pane_id) => {
             preflight(herdr, &pane_id).await?;
             pane_id
         }
-        DispatchTarget::Spawn { argv, cwd } => {
+        DispatchTarget::Spawn { entry, cwd } => {
             let snapshot = herdr
                 .snapshot()
                 .await
@@ -330,10 +334,14 @@ pub async fn dispatch_run(
             // The shared helper owns that hop — including its refusal when
             // the new tab yields no pane, which must never be softened into
             // "use another pane" here.
-            let started = herdr::start_agent_in_new_tab(herdr, &workspace_id, Some(&dir), &argv)
+            // D3: `dir` is the destination this function already validated
+            // against the project's boundary, and it is the only directory
+            // that reaches the trust seeding.
+            let outcome = herdr::start_declared_agent(herdr, &workspace_id, Some(&dir), &entry)
                 .await
                 .map_err(|e| DispatchRefusal::AgentStartFailed(e.to_string()))?;
-            started.pane_id
+            warnings.extend(outcome.warnings);
+            outcome.started.pane_id
         }
     };
 
@@ -361,7 +369,20 @@ pub async fn dispatch_run(
     engine
         .insert_run(&run, feature)
         .map_err(|e| DispatchRefusal::PersistenceFailed(e.to_string()))?;
-    Ok(run)
+    Ok(Dispatched { run, warnings })
+}
+
+/// What a dispatch produced: the durable run, plus anything that went wrong
+/// on the way which did not stop it (herding-entry-conditions D9).
+///
+/// `warnings` exists so a fail-open step cannot go silent. A trust seeding
+/// that fails is not fatal — but the operator must learn it in the same
+/// answer that says the agent started, or the first they know of it is a pane
+/// sitting at a prompt with nothing to attribute it to.
+#[derive(Debug, Clone)]
+pub struct Dispatched {
+    pub run: Run,
+    pub warnings: Vec<String>,
 }
 
 /// The transcript delta versus baseline — everything a `Recent` read has

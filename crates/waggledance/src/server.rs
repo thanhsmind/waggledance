@@ -2179,6 +2179,7 @@ async fn dispatch_board_run(
         Some(BOARD_RUN_PRESET_LABEL.to_string()),
     )
     .await
+    .map(|d| d.run)
     .map_err(dispatch_refusal_response)
 }
 
@@ -2285,7 +2286,14 @@ async fn bee_action_run(
             let cwd = feature_worktree_dir(project, &rollup, feature)
                 .unwrap_or_else(|| project.root_path.clone());
             let target = crate::orchestrate::DispatchTarget::Spawn {
-                argv,
+                // The board resolves its default through `herding_agent_argv`,
+                // which yields a command and no conditions. Widening the board
+                // to the full entry shape is its own change, not this one's.
+                entry: waggledance_core::bee::BeeHerdingEntry {
+                    argv,
+                    env: Vec::new(),
+                    workspace_trust: None,
+                },
                 cwd: Some(cwd.to_string_lossy().into_owned()),
             };
             match dispatch_board_run(st, project, target, &task, feature).await {
@@ -2315,7 +2323,14 @@ async fn bee_action_run(
                 },
             };
             let target = crate::orchestrate::DispatchTarget::Spawn {
-                argv,
+                // The board resolves its default through `herding_agent_argv`,
+                // which yields a command and no conditions. Widening the board
+                // to the full entry shape is its own change, not this one's.
+                entry: waggledance_core::bee::BeeHerdingEntry {
+                    argv,
+                    env: Vec::new(),
+                    workspace_trust: None,
+                },
                 cwd: Some(worktree.to_string_lossy().into_owned()),
             };
             let run = match dispatch_board_run(st, project, target, &task, feature).await {

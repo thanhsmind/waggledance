@@ -2108,24 +2108,95 @@ fn herding_agent_argv_from_config(config: &Value) -> Option<Vec<String>> {
 /// it, which is worse than either answer alone.
 ///
 /// `None` covers every way a label yields no command: no `herding` block, no
-/// `agents` map, no entry under that label, an entry in a shape this reader
-/// does not understand (bee's own `{argv, workspace_trust}` object form), or
-/// an argv that is empty or holds a non-string token. The caller refuses —
-/// resolving a label to the label itself would run `claude-sonnet` as a
-/// command.
+/// `agents` map, no entry under that label, or an argv that is empty or holds
+/// a non-string token. The caller refuses — resolving a label to the label
+/// itself would run `claude-sonnet` as a command.
 pub fn herding_argv_for_label(root: &Path, label: &str) -> Option<Vec<String>> {
-    let raw = fs::read_to_string(root.join(".bee").join("config.json")).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    herding_argv_for_label_from_config(&value, label)
+    herding_entry_for_label(root, label).map(|e| e.argv)
 }
 
-/// [`herding_argv_for_label`]'s pure half, over an already-parsed
+/// Everything a project declares about ONE agent kind: the command, and the
+/// conditions bee applies around it (herding-entry-conditions D1).
+///
+/// bee documents **two** entry shapes, not one — a bare argv array, and an
+/// object `{"argv": […], "env": {…}}` with an optional `workspace_trust`
+/// (`bee-herding/agent-resolution-and-spawn-commands.md`,
+/// `defaults-and-agent-env` D4). Reading only the array was the bug that made
+/// beehive's own `agy-flash` look unusable.
+///
+/// The conditions travel to the **spawn path only**. They are deliberately
+/// absent from [`BeeHerdingRegistry`], which keeps publishing labels and
+/// nothing else: an `env` map holds values a project chose not to put in its
+/// argv, and a trust path names a file outside the repo — neither belongs in
+/// an answer a caller reads (`ask-state-fleet-read` D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeeHerdingEntry {
+    /// The command to run. Never empty — an entry that cannot produce one
+    /// resolves to `None` instead.
+    pub argv: Vec<String>,
+    /// Exported into the pane before the agent starts, when declared.
+    pub env: Vec<(String, String)>,
+    /// The foreign tool's own trust store, when the entry gates on one.
+    pub workspace_trust: Option<BeeWorkspaceTrust>,
+}
+
+/// An entry's declaration that its tool keeps a per-workspace trust list:
+/// which file, and which key inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeeWorkspaceTrust {
+    pub file: String,
+    pub key: String,
+}
+
+/// Read one label's whole entry — argv plus conditions.
+pub fn herding_entry_for_label(root: &Path, label: &str) -> Option<BeeHerdingEntry> {
+    let raw = fs::read_to_string(root.join(".bee").join("config.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    herding_entry_for_label_from_config(&value, label)
+}
+
+/// [`herding_entry_for_label`]'s pure half, over an already-parsed
 /// `.bee/config.json`.
-fn herding_argv_for_label_from_config(config: &Value, label: &str) -> Option<Vec<String>> {
-    match config.get("herding")?.get("agents")?.get(label)? {
-        Value::Array(tokens) => argv_tokens(tokens),
+fn herding_entry_for_label_from_config(config: &Value, label: &str) -> Option<BeeHerdingEntry> {
+    let entry = config.get("herding")?.get("agents")?.get(label)?;
+    match entry {
+        // The bare form: the entry IS the command, and declares no conditions.
+        Value::Array(tokens) => Some(BeeHerdingEntry {
+            argv: argv_tokens(tokens)?,
+            env: Vec::new(),
+            workspace_trust: None,
+        }),
+        Value::Object(_) => Some(BeeHerdingEntry {
+            // Still `None` when the object carries no usable command — an
+            // object is not a command just because it is well-formed.
+            argv: match entry.get("argv")? {
+                Value::Array(tokens) => argv_tokens(tokens)?,
+                _ => return None,
+            },
+            env: entry
+                .get("env")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            workspace_trust: entry.get("workspace_trust").and_then(|t| {
+                Some(BeeWorkspaceTrust {
+                    file: t.get("file")?.as_str()?.to_string(),
+                    key: t.get("key")?.as_str()?.to_string(),
+                })
+            }),
+        }),
         _ => None,
     }
+}
+
+/// [`herding_argv_for_label`]'s pure half — the predicate `resolvable` and the
+/// dispatch resolver share (D7), now covering both entry shapes.
+fn herding_argv_for_label_from_config(config: &Value, label: &str) -> Option<Vec<String>> {
+    herding_entry_for_label_from_config(config, label).map(|e| e.argv)
 }
 
 /// [`BeeHerdingRegistry`]'s pure reader, over an already-parsed
@@ -5483,7 +5554,11 @@ mod tests {
             "source": "startup",
             "work": work,
         });
-        write(root, &format!(".bee/sessions/{id}.json"), &record.to_string());
+        write(
+            root,
+            &format!(".bee/sessions/{id}.json"),
+            &record.to_string(),
+        );
     }
 
     fn only_session(root: &std::path::Path) -> BeeSession {
@@ -5513,7 +5588,10 @@ mod tests {
         assert_eq!(work.title, "make the board name the work");
         assert_eq!(work.status, "active");
         assert_eq!(work.turns, 2);
-        assert_eq!(work.acceptance.as_deref(), Some("Every live session names its ask"));
+        assert_eq!(
+            work.acceptance.as_deref(),
+            Some("Every live session names its ask")
+        );
         assert_eq!(work.updated_at.as_deref(), Some("2026-08-25T08:30:00.000Z"));
 
         std::fs::remove_dir_all(&root).ok();
@@ -5525,14 +5603,20 @@ mod tests {
         // parses, so one bad record must not be able to hide behind a good one.
         for (name, work) in [
             ("not-an-object", serde_json::json!("just a string")),
-            ("no-title", serde_json::json!({ "status": "open", "turns": 1 })),
+            (
+                "no-title",
+                serde_json::json!({ "status": "open", "turns": 1 }),
+            ),
             ("title-not-a-string", serde_json::json!({ "title": 42 })),
             ("null", Value::Null),
         ] {
             let root = fresh_root(&format!("work-bad-{name}"));
             write_session_with_work(&root, "w1", work);
             let session = only_session(&root);
-            assert!(session.work.is_none(), "{name}: a bad work block reads as None");
+            assert!(
+                session.work.is_none(),
+                "{name}: a bad work block reads as None"
+            );
             assert_eq!(session.id, "w1", "{name}: the session itself still parses");
             std::fs::remove_dir_all(&root).ok();
         }
@@ -5571,7 +5655,11 @@ mod tests {
             !rendered.contains("SENTINEL"),
             "W2: the record's text must not survive into the snapshot: {rendered}"
         );
-        assert_eq!(session.work.unwrap().turns, 7, "the turn count still comes through");
+        assert_eq!(
+            session.work.unwrap().turns,
+            7,
+            "the turn count still comes through"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -5601,7 +5689,11 @@ mod tests {
     #[test]
     fn an_absolute_path_in_the_title_or_the_acceptance_is_scrubbed() {
         let root = fresh_root("work-scrub");
-        let inside = root.join("crates").join("bee.rs").to_string_lossy().into_owned();
+        let inside = root
+            .join("crates")
+            .join("bee.rs")
+            .to_string_lossy()
+            .into_owned();
         write_session_with_work(
             &root,
             "w1",
@@ -5616,7 +5708,11 @@ mod tests {
         let work = only_session(&root).work.unwrap();
         let root_str = root.to_string_lossy().into_owned();
         assert!(!work.title.contains(&root_str), "W4: {}", work.title);
-        assert!(work.title.contains("bee.rs"), "the file is still named: {}", work.title);
+        assert!(
+            work.title.contains("bee.rs"),
+            "the file is still named: {}",
+            work.title
+        );
         let acceptance = work.acceptance.unwrap();
         assert!(!acceptance.contains(&root_str), "W4: {acceptance}");
 
@@ -8225,10 +8321,15 @@ mod tests {
     /// ask-state-fleet-read D2: the registry names every label a caller may
     /// ask for, marks the ones that actually resolve, and carries no argv
     /// anywhere. beehive's own store is the shape under test — three array
-    /// entries beside `agy-flash`, which bee writes as an OBJECT this reader
-    /// does not understand. That label must still be listed (it exists, and
-    /// a consumer that cannot see it cannot ask why it fails) while staying
-    /// out of `resolvable` (it does not work today).
+    /// entries beside `agy-flash`, which bee writes as an OBJECT.
+    ///
+    /// *Updated by herding-entry-conditions D1:* that object form is a
+    /// documented bee shape, not a malformed entry, so `agy-flash` now
+    /// resolves and appears in `resolvable`. The earlier version of this test
+    /// asserted the opposite and said "it does not work today" — the reader
+    /// was incomplete, and today has arrived. What has NOT changed is the rule
+    /// underneath: `resolvable` means "this label can start", whatever the
+    /// shape it was declared in.
     #[test]
     fn the_herding_registry_lists_every_label_and_marks_only_the_resolvable_ones() {
         let root = fresh_root("herding-registry-labels");
@@ -8263,8 +8364,8 @@ mod tests {
         );
         assert_eq!(
             registry.resolvable,
-            vec!["claude-sonnet", "pi-agy-flash-3.7"],
-            "bee's object form does not resolve today and must not claim to"
+            vec!["claude-sonnet", "pi-agy-flash-3.7", "agy-flash"],
+            "the object form is a bee shape, so a label declared in it resolves"
         );
 
         // D2 is a property of the type, so prove it the way a consumer would
@@ -8348,13 +8449,15 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// dispatch-project-presets D2/D6: the by-label resolver is the one
-    /// answer to "can this label start?". It resolves an array entry, and
-    /// refuses every other shape — including bee's own object form, which is
-    /// the case that matters, because a label that EXISTS but cannot start is
-    /// the one a caller would otherwise be told is a typo.
+    /// dispatch-project-presets D2/D6, as amended by herding-entry-conditions
+    /// D1: the by-label resolver is the one answer to "can this label start?",
+    /// and it now understands both shapes bee declares — a bare argv array and
+    /// an object carrying `argv`. What still resolves to nothing is an entry
+    /// that yields no usable command, in either shape: an empty argv, an argv
+    /// with a hole in it, an object with no `argv` at all, or a label nobody
+    /// declared.
     #[test]
-    fn a_label_resolves_only_when_its_entry_is_an_argv_this_reader_understands() {
+    fn a_label_resolves_when_either_declared_shape_yields_a_command() {
         let root = fresh_root("herding-by-label");
         write(
             &root,
@@ -8366,8 +8469,9 @@ mod tests {
                         "claude-sonnet": ["claude", "--model", "sonnet"],
                         "agy-flash": {
                             "argv": ["agy", "--dangerously-skip-permissions"],
-                            "workspace_trust": {"file": "~/.gemini/settings.json"}
+                            "workspace_trust": {"file": "~/.gemini/settings.json", "key": "trustedWorkspaces"}
                         },
+                        "no-argv": {"env": {"K": "v"}},
                         "empty": [],
                         "holed": ["claude", 7]
                     }
@@ -8383,8 +8487,16 @@ mod tests {
                 "sonnet".to_string()
             ])
         );
+        assert_eq!(
+            herding_argv_for_label(&root, "agy-flash"),
+            Some(vec![
+                "agy".to_string(),
+                "--dangerously-skip-permissions".to_string()
+            ]),
+            "the object form is a bee shape and must resolve to its argv"
+        );
         for (case, label) in [
-            ("bee's object form", "agy-flash"),
+            ("an object with no argv", "no-argv"),
             ("an empty argv", "empty"),
             ("an argv with a non-string token", "holed"),
             ("a label absent from the map", "no-such-agent"),
@@ -8403,7 +8515,7 @@ mod tests {
             .config
             .and_then(|c| c.herding)
             .expect("a herding block yields a registry");
-        assert_eq!(registry.resolvable, vec!["claude-sonnet"]);
+        assert_eq!(registry.resolvable, vec!["claude-sonnet", "agy-flash"]);
         for label in &registry.agents {
             assert_eq!(
                 herding_argv_for_label(&root, label).is_some(),
@@ -8433,6 +8545,104 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&bare).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// herding-entry-conditions D1: an entry carries its CONDITIONS as well as
+    /// its command, in the shape bee declares them — and the object form of
+    /// `agy-flash` is exactly how beehive writes it.
+    #[test]
+    fn an_object_entry_carries_its_env_and_trust_store_alongside_its_argv() {
+        let root = fresh_root("herding-entry-conditions");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agents": {
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "env": {"AGY_MODE": "flash"},
+                            "workspace_trust": {
+                                "file": "~/.gemini/antigravity-cli/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        },
+                        "plain": ["claude", "--model", "sonnet"]
+                    }
+                }
+            }"#,
+        );
+
+        let entry = herding_entry_for_label(&root, "agy-flash").expect("a declared entry");
+        assert_eq!(entry.argv, vec!["agy", "--dangerously-skip-permissions"]);
+        assert_eq!(
+            entry.env,
+            vec![("AGY_MODE".to_string(), "flash".to_string())]
+        );
+        let trust = entry
+            .workspace_trust
+            .expect("the entry gates on a trust store");
+        assert_eq!(trust.file, "~/.gemini/antigravity-cli/settings.json");
+        assert_eq!(trust.key, "trustedWorkspaces");
+
+        // The bare form is the same entry with no conditions — not a second
+        // code path, and not a reason for a caller to branch on shape.
+        let plain = herding_entry_for_label(&root, "plain").expect("a declared entry");
+        assert_eq!(plain.argv, vec!["claude", "--model", "sonnet"]);
+        assert!(plain.env.is_empty());
+        assert!(plain.workspace_trust.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The conditions reach the spawn path and stop there. `env` values are
+    /// what a project chose to keep OUT of its argv, and a trust path names a
+    /// file outside the repo — neither may travel in an answer a caller reads
+    /// (ask-state-fleet-read D2, still binding).
+    #[test]
+    fn the_published_registry_still_carries_labels_and_nothing_else() {
+        let root = fresh_root("herding-entry-conditions-noleak");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agents": {
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "env": {"AGY_SECRET_MODE": "please-do-not-publish"},
+                            "workspace_trust": {
+                                "file": "~/.gemini/antigravity-cli/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let registry = read_snapshot(&root)
+            .config
+            .and_then(|c| c.herding)
+            .expect("a herding block yields a registry");
+        assert_eq!(registry.agents, vec!["agy-flash"]);
+        assert_eq!(registry.resolvable, vec!["agy-flash"]);
+
+        let published = serde_json::to_string(&registry).expect("registry serializes");
+        for leaked in [
+            "AGY_SECRET_MODE",
+            "please-do-not-publish",
+            "--dangerously-skip-permissions",
+            "trustedWorkspaces",
+            ".gemini",
+        ] {
+            assert!(
+                !published.contains(leaked),
+                "{leaked:?} is a condition, not a label, and must not be published: {published}"
+            );
+        }
+
         std::fs::remove_dir_all(&root).ok();
     }
 
