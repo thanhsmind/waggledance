@@ -28,6 +28,7 @@ never a generation timestamp or any other wall-clock value.
 - [board-approve-actions/](board-approve-actions/index.md) — 1 concept(s)
 - [board-declutter/](board-declutter/index.md) — 1 concept(s)
 - [board-drop-live/](board-drop-live/index.md) — 1 concept(s)
+- [board-entry-conditions/](board-entry-conditions/index.md) — 1 concept(s)
 - [board-live-morph/](board-live-morph/index.md) — 1 concept(s)
 - [board-new-task/](board-new-task/index.md) — 1 concept(s)
 - [board-pane-dedupe/](board-pane-dedupe/index.md) — 1 concept(s)
