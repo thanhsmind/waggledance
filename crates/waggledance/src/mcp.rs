@@ -804,6 +804,65 @@ fn attach_panes(
 /// The file's path rides along as ordinary text next to the short link, because
 /// the link itself is opaque — without it, a transcript full of `/s/…` codes
 /// tells a reader nothing about which document each one was.
+/// Resolve a caller's `preset` label into the command it names, or the
+/// refusal to hand back (dispatch-project-presets D1–D4).
+///
+/// Two sources, in this order and deliberately: the operator's **global**
+/// preset list first, then the **target project's own** `herding.agents` —
+/// the same registry the board's Start button spawns from. Global-first is
+/// what makes this purely additive: an installation that configured global
+/// presets keeps every label pointing exactly where it did, and only labels
+/// that refuse today can begin resolving. Reversing the order would silently
+/// re-aim an existing label at a different command.
+///
+/// The caller never supplies a command from either source — only a name
+/// (`orchestrator-dispatch` D3, unweakened). Nor does this widen who may
+/// dispatch: `terminal.enabled` and the per-project `orchestration.enabled`
+/// are checked by the caller and remain the only gate (D5).
+fn resolve_preset(
+    engine: &Engine,
+    project: &waggledance_core::domain::Project,
+    label: &str,
+) -> std::result::Result<waggledance_core::config::AgentPreset, String> {
+    if let Some(global) = engine
+        .config
+        .terminal
+        .agent_presets
+        .iter()
+        .find(|p| p.label == label)
+    {
+        return Ok(global.clone());
+    }
+    if let Some(argv) = waggledance_core::bee::herding_argv_for_label(&project.root_path, label) {
+        return Ok(waggledance_core::config::AgentPreset {
+            label: label.to_string(),
+            argv,
+        });
+    }
+    // D4: a label the project DECLARES but this reader cannot start is not
+    // "unknown" — calling it that sends a caller hunting a typo that does not
+    // exist. `ask_state`'s `resolvable` list already draws this same line, by
+    // the same predicate (D6), so the two answers cannot disagree.
+    let declared = waggledance_core::bee::read_snapshot(&project.root_path)
+        .config
+        .and_then(|c| c.herding)
+        .is_some_and(|h| h.agents.iter().any(|a| a == label));
+    if declared {
+        return Err(format!(
+            "agent preset {label:?} is declared by project {} but cannot be started: its \
+             herding.agents entry is not an argv this reader understands",
+            project.id
+        ));
+    }
+    // D3: name the project too — with two registries searched, "unknown"
+    // alone no longer says where to look.
+    Err(format!(
+        "unknown agent preset: {label} (searched the configured presets and project {}'s \
+         herding.agents)",
+        project.id
+    ))
+}
+
 /// `waggledance_dispatch`: D3/D6 gated dispatch. Refuses before touching
 /// herdr at all when the project or the terminal family is off, or when the
 /// preset label is unknown — only a resolved preset/pane_id ever reaches
@@ -869,18 +928,12 @@ fn handle_dispatch(
         );
     }
 
-    // Resolved before any herdr call so an unknown label never touches the
-    // socket at all.
+    // Resolved before any herdr call so an unresolvable label never touches
+    // the socket at all.
     let preset = match preset_label {
-        Some(label) => match engine
-            .config
-            .terminal
-            .agent_presets
-            .iter()
-            .find(|p| p.label == label)
-        {
-            Some(p) => Some(p.clone()),
-            None => return tool_error(id, &format!("unknown agent preset: {label}")),
+        Some(label) => match resolve_preset(engine, &project, label) {
+            Ok(p) => Some(p),
+            Err(refusal) => return tool_error(id, &refusal),
         },
         None => None,
     };
@@ -1910,6 +1963,160 @@ mod tests {
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("unknown agent preset: nope"), "{text}");
+        // D3: with two registries searched, "unknown" alone no longer tells a
+        // caller where to look, so the refusal names the project too.
+        assert!(
+            text.contains(&pa.id),
+            "the refusal must name the project whose registry was searched: {text}"
+        );
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    /// D1/D2: a label only the TARGET PROJECT declares now resolves, using
+    /// that project's own argv. This is the asymmetry the feature closes —
+    /// a human clicking Start could already spawn this; an agent could not.
+    ///
+    /// The dispatch is driven all the way to its herdr outcome rather than
+    /// stopping at resolution, because "it resolved" is not the claim: the
+    /// claim is that a project-declared label stops being refused. Whatever
+    /// herdr does next in the sandbox, the answer must no longer be
+    /// `unknown agent preset`.
+    #[test]
+    fn dispatch_resolves_a_label_only_the_target_project_declares() {
+        let (engine, pa) = dispatch_engine("dispatch-project-label");
+        engine.set_orchestration_enabled(&pa.id, true).unwrap();
+        assert!(
+            engine.config.terminal.agent_presets.is_empty(),
+            "this test's premise is an empty global preset list"
+        );
+        write(
+            &pa.root_path,
+            ".bee/config.json",
+            r#"{"herding": {"agents": {"pi-agy-flash-3.7": ["pi", "-a", "--model", "x"]}}}"#,
+        );
+
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "preset": "pi-agy-flash-3.7" }),
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !text.contains("unknown agent preset"),
+            "a label the project declares must not be refused as unknown: {text}"
+        );
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    /// D1's collision rule, pinned because the collision IS the decision:
+    /// the global list is searched first, so an installation that configured
+    /// a label keeps it pointing exactly where it did. Proved by resolution,
+    /// not by dispatch, because the two argvs differ only in what would be
+    /// spawned.
+    #[test]
+    fn a_label_defined_in_both_sources_resolves_to_the_global_one() {
+        let (mut engine, pa) = dispatch_engine("dispatch-preset-collision");
+        write(
+            &pa.root_path,
+            ".bee/config.json",
+            r#"{"herding": {"agents": {"shared": ["from-project"]}}}"#,
+        );
+        engine
+            .config
+            .terminal
+            .agent_presets
+            .push(waggledance_core::config::AgentPreset {
+                label: "shared".to_string(),
+                argv: vec!["from-global".to_string()],
+            });
+
+        let resolved = resolve_preset(&engine, &pa, "shared").expect("both sources hold it");
+        assert_eq!(
+            resolved.argv,
+            vec!["from-global".to_string()],
+            "the global list is searched first, so an existing label never re-aims"
+        );
+
+        // And with no global entry, the same label falls through to the
+        // project — the fallback only ever fills a gap.
+        engine.config.terminal.agent_presets.clear();
+        let resolved = resolve_preset(&engine, &pa, "shared").expect("the project holds it");
+        assert_eq!(resolved.argv, vec!["from-project".to_string()]);
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    /// D4/D6: a label the project DECLARES but that cannot be started is
+    /// refused in those terms, never as unknown — and the line it is refused
+    /// on is exactly the line `ask_state` publishes as `resolvable`, so the
+    /// tool cannot advertise a label and then reject it.
+    #[test]
+    fn a_declared_but_unstartable_label_refuses_in_its_own_terms_and_matches_ask_state() {
+        let (engine, pa) = dispatch_engine("dispatch-object-form");
+        engine.set_orchestration_enabled(&pa.id, true).unwrap();
+        write(
+            &pa.root_path,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agents": {
+                        "claude-sonnet": ["claude", "--model", "sonnet"],
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "workspace_trust": {"file": "~/.gemini/settings.json"}
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let refusal = resolve_preset(&engine, &pa, "agy-flash")
+            .expect_err("bee's object form does not resolve today");
+        assert!(refusal.contains("agy-flash"), "{refusal}");
+        assert!(
+            !refusal.contains("unknown"),
+            "the label exists — calling it unknown sends a caller hunting a typo: {refusal}"
+        );
+
+        // The agreement itself: every label ask_state reports resolvable must
+        // resolve here, and every one it omits must refuse. This is the case
+        // that fails if the two readers ever stop sharing a predicate.
+        let state = call_tool(
+            &engine,
+            "waggledance_ask_state",
+            json!({ "project": pa.id }),
+        );
+        let herding = &state["result"]["structuredContent"]["project"]["herding"];
+        for label in herding["agents"].as_array().unwrap() {
+            let label = label.as_str().unwrap();
+            let published = herding["resolvable"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == label);
+            assert_eq!(
+                resolve_preset(&engine, &pa, label).is_ok(),
+                published,
+                "ask_state and dispatch disagree about {label:?}: {herding}"
+            );
+        }
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    /// A project that declares no registry at all behaves exactly as it does
+    /// today: the fallback finds nothing and the refusal stands.
+    #[test]
+    fn a_project_with_no_herding_block_still_refuses_every_unconfigured_label() {
+        let (engine, pa) = dispatch_engine("dispatch-no-herding");
+        assert!(
+            resolve_preset(&engine, &pa, "claude-sonnet").is_err(),
+            "no global entry and no registry means no command"
+        );
 
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
