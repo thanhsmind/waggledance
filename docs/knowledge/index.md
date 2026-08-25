@@ -13,9 +13,9 @@ never a generation timestamp or any other wall-clock value.
 
 ## Sections
 
-- [patterns/](patterns/index.md) — 1 concept(s)
-- [work/](work/index.md) — 82 concept(s)
+- [patterns/](patterns/index.md) — 5 concept(s)
+- [work/](work/index.md) — 85 concept(s)
 
 ## Critical patterns
 
-None.
+- [A cell that promises a user-visible outcome owes one proof of the whole path](patterns/prove-the-whole-path.md) — Pitfall: slicing a user-visible outcome into per-unit cells lets every slice go green while the feature stays inert, because no proof ever crosses the seams between them.

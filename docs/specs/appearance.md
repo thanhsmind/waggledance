@@ -1,7 +1,7 @@
 ---
 area: appearance
-updated: 2026-08-23
-sources: [adopt-atelier-design-system, console-theme-kanban]
+updated: 2026-08-25
+sources: [adopt-atelier-design-system, console-theme-kanban, mark-state-tone, badge-mark-is-status, dots-off-marks-on, card-glyph-is-status]
 decisions: [D1, D2, D3, D4, D5, D6]
 coverage: full
 ---
@@ -87,6 +87,28 @@ presentation layer and the scheme control — not what any individual page shows
   surfaces). The faces are a geometric sans for display and body and its
   matching monospace for code, counts and branch names.
 
+### An agent's mark carries its state; no dot does
+
+- **Triggers:** any surface that shows a live agent session — the rail's agent
+  row, a project row, a pane tab, a feature's terminal row, the agents drawer,
+  a terminal badge, and a board card's title glyph.
+- **What it shows:** the agent's own mark, tinted by the *state* of the session
+  standing beside it — working, blocked, or the base muted ink for idle. No
+  status dot renders on any session surface; the pill that used to carry one is
+  a word alone, with no tone of its own, because a pill's tone only ever
+  coloured the dot it no longer has (per R8).
+- **On a board card:** the title glyph names *who* is on the card, so it keeps
+  its vendor tint — until a bee session gives it a state, and then the state
+  tone wins. A card with no bee session keeps the plain vendor tint.
+- **Accessibility:** wherever the mark is the only thing stating the state — a
+  row for a pane with no bee record, a collapsed card — the mark is readable
+  rather than decorative: it carries the state as its own text alternative,
+  "<agent kind> — <state word>". Where a state word is already printed beside
+  it, the mark stays decorative and the word does the speaking. Either way no
+  state is ever spoken by colour alone (per R9).
+- **Afterwards:** a reader glancing at any surface reads state from one visual
+  language, and no line names the same state twice.
+
 ### Desktop loading screen
 
 - **Triggers:** launching the desktop app before its window has loaded the web
@@ -120,6 +142,14 @@ authentication. The scheme choice is per-browser (local), not shared or synced.
   its scheme matches the interface that loads after it.
 - **R7 (per D4).** Only the Light/Dark scheme is exposed to the operator; no other
   appearance axis (accent, density, typeface) is offered as a control.
+- **R8.** Session state is spoken by the agent mark's tone and never by a status
+  dot. No status dot renders on any session surface, and a status pill is a
+  dotless, tone-less word. Two dots deliberately survive and are outside this
+  rule: a board card's liveness pulse (recency of a tool call, a different axis
+  from state), and nothing else.
+- **R9.** Colour never carries meaning alone. Where a surface prints the state
+  word beside the mark, the word is the text alternative; where it prints none,
+  the mark itself carries the state in its accessible name.
 
 ## Edge Cases Settled
 
@@ -132,6 +162,13 @@ authentication. The scheme choice is per-browser (local), not shared or synced.
 - A rendered diagram (mermaid) is not code: it renders on a normal
   scheme-appropriate surface, never on the fixed dark code panel, and keeps its
   zoom/pan/fullscreen controls.
+- A terminal badge with no room for both → the mark alone states the status, its
+  title naming it in words ("claude — needs approval"); the pane tab and the
+  feature's terminal row keep their pill because they have the width. Naming the
+  state twice on one line is what that split prevents (per R8).
+- A project row whose dot was decorative → the row now leans on the mark's
+  accessible name instead of a pill's text, so removing the dot removed no
+  meaning (per R9).
 
 ## Open Gaps
 

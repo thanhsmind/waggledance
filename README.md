@@ -48,7 +48,7 @@ type code here.**
 | 🗂️ **Every agent, one drawer** | A slide-in list of every agent across every project, grouped by status. Switch panes without switching windows. |
 | 📖 **Read the docs** | Whole-project markdown: cross-folder links that never 404, full-text search (SQLite FTS5), Mermaid you can pan and zoom, live reload on save. |
 | 💻 **Read the code** | A second reading surface: the project's source as it sits on disk, syntax-coloured, line-numbered. For pointing at a line, not for changing it. |
-| 🤖 **Agent-native** | Four MCP tools: `waggledance_view_file` hands a clickable URL the moment an agent writes a doc; `waggledance_search`, `waggledance_projects`, and `waggledance_ask_state` let it query docs and bee state cross-project instead of re-reading files. |
+| 🤖 **Agent-native** | Seven MCP tools: `waggledance_view_file` hands a clickable URL the moment an agent writes a doc; `waggledance_search`, `waggledance_projects`, and `waggledance_ask_state` let it query docs and bee state cross-project instead of re-reading files; `waggledance_dispatch` / `waggledance_await` / `waggledance_runs` let it hand work to an agent pane in a project that has opted in. |
 | 📱 **Conduct from a phone** | Responsive layout, sidebar drawer, light & dark. Over the LAN or an SSH tunnel. |
 | 🦀 **One binary** | Rust. No runtime, no Node, no Docker. |
 
@@ -182,7 +182,7 @@ waggledance doctor --fix
 ```
 
 Registers an MCP server for whichever of **Claude Code, Codex, and Antigravity** it detects
-on your machine — it never writes config for a tool you don't have — exposing four tools:
+on your machine — it never writes config for a tool you don't have — exposing seven tools:
 
 - **`waggledance_view_file(project_root, relative_path)`** → a clickable `url` to the rendered
   file, **auto-registering** the project and indexing it on first use.
@@ -198,7 +198,21 @@ on your machine — it never writes config for a tool you don't have — exposin
 - **`waggledance_ask_state(project?)`** → parsed `.bee/` state, no file reads required. Omit
   `project` for a rollup across every registered project; pass it for one project's full
   snapshot (feature, phase, mode, open/blocked/stuck cells, recent decisions, sessions,
-  handoff, attention). A project with no `.bee/` reports absent, never an error.
+  handoff, attention). A project with no `.bee/` reports absent, never an error. Also
+  carries the project's `herding` agent **labels** (never the command behind a label,
+  with the resolvable subset marked) and its own `panes` inventory with bee's state and
+  feature joined in — so an orchestrator can reuse an idle pane instead of only ever
+  spawning. `panes` is absent when the terminal feature is off, and null-with-a-reason
+  when the session host can't be reached.
+- **`waggledance_dispatch(project, task, preset? | pane_id?)`** → send a task to an agent
+  pane in a project that has **opted into orchestration**. Either spawn a fresh pane by
+  `preset` (any agent label the *target project* declares — the same source the Start
+  button spawns from) or target an already-running `pane_id`; the two are mutually
+  exclusive. Returns a `run_id`.
+- **`waggledance_await(run_id, timeout_seconds?)`** → block until that run completes,
+  blocks on a human, or the timeout elapses (clamped to 60s server-side).
+- **`waggledance_runs(project?)`** → list dispatched runs and their current status,
+  read-only; narrow to one project with `project`.
 
 Drop the snippet from [`docs/waggledance-agents-template.md`](docs/waggledance-agents-template.md)
 into your project's `AGENTS.md` / `CLAUDE.md` and your agents will hand you a viewable URL

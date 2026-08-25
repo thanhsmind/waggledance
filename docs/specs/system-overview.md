@@ -77,12 +77,33 @@ launcher — CLI, MCP, future desktop — coordinates through `~/.waggledance/da
   stable for a given file and is what tools hand to a person, so a link stays
   short enough to paste into a chat, a commit message, or a terminal without
   wrapping. Both addresses reach the same page; neither replaces the other.
-- **Agent integration (MCP)** — a single tool, `waggledance_view_file(project_root,
-  relative_path)`, that ensures the project exists, indexes the file, ensures the
-  daemon is up, and returns a viewable URL. It returns the short address, and
-  names the file's own path beside it in plain text — the short address is
-  opaque, so without the path a transcript full of them says nothing about which
-  file each one was.
+- **Agent integration (MCP)** — a small tool surface, not one tool. The
+  document door is `waggledance_view_file(project_root, relative_path)`: it
+  ensures the project exists, indexes the file, ensures the daemon is up, and
+  returns a viewable URL. It returns the short address and names the file's own
+  path beside it in plain text — the short address is opaque, so without the
+  path a transcript full of them says nothing about which file each one was.
+  Beside it sit the read tools (project listing, cross-project search, the
+  state rollup, the run listing) and the write door, dispatch. Two rules govern
+  the fleet half of that surface:
+
+  - **The state rollup answers what a project's fleet is, not how to run it.**
+    It names every agent kind the project offers as *labels only* — never the
+    command behind a label — and marks which of those labels can actually
+    start. Beside them it publishes the project's own contained pane inventory,
+    with bee's state and feature joined in, so a caller can tell an idle pane
+    from a working one. The whole rollup is read from one snapshot per call.
+    The pane key is absent when the terminal feature is off, and present-but-
+    empty with a stated reason when the session host cannot be reached — never
+    silently missing.
+  - **A dispatch caller may name any agent kind the target project declares.**
+    Both the human clicking Start and an agent calling dispatch resolve a label
+    against the *target project's own* configuration, through one shared
+    resolver — so the two can never disagree about what a label means. Before
+    this, dispatch resolved labels against a global list that was empty in
+    practice, and an agent could not spawn by kind into another project while a
+    human on the same machine could. A project that has not opted into
+    orchestration still refuses the dispatch, before any label is resolved.
 - **CLI** — `serve` (daemon), plus `register / open / list / search / status /
   refresh / unregister / stop`, `doctor`, and `version` (prints the single-source
   app version, same as `--version`).

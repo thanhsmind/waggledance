@@ -175,6 +175,14 @@ serves (see the web-interface and agent-integration areas for that).
 - Daemon started by the desktop shell → detaches from its launching session
   exactly like a CLI/agent-started daemon (per D d1429530); it is not tied to
   the desktop app's own process lifetime.
+- A project registered into an **already-running** daemon → indexed and served
+  correctly, but it broadcasts no change signal until the daemon is restarted.
+  The daemon watches the set of projects it knew at startup; a project added
+  afterwards is readable but live-reload-dead, and every page for it sits still
+  while its files change. The tell is zero change frames on the live channel for
+  a project whose pages otherwise render fine. Anyone testing live-reload
+  behaviour must restart the daemon after registering a project — a session was
+  lost to this chasing a phantom bug in client code that was working.
 
 ## Open Gaps
 

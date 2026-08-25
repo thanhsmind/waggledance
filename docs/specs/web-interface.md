@@ -1,6 +1,6 @@
 ---
 area: web-interface
-updated: 2026-08-23
+updated: 2026-08-25
 sources: [file-nav-ux, ui-polish-settings-sidebar, agent-terminal, terminal-open-access, cross-board, board-drop-live, upstream-short-link, upstream-code-viewer, console-theme-kanban, console-rail-orchestrator, rail-collapse]
 decisions: [12d62831, 99e8df73, 184c77b0]
 coverage: partial
@@ -423,6 +423,12 @@ snapshot under `docs/specs/visuals/web-interface/` is an open item.
   files by title), TOC scrollspy (`IntersectionObserver` over the article's
   headings, toggles the matching TOC link's active state).
 - `crates/waggledance/assets/app.css` — `.chapter` / `.chap-*` styles, `.toc` /
-  `.backlinks`, `.breadcrumb`, `.fg-sidebar-search`.
+  `.backlinks`, `.breadcrumb`, `.fg-sidebar-search`. `.pinned-row__link` is a
+  four-column grid (mark · status · name+address · state word) whose feature line
+  spans `3 / -1`; the column numbers are written out explicitly, so adding a
+  leading column without renumbering `head`, `state` and `purpose` in the same edit
+  does not shift them — an explicit `grid-column` already occupied by an
+  auto-placed item wraps to the next row instead, which reads on screen as the
+  mark and dot sitting alone above their own name.
 - `crates/waggledance/assets/atelier/components.css` — `.fg-input` / `.fg-select`
   (shared form-field skeleton used by the sidebar search box too).

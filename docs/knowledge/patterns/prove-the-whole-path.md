@@ -7,8 +7,10 @@ bee:
   id: prove-the-whole-path
   lifecycle: active
   areas: [notifications, orchestration]
-  sources: [.bee/cells/archive/dispatch-blocked-notify/dbn-3.json, .bee/cells/archive/dispatch-blocked-notify/dbn-4.json, docs/knowledge/work/dispatch-blocked-notify/delivery.md]
+  sources: [.bee/cells/archive/dispatch-blocked-notify/dbn-3.json, .bee/cells/archive/dispatch-blocked-notify/dbn-4.json, docs/knowledge/work/dispatch-blocked-notify/delivery.md, .bee/cells/archive/ask-state-fleet-read/asfr-4.json]
   polarity: pitfall
+  critical: true
+  signature: prove-the-whole-path
 ---
 
 # A cell that promises a user-visible outcome owes one proof of the whole path
@@ -50,3 +52,16 @@ consumer that never arrived.
 - Name the process, service, or boundary each side of a link lives in while
   the work is being shaped. Two things in one repository are not two things in
   one process, and a plan that never says so lets a worker assume they are.
+
+## Recurrence
+
+- **2026-08-25, ask-state-fleet-read.** A published pane inventory degraded to null
+  on every real call while 875 unit tests stayed green; the reader took a lazily-built
+  handle out of a slot its tests had filled themselves. Found by running the built
+  binary, not by any test, and repaired by a fix-first cell against capped work. The
+  seam there was between a constructor and its reader rather than between two cells —
+  recorded as its own tell in
+  [the-test-builds-the-collaborator-production-does-not](the-test-builds-the-collaborator-production-does-not.md).
+
+This pattern now carries a `bee.signature`, so `bee knowledge report` counts its
+recurrences instead of leaving the count to memory.

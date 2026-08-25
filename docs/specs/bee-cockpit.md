@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
-updated: 2026-08-23
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness]
+updated: 2026-08-25
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness, session-work-line, board-live-morph]
 decisions: []
 coverage: partial
 ---
@@ -210,6 +210,20 @@ somewhere in a project that has nothing to do with the board — a note, a readm
 no longer reloads the board, which reloads on its own feature-history content, not
 on every file a project happens to hold.
 
+When that change does concern it, the board no longer throws the page away. Both
+board surfaces — the home board and a project's own board — refetch their own
+content, match the incoming cards against the ones already on screen by each card's
+stable key (the thing's own detail link), and patch the differences in place. Three
+things survive that the old reload destroyed: anything already running inside a card
+keeps running rather than being rebuilt, every card and column the reader had opened
+stays open, and a card that changed column or position slides from where it was to
+where it now belongs instead of jumping.
+
+Motion is spent on the card as a whole and on nothing else: a card that moves slides,
+a card that arrives fades in, and nothing inside a card animates. Every failure path
+— an unreadable response, a shape the reconciler does not recognise — falls back to a
+full page reload, so the worst case is exactly the behaviour this replaced.
+
 ## The reading order — and why it is the feature
 
 The board answers, top to bottom, in a fixed order:
@@ -240,6 +254,20 @@ question — what is running right now:
   how long ago it last reported in, and the checkout it is working in (the main
   checkout is named as such rather than left blank). A session with no lane of its own
   is labelled by the project's active feature, or plainly as having no active lane.
+  When the session's own record says what it was *asked* to do, the line names that
+  too: the title of the work, its status as a word beside the line and as an attribute
+  on it, and the acceptance the work is measured by, carried on the row's title. Three
+  rules hold on that reading:
+
+  - The whole conversation is deliberately never carried. The record holds it, capped
+    at eight thousand characters per session and re-read on every snapshot; a row shows
+    a title and a card shows the acceptance, and neither needs the transcript.
+  - A status the reader does not recognise is carried through verbatim rather than
+    blanked, so a newer bee that invents a fifth status cannot empty the row on an
+    older viewer.
+  - A session record carrying no work at all renders exactly as it did before this
+    existed. Most records in the wild predate the field, and a blank column reads as a
+    rendering fault rather than as an absence.
 - One line per branch checkout, naming the branch and the feature it carries, or
   saying it carries none. A checkout that could not be read says so and why, rather
   than being dropped or guessed at.
@@ -371,7 +399,10 @@ never clipped to one line:
   that call for a person: *needs an answer* and *needs approval*. The word
   itself is always printed beside its colour, so the state never speaks by
   colour alone, and a state a newer bee invents is carried through as it was
-  rather than forced into one of the five.
+  rather than forced into one of the five. The colour lives on the agent's own
+  mark rather than on a separate dot, and where a collapsed card prints no word
+  the mark carries the state in its accessible name — see the Appearance spec,
+  R8 and R9.
 - **Cell** is the title of the cell the agent holds, falling back to its bare
   id when the store no longer knows the title. An absent cell — or an absent
   feature anywhere this reading appears — renders as a dash, never as a blank
