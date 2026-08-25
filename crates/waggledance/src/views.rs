@@ -869,19 +869,46 @@ pub fn agent_mark_id(kind: &str) -> &'static str {
 /// through [`bee_hub_agent_logo`] to the generic terminal prompt, which is
 /// exactly the right glyph for a shell, so this needs no special case.
 fn pane_program_mark(pane: &TerminalPaneView) -> String {
-    let kind = pane.kind.as_str();
-    let (_, mark) = bee_hub_agent_logo(kind);
-    // terminal-mark-only: the mark no longer sits beside the program's name,
-    // it IS the name -- so it stops being decorative. `title` gives a mouse
-    // the word back on hover; `role="img"` plus `aria-label` give it to a
-    // screen reader, which is the whole reason the printed span could go.
-    // The label is the pane's own `kind` verbatim, escaped like every other
-    // operator-authored string this module renders.
+    pane_program_mark_named(pane, &pane.kind)
+}
+
+/// badge-mark-is-status: [`pane_program_mark`] on the ONE surface that no
+/// longer prints its state -- a terminal badge, where the mark's colour is
+/// now the whole status ([`terminal_badges_nav_from_refs`]). A mark drawn
+/// alone must still SAY what its colour means, or the badge would speak
+/// status by colour alone -- the one thing every pill in this module is
+/// written to avoid. So the label the mark already carries for a mouse and
+/// a screen reader grows the state word the pill used to print: `claude —
+/// needs approval`, from the same [`pane_status_word`] that fed the pill,
+/// so the two readings can never disagree. Every other surface keeps its
+/// pill and so keeps the bare-`kind` label: repeating the state in the
+/// mark's name while the word stands right beside it would be read twice.
+fn pane_program_mark_stateful(pane: &TerminalPaneView) -> String {
+    pane_program_mark_named(
+        pane,
+        &format!(
+            "{kind} — {word}",
+            kind = pane.kind,
+            word = pane_status_word(pane)
+        ),
+    )
+}
+
+/// The shared body of the two above: the toned mark, labelled `label`.
+/// terminal-mark-only: the mark no longer sits beside the program's name,
+/// it IS the name -- so it stops being decorative. `title` gives a mouse
+/// the word back on hover; `role="img"` plus `aria-label` give it to a
+/// screen reader, which is the whole reason the printed span could go.
+/// `label` arrives RAW and is escaped here and inside
+/// [`bee_hub_agent_mark_svg_sized`], like every other operator-authored
+/// string this module renders.
+fn pane_program_mark_named(pane: &TerminalPaneView, label: &str) -> String {
+    let (_, mark) = bee_hub_agent_logo(&pane.kind);
     format!(
         r#"<span class="pane-mark{tone}" title="{label}">{svg}</span>"#,
         tone = pane_mark_tone_class(pane_tone(pane)),
-        label = esc(kind),
-        svg = bee_hub_agent_mark_svg_sized(mark, 12, "pane-mark__svg", Some(kind)),
+        label = esc(label),
+        svg = bee_hub_agent_mark_svg_sized(mark, 12, "pane-mark__svg", Some(label)),
     )
 }
 
@@ -1605,7 +1632,7 @@ fn project_badges(project_id: &str, panes: &[TerminalPaneView]) -> String {
 /// (card-terminals-1) so [`bee_hub_card`] can reuse the exact same nav/pill
 /// markup for a feature card's own checkout panes -- same classes, same
 /// per-pane anchor to `/p/{project_id}/_terminal/pane/{pane_id}`, same
-/// [`status_pill`], program text, and title span -- while carrying its own
+/// toned mark and title span -- while carrying its own
 /// accessible label instead of `project_badges`'s "Terminal panes": a
 /// feature card's panes are the terminals running in that feature's own
 /// *checkout*, not panes that belong to the feature itself (a Main
@@ -1640,6 +1667,19 @@ fn terminal_badges_nav(
 /// per group, rather than re-filtering a slice it has already partitioned.
 /// The emptiness rule is stated once, here, so neither entry point can
 /// render an empty `<nav>`.
+///
+/// badge-mark-is-status: a badge is the most crowded reading of a session
+/// on the board -- a rail row fits several side by side, and a card spends
+/// a whole line on one. It used to spend that line on three pieces where
+/// two of them said the same thing: the mark, then a dot and a word for the
+/// state, then the pane's title. Now that the mark carries the state's own
+/// tone (`mark-state-tone`), the dot and the word are a second telling of a
+/// colour the reader has already read, so the pill is gone and the badge is
+/// mark-then-title. The word itself is NOT gone -- it moves into the mark's
+/// hover title and accessible name via [`pane_program_mark_stateful`], so
+/// nothing here speaks status by colour alone. This is the only surface
+/// that drops its pill: [`pane_tab`] and [`bee_feature_terminal_tab`] have
+/// the room, and keep printing the state in words.
 fn terminal_badges_nav_from_refs(
     project_id: &str,
     panes: &[&TerminalPaneView],
@@ -1666,11 +1706,10 @@ fn terminal_badges_nav_from_refs(
             String::new()
         };
         out.push_str(&format!(
-            r#"<a class="proj-row__badge" href="/p/{pid}/_terminal/pane/{pane_id}">{mark}{status_pill}{title_span}</a>"#,
+            r#"<a class="proj-row__badge" href="/p/{pid}/_terminal/pane/{pane_id}">{mark}{title_span}</a>"#,
             pid = pid,
             pane_id = esc(&p.pane_id),
-            mark = pane_program_mark(p),
-            status_pill = pane_status_pill(p),
+            mark = pane_program_mark_stateful(p),
         ));
     }
     out.push_str("</nav>");
@@ -10223,8 +10262,11 @@ mod tests {
         );
 
         // Colour-only meaning on a project row: every dot is aria-hidden,
-        // and a dot only ever appears on a row that also prints its status
-        // as words.
+        // and a dot only ever appears on a row whose badges carry that same
+        // status as words. badge-mark-is-status moved those words out of a
+        // printed pill and into the badge mark's own accessible name --
+        // still text, still in the tree, still on this row -- so the claim
+        // this test makes is unchanged and only its spelling moves.
         assert_eq!(
             rail.matches(r#"class="fg-status__dot proj-row__dot"#)
                 .count(),
@@ -10245,7 +10287,7 @@ mod tests {
                 "the {tone} dot must render, and must be aria-hidden: {rail}"
             );
             assert!(
-                rail.contains(&format!(">{tone}</span>")),
+                rail.contains(&format!(r#"aria-label="claude — {tone}""#)),
                 "the {tone} dot's meaning must also be present as words: {rail}"
             );
         }
@@ -15198,10 +15240,15 @@ mod tests {
         let tab = pane_tab("/p/proj-a/_terminal/pane/w1:working", &pane, false, "");
         let feature_row = bee_feature_terminal_tab("proj-a", std::slice::from_ref(&pane));
 
-        for (surface, html) in [
-            ("badge", &badge),
-            ("pane tab", &tab),
-            ("feature row", &feature_row),
+        // badge-mark-is-status: the badge is the one surface with no pill
+        // left, so its mark's label absorbs the state word the pill used to
+        // print. The two roomier surfaces still print that word beside the
+        // mark, so their labels stay the bare program name -- naming the
+        // state twice on one row is the bug the split guards against.
+        for (surface, html, label) in [
+            ("badge", &badge, "opencode — working"),
+            ("pane tab", &tab, "opencode"),
+            ("feature row", &feature_row, "opencode"),
         ] {
             assert!(
                 html.contains(AGENT_MARK_OPENCODE.body),
@@ -15215,23 +15262,33 @@ mod tests {
             // has to carry the name itself -- on hover and in the
             // accessibility tree -- and the word must be gone from the page.
             assert!(
-                html.contains(r#"<span class="pane-mark pane-mark--working" title="opencode">"#),
+                html.contains(&format!(
+                    r#"<span class="pane-mark pane-mark--working" title="{label}">"#
+                )),
                 "the mark must name the program on hover: {html}"
             );
             assert!(
-                html.contains(r#"role="img" aria-label="opencode""#),
+                html.contains(&format!(r#"role="img" aria-label="{label}""#)),
                 "the mark must be readable, not decorative, now that it is the only name: {html}"
             );
-            // mark-before-status: every surface reads icon first, then state.
-            let mark_at = html.find(r#"<span class="pane-mark"#).unwrap();
-            let status_at = html
-                .find(r#"<span class="fg-status"#)
-                .or_else(|| html.find(r#"<div class="bee-hub__chips">"#))
-                .unwrap_or_else(|| panic!("the {surface} must state a status: {html}"));
-            assert!(
-                mark_at < status_at,
-                "the mark must lead the status on the {surface}: {html}"
-            );
+            if surface == "badge" {
+                assert!(
+                    !html.contains(r#"<span class="fg-status"#),
+                    "a badge's state is its mark's colour and name now, never a second pill: {html}"
+                );
+            } else {
+                // mark-before-status: a surface that still prints the state
+                // reads icon first, then state.
+                let mark_at = html.find(r#"<span class="pane-mark"#).unwrap();
+                let status_at = html
+                    .find(r#"<span class="fg-status"#)
+                    .or_else(|| html.find(r#"<div class="bee-hub__chips">"#))
+                    .unwrap_or_else(|| panic!("the {surface} must state a status: {html}"));
+                assert!(
+                    mark_at < status_at,
+                    "the mark must lead the status on the {surface}: {html}"
+                );
+            }
             assert!(
                 !html.contains(">opencode<"),
                 "the program word must no longer be printed beside its own mark: {html}"
@@ -15348,7 +15405,7 @@ mod tests {
         };
         let html = project_badges("proj-a", &[pane]);
         let program_at = html
-            .find(r#"<span class="pane-mark pane-mark--working" title="claude">"#)
+            .find(r#"<span class="pane-mark pane-mark--working" title="claude — working">"#)
             .unwrap_or_else(|| panic!("the program's mark must render, naming it: {html}"));
         assert!(
             !html.contains(r#"<span class="proj-row__badge-program">"#),

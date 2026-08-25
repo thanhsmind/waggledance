@@ -19747,15 +19747,20 @@ mod bee_route_tests {
             !body.contains(&href(&shell.pane_id)),
             "board-badges-agents-only: a plain shell pane must never badge on the board: {body}"
         );
+        // badge-mark-is-status: a badge prints no pill any more -- its
+        // mark's colour is the state and its accessible name spells it out,
+        // so each status word is checked where it now lives. The claim is
+        // the same one: every status reaches the board as words, and a
+        // shell's never does.
         for status_text in ["working", "idle", "done", "blocked"] {
             assert!(
-                body.contains(&format!(">{status_text}</span>")),
-                "the {status_text} pill's own text must appear: {body}"
+                body.contains(&format!(r#" — {status_text}""#)),
+                "the {status_text} badge's own state word must appear: {body}"
             );
         }
         assert!(
-            !body.contains(">shell</span>"),
-            "board-badges-agents-only: a shell pane's status pill must never appear on the board: {body}"
+            !body.contains(" — shell\""),
+            "board-badges-agents-only: a shell pane's status must never appear on the board: {body}"
         );
         for program in ["claude", "codex", "aider", "cursor"] {
             assert!(
@@ -27207,7 +27212,7 @@ mod bee_route_tests {
         let board = get_body(&app, &format!("/p/{}/_bee", project.id)).await;
         assert!(
             board.contains(
-                r#"<span class="fg-status fg-status--blocked"><span class="fg-status__dot"></span>needs approval</span>"#
+                r#"<span class="pane-mark pane-mark--blocked" title="claude — needs approval">"#
             ),
             "herdr hosting the session id keeps a heartbeat-stale blocked record on its pane: {board}"
         );
@@ -27424,9 +27429,13 @@ mod bee_route_tests {
             !board.contains(r#"<span class="bee-hub__agent-signal">no signal</span>"#),
             "a record 12 s old is still speaking — no no-signal marker belongs on it: {board}"
         );
+        // badge-mark-is-status: the badge's own state is its mark now --
+        // the tone colours it, the accessible name says it. The claim is
+        // unchanged (bee's state beats herdr's idle on the pane's badge);
+        // only where that state is written moved.
         assert!(
             board.contains(
-                r#"<span class="fg-status fg-status--blocked"><span class="fg-status__dot"></span>needs approval</span>"#
+                r#"<span class="pane-mark pane-mark--blocked" title="claude — needs approval">"#
             ),
             "bee's state must colour AND name the pane's own badge, over herdr's idle (A3): {board}"
         );
