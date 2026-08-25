@@ -54,6 +54,21 @@ pub enum HerdrError {
     },
     #[error("invalid agent argv: {0}")]
     InvalidAgentArgv(String),
+    /// `tab.create` succeeded but no pane carrying that tab could be found
+    /// in the snapshot that followed. Protocol 20 does not hand the pane back
+    /// with the tab, so this is the one hop that can come up empty — and it
+    /// is reported rather than papered over, because the tempting recovery
+    /// (use some other pane) means starting an agent on top of work somebody
+    /// else has open. The tab id rides along so a human can find and close
+    /// what was left behind.
+    #[error(
+        "tab {tab_id} was created in workspace {workspace_id} but no pane for it appeared; \
+         started nothing, and the tab is still open"
+    )]
+    TabPaneUnresolved {
+        tab_id: String,
+        workspace_id: String,
+    },
     #[error("herdr refused the request ({code}): {message}")]
     Remote { code: String, message: String },
 }
@@ -85,7 +100,6 @@ impl ReadSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabCreated {
     pub tab_id: String,
-    pub pane_id: String,
 }
 
 /// Result of `agent.start` — the new agent's pane/tab ids, plus the name
@@ -196,43 +210,274 @@ pub trait Herdr: Send + Sync {
     async fn send_keys(&self, pane_id: &str, keys: &[String]) -> Result<()>;
 
     /// Create a plain shell tab in `workspace_id`, never stealing the
-    /// desktop's focus (`focus: false`). Returns the new tab's id and its
-    /// root pane's id.
+    /// desktop's focus (`focus: false`). Returns the new tab's id.
+    ///
+    /// **It does not return a pane.** Protocol 20's `tab_created` carries
+    /// `{type, tab}` and its `TabInfo` has no pane id of any kind, so the
+    /// pane a caller wants must be found afterwards by matching this
+    /// `tab_id` against a fresh snapshot (`pane.list` filters by workspace
+    /// only). That hop is the caller's, deliberately: it is where the
+    /// "no pane for this tab" failure has to be decided, and it must fail
+    /// loudly rather than settle for a neighbouring pane.
     ///
     /// `cwd` is optional: `Some(path)` seeds that exact directory; `None`
     /// omits the key and lets herdr resolve the **workspace's own anchor**
     /// (its focused pane's folder), which is exactly what the desktop does.
-    /// Omitting it here is safe — see the asymmetry warning on
-    /// [`Herdr::agent_start`].
     async fn tab_create(&self, workspace_id: &str, cwd: Option<&str>) -> Result<TabCreated>;
 
-    /// Start a named agent in `workspace_id`, never stealing the desktop's
-    /// focus (`focus: false`). No `tab_id`/`split` is sent — upstream's
-    /// default placement (split Right off the workspace's active tab) is
-    /// accepted as-is. The name is auto-generated and a collision retried
-    /// transparently (see `retry_on_name_collision`): callers never see
-    /// `AgentNameTaken` themselves. Returns the new pane's and tab's ids plus
-    /// the name that actually succeeded.
+    /// Start a named agent **in an existing pane**. The name is
+    /// auto-generated and a collision retried transparently (see
+    /// `retry_on_name_collision`): callers never see `AgentNameTaken`
+    /// themselves. Returns the pane's and tab's ids plus the name that
+    /// actually succeeded.
     ///
-    /// **`cwd` is asymmetric with [`Herdr::tab_create`] — do not assume they
-    /// fall back alike.** `Some(path)` seeds that exact directory. `None`
-    /// omits the key, but herdr does **not** resolve the workspace anchor for
-    /// `agent.start`: it falls back to the **herdr process's own current
-    /// directory**, an arbitrary folder unrelated to the destination.
-    /// Starting an agent there is the silent wrong-repo start a caller must
-    /// refuse rather than pass `None` here — unlike `tab_create`, where
-    /// omitting is safe.
-    async fn agent_start(
-        &self,
-        workspace_id: &str,
-        cwd: Option<&str>,
-        argv: &[String],
-    ) -> Result<AgentStarted>;
+    /// `argv` is split the way herdr's own protocol wants it and the way bee
+    /// already writes it: **`argv[0]` is the agent `kind`** (`claude`, `pi`,
+    /// `codex`, `agy`) and the rest are its `args`. An empty `argv` is
+    /// refused before anything reaches the socket.
+    ///
+    /// There is no `cwd` here, and that is protocol 20's doing rather than a
+    /// simplification: `agent.start` no longer creates anything, so the
+    /// directory question is settled earlier, when the pane is made. The
+    /// caller creates a tab at the destination it has already validated,
+    /// resolves that tab's pane, and passes it here — which also removes the
+    /// old hazard this doc used to warn about, where omitting `cwd` started
+    /// an agent in herdr's own process directory.
+    async fn agent_start(&self, pane_id: &str, argv: &[String]) -> Result<AgentStarted>;
+}
+
+/// Start an agent in a pane of its own: create a tab at `cwd`, find the pane
+/// that tab brought with it, and start the agent there.
+///
+/// This is what protocol 20 turned `agent.start` into. Before it, one call
+/// both made a pane and launched into it; now `agent.start` only ever
+/// attaches to an existing pane, and `tab_created` does not say which pane it
+/// just made — `TabInfo` carries no pane id, and `pane.list` filters by
+/// workspace, not tab. So the hop goes through a fresh snapshot, matching on
+/// `tab_id`.
+///
+/// **Matched on `tab_id` alone.** Not the newest pane, not the focused one,
+/// not the last in the list: each of those picks the wrong pane on a busy
+/// machine, and the cost of picking wrong is an agent typing into somebody
+/// else's session. When no pane matches, this returns
+/// [`HerdrError::TabPaneUnresolved`] and starts nothing — the tab is left
+/// standing and named in the error rather than quietly reused.
+///
+/// One implementation for every caller (the board's spawn, the board's
+/// shell-create, and MCP dispatch) on purpose: a second copy of this hop
+/// would be free to drift into a friendlier fallback, and friendlier is
+/// exactly wrong here.
+pub async fn start_agent_in_new_tab(
+    herdr: &dyn Herdr,
+    workspace_id: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<AgentStarted> {
+    let created = herdr.tab_create(workspace_id, cwd).await?;
+    let pane_id = pane_of_tab(herdr, &created.tab_id).await?.ok_or_else(|| {
+        HerdrError::TabPaneUnresolved {
+            tab_id: created.tab_id.clone(),
+            workspace_id: workspace_id.to_string(),
+        }
+    })?;
+
+    // A pane exists the moment the tab does, but it is not immediately able
+    // to host an agent — herdr answers `agent_pane_busy: … is not an
+    // available shell` for the first fraction of a second while the shell
+    // comes up. Observed live on 2026-08-25, one step past the protocol port.
+    // So: try, and on THAT refusal only, wait and try again, a small fixed
+    // number of times.
+    //
+    // Only that code is retried. A retry loop that swallowed other failures
+    // would be worse than the race it fixes — a name collision, an
+    // unreachable socket or a refusal from the agent itself must surface at
+    // once. And when the attempts run out, herdr's own last words come back:
+    // never a summary, and never another pane.
+    let mut attempt = 0;
+    loop {
+        match herdr.agent_start(&pane_id, argv).await {
+            Err(e) if attempt + 1 < PANE_READY_ATTEMPTS && is_pane_not_ready(&e) => {
+                attempt += 1;
+                tokio::time::sleep(PANE_READY_INTERVAL).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// How many times [`start_agent_in_new_tab`] will re-offer a freshly created
+/// pane that herdr says is not ready yet, and how long it waits between
+/// offers. Deliberately small: a pane that is genuinely unusable should fail
+/// in about a second, not hold a caller for minutes.
+const PANE_READY_ATTEMPTS: u32 = 6;
+const PANE_READY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// herdr's "that pane cannot host an agent yet" refusal — the startup race,
+/// and the only error [`start_agent_in_new_tab`] retries.
+fn is_pane_not_ready(e: &HerdrError) -> bool {
+    matches!(e, HerdrError::Remote { code, .. } if code == "agent_pane_busy")
+}
+
+/// The pane belonging to `tab_id`, read from a fresh snapshot. `None` when
+/// the tab has no pane yet — the caller decides what that means.
+pub async fn pane_of_tab(herdr: &dyn Herdr, tab_id: &str) -> Result<Option<String>> {
+    let snapshot = herdr.snapshot().await?;
+    Ok(snapshot
+        .panes
+        .iter()
+        .find(|p| p.tab_id == tab_id)
+        .map(|p| p.pane_id.clone()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A herdr whose `agent_start` refuses `agent_pane_busy` a fixed number
+    /// of times before succeeding — the startup race, made deterministic.
+    /// Every other method answers the minimum `start_agent_in_new_tab` needs.
+    struct FlakyPane {
+        refusals: std::sync::Mutex<u32>,
+        other_error: Option<&'static str>,
+        starts: std::sync::Mutex<u32>,
+        snapshots: std::sync::Mutex<u32>,
+    }
+
+    impl FlakyPane {
+        fn refusing(n: u32) -> Self {
+            Self {
+                refusals: std::sync::Mutex::new(n),
+                other_error: None,
+                starts: std::sync::Mutex::new(0),
+                snapshots: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn failing_with(code: &'static str) -> Self {
+            Self {
+                refusals: std::sync::Mutex::new(u32::MAX),
+                other_error: Some(code),
+                starts: std::sync::Mutex::new(0),
+                snapshots: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Herdr for FlakyPane {
+        async fn snapshot(&self) -> Result<Snapshot> {
+            *self.snapshots.lock().unwrap() += 1;
+            Ok(Snapshot {
+                panes: vec![wire::Pane {
+                    pane_id: "w1:new".into(),
+                    workspace_id: "w1".into(),
+                    tab_id: "w1:new-tab".into(),
+                    cwd: None,
+                    foreground_cwd: None,
+                }],
+                ..Default::default()
+            })
+        }
+        async fn ping(&self) -> Result<ProtocolInfo> {
+            unreachable!()
+        }
+        async fn read_pane(&self, _: &str, _: ReadSource, _: usize) -> Result<ScreenRead> {
+            unreachable!()
+        }
+        async fn send_input(&self, _: &str, _: &str, _: bool) -> Result<()> {
+            unreachable!()
+        }
+        async fn send_text(&self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn send_keys(&self, _: &str, _: &[String]) -> Result<()> {
+            unreachable!()
+        }
+        async fn tab_create(&self, _: &str, _: Option<&str>) -> Result<TabCreated> {
+            Ok(TabCreated {
+                tab_id: "w1:new-tab".into(),
+            })
+        }
+        async fn agent_start(&self, pane_id: &str, _: &[String]) -> Result<AgentStarted> {
+            *self.starts.lock().unwrap() += 1;
+            let mut left = self.refusals.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(HerdrError::Remote {
+                    code: self.other_error.unwrap_or("agent_pane_busy").into(),
+                    message: format!("agent target pane {pane_id} is not an available shell"),
+                });
+            }
+            Ok(AgentStarted {
+                tab_id: "w1:new-tab".into(),
+                pane_id: pane_id.to_string(),
+                name: "started".into(),
+            })
+        }
+    }
+
+    /// The race this exists for: herdr refuses the brand-new pane twice while
+    /// its shell comes up, and the third offer succeeds.
+    #[tokio::test]
+    async fn a_pane_that_is_not_ready_yet_is_offered_again_until_it_is() {
+        let h = FlakyPane::refusing(2);
+        let started = start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .expect("a pane that becomes ready must be started, not refused");
+
+        assert_eq!(started.pane_id, "w1:new");
+        assert_eq!(*h.starts.lock().unwrap(), 3, "two refusals, then success");
+    }
+
+    /// The bound is real, and giving up returns herdr's own last words rather
+    /// than a summary — and never another pane.
+    #[tokio::test]
+    async fn a_pane_that_never_becomes_ready_gives_up_with_herdrs_own_error() {
+        let h = FlakyPane::refusing(u32::MAX);
+        let err = start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .expect_err("a pane that never comes up must fail");
+
+        match err {
+            HerdrError::Remote { code, message } => {
+                assert_eq!(code, "agent_pane_busy");
+                assert!(message.contains("w1:new"), "{message}");
+            }
+            other => panic!("expected herdr's own refusal, got {other:?}"),
+        }
+        assert_eq!(
+            *h.starts.lock().unwrap(),
+            PANE_READY_ATTEMPTS,
+            "the bound is finite and is the one the constant names"
+        );
+    }
+
+    /// Only the not-ready refusal is retried. Anything else is a real failure
+    /// and must surface on the first attempt — a loop that swallowed those
+    /// would be worse than the race it fixes.
+    #[tokio::test]
+    async fn any_other_refusal_is_not_retried() {
+        let h = FlakyPane::failing_with("agent_name_taken");
+        let err = start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .expect_err("an unrelated refusal must not be retried");
+
+        assert!(matches!(err, HerdrError::Remote { ref code, .. } if code == "agent_name_taken"));
+        assert_eq!(*h.starts.lock().unwrap(), 1, "tried exactly once");
+    }
+
+    /// The common case pays nothing: a pane ready on the first offer costs one
+    /// start and the single snapshot the tab-to-pane hop already needs.
+    #[tokio::test]
+    async fn a_ready_pane_costs_no_extra_attempt() {
+        let h = FlakyPane::refusing(0);
+        start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(*h.starts.lock().unwrap(), 1);
+        assert_eq!(*h.snapshots.lock().unwrap(), 1);
+    }
 
     /// A synthetic "already used" set, standing in for a real snapshot's
     /// agents[] just for this pure retry logic -- proves the loop itself

@@ -363,8 +363,7 @@ impl SocketHerdr {
     async fn agent_start_named(
         &self,
         name: &str,
-        workspace_id: &str,
-        cwd: Option<&str>,
+        pane_id: &str,
         argv: &[String],
     ) -> Result<AgentStarted> {
         if argv.is_empty() {
@@ -373,12 +372,9 @@ impl SocketHerdr {
             ));
         }
         let result = self
-            .call(
-                "agent.start",
-                agent_start_params(name, argv, cwd, workspace_id),
-            )
+            .call("agent.start", agent_start_params(name, pane_id, argv))
             .await
-            .map_err(|e| attach_agent_start_context(e, name, workspace_id))?;
+            .map_err(|e| attach_agent_start_context(e, name, pane_id))?;
         // result: { "type":"agent_started", "agent": { ..., "pane_id":..., "tab_id":... }, "argv":[...] }
         let agent = result
             .get("agent")
@@ -550,17 +546,21 @@ fn attach_workspace_id(error: HerdrError, workspace_id: &str) -> HerdrError {
 /// its own process directory, not the workspace anchor (see
 /// [`super::Herdr::agent_start`]); callers must not omit it unless that is
 /// intended. Pure, same testable seam as `tab_create_params`.
-fn agent_start_params(name: &str, argv: &[String], cwd: Option<&str>, workspace_id: &str) -> Value {
-    let mut params = json!({
+/// Protocol 20's `AgentStartParams`: `{name, kind, pane_id}` required, `args`
+/// optional. `kind` is `argv[0]` and `args` is the rest — the same split bee
+/// itself performs (`bee herding wave` "splits token 0 into the herdr agent
+/// kind and the remaining tokens into the agent's own argv"), which is why
+/// every `herding.agents` entry leads with `claude` / `pi` / `agy`.
+///
+/// The caller guarantees a non-empty `argv`; `agent_start_named` refuses an
+/// empty one before reaching here.
+fn agent_start_params(name: &str, pane_id: &str, argv: &[String]) -> Value {
+    json!({
         "name": name,
-        "argv": argv,
-        "workspace_id": workspace_id,
-        "focus": false,
-    });
-    if let Some(cwd) = cwd {
-        params["cwd"] = json!(cwd);
-    }
-    params
+        "kind": argv[0],
+        "pane_id": pane_id,
+        "args": &argv[1..],
+    })
 }
 
 /// `parse_response` cannot know the caller-supplied name or workspace_id, so
@@ -695,30 +695,22 @@ impl Herdr for SocketHerdr {
             .call("tab.create", tab_create_params(workspace_id, cwd))
             .await
             .map_err(|e| attach_workspace_id(e, workspace_id))?;
-        // result: { "type":"tab_created", "tab": { "tab_id":..., ... }, "root_pane": { "pane_id":..., ... } }
+        // Protocol 20: { "type":"tab_created", "tab": TabInfo } — and TabInfo
+        // carries no pane id at all, so there is nothing here to read one
+        // from. The caller finds the pane by matching this tab_id against a
+        // fresh snapshot.
         let tab_id = result
             .get("tab")
             .and_then(|t| t.get("tab_id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| HerdrError::Malformed("tab_created.tab.tab_id missing".into()))?
             .to_string();
-        let pane_id = result
-            .get("root_pane")
-            .and_then(|p| p.get("pane_id"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| HerdrError::Malformed("tab_created.root_pane.pane_id missing".into()))?
-            .to_string();
-        Ok(TabCreated { tab_id, pane_id })
+        Ok(TabCreated { tab_id })
     }
 
-    async fn agent_start(
-        &self,
-        workspace_id: &str,
-        cwd: Option<&str>,
-        argv: &[String],
-    ) -> Result<AgentStarted> {
+    async fn agent_start(&self, pane_id: &str, argv: &[String]) -> Result<AgentStarted> {
         retry_on_name_collision(generate_agent_name, |name| async move {
-            self.agent_start_named(&name, workspace_id, cwd, argv).await
+            self.agent_start_named(&name, pane_id, argv).await
         })
         .await
     }
@@ -829,30 +821,14 @@ mod tests {
         assert_eq!(obj.len(), 2, "exactly workspace_id and focus, no cwd");
     }
 
-    #[test]
-    fn createcwd_agentstart_params_omit_cwd_when_none() {
-        // Same omit-when-absent contract as tab.create's params -- the key is
-        // gone, not blanked. (The asymmetric FALLBACK herdr then applies is a
-        // server behavior documented on the trait, not visible in the wire
-        // params, which look identical to tab.create's absent-cwd case.)
-        let argv = vec!["claude".to_string()];
-        let params = agent_start_params("mobile-agent-1", &argv, None, "w1");
-        assert_eq!(
-            params,
-            json!({
-                "name": "mobile-agent-1",
-                "argv": ["claude"],
-                "workspace_id": "w1",
-                "focus": false,
-            })
-        );
-        let obj = params.as_object().unwrap();
-        assert!(
-            !obj.contains_key("cwd"),
-            "cwd key must be omitted, not empty"
-        );
-        assert_eq!(obj.len(), 4, "name, argv, workspace_id, focus -- no cwd");
-    }
+    // REMOVED with the protocol 20 port:
+    // `createcwd_agentstart_params_omit_cwd_when_none` pinned that agent.start
+    // omitted the `cwd` key rather than blanking it. Protocol 20's
+    // AgentStartParams has no cwd at all — the directory is settled when the
+    // pane is created — so there is no key left to omit. What that test really
+    // guarded, the exact wire shape, is pinned harder by
+    // `agentstart_params_are_protocol_20s_shape` above, which asserts the
+    // whole object rather than one absent field.
 
     #[test]
     fn tabcreate_error_attaches_caller_workspace_id() {
@@ -896,30 +872,38 @@ mod tests {
     }
 
     #[test]
-    fn agentstart_params_omit_tab_id_and_split() {
-        // Exactly name, argv, cwd, workspace_id, focus:false -- no tab_id,
-        // no split (sending both a tab and a workspace opens
-        // agent_placement_conflict for no product gain).
-        let argv = vec!["claude".to_string()];
-        let params = agent_start_params("mobile-agent-1", &argv, Some("/home/dev/project"), "w1");
+    fn agentstart_params_are_protocol_20s_shape() {
+        // The exact bytes agent.start puts on the wire. Pinned because the
+        // old shape ({name, argv, workspace_id, cwd, focus}) was wrong for
+        // four protocol versions and no test noticed: every test ran against
+        // a double that was wrong in the same way. Protocol 20 wants
+        // {name, kind, pane_id} with the rest of the command as args.
+        let argv = vec![
+            "pi".to_string(),
+            "-a".to_string(),
+            "--model".to_string(),
+            "x".to_string(),
+        ];
+        let params = agent_start_params("mobile-agent-1", "w1:p1", &argv);
         assert_eq!(
             params,
             json!({
                 "name": "mobile-agent-1",
-                "argv": ["claude"],
-                "cwd": "/home/dev/project",
-                "workspace_id": "w1",
-                "focus": false,
+                "kind": "pi",
+                "pane_id": "w1:p1",
+                "args": ["-a", "--model", "x"],
             })
         );
-        let obj = params.as_object().unwrap();
-        assert_eq!(
-            obj.len(),
-            5,
-            "must send exactly these five keys, no tab_id/split"
-        );
-        assert!(!obj.contains_key("tab_id"));
-        assert!(!obj.contains_key("split"));
+    }
+
+    #[test]
+    fn agentstart_params_single_token_argv_is_all_kind_and_no_args() {
+        // argv[0] is the kind and the REST are args, so a one-token command
+        // sends an empty args list rather than repeating itself.
+        let argv = vec!["claude".to_string()];
+        let params = agent_start_params("solo", "w1:p1", &argv);
+        assert_eq!(params["kind"], "claude");
+        assert_eq!(params["args"], json!([]));
     }
 
     #[test]
@@ -973,7 +957,7 @@ mod tests {
         // fail on connection rather than returning InvalidAgentArgv.
         let client = SocketHerdr::new(PathBuf::from("/nonexistent/herdr.sock"));
         let err = client
-            .agent_start_named("mobile-agent-1", "w1", Some("/home/dev"), &[])
+            .agent_start_named("mobile-agent-1", "w1:p1", &[])
             .await
             .unwrap_err();
         assert!(matches!(err, HerdrError::InvalidAgentArgv(_)));

@@ -4322,12 +4322,23 @@ async fn terminal_create_pane(
     let Some((workspace_id, cwd)) = project_creation_destination(&snapshot, &boundary) else {
         return destination_unresolved_response(&project.id);
     };
-    match st.herdr.tab_create(&workspace_id, Some(&cwd)).await {
-        Ok(created) => (
+    let created = match st.herdr.tab_create(&workspace_id, Some(&cwd)).await {
+        Ok(created) => created,
+        Err(e) => return create_error_response(e),
+    };
+    // Protocol 20's tab_created carries no pane id, so the pane this route
+    // must hand back is found by matching the tab — the same hop, and the
+    // same refusal, the spawn path uses.
+    match herdr::pane_of_tab(st.herdr.as_ref(), &created.tab_id).await {
+        Ok(Some(pane_id)) => (
             StatusCode::OK,
-            Json(json!({ "tab_id": created.tab_id, "pane_id": created.pane_id })),
+            Json(json!({ "tab_id": created.tab_id, "pane_id": pane_id })),
         )
             .into_response(),
+        Ok(None) => create_error_response(herdr::HerdrError::TabPaneUnresolved {
+            tab_id: created.tab_id,
+            workspace_id,
+        }),
         Err(e) => create_error_response(e),
     }
 }
@@ -4380,7 +4391,7 @@ async fn terminal_create_agent(
     let Some((workspace_id, cwd)) = project_creation_destination(&snapshot, &boundary) else {
         return destination_unresolved_response(&project.id);
     };
-    match st.herdr.agent_start(&workspace_id, Some(&cwd), &argv).await {
+    match herdr::start_agent_in_new_tab(st.herdr.as_ref(), &workspace_id, Some(&cwd), &argv).await {
         Ok(started) => (
             StatusCode::OK,
             Json(json!({
@@ -4852,6 +4863,35 @@ fn key_main_panes_by_feature(
         }
     }
     out
+}
+
+/// `tab.create` plus the pane it brought, as one value — test-only.
+///
+/// Protocol 20's `tab_created` carries only the tab (`TabInfo` has no pane
+/// id), so production finds the pane by matching that tab against a fresh
+/// snapshot. Tests below want both ids, and they find the pane exactly the
+/// way production does rather than by a shortcut the real code cannot take.
+#[cfg(test)]
+struct CreatedTab {
+    tab_id: String,
+    pane_id: String,
+}
+
+#[cfg(test)]
+async fn create_tab_with_pane(
+    h: &dyn herdr::Herdr,
+    workspace_id: &str,
+    cwd: Option<&str>,
+) -> CreatedTab {
+    let created = h.tab_create(workspace_id, cwd).await.unwrap();
+    let pane_id = crate::herdr::pane_of_tab(h, &created.tab_id)
+        .await
+        .unwrap()
+        .expect("a created tab brings a pane");
+    CreatedTab {
+        tab_id: created.tab_id,
+        pane_id,
+    }
 }
 
 #[cfg(test)]
@@ -8699,10 +8739,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-badged", "live-badged");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&config_dir);
         st.herdr = fake;
@@ -8760,10 +8804,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-quiet", "live-quiet");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_available(false);
 
         let mut st = build_state_with_dir(&config_dir);
@@ -10147,8 +10195,15 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        // Protocol 20 starts an agent INTO a pane, so make one first — the
+        // same two steps production takes.
+        let tab = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+        let pane_id = crate::herdr::pane_of_tab(fake.as_ref(), &tab.tab_id)
+            .await
+            .unwrap()
+            .expect("the created tab has a pane");
         let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .agent_start(&pane_id, &["claude".to_string()])
             .await
             .unwrap();
 
@@ -13859,46 +13914,48 @@ mod bee_route_tests {
         std::os::unix::fs::symlink(&escape_target, &symlink_path).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let at_root = fake
-            .agent_start(
-                "w1",
-                Some(&root_a.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let above = fake
-            .agent_start(
-                "w1",
-                Some(&scratch.to_string_lossy()), // project-a's parent directory
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let below_agent = fake
-            .agent_start(
-                "w1",
-                Some(&below.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let via_symlink = fake
-            .agent_start(
-                "w1",
-                Some(&symlink_path.to_string_lossy()), // raw cwd is under root_a, resolves outside
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let other_project = fake
-            .agent_start(
-                "w1",
-                Some(&root_b.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let at_root = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root_a.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let above = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&scratch.to_string_lossy()),
+            // project-a's parent directory
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let below_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&below.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        // raw cwd is under root_a, resolves outside
+        let via_symlink = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&symlink_path.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let other_project = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root_b.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -14174,14 +14231,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -14259,10 +14316,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-revision-changed-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(&started.pane_id, "first frame", "first frame", None);
 
         let mut st = build_state_with_dir(&dir);
@@ -14309,10 +14370,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-doc-links-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let screen = "wrote docs/specs/agent-terminal.md and docs/assets/logo.png\n";
         fake.seed_scroll_pane(&started.pane_id, screen, screen, None);
 
@@ -14354,10 +14419,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-url-links-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let screen = "see https://example.dev/status and box.local:7700 too\n";
         fake.seed_scroll_pane(&started.pane_id, screen, screen, None);
 
@@ -14398,10 +14467,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-scrollback-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         // A pane whose scrollback runs well past both the visible frame and
         // the read limit, every line individually identifiable.
         let visible = "line 499";
@@ -14456,10 +14529,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-revision-unchanged-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(&started.pane_id, "steady frame", "steady frame", None);
 
         let mut st = build_state_with_dir(&dir);
@@ -14499,10 +14576,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-revision-empty-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(&started.pane_id, "", "", None);
 
         let mut st = build_state_with_dir(&dir);
@@ -14550,14 +14631,22 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-revision-two-panes-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let pane_a = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let pane_b = fake
-            .agent_start("w2", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane_a = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let pane_b = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(&pane_a.pane_id, "shared frame", "shared frame", None);
         fake.seed_scroll_pane(&pane_b.pane_id, "shared frame", "shared frame", None);
 
@@ -14629,10 +14718,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-utf8-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let screen_text = "屏幕内容 😀\n❯ ";
         fake.seed_scroll_pane(&started.pane_id, screen_text, screen_text, None);
 
@@ -14676,10 +14769,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-ansi-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let raw = "\u{1b}[31m<script>bad</script>\u{1b}[0m\u{1b}[2Jplain";
         fake.seed_scroll_pane(&started.pane_id, raw, raw, None);
 
@@ -14729,10 +14826,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-no-history-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let text = "live frame\n❯ ";
         fake.seed_scroll_pane(&started.pane_id, text, text, Some("older frame\n❯ "));
 
@@ -14781,10 +14882,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-history-2-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &started.pane_id,
@@ -14848,10 +14953,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-live-after-history-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &started.pane_id,
@@ -15106,10 +15215,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("scroll-explicit-zero-with-record-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &started.pane_id,
@@ -15191,10 +15304,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("scroll-explicit-zero-no-record-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &started.pane_id,
@@ -15787,14 +15904,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -15834,10 +15951,14 @@ mod bee_route_tests {
         let root = fresh_root("transcript-not-available-project");
         let transcript_root = fresh_root("transcript-not-available-claude");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -15877,10 +15998,14 @@ mod bee_route_tests {
         let root = fresh_root("transcript-cursor-project");
         let transcript_root = fresh_root("transcript-cursor-claude");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let cwd = canonical_cwd(&root);
         write_transcript(
             &transcript_root,
@@ -16011,10 +16136,14 @@ mod bee_route_tests {
         let root = fresh_root("transcript-bad-cursor-project");
         let transcript_root = fresh_root("transcript-bad-cursor-claude");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let cwd = canonical_cwd(&root);
         write_transcript(&transcript_root, &cwd, "s1", "");
 
@@ -16049,10 +16178,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("transcript-page-render-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16444,10 +16577,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-input-stage-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16498,10 +16635,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-input-submit-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16550,10 +16691,8 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-input-shell-join-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16603,10 +16742,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-input-agent-verbatim-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16652,10 +16795,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-keys-reach-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16712,14 +16859,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -16864,10 +17011,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16934,14 +17085,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17320,10 +17471,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-reply-bar-render-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17412,9 +17567,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-ctrl-c-key-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17469,10 +17629,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-ctrl-c-send-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -17520,10 +17684,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-scroll-fab-render-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17668,7 +17836,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -17737,14 +17906,16 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&owned_sub.to_string_lossy()),
             &["claude".to_string()],
         )
         .await
         .unwrap();
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -17797,9 +17968,7 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-shell-only-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.tab_create("w1", Some(&stray_root.to_string_lossy()))
-            .await
-            .unwrap();
+        create_tab_with_pane(fake.as_ref(), "w1", Some(&stray_root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17827,14 +17996,16 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-dedup-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
         )
         .await
         .unwrap();
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["codex".to_string()],
@@ -17887,12 +18058,22 @@ mod bee_route_tests {
         let with_slash = format!("{bare}/");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&bare), &["claude".to_string()])
-            .await
-            .unwrap();
-        fake.agent_start("w1", Some(&with_slash), &["codex".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&bare),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&with_slash),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17942,9 +18123,14 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&hostile_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&hostile_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17987,14 +18173,14 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-empty-cwd-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_pane_dirs(&started.pane_id, None, None)
             .await
             .unwrap();
@@ -18028,14 +18214,14 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-empty-string-cwd-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -18102,7 +18288,8 @@ mod bee_route_tests {
         let project_root = fresh_root("suggest-own-root-project");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&project_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18144,7 +18331,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&pane_cwd).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&pane_cwd.to_string_lossy()),
             &["claude".to_string()],
@@ -18201,9 +18389,14 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&dotted_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&dotted_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -18251,9 +18444,14 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&dotted_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&dotted_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -18292,9 +18490,14 @@ mod bee_route_tests {
         let dotted_cwd = format!("{}/a/../b", scratch.to_string_lossy().trim_end_matches('/'));
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&dotted_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&dotted_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -18333,7 +18536,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&sibling_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&sibling_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18388,9 +18592,14 @@ mod bee_route_tests {
         let pane_cwd = link.to_string_lossy().to_string();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&pane_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&pane_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         st.herdr = fake;
 
         let resp = get(router(st), "/").await;
@@ -18427,7 +18636,8 @@ mod bee_route_tests {
         let pane_cwd = missing_root.join("sub");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&pane_cwd.to_string_lossy()),
             &["claude".to_string()],
@@ -18477,7 +18687,8 @@ mod bee_route_tests {
         let denied_root = PathBuf::from("/etc/waggledance-test-fixture-nonexistent");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18520,7 +18731,8 @@ mod bee_route_tests {
         write(&stray_root, "README.md", "# Stray\n");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18603,7 +18815,8 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-double-register-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18674,9 +18887,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some("/etc"), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some("/etc"),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -18737,7 +18955,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18987,22 +19206,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let owned = fake
-            .agent_start(
-                "w1",
-                Some(&project_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let owned = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&project_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19215,10 +19434,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fixture = std::sync::Arc::new(FakeHerdr::new());
-        let started = fixture
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fixture.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = Arc::new(HangingHerdr);
@@ -19291,30 +19514,30 @@ mod bee_route_tests {
         }
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let parent_pane = fake
-            .agent_start(
-                "w1",
-                Some(&parent_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let branch_pane = fake
-            .agent_start(
-                "w1",
-                Some(&branch_root.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
-        let sibling_pane = fake
-            .agent_start(
-                "w1",
-                Some(&sibling_root.to_string_lossy()),
-                &["aider".to_string()],
-            )
-            .await
-            .unwrap();
+        let parent_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&parent_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let branch_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&branch_root.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
+        let sibling_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&sibling_root.to_string_lossy()),
+            &["aider".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19496,8 +19719,7 @@ mod bee_route_tests {
         }
         async fn agent_start(
             &self,
-            _workspace_id: &str,
-            _cwd: Option<&str>,
+            _pane_id: &str,
             _argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
             unimplemented!("index_page never starts an agent")
@@ -19558,10 +19780,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19610,22 +19836,22 @@ mod bee_route_tests {
             PathBuf::from("/etc/waggledance-test-fixture-nonexistent-projects-home-1");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let ok_pane = fake
-            .agent_start(
-                "w1",
-                Some(&ok_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let denied_pane = fake
-            .agent_start(
-                "w1",
-                Some(&denied_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let ok_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&ok_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let denied_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&denied_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19691,38 +19917,51 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let working = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let working = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&working.pane_id, AgentStatus::Working)
             .await
             .unwrap();
-        let idle = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["codex".to_string()])
-            .await
-            .unwrap();
+        let idle = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&idle.pane_id, AgentStatus::Idle)
             .await
             .unwrap();
-        let done = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["aider".to_string()])
-            .await
-            .unwrap();
+        let done = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["aider".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&done.pane_id, AgentStatus::Done)
             .await
             .unwrap();
-        let blocked = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["cursor".to_string()])
-            .await
-            .unwrap();
+        let blocked = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["cursor".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&blocked.pane_id, AgentStatus::Blocked)
             .await
             .unwrap();
-        let shell = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let shell = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19800,9 +20039,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -20279,10 +20523,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -20825,22 +21073,23 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let shell = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let shell = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -20913,24 +21162,36 @@ mod bee_route_tests {
         for seeded in ["w1:p1", "w1:p2", "w2:p3", "w2:p4"] {
             fake.set_status(seeded, AgentStatus::Idle).await.unwrap();
         }
-        let rest = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let rest = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&rest.pane_id, AgentStatus::Done)
             .await
             .unwrap();
-        let working = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["codex".to_string()])
-            .await
-            .unwrap();
+        let working = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&working.pane_id, AgentStatus::Working)
             .await
             .unwrap();
-        let blocked = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["aider".to_string()])
-            .await
-            .unwrap();
+        let blocked = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["aider".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&blocked.pane_id, AgentStatus::Blocked)
             .await
             .unwrap();
@@ -20968,22 +21229,26 @@ mod bee_route_tests {
         for seeded in ["w1:p1", "w1:p2", "w2:p3", "w2:p4"] {
             fake2.set_status(seeded, AgentStatus::Idle).await.unwrap();
         }
-        let rest2 = fake2
-            .agent_start(
-                "w1",
-                Some(&root2.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let rest2 = crate::herdr::start_agent_in_new_tab(
+            fake2.as_ref(),
+            "w1",
+            Some(&root2.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake2
             .set_status(&rest2.pane_id, AgentStatus::Done)
             .await
             .unwrap();
-        let working2 = fake2
-            .agent_start("w1", Some(&root2.to_string_lossy()), &["codex".to_string()])
-            .await
-            .unwrap();
+        let working2 = crate::herdr::start_agent_in_new_tab(
+            fake2.as_ref(),
+            "w1",
+            Some(&root2.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
         fake2
             .set_status(&working2.pane_id, AgentStatus::Working)
             .await
@@ -21027,10 +21292,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let _agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let _agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21129,18 +21398,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21200,10 +21473,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21259,18 +21536,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21356,21 +21637,25 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&project_agent.pane_id, AgentStatus::Working)
             .await
             .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21429,18 +21714,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21497,9 +21786,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21556,18 +21850,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21630,10 +21928,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21678,9 +21980,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21775,18 +22082,22 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let main_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let wt_pane = fake
-            .agent_start(
-                "w1",
-                Some(&sibling.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let main_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let wt_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&sibling.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&config_dir);
         st.herdr = fake;
@@ -21922,10 +22233,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-main", "live-main");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&config_dir);
         st.herdr = fake;
@@ -21974,10 +22289,14 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&config_dir);
         st.herdr = fake;
@@ -22231,14 +22550,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         // Switch off (default): the home page must carry no trace of the
         // feature at all — not even the word "Unassigned". Byte-identical
@@ -22418,22 +22737,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let owned = fake
-            .agent_start(
-                "w1",
-                Some(&project_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let owned = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&project_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -22525,14 +22844,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(
             &stray.pane_id,
             "unassigned first frame",
@@ -22604,14 +22923,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let text = "unassigned live frame";
         fake.seed_scroll_pane(&stray.pane_id, text, text, Some("unassigned older frame"));
 
@@ -22655,14 +22974,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let text = "see https://example.dev/status now";
         fake.seed_scroll_pane(&stray.pane_id, text, text, None);
 
@@ -22705,14 +23024,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &stray.pane_id,
@@ -22876,22 +23195,22 @@ mod bee_route_tests {
         let fake = std::sync::Arc::new(FakeHerdr::new());
         // A pane whose cwd sits under the hard-deny-listed project's own
         // root -- this is the pane that must NOT leak into Unassigned.
-        let denied_project_pane = fake
-            .agent_start(
-                "w1",
-                Some(&denied_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let denied_project_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&denied_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -22926,10 +23245,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-keys-bound-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -22975,14 +23298,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -23021,7 +23344,7 @@ mod bee_route_tests {
     /// existing tab). Every other `Herdr` method is unreachable — the create
     /// routes never call them. Mirrors herdr-go's own `RecordingHerdr`
     /// (`herdr-go/src/web/create.rs`).
-    type AgentCallLog = Vec<(String, Option<String>, Vec<String>)>;
+    type AgentCallLog = Vec<(String, Vec<String>)>;
 
     struct RecordingHerdr {
         snap: herdr::Snapshot,
@@ -23104,26 +23427,23 @@ mod bee_route_tests {
             }
             Ok(herdr::TabCreated {
                 tab_id: format!("{workspace_id}:created-tab"),
-                pane_id: format!("{workspace_id}:created-pane"),
             })
         }
         async fn agent_start(
             &self,
-            workspace_id: &str,
-            cwd: Option<&str>,
+            pane_id: &str,
             argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
-            self.agent_calls.lock().unwrap().push((
-                workspace_id.to_string(),
-                cwd.map(str::to_string),
-                argv.to_vec(),
-            ));
+            self.agent_calls
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), argv.to_vec()));
             if let Some(err) = self.fail.lock().unwrap().take() {
                 return Err(err);
             }
             Ok(herdr::AgentStarted {
-                tab_id: format!("{workspace_id}:created-agent-tab"),
-                pane_id: format!("{workspace_id}:created-agent-pane"),
+                tab_id: "w:created-tab".into(),
+                pane_id: pane_id.to_string(),
                 name: "recorded-agent".into(),
             })
         }
@@ -23151,13 +23471,26 @@ mod bee_route_tests {
                 tab_id: "w:t".into(),
                 focused_pane_id: Some("w:p".into()),
             }],
-            panes: vec![herdr::wire::Pane {
-                pane_id: "w:p".into(),
-                workspace_id: "w".into(),
-                tab_id: "w:t".into(),
-                cwd: Some(p.clone()),
-                foreground_cwd: Some(p),
-            }],
+            panes: vec![
+                herdr::wire::Pane {
+                    pane_id: "w:p".into(),
+                    workspace_id: "w".into(),
+                    tab_id: "w:t".into(),
+                    cwd: Some(p.clone()),
+                    foreground_cwd: Some(p.clone()),
+                },
+                // The pane `tab.create` brings with it. Protocol 20 does not
+                // return it, so the spawn path finds it here by tab_id — a
+                // double whose snapshot lacked it would make every spawn test
+                // fail for a reason the production code does not have.
+                herdr::wire::Pane {
+                    pane_id: "w:created-pane".into(),
+                    workspace_id: "w".into(),
+                    tab_id: "w:created-tab".into(),
+                    cwd: Some(p.clone()),
+                    foreground_cwd: Some(p),
+                },
+            ],
             ..herdr::Snapshot::default()
         }
     }
@@ -23212,8 +23545,7 @@ mod bee_route_tests {
         }
         async fn agent_start(
             &self,
-            _workspace_id: &str,
-            _cwd: Option<&str>,
+            _pane_id: &str,
             _argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
             unreachable!("page-selection tests never start an agent")
@@ -23274,14 +23606,22 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("pane-scope-two-panes-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let first = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let second = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let first = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let second = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -23344,14 +23684,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_pane = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -23974,13 +24314,16 @@ mod bee_route_tests {
 
         let calls = herdr.agent_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "w");
+        assert_eq!(calls[0].0, "w:created-pane");
+        assert_eq!(calls[0].1, vec!["claude".to_string()]);
+        // Protocol 20's agent.start carries no directory — the pane is made
+        // first and the directory rides on that call, so that is where the
+        // destination is now asserted.
         let canonical_root = std::fs::canonicalize(&root).unwrap();
-        assert_eq!(
-            calls[0].1.as_deref(),
-            Some(canonical_root.to_str().unwrap())
-        );
-        assert_eq!(calls[0].2, vec!["claude".to_string()]);
+        let tabs = herdr.tab_calls.lock().unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].0, "w");
+        assert_eq!(tabs[0].1.as_deref(), Some(canonical_root.to_str().unwrap()));
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
@@ -24029,13 +24372,18 @@ mod bee_route_tests {
         let calls = herdr.agent_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].2,
+            calls[0].1,
             vec!["claude".to_string()],
             "the started argv must be the configured preset's own, never anything from the request body"
         );
+        // The security property is unchanged, only the call that carries the
+        // directory moved: under protocol 20 the pane is created first, so the
+        // request's own cwd must fail to reach THAT call.
         let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let tabs = herdr.tab_calls.lock().unwrap();
+        assert_eq!(tabs.len(), 1);
         assert_eq!(
-            calls[0].1.as_deref(),
+            tabs[0].1.as_deref(),
             Some(canonical_root.to_str().unwrap()),
             "the request's own bogus \"cwd\" must never reach herdr"
         );
@@ -24556,10 +24904,8 @@ mod bee_route_tests {
         let root = fresh_root("scope-shell-row-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -24594,10 +24940,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&outside.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&outside.to_string_lossy())).await;
         fake.set_pane_dirs(
             &created.pane_id,
             Some(&outside.to_string_lossy()),
@@ -24652,10 +24996,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
         fake.set_pane_dirs(
             &created.pane_id,
             Some(&root.to_string_lossy()),
@@ -24696,14 +25038,14 @@ mod bee_route_tests {
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
         // agent_start sets cwd == foreground_cwd, both outside the root.
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -24778,10 +25120,8 @@ mod bee_route_tests {
         std::os::unix::fs::symlink(&escape_target, &symlink_path).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
         // cwd absent: only foreground_cwd is consulted, and its raw path
         // sits under the root but resolves outside it.
         fake.set_pane_dirs(
@@ -24831,10 +25171,8 @@ mod bee_route_tests {
         let root = fresh_root("scope-no-dirs-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
         fake.set_pane_dirs(&created.pane_id, None, None)
             .await
             .unwrap();
@@ -24874,10 +25212,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let stray = fake
-            .tab_create("w1", Some(&stray_root.to_string_lossy()))
-            .await
-            .unwrap();
+        let stray =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&stray_root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -24936,10 +25272,8 @@ mod bee_route_tests {
         // Sub-case: matched only via foreground_cwd -- nothing is ever
         // written at that path, so the transcript route must answer
         // available:false rather than 404 (membership already passed).
-        let fg_only = fake
-            .tab_create("w1", Some(&outside.to_string_lossy()))
-            .await
-            .unwrap();
+        let fg_only =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&outside.to_string_lossy())).await;
         fake.set_pane_dirs(
             &fg_only.pane_id,
             Some(&outside.to_string_lossy()),
@@ -24950,10 +25284,8 @@ mod bee_route_tests {
 
         // Sub-case: both directories validate -- the transcript is written
         // only at the cwd path, proving cwd wins the precedence.
-        let both_match = fake
-            .tab_create("w1", Some(&inner_cwd.to_string_lossy()))
-            .await
-            .unwrap();
+        let both_match =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&inner_cwd.to_string_lossy())).await;
         fake.set_pane_dirs(
             &both_match.pane_id,
             Some(&inner_cwd.to_string_lossy()),
@@ -25039,14 +25371,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&child_root).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let shared = fake
-            .agent_start(
-                "w1",
-                Some(&child_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let shared = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&child_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -25107,9 +25439,14 @@ mod bee_route_tests {
         let root = fresh_root("scope-identity-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -25123,8 +25460,13 @@ mod bee_route_tests {
             .unwrap();
         assert_eq!(terminal_resp.status(), StatusCode::OK);
         let terminal_body = body_string(terminal_resp).await;
+        // "Shell", not "main": protocol 20's agent.start cannot create a
+        // pane, so a spawn now makes its OWN tab and starts there, instead of
+        // splitting into the workspace's active tab the way protocol 16 did.
+        // The card still names workspace and tab together, which is what this
+        // test is for — only which tab a spawn lands in changed.
         assert!(
-            terminal_body.contains("frontend-app · main"),
+            terminal_body.contains("frontend-app · Shell"),
             "the terminal card must name its workspace and tab together: {terminal_body}"
         );
 
@@ -25135,7 +25477,7 @@ mod bee_route_tests {
         assert_eq!(transcript_resp.status(), StatusCode::OK);
         let transcript_body = body_string(transcript_resp).await;
         assert!(
-            transcript_body.contains("frontend-app · main"),
+            transcript_body.contains("frontend-app · Shell"),
             "the transcript card must name its workspace and tab together: {transcript_body}"
         );
 
@@ -25159,31 +25501,47 @@ mod bee_route_tests {
         let root = fresh_root("scope-status-pill-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let working = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let working = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&working.pane_id, herdr::AgentStatus::Working)
             .await
             .unwrap();
-        let idle = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let idle = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&idle.pane_id, herdr::AgentStatus::Idle)
             .await
             .unwrap();
-        let done = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let done = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&done.pane_id, herdr::AgentStatus::Done)
             .await
             .unwrap();
-        let blocked = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let blocked = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&blocked.pane_id, herdr::AgentStatus::Blocked)
             .await
             .unwrap();
@@ -25270,10 +25628,14 @@ mod bee_route_tests {
         let root = fresh_root("scope-status-unknown-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&started.pane_id, herdr::AgentStatus::Unknown)
             .await
             .unwrap();
@@ -25316,10 +25678,8 @@ mod bee_route_tests {
         let root = fresh_root("scope-shell-identity-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -25389,14 +25749,16 @@ mod bee_route_tests {
         let root = fresh_root("scope-shell-aria-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let agent_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let shell_pane = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let agent_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let shell_pane =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -25465,14 +25827,16 @@ mod bee_route_tests {
         let root = fresh_root("scope-controls-survive-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let agent_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let shell_pane = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let agent_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let shell_pane =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26419,10 +26783,14 @@ mod bee_route_tests {
         let root = fresh_root("drawer-mark-sprite-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26464,14 +26832,15 @@ mod bee_route_tests {
         let root = fresh_root("agent-switch-drawer-shell-filter-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let shell = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let shell = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26509,14 +26878,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&inner).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let agent = fake
-            .agent_start(
-                "w1",
-                Some(&inner.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&inner.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26569,10 +26938,14 @@ mod bee_route_tests {
         // this pane is the titleless case; the seeded `w2:p3` agent
         // ("Finished the refactor") rides the Unassigned half untouched and
         // is the titled case.
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -27811,10 +28184,14 @@ mod bee_route_tests {
         fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         // bap-6: the wake target is the pane whose own live session says it
         // is on this feature, so the fixture has to bind one — a bare pane in
         // the checkout is no longer enough, and the sibling test below proves
@@ -28026,10 +28403,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-perm", "live-perm");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         write(
             &root,
             ".bee/sessions/live-blocked.json",
@@ -28094,10 +28475,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-quiet", "live-quiet");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         // The agent is live and bound to the feature — just working, not
         // blocked. That is precisely the case an Approve must not reach.
         write(
@@ -28161,10 +28546,14 @@ mod bee_route_tests {
         fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -28231,10 +28620,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-off-perm", "live-off-perm");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         write(
             &root,
             ".bee/sessions/live-off-blocked.json",
@@ -28561,14 +28954,22 @@ mod bee_route_tests {
         // has a worktree, so `project_feature_panes` maps both onto both
         // cards. Only `activity.feature` tells them apart.
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let alpha_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let beta_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let alpha_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let beta_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         for (session, feature, pane_id) in [
             ("live-alpha-agent", "feat-alpha", &alpha_pane.pane_id),
             ("live-beta-agent", "feat-beta", &beta_pane.pane_id),
@@ -28752,8 +29153,14 @@ mod bee_route_tests {
 
     #[derive(Default)]
     struct RunHerdrLog {
-        /// `(workspace_id, cwd, argv)` per `agent_start`, in order.
-        starts: Vec<(String, Option<String>, Vec<String>)>,
+        /// `(pane_id, argv)` per `agent_start`, in order. Protocol 20's
+        /// agent.start carries no directory — it attaches to a pane that
+        /// already exists — so the destination is recorded on `tabs` below.
+        starts: Vec<(String, Vec<String>)>,
+        /// `(workspace_id, cwd)` per `tab_create`, in order. This is where a
+        /// spawn's directory is now decided, and therefore where a test
+        /// asserting "the agent starts in the feature's own worktree" looks.
+        tabs: Vec<(String, Option<String>)>,
         /// `(pane_id, text)` per `send_input`, in order.
         inputs: Vec<(String, String)>,
     }
@@ -28773,8 +29180,12 @@ mod bee_route_tests {
             }
         }
 
-        fn starts(&self) -> Vec<(String, Option<String>, Vec<String>)> {
+        fn starts(&self) -> Vec<(String, Vec<String>)> {
             self.log.lock().unwrap().starts.clone()
+        }
+
+        fn tabs(&self) -> Vec<(String, Option<String>)> {
+            self.log.lock().unwrap().tabs.clone()
         }
 
         fn inputs(&self) -> Vec<(String, String)> {
@@ -28785,7 +29196,18 @@ mod bee_route_tests {
     #[async_trait::async_trait]
     impl herdr::Herdr for RunHerdr {
         async fn snapshot(&self) -> herdr::Result<herdr::Snapshot> {
-            Ok(self.snap.clone())
+            let mut snap = self.snap.clone();
+            // The pane the spawn's own tab brings with it. Production finds
+            // it here by tab_id; a double whose snapshot lacked it would fail
+            // every spawn test for a reason the real code does not have.
+            snap.panes.push(herdr::wire::Pane {
+                pane_id: self.spawned_pane.clone(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:spawned-tab".into(),
+                cwd: None,
+                foreground_cwd: None,
+            });
+            Ok(snap)
         }
         async fn ping(&self) -> herdr::Result<herdr::ProtocolInfo> {
             unreachable!("the run actions never ping")
@@ -28817,22 +29239,29 @@ mod bee_route_tests {
         }
         async fn tab_create(
             &self,
-            _workspace_id: &str,
-            _cwd: Option<&str>,
+            workspace_id: &str,
+            cwd: Option<&str>,
         ) -> herdr::Result<herdr::TabCreated> {
-            unreachable!("the run actions never create a tab")
+            // A spawn creates a tab now — protocol 20's agent.start cannot.
+            self.log
+                .lock()
+                .unwrap()
+                .tabs
+                .push((workspace_id.to_string(), cwd.map(str::to_string)));
+            Ok(herdr::TabCreated {
+                tab_id: "w1:spawned-tab".into(),
+            })
         }
         async fn agent_start(
             &self,
-            workspace_id: &str,
-            cwd: Option<&str>,
+            pane_id: &str,
             argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
-            self.log.lock().unwrap().starts.push((
-                workspace_id.to_string(),
-                cwd.map(str::to_string),
-                argv.to_vec(),
-            ));
+            self.log
+                .lock()
+                .unwrap()
+                .starts
+                .push((pane_id.to_string(), argv.to_vec()));
             Ok(herdr::AgentStarted {
                 tab_id: "w1:t1".into(),
                 pane_id: self.spawned_pane.clone(),
@@ -29029,7 +29458,7 @@ mod bee_route_tests {
         let starts = herdr_double.starts();
         assert_eq!(starts.len(), 1, "exactly one agent is started: {starts:?}");
         assert_eq!(
-            starts[0].2,
+            starts[0].1,
             vec![
                 "claude".to_string(),
                 "--model".to_string(),
@@ -29037,8 +29466,12 @@ mod bee_route_tests {
             ],
             "the argv is the project's own recorded preset (D4)"
         );
+        // Protocol 20 moved the directory onto the call that creates the
+        // pane; the property is unchanged, only the call that carries it.
+        let tabs = herdr_double.tabs();
+        assert_eq!(tabs.len(), 1, "exactly one tab is created: {tabs:?}");
         assert_eq!(
-            starts[0].1.as_deref().map(std::path::Path::new),
+            tabs[0].1.as_deref().map(std::path::Path::new),
             Some(sibling.as_path()),
             "the agent starts in the feature's own worktree"
         );
@@ -29141,8 +29574,12 @@ mod bee_route_tests {
 
         let starts = herdr_double.starts();
         assert_eq!(starts.len(), 1);
+        // The directory rides on tab.create under protocol 20 — agent.start
+        // only names the pane it attaches to.
+        let tabs = herdr_double.tabs();
+        assert_eq!(tabs.len(), 1);
         assert_eq!(
-            starts[0].1.as_deref().map(std::path::Path::new),
+            tabs[0].1.as_deref().map(std::path::Path::new),
             Some(sibling.as_path()),
             "the agent starts in the worktree bee just made"
         );
