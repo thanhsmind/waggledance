@@ -3751,6 +3751,27 @@ fn bee_hub_style() -> String {
    right edge for a floated corner to anchor to. */
 .bee-hub__row { display: block; min-width: 0; overflow-wrap: anywhere; color: var(--color-text); font-size: var(--type-body-sm-size); text-decoration: none; padding: var(--density-row-pad-y) var(--space-2); border-bottom: var(--border-width-hairline) solid var(--color-border); }
 .bee-hub__row:hover { color: var(--color-action); }
+/* board-live-morph D2 (docs/history/board-live-morph/CONTEXT.md): motion is
+   spent on the card, not on its contents. The shell (a full card, above)
+   and this row (a dense row) are the only two keyed elements `app.js`'s
+   in-place patch ever moves or fades -- everything a card or row draws
+   inside itself swaps with no animation, so this transition never reaches
+   past the shell/row boundary. `transform` is what the patch's FLIP step
+   sets inline for a card/row that changed column or order; `opacity` is
+   what `.bee-hub__enter`/`.bee-hub__leave` below animate for one that
+   appeared or is leaving. A fresh page load sets neither inline style, so
+   this transition is inert until the first patch runs. */
+.bee-hub__shell, .bee-hub__row { transition: transform var(--motion-settle) var(--ease-standard), opacity var(--motion-settle) var(--ease-standard); }
+.bee-hub__enter { opacity: 0; }
+.bee-hub__leave { opacity: 0; }
+@media (prefers-reduced-motion: reduce) {
+  /* The patch itself still runs -- a card still lands in its new column,
+     still appears, still leaves -- only the movement is removed, so this
+     zeroes the duration rather than dropping the rule. */
+  .bee-hub__shell, .bee-hub__row {
+    transition-duration: 0.01ms !important;
+  }
+}
 /* cross-board D5/D10: the cross-project board's own project label and ship
    time on a Finished row — absent on every per-project board row, which
    passes neither and renders unchanged.

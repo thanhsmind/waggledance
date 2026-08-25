@@ -1645,21 +1645,344 @@
     }
     return false;
   }
-  // The one place a reload actually happens, and the one place the dialog
-  // rule lives (D2's confirm is a real modal the human is mid-answer in): a
-  // reload that would pull it out from under them becomes ONE pending
-  // reload, never a fresh 1.5 s timer armed over and over behind a dialog
-  // nobody has closed yet. The flag is flushed by the events that close a
-  // modal, so the reload lands as soon as the dialog is gone instead of up
-  // to a second and a half later.
+  // board-live-morph (docs/history/board-live-morph/CONTEXT.md, D1): only a
+  // board surface -- the home Kanban tab and /p/<id>/_bee -- patches in
+  // place; every other page keeps calling location.reload() through the
+  // fallback below exactly as it always has. `[data-feature-hub]` is the
+  // one attribute both boards render on their shared root section
+  // (views.rs::bee_render_hub_section / bee_cross_project_features_section)
+  // and no other page renders, so its presence is the whole test.
+  var hubPatchInFlight = false; // poller-inflight-guard precedent: a burst of signals must never stack a second patch fetch behind one still outstanding
+  // Every attribute except `open` -- a `<details>`'s own fold state is
+  // never read off the fetch, only ever restored from what was captured
+  // before this swap (see hubRestoreOpen below).
+  function hubCopyAttrs(oldEl, newEl) {
+    var i, name;
+    var oldAttrs = oldEl.attributes;
+    for (i = oldAttrs.length - 1; i >= 0; i--) {
+      name = oldAttrs[i].name;
+      if (name === "open") continue;
+      if (!newEl.hasAttribute(name)) oldEl.removeAttribute(name);
+    }
+    var newAttrs = newEl.attributes;
+    for (i = 0; i < newAttrs.length; i++) {
+      name = newAttrs[i].name;
+      if (name === "open") continue;
+      if (oldEl.getAttribute(name) !== newAttrs[i].value) oldEl.setAttribute(name, newAttrs[i].value);
+    }
+  }
+  // A card's own fold (`details.bee-hub__card`, keyed by its shell's
+  // data-hub-key) and a column's own fold (`details.bee-hub__group`/
+  // `.bee-hub__archive`, keyed by data-hub-group) both read as plain
+  // content once the swap below rewrites them, so what the human opened
+  // is captured here, before anything moves, and reapplied once the new
+  // DOM is in place -- a card or column they opened must not fold itself.
+  function hubCaptureOpen(section) {
+    var state = { cards: {}, columns: {} };
+    var shells = section.querySelectorAll("[data-hub-key]");
+    var i, d;
+    for (i = 0; i < shells.length; i++) {
+      d = shells[i].querySelector("details.bee-hub__card");
+      if (d) state.cards[shells[i].getAttribute("data-hub-key")] = d.open;
+    }
+    var cols = section.querySelectorAll(".bee-hub__groups > [data-hub-group]");
+    for (i = 0; i < cols.length; i++) {
+      if (cols[i].tagName === "DETAILS") {
+        state.columns[cols[i].getAttribute("data-hub-group")] = cols[i].open;
+      }
+    }
+    var archive = section.querySelector(".bee-hub__archive");
+    if (archive) state.columns[archive.getAttribute("data-hub-group")] = archive.open;
+    return state;
+  }
+  function hubRestoreOpen(section, state) {
+    var shells = section.querySelectorAll("[data-hub-key]");
+    var i, d, key;
+    for (i = 0; i < shells.length; i++) {
+      key = shells[i].getAttribute("data-hub-key");
+      if (Object.prototype.hasOwnProperty.call(state.cards, key)) {
+        d = shells[i].querySelector("details.bee-hub__card");
+        if (d) d.open = state.cards[key];
+      }
+    }
+    var cols = section.querySelectorAll(".bee-hub__groups > [data-hub-group]");
+    for (i = 0; i < cols.length; i++) {
+      key = cols[i].getAttribute("data-hub-group");
+      if (cols[i].tagName === "DETAILS" && Object.prototype.hasOwnProperty.call(state.columns, key)) {
+        cols[i].open = state.columns[key];
+      }
+    }
+    var archive = section.querySelector(".bee-hub__archive");
+    if (archive) {
+      key = archive.getAttribute("data-hub-group");
+      if (Object.prototype.hasOwnProperty.call(state.columns, key)) archive.open = state.columns[key];
+    }
+  }
+  // The six group/archive containers are matched by their own
+  // data-hub-group -- the one identity that never changes across a
+  // render, unlike a card's own data-hub-key, which can land in a
+  // different one of these six when a feature changes column.
+  function hubPairGroups(oldSection, newSection) {
+    var oldGroups = oldSection.querySelectorAll(".bee-hub__groups > [data-hub-group]");
+    var newGroups = newSection.querySelectorAll(".bee-hub__groups > [data-hub-group]");
+    var pairs = [];
+    var i, j, key, match;
+    for (i = 0; i < oldGroups.length; i++) {
+      key = oldGroups[i].getAttribute("data-hub-group");
+      match = null;
+      for (j = 0; j < newGroups.length; j++) {
+        if (newGroups[j].getAttribute("data-hub-group") === key) { match = newGroups[j]; break; }
+      }
+      if (match) pairs.push({ oldEl: oldGroups[i], newEl: match, archive: false });
+    }
+    var oldArchive = oldSection.querySelector(".bee-hub__archive");
+    var newArchive = newSection.querySelector(".bee-hub__archive");
+    if (oldArchive && newArchive) pairs.push({ oldEl: oldArchive, newEl: newArchive, archive: true });
+    return pairs;
+  }
+  // The one place a card/row actually gets keyed: reconciles the direct
+  // children of a `.bee-hub__cards` container against the ordered list the
+  // fetch just rendered. A key present in both keeps its live node --
+  // moved into position, its own inner content replaced -- so the FLIP
+  // below has a real box to measure on both sides; a key only in the new
+  // list is a fresh insert, faded in; a key only in the old list is left
+  // for the leaves pass in hubPatchSection below, which every container's
+  // own untouched leftovers fall into once every wanted key elsewhere has
+  // claimed its own live node.
+  function hubReconcileCards(container, newCardsEl, oldByKey, moved, enters) {
+    var wanted = newCardsEl ? Array.prototype.slice.call(newCardsEl.children) : [];
+    var prev = null;
+    var i, newChild, key, liveEl, wantPos, freshEl;
+    for (i = 0; i < wanted.length; i++) {
+      newChild = wanted[i];
+      key = newChild.getAttribute("data-hub-key");
+      liveEl = key ? oldByKey[key] : null;
+      wantPos = prev ? prev.nextSibling : container.firstChild;
+      if (liveEl) {
+        if (wantPos !== liveEl) container.insertBefore(liveEl, wantPos);
+        liveEl.innerHTML = newChild.innerHTML;
+        // A dense row carries its own group on itself (unlike a card,
+        // whose group rides its inner `details`, already covered by the
+        // innerHTML swap above) -- synced here or a row that changed
+        // column would carry a stale data-hub-group after "content only".
+        if (newChild.hasAttribute("data-hub-group")) {
+          liveEl.setAttribute("data-hub-group", newChild.getAttribute("data-hub-group"));
+        }
+        moved.push({ key: key, el: liveEl });
+        prev = liveEl;
+      } else {
+        freshEl = document.importNode(newChild, true);
+        freshEl.classList.add("bee-hub__enter");
+        container.insertBefore(freshEl, wantPos);
+        enters.push(freshEl);
+        prev = freshEl;
+      }
+    }
+  }
+  // Everything in one group/archive pair OUTSIDE its `.bee-hub__cards`
+  // container -- the header, the count, the waiting chip, the archive
+  // summary -- is wholesale (D2 only ever animates the card/row itself).
+  function hubPatchGroup(pair, oldByKey, moved, enters) {
+    var oldEl = pair.oldEl, newEl = pair.newEl;
+    var oldHead = oldEl.firstElementChild;
+    var newHead = newEl.firstElementChild;
+    if (oldHead && newHead) oldEl.replaceChild(document.importNode(newHead, true), oldHead);
+    hubCopyAttrs(oldEl, newEl);
+
+    var oldBody = oldEl, newBody = newEl;
+    if (pair.archive) {
+      oldBody = oldEl.lastElementChild; // .bee-hub__archive-body
+      newBody = newEl.lastElementChild;
+      hubCopyAttrs(oldBody, newBody);
+    }
+
+    var oldCards = oldBody.querySelector(".bee-hub__cards");
+    var newCards = newBody.querySelector(".bee-hub__cards");
+    var freshCards = false;
+    if (!oldCards) {
+      oldCards = document.createElement("div");
+      oldCards.className = "bee-hub__cards";
+      freshCards = true;
+    }
+    hubReconcileCards(oldCards, newCards, oldByKey, moved, enters);
+
+    var oldEmpty = oldBody.querySelector(".fg-empty");
+    var newEmpty = newBody.querySelector(".fg-empty");
+    if (oldCards.children.length === 0) {
+      if (newEmpty) {
+        var freshEmpty = document.importNode(newEmpty, true);
+        if (oldEmpty) oldBody.replaceChild(freshEmpty, oldEmpty);
+        else if (oldCards.parentNode === oldBody) oldBody.replaceChild(freshEmpty, oldCards);
+        else oldBody.appendChild(freshEmpty);
+      } else if (oldCards.parentNode === oldBody) {
+        oldBody.removeChild(oldCards);
+      }
+    } else if (freshCards) {
+      if (oldEmpty) oldBody.replaceChild(oldCards, oldEmpty);
+      else oldBody.appendChild(oldCards);
+    }
+  }
+  // Every top-level child of the section that is not `.bee-hub__groups`
+  // (handled above, group by group) or `.bee-hub__archive` (the same) --
+  // the heading, the stat tiles, the cross-project board's own
+  // read-errors strip -- carries no key of its own and is replaced
+  // wholesale, in the fetched page's own order.
+  function hubPatchWholesale(oldSection, newSection) {
+    var oldGroups = oldSection.querySelector(".bee-hub__groups");
+    var oldArchive = oldSection.querySelector(".bee-hub__archive");
+    var child = oldSection.firstChild;
+    var next;
+    while (child) {
+      next = child.nextSibling;
+      if (child !== oldGroups && child !== oldArchive) oldSection.removeChild(child);
+      child = next;
+    }
+    var before = [];
+    var after = [];
+    var pastGroups = false;
+    var newChild = newSection.firstChild;
+    while (newChild) {
+      if (newChild.nodeType === 1 && newChild.classList && newChild.classList.contains("bee-hub__groups")) {
+        pastGroups = true;
+      } else if (!(newChild.nodeType === 1 && newChild.classList && newChild.classList.contains("bee-hub__archive"))) {
+        (pastGroups ? after : before).push(newChild);
+      }
+      newChild = newChild.nextSibling;
+    }
+    var i;
+    for (i = 0; i < before.length; i++) oldSection.insertBefore(document.importNode(before[i], true), oldGroups);
+    for (i = 0; i < after.length; i++) oldSection.insertBefore(document.importNode(after[i], true), oldArchive || null);
+  }
+  // Fades a leaving card/row out, then removes it once the transition
+  // ends -- or after one guaranteed fallback tick, so a backgrounded tab
+  // (whose transitionend never fires) cannot leave it stuck forever.
+  function hubFadeLeave(el) {
+    var done = false;
+    function remove() {
+      if (done) return;
+      done = true;
+      if (el.parentNode) el.parentNode.removeChild(el);
+    }
+    el.addEventListener("transitionend", remove, { once: true });
+    setTimeout(remove, 400);
+    el.classList.add("bee-hub__leave");
+  }
+  // The full in-place patch (D1/D2): reconcile every card/row by its own
+  // data-hub-key, wherever it currently sits, then FLIP the survivors in
+  // one batch. `section` is the live `[data-feature-hub]` root; `next` is
+  // the same element out of the page this function just fetched.
+  function hubPatchSection(section, next) {
+    var openState = hubCaptureOpen(section);
+    var oldKeyed = section.querySelectorAll("[data-hub-key]");
+    var oldRects = {};
+    var oldByKey = {};
+    var i, k;
+    for (i = 0; i < oldKeyed.length; i++) {
+      k = oldKeyed[i].getAttribute("data-hub-key");
+      // Read every old box before a single node moves -- a rect taken
+      // mid-swap would already be measuring the new layout.
+      oldRects[k] = oldKeyed[i].getBoundingClientRect();
+      oldByKey[k] = oldKeyed[i];
+    }
+
+    var moved = [];
+    var enters = [];
+    var pairs = hubPairGroups(section, next);
+    for (i = 0; i < pairs.length; i++) hubPatchGroup(pairs[i], oldByKey, moved, enters);
+
+    var newPresent = {};
+    var newKeyed = next.querySelectorAll("[data-hub-key]");
+    for (i = 0; i < newKeyed.length; i++) newPresent[newKeyed[i].getAttribute("data-hub-key")] = true;
+    var leaves = [];
+    for (k in oldByKey) {
+      if (Object.prototype.hasOwnProperty.call(oldByKey, k) && !newPresent[k] && oldByKey[k].parentNode) {
+        leaves.push(oldByKey[k]);
+      }
+    }
+
+    hubPatchWholesale(section, next);
+    hubRestoreOpen(section, openState);
+
+    // FLIP, batched: read every survivor's new box first (the first read
+    // below is the one forced reflow this half needs), then write every
+    // starting transform, then force exactly one more reflow to commit
+    // them before the final write clears them and lets the CSS
+    // transition in bee_hub_style() carry the motion.
+    var afterRects = [];
+    for (i = 0; i < moved.length; i++) afterRects[i] = moved[i].el.getBoundingClientRect();
+    for (i = 0; i < moved.length; i++) {
+      var before = oldRects[moved[i].key];
+      if (!before) continue;
+      var a = afterRects[i];
+      var dx = before.left - a.left;
+      var dy = before.top - a.top;
+      if (dx || dy) {
+        moved[i].el.style.transition = "none";
+        moved[i].el.style.transform = "translate(" + dx + "px, " + dy + "px)";
+      }
+    }
+    void section.offsetHeight; // exactly one forced reflow for the whole batch
+    for (i = 0; i < moved.length; i++) {
+      if (moved[i].el.style.transform) {
+        moved[i].el.style.transition = "";
+        moved[i].el.style.transform = "";
+      }
+    }
+    for (i = 0; i < enters.length; i++) enters[i].classList.remove("bee-hub__enter");
+    for (i = 0; i < leaves.length; i++) hubFadeLeave(leaves[i]);
+  }
+  // On a board surface (`[data-feature-hub]` is only ever rendered by
+  // views.rs::bee_render_hub_section / bee_cross_project_features_section,
+  // D1), refetch this same page and patch its board section in place
+  // instead of throwing the whole page away. Every failure -- no board
+  // section on this page at all, the fetch itself, a non-ok status, a
+  // fetched page with no `[data-feature-hub]` of its own -- falls back to
+  // the real reload, never a half-applied patch.
+  function applyUpdate() {
+    var section = document.querySelector("[data-feature-hub]");
+    if (!section) { location.reload(); return; }
+    if (hubPatchInFlight) return; // poller-inflight-guard precedent: never stack a second patch behind one still outstanding
+    hubPatchInFlight = true;
+    fetch(location.href, { credentials: "same-origin" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("bee-hub patch: bad status");
+        return res.text();
+      })
+      .then(function (html) {
+        // DOMParser never throws on malformed markup -- it hands back a
+        // document with no [data-feature-hub], which is the same failure
+        // as a fetch that never reached this page at all.
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        var next = doc.querySelector("[data-feature-hub]");
+        if (!next) throw new Error("bee-hub patch: no section in the fetched page");
+        hubPatchSection(section, next);
+      })
+      .then(function () {
+        hubPatchInFlight = false;
+      })
+      .catch(function () {
+        hubPatchInFlight = false;
+        location.reload();
+      });
+  }
+  // The one place a reload or a patch actually happens, and the one place
+  // the dialog rule lives (D2's confirm is a real modal the human is
+  // mid-answer in): a reload that would pull it out from under them
+  // becomes ONE pending reload, never a fresh 1.5 s timer armed over and
+  // over behind a dialog nobody has closed yet. The flag is flushed by the
+  // events that close a modal, so the reload lands as soon as the dialog
+  // is gone instead of up to a second and a half later. board-live-morph
+  // D1 routes this through applyUpdate() -- an in-place patch on a board
+  // surface, location.reload() everywhere else and on every failure --
+  // rather than changing what triggers it or the modal rule around it.
   function reloadNow() {
     if (modalOpen()) { reloadPending = true; return; }
-    location.reload();
+    applyUpdate();
   }
   function flushPendingReload() {
     if (!reloadPending || modalOpen()) return;
     reloadPending = false;
-    location.reload();
+    applyUpdate();
   }
   // A modal closes on a click (its own button, or the backdrop), on a key
   // (Escape), or — for a real `<dialog>` — by firing `close`, which does not
