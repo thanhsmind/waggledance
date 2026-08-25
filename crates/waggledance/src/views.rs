@@ -933,7 +933,11 @@ fn pane_mark_tone_class(tone: &str) -> &'static str {
 /// The state glyph a hub card's title leads with, keyed by the column the
 /// card sits in. Decorative: the column header already names the state,
 /// so the glyph is `aria-hidden` and carries no text alternative.
-fn bee_hub_kind_icon(group_key: &str, panes: &[TerminalPaneView]) -> String {
+fn bee_hub_kind_icon(
+    group_key: &str,
+    panes: &[TerminalPaneView],
+    agent: Option<&BeeCardAgent>,
+) -> String {
     // card-agent-logos: when an agent session is attached to the card, the
     // glyph is that agent's own mark (Claude, OpenAI/Codex, Gemini, or a
     // generic prompt for a kind without a drawn logo) rather than the
@@ -941,16 +945,24 @@ fn bee_hub_kind_icon(group_key: &str, panes: &[TerminalPaneView]) -> String {
     // while WHO is working on the card is the thing no other element says
     // at a glance. An active session (working/blocked) wins over a quiet
     // one; with no agent pane at all the column glyph stays.
-    let agent = panes
+    let agent_pane = panes
         .iter()
         .filter(|p| p.kind != "shell")
         .max_by_key(|p| matches!(pane_tone(p), "working" | "blocked"));
-    if let Some(pane) = agent {
+    // card-glyph-is-status: the state the card's own dot used to carry now
+    // rides this glyph, so the collapsed card still answers "is anyone on
+    // this, and how is it going" in one element instead of two. It is read
+    // from the CARD's session record, never from the panes: the dot only
+    // ever rendered when that record existed, so a card without one renders
+    // exactly the markup it always did.
+    let state_class = bee_hub_kind_state_class(agent);
+    if let Some(pane) = agent_pane {
         let (slug, mark) = bee_hub_agent_logo(&pane.kind);
         return format!(
-            r#"<span class="bee-hub__kind bee-hub__kind--agent bee-hub__kind--{slug}" title="{kind}" aria-hidden="true">{svg}</span>"#,
+            r#"<span class="bee-hub__kind bee-hub__kind--agent bee-hub__kind--{slug}{state}" {naming}>{svg}</span>"#,
             slug = slug,
-            kind = esc(&pane.kind),
+            state = state_class,
+            naming = bee_hub_kind_naming(&pane.kind, agent),
             svg = bee_hub_agent_mark_svg(mark),
         );
     }
@@ -963,10 +975,55 @@ fn bee_hub_kind_icon(group_key: &str, panes: &[TerminalPaneView]) -> String {
         _ => HUB_KIND_ICON_TODO,
     };
     format!(
-        r#"<span class="bee-hub__kind bee-hub__kind--{group_key}" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{body}</svg></span>"#,
+        r#"<span class="bee-hub__kind bee-hub__kind--{group_key}{state}" {naming}><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{body}</svg></span>"#,
         group_key = group_key,
+        state = state_class,
+        naming = bee_hub_kind_naming_columnar(agent),
         body = body,
     )
+}
+
+/// card-glyph-is-status: the tone the card's title glyph takes from the
+/// session on the card. `working` reads warning and `needs-you` reads
+/// danger -- the two states the retired dot coloured for -- while `idle`,
+/// `exited` and a card with no session at all add no class and keep the
+/// glyph's own ink, the same "a state a glyph does not have is never
+/// borrowed" rule every other tone mapping here holds itself to.
+fn bee_hub_kind_state_class(agent: Option<&BeeCardAgent>) -> &'static str {
+    match agent.map(|a| a.tone) {
+        Some("working") => " bee-hub__kind--state-working",
+        Some("needs-you") => " bee-hub__kind--state-blocked",
+        _ => "",
+    }
+}
+
+/// The glyph's `title` and accessibility attributes. Without a session the
+/// glyph is decoration beside a column header that already names the state,
+/// exactly as before. WITH one it is the only thing on a collapsed card
+/// saying how the session is doing, so it takes over the `role="img"` and
+/// the `agent: <word>` name the dot used to carry -- the state is never
+/// spoken by colour alone, on this card or on any other surface.
+fn bee_hub_kind_naming(kind: &str, agent: Option<&BeeCardAgent>) -> String {
+    match agent {
+        Some(a) => format!(
+            r#"role="img" aria-label="{kind} — agent: {word}" title="{kind} — agent: {word}""#,
+            kind = esc(kind),
+            word = esc(&a.state_word),
+        ),
+        None => format!(r#"title="{kind}" aria-hidden="true""#, kind = esc(kind)),
+    }
+}
+
+/// [`bee_hub_kind_naming`] for the column glyph, which has no program name
+/// to lead with.
+fn bee_hub_kind_naming_columnar(agent: Option<&BeeCardAgent>) -> String {
+    match agent {
+        Some(a) => format!(
+            r#"role="img" aria-label="agent: {word}" title="agent: {word}""#,
+            word = esc(&a.state_word),
+        ),
+        None => r#"aria-hidden="true""#.to_string(),
+    }
 }
 
 /// console-theme-kanban (ctk-12) — was `project_list_main`, the body of
@@ -3451,6 +3508,14 @@ fn bee_hub_style() -> String {
 .bee-hub__kind--kilocode { color: var(--color-text-muted); }
 .bee-hub__kind--amp { color: #f2542d; }
 .bee-hub__kind--generic { color: var(--color-text-muted); }
+/* card-glyph-is-status: the session's state, on the glyph. Two classes
+   deep so it lands after the vendor tints above without an `!important`:
+   a working Claude card reads warning, not Claude orange, because what a
+   glance off this board needs first is how the work is going, not whose
+   logo is on it. Only the two states the retired dot coloured for are
+   named; quiet keeps whatever ink the glyph already had. */
+.bee-hub__kind.bee-hub__kind--state-working { color: var(--color-warning); }
+.bee-hub__kind.bee-hub__kind--state-blocked { color: var(--color-danger); }
 .bee-hub__summary .fg-card__title { flex: 1 1 0; min-width: 0; }
 .bee-hub__summary::-webkit-details-marker { display: none; }
 .bee-hub__summary:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
@@ -3514,24 +3579,13 @@ fn bee_hub_style() -> String {
    need an expand. `flex: 1 0 100%` claims that second row after the
    title, badge and chevron have filled row one; `order` keeps it there
    however those three wrap.
-   agent-dot-owner-row: that row now carries the agent's state too, as a
-   colour dot at its head rather than the second full row of words the
-   agent line used to spend on the collapsed card. Two rows became one:
-   dot, then project. The words the dot stands for are not lost -- the
-   agent line still prints `agent: <state>` in the expandable body, so
-   the state is never colour alone (A3). */
+   card-glyph-is-status: the agent's state used to ride this row as a
+   colour dot at its head; it is the card's title glyph now, so this row
+   carries the project and nothing else. The words are not lost -- the
+   glyph carries `agent: <state>` as its own accessible name, and the
+   agent line still prints it in the expandable body (A3). */
 .bee-hub__owner { flex: 1 0 100%; order: 5; display: flex; align-items: center; gap: var(--space-1); min-width: 0; }
 .bee-hub__summary .bee-hub__project, .bee-hub__summary .bee-hub__slug { min-width: 0; margin: 0; line-height: var(--type-micro-leading); overflow-wrap: anywhere; }
-/* The dot draws itself rather than leaning on `.fg-status__dot`, the same
-   way `.bee-hub__pulse` below does -- this stylesheet is inline and does
-   not share the components sheet's class vocabulary. `exited` is the
-   "done" reading: the agent finished and left. An unknown state a newer
-   bee writes falls through to the base disabled colour. */
-.bee-hub__agent-dot { display: inline-block; width: 7px; height: 7px; border-radius: var(--radius-pill); flex: none; background: currentColor; box-shadow: var(--status-glow); color: var(--color-text-disabled); }
-.bee-hub__agent-dot--working { color: var(--color-warning); }
-.bee-hub__agent-dot--needs-you { color: var(--color-danger); }
-.bee-hub__agent-dot--idle { color: var(--color-text-disabled); }
-.bee-hub__agent-dot--exited { color: var(--color-success); }
 .bee-hub__agent { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: 0; padding: 0; font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
 .bee-hub__agent-state { color: var(--color-text-muted); }
 .bee-hub__agent-state--working { color: var(--color-warning); }
@@ -5899,21 +5953,6 @@ fn bee_quiet_age(age_seconds: Option<f64>) -> String {
     }
 }
 
-/// agent-dot-owner-row: the state as ONE colour dot, for the collapsed
-/// card's owner row. It says exactly what [`bee_hub_agent_line`]'s state
-/// word says and takes its tone from the same `agent.tone`, so the two can
-/// never disagree — the dot is the glanceable spelling, the line in the
-/// body is the readable one. Decorative it is not: `role="img"` plus the
-/// state in `aria-label` means a screen reader hears the word, and `title`
-/// gives a pointer the same word on hover.
-fn bee_hub_agent_dot(agent: &BeeCardAgent) -> String {
-    format!(
-        r#"<span class="bee-hub__agent-dot bee-hub__agent-dot--{tone}" role="img" aria-label="agent: {word}" title="agent: {word}"></span>"#,
-        tone = agent.tone,
-        word = esc(&agent.state_word),
-    )
-}
-
 /// A6's line itself: state word in its own tone, the held cell, and how long
 /// the record has been quiet — plus the muted `no signal` marker when the
 /// freshest record has stopped speaking (A1).
@@ -6301,13 +6340,15 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     //
     // agent-dot-owner-row: A6 used to spend a SECOND full row of the
     // collapsed summary on the agent line's words, so an in-progress card
-    // was four rows before it said anything about the work. The state now
-    // rides that same project row as a colour dot at its head — one row,
-    // `<dot> <project>` — and the line of words moves into the expandable
-    // body with the cell it holds and how long it has been quiet. What a
-    // glance needs is "is anyone on this, and how is it going": the dot
-    // answers that; the cell title and the quiet age are reading, not
-    // glancing, so they cost the expand they always should have.
+    // was four rows before it said anything about the work. The line of
+    // words moved into the expandable body with the cell it holds and how
+    // long it has been quiet. What a glance needs is "is anyone on this,
+    // and how is it going"; the cell title and the quiet age are reading,
+    // not glancing, so they cost the expand they always should have.
+    // card-glyph-is-status: the glance half was a colour dot at the head of
+    // this row. It is the card's TITLE GLYPH now — one element instead of
+    // two, in the row a reader looks at first — so the owner row is the
+    // project label and nothing else, and renders only when it has one.
     let agent_html = match agent {
         Some(agent) => bee_hub_agent_line(agent),
         None => String::new(),
@@ -6315,18 +6356,12 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // The owner row itself. It renders only when it has something to carry:
     // no agent and no project label (a slug-only card whose title is its
     // own feature name) is no row at all, never an empty one (D2).
-    let owner_html = {
-        let dot_html = match agent {
-            Some(agent) => bee_hub_agent_dot(agent),
-            None => String::new(),
-        };
-        if dot_html.is_empty() && subtitle_html.is_empty() {
-            String::new()
-        } else {
-            format!(r#"<div class="bee-hub__owner">{dot_html}{subtitle_html}</div>"#)
-        }
+    let owner_html = if subtitle_html.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="bee-hub__owner">{subtitle_html}</div>"#)
     };
-    let kind_html = bee_hub_kind_icon(group_key, panes);
+    let kind_html = bee_hub_kind_icon(group_key, panes, agent);
     let title_html = match title {
         Some(t) => format!(
             r#"<div class="fg-card__title">{title}</div>"#,
@@ -17145,26 +17180,53 @@ mod tests {
         );
     }
 
-    /// agent-dot-owner-row: every tone [`bee_card_agent`] can produce has a
-    /// colour of its own, and the dot never speaks by colour alone — the
-    /// state word rides in `aria-label` and `title` on the dot itself, and
-    /// again as words on the agent line in the body.
+    /// card-glyph-is-status: the card's dot is gone and its two jobs are on
+    /// the title glyph -- the tone, and the state in words. The bug this
+    /// guards is a glyph that keeps its vendor tint on a session that needs
+    /// the human, and it pins the quiet case just as hard: a state the card
+    /// does not have borrows no colour, and a card with no session at all
+    /// renders exactly the decorative glyph it always did.
     #[test]
-    fn bee_hub_agent_dot_carries_a_tone_colour_and_the_state_in_words() {
+    fn a_cards_title_glyph_carries_the_sessions_tone_and_its_state_in_words() {
         let css = bee_hub_style();
-        for tone in ["working", "needs-you", "idle", "exited"] {
+        assert!(
+            !css.contains(".bee-hub__agent-dot"),
+            "no card dot may survive beside a glyph that wears the tone: {css}"
+        );
+        for (state, token) in [
+            ("working", "--color-warning"),
+            ("blocked", "--color-danger"),
+        ] {
             assert!(
                 css.contains(&format!(
-                    ".bee-hub__agent-dot--{tone} {{ color: var(--color-"
+                    ".bee-hub__kind.bee-hub__kind--state-{state} {{ color: var({token}); }}"
                 )),
-                "the {tone} dot must carry its own colour: {css}"
+                "the {state} glyph must carry its own colour, two classes deep so it                  beats the vendor tint: {css}"
             );
         }
-        let dot = bee_hub_agent_dot(&blocked_card_agent());
-        assert_eq!(
-            dot,
-            r#"<span class="bee-hub__agent-dot bee-hub__agent-dot--needs-you" role="img" aria-label="agent: needs approval" title="agent: needs approval"></span>"#,
-            "the dot must name its state for a screen reader and on hover: {dot}"
+
+        let mut pane = pane_with_status("working");
+        pane.kind = "claude".into();
+        let panes = std::slice::from_ref(&pane);
+
+        let blocked = bee_hub_kind_icon("in-progress", panes, Some(&blocked_card_agent()));
+        assert!(
+            blocked.contains("bee-hub__kind--state-blocked"),
+            "a session that needs the human must redden the glyph: {blocked}"
+        );
+        assert!(
+            blocked.contains(
+                r#"role="img" aria-label="claude — agent: needs approval" title="claude — agent: needs approval""#
+            ),
+            "the glyph must name the state the dot used to name: {blocked}"
+        );
+
+        // No session on the card: byte-identical to before this change.
+        let quiet = bee_hub_kind_icon("in-progress", panes, None);
+        assert!(
+            !quiet.contains("bee-hub__kind--state-")
+                && quiet.contains(r#"title="claude" aria-hidden="true""#),
+            "a card with no session keeps the decorative, untinted glyph: {quiet}"
         );
     }
 
@@ -18403,7 +18465,7 @@ mod tests {
     fn bee_hub_kind_icon_draws_the_attached_agents_own_mark() {
         let mut pane = pane_with_status("running");
         pane.kind = "opencode".into();
-        let icon = bee_hub_kind_icon("in-progress", std::slice::from_ref(&pane));
+        let icon = bee_hub_kind_icon("in-progress", std::slice::from_ref(&pane), None);
         assert!(
             icon.contains(r#"class="bee-hub__kind bee-hub__kind--agent bee-hub__kind--opencode""#),
             "the glyph must carry the agent modifier and the vendor slug: {icon}"
@@ -18418,7 +18480,7 @@ mod tests {
         );
 
         // No agent pane at all: the column's own state glyph stays.
-        let column = bee_hub_kind_icon("in-progress", &[]);
+        let column = bee_hub_kind_icon("in-progress", &[], None);
         assert!(
             column.contains(HUB_KIND_ICON_IN_PROGRESS) && !column.contains("bee-hub__kind--agent"),
             "with no agent attached the column glyph must be untouched: {column}"
