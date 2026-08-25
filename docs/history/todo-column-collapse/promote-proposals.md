@@ -83,3 +83,26 @@ The board's Todo column now ships folded behind a native disclosure on both boar
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 1 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 1 pattern candidate(s), 0 file(s) written.
+---
+
+## Resolution — 2026-08-25, nothing left to apply
+
+Reviewed at feature close. All three sections are already covered; none is
+applied from here.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/todo-column-collapse/delivery.md`
+  already exists as a curated record and says more than this draft: why the
+  column was the one worth folding, what the summary keeps, that nothing
+  persists between visits, both boards changed together, the locked decision
+  `99d0b579`, and the live-board confirmation against a running daemon. The
+  draft would be a downgrade.
+- **(b) Area updates** — nothing proposed. The generator found no capped
+  `behavior_change` cell for either `bee-cockpit` or `web-interface`, so there
+  is no candidate bullet to sync.
+- **(c) Pattern candidate** — already promoted, not from here. The three
+  recorded deviations are one phenomenon, and it landed as
+  `docs/knowledge/patterns/deferring-a-commit-on-a-contended-file.md`
+  (`lifecycle: active`), which cites this feature's delivery record as its
+  source and generalizes past this cell into a practice: prefer a path-scoped
+  commit of your own paths over deferring. Saving the draft candidate beside it
+  would duplicate it at a lower quality.
