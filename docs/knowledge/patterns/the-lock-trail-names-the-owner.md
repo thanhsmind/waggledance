@@ -38,3 +38,21 @@ A worktree's *creation* is not evidence that the dirt in the main checkout is ab
 move into it. Check what the worktree actually contains — tracked files and what is on
 disk — before telling anyone to wait for a move that may never come. Inferring the
 move from the creation is the same correlation-shaped reasoning the lock trail beats.
+
+## Turning the id into somewhere a human can walk
+
+A session id is evidence, not an address. Agent-to-agent names are assigned
+independently of bee session ids and share no prefix with them, so the id the lock
+trail hands you cannot be messaged and cannot be pointed at.
+
+The session record closes that gap: it carries the terminal pane the session occupies,
+alongside its checkout and the feature it names. That pane *is* the address — a human
+can walk to it in one glance, and it is stable where the id is opaque.
+
+Two cautions, both seen in the same read:
+
+- Resolve the pane from the session id, never the reverse. One pane accumulates several
+  session records over a day — a fresh conversation or a resume in the same pane files a
+  new id against it — so a pane maps to many ids while each id maps to exactly one pane.
+- Prefer the record with the freshest heartbeat when a pane shows several. The rest are
+  history.
