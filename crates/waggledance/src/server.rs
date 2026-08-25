@@ -5155,6 +5155,13 @@ struct AgentPaneRow {
     /// The feature lane that session is bound to, or `null` for an unbound
     /// session (A1).
     feature: Option<String>,
+    /// drawer-mark-sprite: which agent mark this pane's program draws, as the
+    /// `<symbol>` id `views::agent_mark_sprite` emits beside the drawer. The
+    /// drawer is rendered in the browser, so it cannot call
+    /// `views::bee_hub_agent_logo` itself; sending the id keeps the artwork
+    /// and the vendor matching in one place and gives `assets/app.js` nothing
+    /// to duplicate — it only writes `<use href="#agent-mark-{mark}">`.
+    mark: &'static str,
 }
 
 /// drawer-title-1: the terminal title of the agent behind `pane_id`, or `""`
@@ -5216,6 +5223,7 @@ fn agent_pane_rows(
             rows.push(AgentPaneRow {
                 bee_state: pane.bee_state.as_ref().map(bee_state_slug),
                 feature: pane.bee_feature.clone(),
+                mark: views::agent_mark_id(&pane.kind),
                 project_id: Some(project.id.clone()),
                 project_name: project.name.clone(),
                 url: format!("/p/{}/_terminal/pane/{}", project.id, pane.pane_id),
@@ -5247,6 +5255,7 @@ fn agent_pane_rows(
             // store this server reads.
             bee_state: None,
             feature: None,
+            mark: views::agent_mark_id(&pane.kind),
             project_id: None,
             project_name: "(unassigned)".to_string(),
             url: "/_terminal/unassigned".to_string(),
@@ -19218,10 +19227,33 @@ mod bee_route_tests {
         let body = body_string(get(app, "/").await).await;
         let elapsed = start.elapsed();
 
+        // drawer-mark-sprite put a fixed `<symbol>` library on every page --
+        // icon definitions, byte-identical whether or not a single agent
+        // exists, so it can leak nothing about a running pane. It does spell
+        // the artwork names, `agent-mark-claude` among them, which is why it
+        // comes out of the searched text before the claim below runs. The
+        // claim itself is untouched and still covers every byte this page
+        // derives from an actual pane.
+        // A `<symbol>` body holds paths, never a nested `<svg>`, so the first
+        // closing tag after the sprite opens is the sprite's own.
+        let searched = match body.find(r#"<svg class="agent-mark-sprite""#) {
+            Some(start) => {
+                let end = body[start..]
+                    .find("</svg>")
+                    .map(|i| start + i + "</svg>".len())
+                    .unwrap_or_else(|| panic!("the sprite must close: {body}"));
+                format!("{}{}", &body[..start], &body[end..])
+            }
+            None => body.clone(),
+        };
         assert!(
-            !body.contains("proj-row__badges")
-                && !body.contains(&started.pane_id)
-                && !body.contains("claude"),
+            !searched.contains("agent-mark-"),
+            "the sprite must be the ONLY thing removed, and it must be gone: {searched}"
+        );
+        assert!(
+            !searched.contains("proj-row__badges")
+                && !searched.contains(&started.pane_id)
+                && !searched.contains("claude"),
             "the switch off must carry no pane id, program name, or badge markup: {body}"
         );
         assert!(
@@ -25289,8 +25321,13 @@ mod bee_route_tests {
             strip.contains(&format!("/pane/{}", created.pane_id)),
             "no tab for the shell pane: {body}"
         );
+        // terminal-mark-only: the program word gave way to its mark, so the
+        // name a shell row states now rides on that mark -- as a hover title
+        // and as the label a screen reader reads. The claim is unchanged: the
+        // row names itself a shell, not an agent kind.
         assert!(
-            strip.contains("class=\"term-pane__meta\">shell<"),
+            strip.contains(r#"<span class="pane-mark" title="shell">"#)
+                && strip.contains(r#"role="img" aria-label="shell""#),
             "a shell row must name itself a shell, not an agent kind: {body}"
         );
         assert!(
@@ -26347,6 +26384,52 @@ mod bee_route_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// drawer-mark-sprite: every `GET /api/agents` row names the mark its
+    /// program draws, as the `<symbol>` id the page's own sprite carries.
+    /// The drawer builds its rows in the browser, so this id is the only
+    /// thing telling it which artwork to reference -- a row without one, or
+    /// with an id the sprite does not hold, draws an empty box.
+    #[tokio::test]
+    async fn api_agents_rows_name_the_mark_their_program_draws() {
+        let dir = fresh_root("drawer-mark-sprite-data");
+        enable_terminal(&dir);
+        let root = fresh_root("drawer-mark-sprite-project");
+
+        let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        let agent = fake
+            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .await
+            .unwrap();
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        register(&st, &root, "drawer-mark-sprite");
+        let app = router(st);
+
+        let resp = get(app, "/api/agents").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+
+        let row = rows
+            .iter()
+            .find(|r| r["pane_id"] == agent.pane_id)
+            .unwrap_or_else(|| panic!("the agent pane must appear in the feed: {body}"));
+        let mark = row["mark"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every row must name its mark: {body}"));
+        assert_eq!(
+            mark,
+            views::agent_mark_id("claude"),
+            "the feed must agree with the server's own vendor lookup: {body}"
+        );
+        // The id has to resolve against what the page actually ships.
+        assert!(
+            views::agent_mark_sprite().contains(&format!(r#"id="agent-mark-{mark}""#)),
+            "the sprite the page ships must hold the id the feed hands out: {body}"
+        );
     }
 
     /// agent-switch-drawer-1: `GET /api/agents` drops a shell row (no agent
@@ -27459,13 +27542,15 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A1, edge: a session holding no claim renders the cell as a dash — the
-    /// absent-field shape, never an error and never an empty gap. It also
-    /// runs in no herdr pane at all, which is what proves the feature join
-    /// (`activity.feature`) stands on its own: the card still names its
-    /// agent with nothing but a session record to go on.
+    /// A1, edge: a session holding no claim renders no cell segment at all —
+    /// the line reads `agent: working · quiet 3s`, not `agent: working · —
+    /// · quiet 3s`, since a lone dash where a cell name goes reads as a card
+    /// that failed to load. It also runs in no herdr pane at all, which is
+    /// what proves the feature join (`activity.feature`) stands on its own:
+    /// the card still names its agent with nothing but a session record to
+    /// go on.
     #[tokio::test]
-    async fn bee_agent_activity_session_holding_no_cell_renders_a_dash_and_needs_no_pane() {
+    async fn bee_agent_activity_session_holding_no_cell_drops_the_segment_and_needs_no_pane() {
         let dir = fresh_root("bee-activity-dash-data");
         enable_terminal(&dir);
         let root = fresh_root("bee-activity-dash-project");
@@ -27496,8 +27581,14 @@ mod bee_route_tests {
             "a session in no herdr pane still names its agent on the card (A2's feature join): {board}"
         );
         assert!(
-            board.contains(r#"<span class="bee-hub__agent-cell">—</span>"#),
-            "an absent cell renders as a dash (A1): {board}"
+            !board.contains(r#"<span class="bee-hub__agent-cell">"#),
+            "an absent cell renders no cell segment, not a bare dash: {board}"
+        );
+        assert!(
+            board.contains(
+                r#"agent: working</span> · <span class="bee-hub__agent-quiet">quiet"#
+            ),
+            "dropping the segment takes its separator with it, so the state word runs              straight into the quiet reading: {board}"
         );
         assert!(
             board.contains(

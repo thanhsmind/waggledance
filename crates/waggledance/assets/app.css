@@ -340,9 +340,10 @@ html[data-scheme="dark"] .topbar .home {
     min-width: 0;
     overflow: hidden;
   }
-  /* The tab's own parts shrink rather than push the control off the edge. */
-  .pane-bar__current .term-pane__id,
-  .pane-bar__current .term-pane__meta {
+  /* The tab's own parts shrink rather than push the control off the edge.
+     terminal-mark-only retired the tab's `.term-pane__meta` program word --
+     the mark says it now -- so only the id still needs clipping. */
+  .pane-bar__current .term-pane__id {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -682,9 +683,31 @@ html[data-scheme="dark"] .topbar .home {
   border-color: var(--color-border-strong);
   background: var(--color-surface-hover);
 }
-.proj-row__badge-program {
+/* agent-marks-everywhere: the pane's own program mark, ahead of the name it
+   belongs to. Every surface that prints a program name uses this one class —
+   a project row's badge, a board card's badge, a pane tab above a terminal,
+   and a feature's terminal list — so the mark reads the same size and weight
+   in all four. It takes the ink of the text beside it rather than a vendor
+   tint: the terminal page never loads the board's own stylesheet, and a mark
+   coloured on some pages and grey on others reads as two marks, not one.
+   `flex: none` keeps it from being squeezed by a long terminal title, and
+   `display: block` on the svg drops the inline baseline gap that would
+   otherwise push it off the badge's centre line. */
+.pane-mark {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
   color: var(--color-text-muted);
-  font-size: var(--type-caption-size);
+  margin-inline: 1px;
+}
+.pane-mark__svg {
+  display: block;
+}
+/* In the feature terminal list the mark leads a text line rather than
+   sitting in a flex row, so it needs its own breathing room. */
+.bee-cell__meta .pane-mark {
+  margin-right: var(--space-1);
+  vertical-align: -1px;
 }
 /* badge-title (D 6b39db89, touches D1a 7810e5ee): the pane's own terminal
    title, rendered only when it says something the program text above did
@@ -1223,7 +1246,13 @@ html[data-scheme="dark"] .topbar .home {
    agent is aimed at, rendered only when a live session names one. */
 .pinned-row__link {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  /* drawer-agent-mark added the leading column: the agent's own program mark,
+     ahead of the status dot, so this drawer reads in the same order as the
+     board's terminal badges. It is its own column rather than a wrapper
+     around the dot on purpose — `.proj-row__dot--blocked ~ .pinned-row__state`
+     below reaches the state word through the dot as a direct sibling, and
+     wrapping the dot would quietly break how a blocked agent reads. */
+  grid-template-columns: auto auto 1fr auto;
   align-items: baseline;
   column-gap: var(--space-2);
   row-gap: var(--space-1);
@@ -1295,7 +1324,9 @@ html[data-scheme="dark"] .topbar .home {
    the name and state columns so the feature has the whole width the name
    had, and it is absent entirely when no live session names a feature. */
 .pinned-row__purpose {
-  grid-column: 2 / -1;
+  /* Column 3: under the name, exactly where it sat before the mark's column
+     was added ahead of the dot. */
+  grid-column: 3 / -1;
   min-width: 0;
 }
 .pinned-row__purpose-icon {
@@ -2582,20 +2613,36 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
 
 /* terminal-image-attach (D1/D2): the attach control that rides inside a
    project pane's `.term-reply` form (`views.rs::pane_cards`, gated off the
-   Unassigned page). Styled to match the existing `.term-reply__send` /
-   `.term-reply__stage` pair those rules already sit beside in
-   `views.rs::PROJECT_TAB_STYLE`. */
-.term-attach { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); }
+   Unassigned page). compact-attach: this box is now the whole composer —
+   chips on top, the writing field (`.term-reply__field`, styled in
+   `views.rs::PROJECT_TAB_STYLE` beside the rest of the reply row) under
+   them, the error banner below — rather than a labelled button parked under
+   the textarea. */
+.term-attach { display: flex; flex-direction: column; gap: var(--space-1); }
+/* The chip list renders on every pane and is empty until something is
+   attached; without this it would still claim a row's worth of the column's
+   gap above the field. */
+.term-attach__chips:empty { display: none; }
+/* The picker is a plain round icon sitting on the field's left edge, sized
+   to the line it sits beside — the label moved to `title`/`aria-label`, so
+   nothing is lost to a reader or a screen reader. */
 .term-attach__btn {
-  align-self: flex-start;
-  padding: var(--space-1) var(--space-3);
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
   border: var(--border-width-hairline) solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-radius: 50%;
   background: var(--color-surface-raised);
   color: var(--color-text);
   cursor: pointer;
-  font-size: var(--type-body-sm-size);
+  line-height: 1;
+  font-size: var(--type-body-size);
 }
+.term-attach__btn:hover { border-color: var(--color-action); color: var(--color-action); }
 .term-attach__chips {
   display: flex;
   flex-wrap: wrap;

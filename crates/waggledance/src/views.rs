@@ -579,32 +579,322 @@ const HUB_KIND_ICON_IN_PROGRESS: &str =
 const HUB_KIND_ICON_REVIEW: &str = r#"<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"></path><circle cx="12" cy="12" r="3"></circle>"#;
 const HUB_KIND_ICON_COMPOUND: &str = r#"<polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline>"#;
 const HUB_KIND_ICON_READY: &str = r#"<circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M6 21V9a9 9 0 0 0 9 9"></path>"#;
-const AGENT_LOGO_CLAUDE: &str = r#"<path d="M12 3.5v17M3.5 12h17M6 6l12 12M18 6L6 18"></path>"#;
-const AGENT_LOGO_OPENAI: &str = r#"<path d="M12 2.8l8 4.6v9.2l-8 4.6-8-4.6V7.4z"></path><path d="M12 7.6l3.9 2.2v4.4L12 16.4l-3.9-2.2V9.8z"></path><path d="M4 7.4l4.1 2.4M20 7.4l-4.1 2.4M12 21.2v-4.8"></path>"#;
-const AGENT_LOGO_GEMINI: &str = r#"<path d="M12 2.5c0 5.3 4.2 9.5 9.5 9.5-5.3 0-9.5 4.2-9.5 9.5 0-5.3-4.2-9.5-9.5-9.5 5.3 0 9.5-4.2 9.5-9.5z" fill="currentColor" stroke="none"></path>"#;
-const AGENT_LOGO_GENERIC: &str =
-    r#"<polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line>"#;
+/// One agent's own mark, as it is drawn on a card: the source artwork's own
+/// `viewBox` (the set mixes 24-, 32- and 250-unit boxes, and reusing one box
+/// for all of them would squash the odd ones out) plus its path body.
+///
+/// The marks below are the real vendor artwork, distilled to path data from
+/// the SVG set in Untrivial-ai/agent-orchestrator
+/// (`frontend/src/renderer/assets/agents`, Apache-2.0) and inlined as
+/// constants rather than shipped as asset files -- the same idiom every other
+/// icon in this file already uses, so a card costs no extra request and the
+/// mark tints with `currentColor` like the rest of the console. Each vendor's
+/// mark stays the vendor's, used only to name that vendor's own product.
+struct AgentMark {
+    /// Stable, kebab-case name of the artwork -- NOT the vendor slug, which
+    /// two marks can share (Claude and Claude Code both tint as `anthropic`).
+    /// This is what [`agent_mark_sprite`] turns into a `<symbol>` id and what
+    /// the `/api/agents` feed hands the drawer's own client-side renderer, so
+    /// the browser can draw a mark without a copy of its path data in
+    /// JavaScript.
+    id: &'static str,
+    view_box: &'static str,
+    body: &'static str,
+    /// True for a line drawing (the generic prompt) rather than a filled
+    /// logo -- the two need opposite `fill`/`stroke` settings on the `<svg>`.
+    stroked: bool,
+}
+
+/// Claude.
+const AGENT_MARK_CLAUDE: AgentMark = AgentMark {
+    id: "claude",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"></path>"#,
+    stroked: false,
+};
+/// Claude Code.
+const AGENT_MARK_CLAUDE_CODE: AgentMark = AgentMark {
+    id: "claude-code",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z"></path>"#,
+    stroked: false,
+};
+/// Codex.
+const AGENT_MARK_CODEX: AgentMark = AgentMark {
+    id: "codex",
+    view_box: "0 0 250 250",
+    body: r#"<path d="m84.3 5.1q3.7-1.5 7.7-2.6 3.9-1 7.9-1.6 4-0.5 8.1-0.6 4 0 8 0.5 20.7 2.4 37.1 17.7 0.1 0.1 0.4 0.3 0.1 0 0.2 0 0 0 0.2 0 0 0 0.1 0 0 0 0.1 0 5.2-1.4 10.7-1.9 5.4-0.4 10.7 0.1 5.5 0.4 10.7 1.9 5.2 1.3 10.1 3.6l0.6 0.4 1.6 0.8q5.2 2.5 9.7 6.1 4.7 3.4 8.6 7.7 3.8 4.3 6.9 9.2 3 4.8 5.2 10.2 4.3 10.5 4.3 22.1 0.2 2.1 0 4.2-0.1 2.2-0.2 4.3-0.3 2.1-0.7 4.3-0.4 2.1-0.9 4.1 0 0.2 0 0.4 0 0.2 0 0.5 0 0.1 0.1 0.4 0.1 0.1 0.3 0.3 12.3 12.6 16.3 30 6 29.7-12.2 53.5l-1.9 2.2q-3 3.5-6.5 6.4-3.4 3.1-7.3 5.5-3.8 2.4-8.1 4.2-4.1 1.9-8.5 3.2-0.3 0-0.4 0.2-0.3 0-0.4 0.1-0.1 0.1-0.3 0.4 0 0.1-0.1 0.3c-2.7 7.7-5.3 14.2-10.2 20.7-12.5 16.5-30.8 25.5-51.5 25.5q-24.6-0.1-43.6-18.1-0.2-0.1-0.4-0.2-0.2-0.1-0.4-0.1-0.2 0-0.3 0-0.3 0-0.4 0c-5.4 1.7-10.9 1.9-16.7 1.9q-3.5 0-7-0.5-3.4-0.4-6.9-1.2-3.3-0.8-6.6-2-3.3-1.2-6.4-2.8-3.3-1.6-6.4-3.6-3-2-5.8-4.3-3-2.3-5.5-5-2.5-2.6-4.6-5.6c-2.2-2.7-4.3-5.4-5.8-8.5q-0.8-1.6-1.6-3.2-0.6-1.7-1.3-3.3-0.7-1.7-1.2-3.4-0.5-1.6-1-3.4-1.1-4-1.6-7.9-0.6-4-0.6-8 0-4 0.6-8 0.4-4 1.4-8 0 0 0-0.1 0-0.1 0-0.1 0.2-0.2 0.2-0.3 0-0.1-0.2-0.1 0-0.2 0-0.3 0-0.1-0.1-0.1 0-0.2 0-0.2-0.1-0.1-0.1-0.1-2.4-2.5-4.6-5.2-2.1-2.7-4-5.4-1.7-3-3.2-6-1.5-3.1-2.6-6.3-0.8-2-1.3-4.1-0.7-2-1.1-4-0.4-2.1-0.7-4.2-0.2-2.2-0.4-4.3-0.2-2.8-0.1-5.6 0-2.8 0.3-5.4 0.1-2.8 0.6-5.6 0.4-2.8 1.1-5.5 7-23.1 26.9-36.3 4.3-2.9 8.2-4.5 4.5-1.9 9-3.2 0.2 0 0.3-0.1 0.1-0.2 0.3-0.3 0.1 0 0.1-0.3 0.1-0.1 0.1-0.2 1-3.1 2.2-6 1-2.9 2.5-5.7 1.5-3 3.2-5.6 1.7-2.7 3.7-5.1 2.5-3.2 5.3-5.9 3-2.8 6.1-5.4 3.2-2.4 6.8-4.4 3.5-2 7.2-3.5zm48.3 146.4c-2.3 0.1-4.4 1-6 2.8-1.5 1.6-2.4 3.7-2.4 5.9 0 2.3 0.9 4.4 2.4 6.2 1.6 1.6 3.7 2.5 6 2.6h50.4c2.4 0.1 4.8-0.6 6.5-2.4 1.7-1.6 2.8-4 2.8-6.4 0-2.4-1.1-4.7-2.8-6.3-1.7-1.8-4.1-2.6-6.5-2.4zm-56.7-64.9c-1.2-1.9-3-3.4-5.3-3.9-2.2-0.5-4.5-0.3-6.5 0.9-2 1.1-3.5 3-4.1 5.2-0.7 2.2-0.4 4.6 0.6 6.5l17.7 30.9-17.5 29.5c-1.2 2-1.6 4.5-1.1 6.8 0.7 2.3 2.1 4.1 4.1 5.3 2 1.2 4.4 1.6 6.7 0.9 2.2-0.5 4.2-1.9 5.4-3.9l20.1-34.1q0.7-0.9 0.9-2.1 0.3-1.1 0.3-2.3 0-1.2-0.3-2.2-0.2-1.2-0.8-2.2z"></path>"#,
+    stroked: false,
+};
+/// opencode.
+const AGENT_MARK_OPENCODE: AgentMark = AgentMark {
+    id: "opencode",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M16 6H8v12h8V6zm4 16H4V2h16v20z"></path>"#,
+    stroked: false,
+};
+/// GitHub Copilot.
+const AGENT_MARK_COPILOT: AgentMark = AgentMark {
+    id: "copilot",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M23.922 16.992c-.861 1.495-5.859 5.023-11.922 5.023-6.063 0-11.061-3.528-11.922-5.023A.641.641 0 0 1 0 16.736v-2.869a.841.841 0 0 1 .053-.22c.372-.935 1.347-2.292 2.605-2.656.167-.429.414-1.055.644-1.517a10.195 10.195 0 0 1-.052-1.086c0-1.331.282-2.499 1.132-3.368.397-.406.89-.717 1.474-.952 1.399-1.136 3.392-2.093 6.122-2.093 2.731 0 4.767.957 6.166 2.093.584.235 1.077.546 1.474.952.85.869 1.132 2.037 1.132 3.368 0 .368-.014.733-.052 1.086.23.462.477 1.088.644 1.517 1.258.364 2.233 1.721 2.605 2.656a.832.832 0 0 1 .053.22v2.869a.641.641 0 0 1-.078.256ZM12.172 11h-.344a4.323 4.323 0 0 1-.355.508C10.703 12.455 9.555 13 7.965 13c-1.725 0-2.989-.359-3.782-1.259a2.005 2.005 0 0 1-.085-.104L4 11.741v6.585c1.435.779 4.514 2.179 8 2.179 3.486 0 6.565-1.4 8-2.179v-6.585l-.098-.104s-.033.045-.085.104c-.793.9-2.057 1.259-3.782 1.259-1.59 0-2.738-.545-3.508-1.492a4.323 4.323 0 0 1-.355-.508h-.016.016Zm.641-2.935c.136 1.057.403 1.913.878 2.497.442.544 1.134.938 2.344.938 1.573 0 2.292-.337 2.657-.751.384-.435.558-1.15.558-2.361 0-1.14-.243-1.847-.705-2.319-.477-.488-1.319-.862-2.824-1.025-1.487-.161-2.192.138-2.533.529-.269.307-.437.808-.438 1.578v.021c0 .265.021.562.063.893Zm-1.626 0c.042-.331.063-.628.063-.894v-.02c-.001-.77-.169-1.271-.438-1.578-.341-.391-1.046-.69-2.533-.529-1.505.163-2.347.537-2.824 1.025-.462.472-.705 1.179-.705 2.319 0 1.211.175 1.926.558 2.361.365.414 1.084.751 2.657.751 1.21 0 1.902-.394 2.344-.938.475-.584.742-1.44.878-2.497Z"></path><path d="M14.5 14.25a1 1 0 0 1 1 1v2a1 1 0 0 1-2 0v-2a1 1 0 0 1 1-1Zm-5 0a1 1 0 0 1 1 1v2a1 1 0 0 1-2 0v-2a1 1 0 0 1 1-1Z"></path>"#,
+    stroked: false,
+};
+/// Cursor.
+const AGENT_MARK_CURSOR: AgentMark = AgentMark {
+    id: "cursor",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M22.106 5.68L12.5.135a.998.998 0 00-.998 0L1.893 5.68a.84.84 0 00-.419.726v11.186c0 .3.16.577.42.727l9.607 5.547a.999.999 0 00.998 0l9.608-5.547a.84.84 0 00.42-.727V6.407a.84.84 0 00-.42-.726zm-.603 1.176L12.228 22.92c-.063.108-.228.064-.228-.061V12.34a.59.59 0 00-.295-.51l-9.11-5.26c-.107-.062-.063-.228.062-.228h18.55c.264 0 .428.286.296.514z"></path>"#,
+    stroked: false,
+};
+/// Cline.
+const AGENT_MARK_CLINE: AgentMark = AgentMark {
+    id: "cline",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M17.035 3.991c2.75 0 4.98 2.24 4.98 5.003v1.667l1.45 2.896a1.01 1.01 0 01-.002.909l-1.448 2.864v1.668c0 2.762-2.23 5.002-4.98 5.002H7.074c-2.751 0-4.98-2.24-4.98-5.002V17.33l-1.48-2.855a1.01 1.01 0 01-.003-.927l1.482-2.887V8.994c0-2.763 2.23-5.003 4.98-5.003h9.962zM8.265 9.6a2.274 2.274 0 00-2.274 2.274v4.042a2.274 2.274 0 004.547 0v-4.042A2.274 2.274 0 008.265 9.6zm7.326 0a2.274 2.274 0 00-2.274 2.274v4.042a2.274 2.274 0 104.548 0v-4.042A2.274 2.274 0 0015.59 9.6z"></path><path d="M12.054 5.558a2.779 2.779 0 100-5.558 2.779 2.779 0 000 5.558z"></path>"#,
+    stroked: false,
+};
+/// Goose.
+const AGENT_MARK_GOOSE: AgentMark = AgentMark {
+    id: "goose",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M21.595 23.61c1.167-.254 2.405-.944 2.405-.944l-2.167-1.784a12.124 12.124 0 01-2.695-3.131 12.127 12.127 0 00-3.97-4.049l-.794-.462a1.115 1.115 0 01-.488-.815.844.844 0 01.154-.575c.413-.582 2.548-3.115 2.94-3.44.503-.416 1.065-.762 1.586-1.159.074-.056.148-.112.221-.17.003-.002.007-.004.009-.007.167-.131.325-.272.45-.438.453-.524.563-.988.59-1.193-.061-.197-.244-.639-.753-1.148.319.02.705.272 1.056.569.235-.376.481-.773.727-1.171.165-.266-.08-.465-.086-.471h-.001V3.22c-.007-.007-.206-.25-.471-.086-.567.35-1.134.702-1.639 1.021 0 0-.597-.012-1.305.599a2.464 2.464 0 00-.438.45l-.007.009c-.058.072-.114.147-.17.221-.397.521-.743 1.083-1.16 1.587-.323.391-2.857 2.526-3.44 2.94a.842.842 0 01-.574.153 1.115 1.115 0 01-.815-.488l-.462-.794a12.123 12.123 0 00-4.049-3.97 12.133 12.133 0 01-3.13-2.695L1.332 0S.643 1.238.39 2.405c.352.428 1.27 1.49 2.34 2.302C1.58 4.167.73 3.75.06 3.4c-.103.765-.063 1.92.043 2.816.726.317 1.961.806 3.219 1.066-1.006.236-2.11.278-2.961.262.15.554.358 1.119.64 1.688.119.263.25.52.39.77.452.125 2.222.383 3.164.171l-2.51.897a27.776 27.776 0 002.544 2.726c2.031-1.092 2.494-1.241 4.018-2.238-2.467 2.008-3.108 2.828-3.8 3.67l-.483.678c-.25.351-.469.725-.65 1.117-.61 1.31-1.47 4.1-1.47 4.1-.154.486.202.842.674.674 0 0 2.79-.861 4.1-1.47.392-.182.766-.4 1.118-.65l.677-.483c.227-.187.453-.37.701-.586 0 0 1.705 2.02 3.458 3.349l.896-2.511c-.211.942.046 2.712.17 3.163.252.142.509.272.772.392.569.28 1.134.49 1.688.64-.016-.853.026-1.956.261-2.962.26 1.258.75 2.493 1.067 3.219.895.106 2.051.146 2.816.043a73.87 73.87 0 01-1.308-2.67c.811 1.07 1.874 1.988 2.302 2.34h-.001z"></path>"#,
+    stroked: false,
+};
+/// Amp.
+const AGENT_MARK_AMP: AgentMark = AgentMark {
+    id: "amp",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M15.087 23.18L12.03 24l-2.097-7.823-5.738 5.738-2.251-2.251 5.718-5.719-7.769-2.082.82-3.057 11.294 3.08 3.08 11.295z"></path><path d="M19.505 18.762l-3.057.82-2.564-9.573-9.572-2.564.819-3.057 11.295 3.079 3.08 11.295z"></path><path d="M23.893 14.374l-3.057.82-2.565-9.572L8.7 3.057 9.52 0l11.295 3.08 3.079 11.294z"></path>"#,
+    stroked: false,
+};
+/// Kilo Code.
+const AGENT_MARK_KILOCODE: AgentMark = AgentMark {
+    id: "kilocode",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M0 0v24h24V0H0zm22.222 22.222H1.778V1.778h20.444v20.444zm-7.555-4.964h2.222v1.778h-2.794L12.89 17.83v-2.794h1.778v2.222zm4 0h-1.778v-2.222h-2.222v-1.778h2.793l1.207 1.207v2.793zm-7.556-2.591H9.333v-1.778h1.778v1.778zm-5.778-1.778h1.778v4h4v1.778H6.54L5.333 17.46V12.89zm13.334-3.556v1.778h-5.778V9.333h1.987V7.111h-1.987V5.333h2.558l1.206 1.207v2.793h2.014zm-11.556-2h2.222l1.778 1.778v2H9.333v-2H7.111v2H5.333V5.333h1.778v2zm4 0H9.333v-2h1.778v2z"></path>"#,
+    stroked: false,
+};
+
+/// Gemini has no SVG in the upstream set, so it keeps the four-point star
+/// this file has always drawn for it -- a filled path, like the real marks.
+const AGENT_MARK_GEMINI: AgentMark = AgentMark {
+    id: "gemini",
+    view_box: "0 0 24 24",
+    body: r#"<path d="M12 2.5c0 5.3 4.2 9.5 9.5 9.5-5.3 0-9.5 4.2-9.5 9.5 0-5.3-4.2-9.5-9.5-9.5 5.3 0 9.5-4.2 9.5-9.5z"></path>"#,
+    stroked: false,
+};
+/// The fallback for an agent with no mark of its own -- a terminal prompt,
+/// the same drawing the Agents tab uses. Thirteen agents in the upstream set
+/// ship as PNG only (Aider, Grok, Qwen, Kimi, Droid, Devin and friends);
+/// embedding those as data URIs would cost the page hundreds of kilobytes to
+/// say what this glyph already says, so they land here.
+const AGENT_MARK_GENERIC: AgentMark = AgentMark {
+    id: "generic",
+    view_box: "0 0 24 24",
+    body: r#"<polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line>"#,
+    stroked: true,
+};
 const HUB_KIND_ICON_FINISHED: &str = r#"<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline>"#;
 
 /// The mark drawn for an agent `kind` (herdr's free-form `agent` field):
-/// a class slug plus the SVG body. Matched by substring so `claude-code`,
-/// `codex-cli` or `openai` still land on their vendor's mark; anything
-/// unrecognised draws the generic prompt.
-fn bee_hub_agent_logo(kind: &str) -> (&'static str, &'static str) {
-    let k = kind.to_ascii_lowercase();
-    if k.contains("claude") || k.contains("anthropic") {
-        ("anthropic", AGENT_LOGO_CLAUDE)
+/// a class slug -- what `bee_hub_style` tints -- plus the mark itself.
+///
+/// `kind` is operator-authored and arrives in whatever spelling the preset
+/// used, so every name is matched by substring: `claude-code`, `codex-cli`,
+/// `gh-copilot` and `opencode-run` all reach their own vendor. Order is
+/// load-bearing where one name contains another. A bare `claude` is the
+/// Claude Code CLI -- that is the binary's own name, and it is what a pane
+/// running under bee reports -- so it draws the Claude Code mark, not the
+/// Claude product sunburst: at 16px the sunburst reads as a plain asterisk
+/// and says nothing about which Anthropic surface is running. The sunburst
+/// is still reachable, by the names that actually mean the product rather
+/// than the CLI (`anthropic`, `claude-app`), and both share the `anthropic`
+/// slug, because the slug names the vendor whose colour the mark takes, not
+/// the program. That
+/// distinction is also a guard: the home page must not name a running program
+/// while the terminal switch is off, and a slug spelled after the program
+/// would put that name in the stylesheet on every page
+/// (`home_page_carries_no_pane_badges_when_terminal_switch_is_off`).
+/// `amp` is the one name short enough to collide
+/// inside ordinary words ("example", "champion"), so it alone must match the
+/// whole field rather than any part of it. Anything unrecognised draws the
+/// generic prompt.
+fn bee_hub_agent_logo(kind: &str) -> (&'static str, &'static AgentMark) {
+    let k = kind.trim().to_ascii_lowercase();
+    if k.contains("claude-app") || k.contains("anthropic") {
+        ("anthropic", &AGENT_MARK_CLAUDE)
+    } else if k.contains("claude") {
+        ("anthropic", &AGENT_MARK_CLAUDE_CODE)
+    } else if k.contains("opencode") {
+        ("opencode", &AGENT_MARK_OPENCODE)
     } else if k.contains("codex")
         || k.contains("openai")
         || k.contains("chatgpt")
         || k.contains("gpt")
     {
-        ("openai", AGENT_LOGO_OPENAI)
+        ("openai", &AGENT_MARK_CODEX)
+    } else if k.contains("copilot") {
+        ("copilot", &AGENT_MARK_COPILOT)
+    } else if k.contains("cursor") {
+        ("cursor", &AGENT_MARK_CURSOR)
+    } else if k.contains("cline") {
+        ("cline", &AGENT_MARK_CLINE)
+    } else if k.contains("goose") {
+        ("goose", &AGENT_MARK_GOOSE)
+    } else if k.contains("kilocode") || k.contains("kilo-code") {
+        ("kilocode", &AGENT_MARK_KILOCODE)
+    } else if k == "amp" {
+        ("amp", &AGENT_MARK_AMP)
     } else if k.contains("gemini") || k.contains("google") {
-        ("gemini", AGENT_LOGO_GEMINI)
+        ("gemini", &AGENT_MARK_GEMINI)
     } else {
-        ("generic", AGENT_LOGO_GENERIC)
+        ("generic", &AGENT_MARK_GENERIC)
     }
+}
+
+/// One agent mark, drawn into the 16px box a card's title leads with. A
+/// filled logo and the generic line drawing want opposite `fill`/`stroke`
+/// settings, and both take their colour from `currentColor`, which is what
+/// lets `bee_hub_style` tint a mark by vendor without touching the artwork.
+fn bee_hub_agent_mark_svg(mark: &AgentMark) -> String {
+    bee_hub_agent_mark_svg_sized(mark, 16, "", None)
+}
+
+/// [`bee_hub_agent_mark_svg`] at a caller-chosen size and class -- what the
+/// pill-sized surfaces use (agent-marks-everywhere). A card's title glyph
+/// gets 16px in its own tinted box; a terminal badge, a pane tab and a
+/// feature's terminal row get a smaller mark inheriting the ink of the name
+/// beside it, because the terminal page never loads `bee_hub_style` and a
+/// mark tinted on some pages and grey on others would read as two different
+/// marks rather than one.
+fn bee_hub_agent_mark_svg_sized(
+    mark: &AgentMark,
+    size: u32,
+    class: &str,
+    label: Option<&str>,
+) -> String {
+    let paint = if mark.stroked {
+        r#"fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round""#
+    } else {
+        r#"fill="currentColor" stroke="none""#
+    };
+    let class_attr = if class.is_empty() {
+        String::new()
+    } else {
+        format!(r#" class="{class}""#)
+    };
+    // A mark drawn beside the word it stands for is decoration and must stay
+    // out of the accessibility tree; a mark drawn INSTEAD of that word is the
+    // only thing saying it, and has to carry the name itself.
+    let role_attr = match label {
+        Some(label) => format!(r#" role="img" aria-label="{}""#, esc(label)),
+        None => r#" aria-hidden="true""#.to_string(),
+    };
+    format!(
+        r#"<svg{class_attr}{role_attr} viewBox="{view_box}" width="{size}" height="{size}" {paint}>{body}</svg>"#,
+        class_attr = class_attr,
+        role_attr = role_attr,
+        view_box = mark.view_box,
+        size = size,
+        paint = paint,
+        body = mark.body,
+    )
+}
+
+/// Every mark this file draws, in the order [`AGENT_MARKS`] lists them --
+/// the one place a new mark has to be registered so the sprite, and with it
+/// the client-rendered Agents drawer, picks it up automatically.
+const AGENT_MARKS: [&AgentMark; 12] = [
+    &AGENT_MARK_CLAUDE,
+    &AGENT_MARK_CLAUDE_CODE,
+    &AGENT_MARK_CODEX,
+    &AGENT_MARK_OPENCODE,
+    &AGENT_MARK_COPILOT,
+    &AGENT_MARK_CURSOR,
+    &AGENT_MARK_CLINE,
+    &AGENT_MARK_GOOSE,
+    &AGENT_MARK_AMP,
+    &AGENT_MARK_KILOCODE,
+    &AGENT_MARK_GEMINI,
+    &AGENT_MARK_GENERIC,
+];
+
+/// drawer-mark-sprite: every mark as an inert `<symbol>`, emitted once per
+/// page beside the Agents drawer.
+///
+/// The drawer is the one agent surface this file does not render -- its rows
+/// are built in the browser by `assets/app.js` from `GET /api/agents`, which
+/// is why the marks reached every other surface and not that one. Copying the
+/// path data into JavaScript would have made two sources of truth for the
+/// same artwork, so instead the artwork stays here and the feed hands the
+/// client a mark id; a row draws `<use href="#agent-mark-{id}">` and the
+/// browser resolves it against this sprite. Nothing is injected as HTML.
+///
+/// The sprite itself never renders: `hidden` keeps it out of the layout and
+/// `aria-hidden` out of the accessibility tree. A `<symbol>` carries its own
+/// `viewBox`, which is what lets Codex's 250-unit box and opencode's 24-unit
+/// one share a sprite and still draw correctly at the same 12px.
+pub fn agent_mark_sprite() -> String {
+    let symbols: String = AGENT_MARKS
+        .iter()
+        .map(|mark| {
+            format!(
+                r#"<symbol id="agent-mark-{id}" viewBox="{view_box}">{body}</symbol>"#,
+                id = mark.id,
+                view_box = mark.view_box,
+                body = mark.body,
+            )
+        })
+        .collect();
+    format!(
+        r#"<svg class="agent-mark-sprite" hidden aria-hidden="true" width="0" height="0">{symbols}</svg>"#
+    )
+}
+
+/// The mark id `GET /api/agents` hands the drawer for a pane's own program
+/// (drawer-mark-sprite) -- the client half of [`bee_hub_agent_logo`], so the
+/// browser and the server never disagree about which artwork an agent gets.
+pub fn agent_mark_id(kind: &str) -> &'static str {
+    bee_hub_agent_logo(kind).1.id
+}
+
+/// The mark a pane's own program is named with, wherever that name is
+/// printed as plain text (agent-marks-everywhere): the terminal badges on a
+/// project row and a board card, the pane tabs above a terminal, and a
+/// feature's terminal list. Decorative -- the program's name sits right
+/// beside it, so the glyph adds recognition, never the only reading.
+///
+/// A plain shell pane is not an agent and has no vendor mark; it falls
+/// through [`bee_hub_agent_logo`] to the generic terminal prompt, which is
+/// exactly the right glyph for a shell, so this needs no special case.
+fn pane_program_mark(kind: &str) -> String {
+    let (_, mark) = bee_hub_agent_logo(kind);
+    // terminal-mark-only: the mark no longer sits beside the program's name,
+    // it IS the name -- so it stops being decorative. `title` gives a mouse
+    // the word back on hover; `role="img"` plus `aria-label` give it to a
+    // screen reader, which is the whole reason the printed span could go.
+    // The label is the pane's own `kind` verbatim, escaped like every other
+    // operator-authored string this module renders.
+    format!(
+        r#"<span class="pane-mark" title="{label}">{svg}</span>"#,
+        label = esc(kind),
+        svg = bee_hub_agent_mark_svg_sized(mark, 12, "pane-mark__svg", Some(kind)),
+    )
+}
+
+/// [`pane_program_mark`] where the mark is recognition only, not the name:
+/// the Agents drawer (drawer-agent-mark). A drawer row already prints its
+/// state in words and labels its own status dot, so the mark is read by the
+/// eye and skipped by a screen reader -- the hover title still gives a mouse
+/// the program's name.
+fn pane_program_mark_decorative(kind: &str) -> String {
+    let (_, mark) = bee_hub_agent_logo(kind);
+    format!(
+        r#"<span class="pane-mark" title="{label}">{svg}</span>"#,
+        label = esc(kind),
+        svg = bee_hub_agent_mark_svg_sized(mark, 12, "pane-mark__svg", None),
+    )
 }
 
 /// The state glyph a hub card's title leads with, keyed by the column the
@@ -623,12 +913,12 @@ fn bee_hub_kind_icon(group_key: &str, panes: &[TerminalPaneView]) -> String {
         .filter(|p| p.kind != "shell")
         .max_by_key(|p| matches!(pane_tone(p), "working" | "blocked"));
     if let Some(pane) = agent {
-        let (slug, body) = bee_hub_agent_logo(&pane.kind);
+        let (slug, mark) = bee_hub_agent_logo(&pane.kind);
         return format!(
-            r#"<span class="bee-hub__kind bee-hub__kind--agent bee-hub__kind--{slug}" title="{kind}" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{body}</svg></span>"#,
+            r#"<span class="bee-hub__kind bee-hub__kind--agent bee-hub__kind--{slug}" title="{kind}" aria-hidden="true">{svg}</span>"#,
             slug = slug,
             kind = esc(&pane.kind),
-            body = body,
+            svg = bee_hub_agent_mark_svg(mark),
         );
     }
     let body = match group_key {
@@ -1029,12 +1319,19 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
             rows.push_str(&format!(
                 r#"<li class="pinned-row">
   <a class="pinned-row__link{on_class}" href="{href}"{aria}>
-    <span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" role="img" aria-label="{status}"></span><span class="pinned-row__head"><span class="pinned-row__name">{label}</span> <span class="pinned-row__meta">{meta}</span></span>{bee_state_html}{bee_feature_html}
+    {mark}<span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" role="img" aria-label="{status}"></span><span class="pinned-row__head"><span class="pinned-row__name">{label}</span> <span class="pinned-row__meta">{meta}</span></span>{bee_state_html}{bee_feature_html}
   </a>
 </li>"#,
                 on_class = if on { " pinned-row__link--on" } else { "" },
                 href = esc(&format!("/?tab=terminals&pane={}", pane.view.pane_id)),
                 aria = if on { r#" aria-current="page""# } else { "" },
+                // drawer-agent-mark: the drawer reads like the board's own
+                // terminal badges -- mark first, then state -- so the same
+                // agent is recognised the same way in both places. Here the
+                // mark stays decorative: unlike a badge, this row prints its
+                // state in words and its dot already carries a label, so a
+                // second spoken name would only be repetition.
+                mark = pane_program_mark_decorative(&pane.view.kind),
                 tone = tone,
                 // Unlike a project row — which prints its statuses as
                 // `status_pill` words on its own next line, letting its dot
@@ -1346,11 +1643,11 @@ fn terminal_badges_nav_from_refs(
             String::new()
         };
         out.push_str(&format!(
-            r#"<a class="proj-row__badge" href="/p/{pid}/_terminal/pane/{pane_id}">{status_pill}<span class="proj-row__badge-program">{program}</span>{title_span}</a>"#,
+            r#"<a class="proj-row__badge" href="/p/{pid}/_terminal/pane/{pane_id}">{mark}{status_pill}{title_span}</a>"#,
             pid = pid,
             pane_id = esc(&p.pane_id),
+            mark = pane_program_mark(&p.kind),
             status_pill = pane_status_pill(p),
-            program = esc(&p.kind),
         ));
     }
     out.push_str("</nav>");
@@ -1612,7 +1909,18 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    box owns the full width — squeezing it beside two buttons left barely a
    phone's worth of room for the one field an operator actually types into. */
 .term-reply { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); }
-.term-reply__text { width: 100%; min-width: 0; box-sizing: border-box; padding: var(--space-1) var(--space-2); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); font-family: var(--font-mono, monospace); font-size: var(--type-body-sm-size); line-height: 1.35; background: var(--color-bg); color: var(--color-text); resize: vertical; }
+/* compact-attach: the box an operator writes in is drawn by this wrapper,
+   not by the textarea, so the attach icon can sit inside the same outline
+   instead of taking a row of its own beneath it. The icon is pinned to the
+   top-left and the textarea takes the rest of the width; both stay on one
+   line however tall the textarea is dragged. `align-items: flex-start`
+   keeps the icon by the first line of type rather than floating to the
+   middle of a resized box. */
+.term-reply__field { display: flex; align-items: flex-start; gap: var(--space-1); width: 100%; min-width: 0; box-sizing: border-box; padding: var(--space-1) var(--space-2); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-bg); }
+/* The field wrapper owns the focus ring the textarea's own outline used to
+   give, so focusing the box still reads as focused. */
+.term-reply__field:focus-within { border-color: var(--color-action); }
+.term-reply__text { flex: 1 1 auto; width: auto; min-width: 0; box-sizing: border-box; padding: 0; border: 0; border-radius: 0; font-family: var(--font-mono, monospace); font-size: var(--type-body-sm-size); line-height: 1.35; background: transparent; color: var(--color-text); resize: vertical; outline: none; }
 /* Safari on iOS zooms the page whenever it focuses a control smaller than
    16px, and the zoom sticks — on a phone, one tap into the reply box left
    the operator looking at a magnified card. The box is deliberately 13px on
@@ -1763,13 +2071,13 @@ fn pane_tab(link: &str, p: &TerminalPaneView, active: bool, extra: &str) -> Stri
         (false, false) => format!("pane-strip__tab {extra}"),
     };
     format!(
-        r#"<a class="{cls}" href="{href}"><span class="term-pane__id">{workspace} · {tab}</span> {status_pill}<span class="term-pane__meta">{program}</span></a>"#,
+        r#"<a class="{cls}" href="{href}"><span class="term-pane__id">{workspace} · {tab}</span> {mark}{status_pill}</a>"#,
         cls = cls,
         href = esc(link),
         workspace = esc(&p.workspace),
         tab = esc(&p.tab),
+        mark = pane_program_mark(&p.kind),
         status_pill = pane_status_pill(p),
-        program = esc(&p.kind),
     )
 }
 
@@ -2346,13 +2654,24 @@ fn pane_controls(
         ),
         _ => r#"<button type="button" class="term-reply__approve">Approve</button>"#.to_string(),
     };
-    let attach_block = if attach {
+    // compact-attach: the picker is an icon that rides INSIDE the writing
+    // box, on its left edge, rather than a labelled button parked under it —
+    // the shape every chat composer has settled on. The wrapper that draws
+    // the box is `.term-reply__field`; the textarea inside it gives up its
+    // own border so the two read as one control. Everything the attach
+    // wiring in `assets/app.js` looks up still hangs off the same
+    // `.term-attach[data-pane-id]` box (input, button, chips, error), so
+    // only the nesting moved, never a selector.
+    let field = if attach {
         format!(
             r#"
     <div class="term-attach" data-pane-id="{pane_id}"{base_attr}>
       <input type="file" class="term-attach__input" data-pane-id="{pane_id}" accept="image/*" multiple aria-label="Attach images to send to {name}" hidden>
-      <button type="button" class="term-attach__btn" data-pane-id="{pane_id}">Attach images</button>
       <ul class="term-attach__chips" data-pane-id="{pane_id}"></ul>
+      <div class="term-reply__field">
+        <button type="button" class="term-attach__btn" data-pane-id="{pane_id}" title="Attach images" aria-label="Attach images to send to {name}">+</button>
+        <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
+      </div>
       <p class="term-attach__error" data-pane-id="{pane_id}" role="alert" hidden></p>
     </div>"#,
             pane_id = esc(pane_id),
@@ -2360,7 +2679,13 @@ fn pane_controls(
             base_attr = base_attr,
         )
     } else {
-        String::new()
+        format!(
+            r#"
+    <div class="term-reply__field">
+      <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
+    </div>"#,
+            name = esc(name),
+        )
     };
     format!(
         r#"<div class="term-controls">
@@ -2377,8 +2702,7 @@ fn pane_controls(
       <button type="button" data-key="ctrl+c">Ctrl+C</button>
     </div>
   </div>
-  <form class="term-reply" data-pane-id="{pane_id}"{base_attr}{state_attr}>
-    <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>{attach_block}
+  <form class="term-reply" data-pane-id="{pane_id}"{base_attr}{state_attr}>{field}
     <div class="term-reply__actions">
       {approve_btn}
       <button type="button" class="term-reply__stage">Stage</button>
@@ -2387,7 +2711,7 @@ fn pane_controls(
   </form>"#,
         pane_id = esc(pane_id),
         name = esc(name),
-        attach_block = attach_block,
+        field = field,
         base_attr = base_attr,
         state_attr = state_attr,
         approve_btn = approve_btn,
@@ -2480,12 +2804,14 @@ fn agent_switch_drawer(homepage: bool) -> String {
     };
     format!(
         r#"<div class="agent-drawer js-menu">
+  {sprite}
   <input type="checkbox" id="agent-drawer-toggle" class="agent-drawer__check">
   <div class="fg-drawer">
     <div class="fg-drawer__head"><span class="fg-drawer__title">Agents</span></div>
     <div class="fg-drawer__body" data-agent-drawer-list{homepage_attr}></div>
   </div>
 </div>"#,
+        sprite = agent_mark_sprite(),
         homepage_attr = homepage_attr,
     )
 }
@@ -2967,6 +3293,17 @@ fn bee_hub_style() -> String {
 .bee-hub__group-label { font-family: var(--font-mono); font-size: var(--type-label-size); font-weight: var(--type-label-weight); letter-spacing: var(--type-label-tracking); text-transform: uppercase; color: var(--color-text); line-height: 1; }
 .bee-hub__group-waiting { font-family: var(--font-mono); font-size: var(--type-tag-size); font-weight: var(--type-tag-weight); color: var(--color-accent-alt-2); background: color-mix(in srgb, var(--color-accent-alt-2) 10%, transparent); padding: 2px 6px; border-radius: var(--radius-pill); line-height: 1; white-space: nowrap; }
 .bee-hub__group-count { margin-left: auto; font-family: var(--font-mono); font-size: var(--type-tag-size); font-weight: var(--type-tag-weight); opacity: 0.6; color: var(--color-text); line-height: 1; }
+/* todo-column-collapse: Todo is the one column that folds. It is a native
+   `<details>` -- the same no-JS, no-persisted-state disclosure the archive
+   bar and the In Progress cards already use -- so its own
+   `.bee-hub__group-header` h4 rides inside a `<summary>` and keeps every
+   header rule above; only the summary's default marker and cursor need
+   saying here. The count stays in that summary while closed, so folding the
+   longest column on the board never understates what it holds. */
+.bee-hub__group--fold > .bee-hub__group-summary { cursor: pointer; list-style: none; min-width: 0; }
+.bee-hub__group--fold > .bee-hub__group-summary::-webkit-details-marker { display: none; }
+.bee-hub__group--fold > .bee-hub__group-summary:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
+.bee-hub__group--fold[open] > .bee-hub__group-summary .bee-hub__chev { transform: rotate(90deg); }
 /* kanban-columns-archive: the folded Finished bar — a native `<details>`
    (no JS) spanning the full board width beneath `.bee-hub__groups` rather
    than sitting in it as a fifth track. `data-hub-group`/`data-hub-count`
@@ -3090,9 +3427,22 @@ fn bee_hub_style() -> String {
 .bee-hub__kind--ready-to-merge { color: var(--color-accent-alt-4); }
 .bee-hub__kind--todo { color: var(--color-accent-alt-1); }
 .bee-hub__kind--agent { background: color-mix(in srgb, currentColor 14%, transparent); }
+/* card-agent-logos, redrawn by agent-logo-marks: one tint per vendor, on the
+   real artwork. Every mark is a `currentColor` shape, so the colour lives
+   here and the SVG constants stay pure geometry -- which is also what lets a
+   vendor without a house colour (opencode, Cline, Amp, Kilo Code, Goose,
+   Copilot's own mark on this surface) read in the console's own muted ink
+   rather than borrow someone else's hue. */
 .bee-hub__kind--anthropic { color: #d97757; }
 .bee-hub__kind--openai { color: #10a37f; }
 .bee-hub__kind--gemini { color: #4e8df5; }
+.bee-hub__kind--cursor { color: var(--color-text); }
+.bee-hub__kind--copilot,
+.bee-hub__kind--opencode,
+.bee-hub__kind--cline,
+.bee-hub__kind--goose,
+.bee-hub__kind--kilocode { color: var(--color-text-muted); }
+.bee-hub__kind--amp { color: #f2542d; }
 .bee-hub__kind--generic { color: var(--color-text-muted); }
 .bee-hub__summary .fg-card__title { flex: 1 1 0; min-width: 0; }
 .bee-hub__summary::-webkit-details-marker { display: none; }
@@ -3154,11 +3504,28 @@ fn bee_hub_style() -> String {
 /* card-project-first: the project/slug line rides in the collapsed
    `<summary>`, directly under the card's own name -- the project a card
    belongs to is the first thing the board is read by, so it must not
-   need an expand. Same `flex: 1 0 100%` second-row idiom as the agent
-   line below it, with a lower `order` so project reads above agent
-   however row one wraps. */
-.bee-hub__summary .bee-hub__project, .bee-hub__summary .bee-hub__slug { flex: 1 0 100%; order: 5; margin: 0; line-height: var(--type-micro-leading); }
-.bee-hub__agent { flex: 1 0 100%; order: 10; display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: 0; padding: 0; font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
+   need an expand. `flex: 1 0 100%` claims that second row after the
+   title, badge and chevron have filled row one; `order` keeps it there
+   however those three wrap.
+   agent-dot-owner-row: that row now carries the agent's state too, as a
+   colour dot at its head rather than the second full row of words the
+   agent line used to spend on the collapsed card. Two rows became one:
+   dot, then project. The words the dot stands for are not lost -- the
+   agent line still prints `agent: <state>` in the expandable body, so
+   the state is never colour alone (A3). */
+.bee-hub__owner { flex: 1 0 100%; order: 5; display: flex; align-items: center; gap: var(--space-1); min-width: 0; }
+.bee-hub__summary .bee-hub__project, .bee-hub__summary .bee-hub__slug { min-width: 0; margin: 0; line-height: var(--type-micro-leading); overflow-wrap: anywhere; }
+/* The dot draws itself rather than leaning on `.fg-status__dot`, the same
+   way `.bee-hub__pulse` below does -- this stylesheet is inline and does
+   not share the components sheet's class vocabulary. `exited` is the
+   "done" reading: the agent finished and left. An unknown state a newer
+   bee writes falls through to the base disabled colour. */
+.bee-hub__agent-dot { display: inline-block; width: 7px; height: 7px; border-radius: var(--radius-pill); flex: none; background: currentColor; box-shadow: var(--status-glow); color: var(--color-text-disabled); }
+.bee-hub__agent-dot--working { color: var(--color-warning); }
+.bee-hub__agent-dot--needs-you { color: var(--color-danger); }
+.bee-hub__agent-dot--idle { color: var(--color-text-disabled); }
+.bee-hub__agent-dot--exited { color: var(--color-success); }
+.bee-hub__agent { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1); margin: 0; padding: 0; font-family: var(--font-mono); font-size: var(--type-micro-size); line-height: var(--type-micro-leading); color: var(--color-text-muted); }
 .bee-hub__agent-state { color: var(--color-text-muted); }
 .bee-hub__agent-state--working { color: var(--color-warning); }
 .bee-hub__agent-state--needs-you { color: var(--color-danger); }
@@ -4598,7 +4965,9 @@ fn bee_render_hub_section(
             todo_count,
             0,
             &todo_cards,
-            "Nothing in Todo."
+            "Nothing in Todo.",
+            // todo-column-collapse: Todo is the one column that ships folded.
+            true
         ),
         in_progress_group = bee_hub_group(
             "In Progress",
@@ -4606,7 +4975,8 @@ fn bee_render_hub_section(
             in_progress_count,
             in_progress_waiting_count,
             &in_progress_cards,
-            "Nothing in progress."
+            "Nothing in progress.",
+            false
         ),
         review_group = bee_hub_group(
             "Review",
@@ -4614,7 +4984,8 @@ fn bee_render_hub_section(
             review_count,
             0,
             &review_cards,
-            "Nothing in Review."
+            "Nothing in Review.",
+            false
         ),
         compound_group = bee_hub_group(
             "Compound",
@@ -4622,7 +4993,8 @@ fn bee_render_hub_section(
             compound_count,
             0,
             &compound_cards,
-            "Nothing in Compound."
+            "Nothing in Compound.",
+            false
         ),
         ready_to_merge_group = bee_hub_group(
             "Ready to merge",
@@ -4630,7 +5002,8 @@ fn bee_render_hub_section(
             ready_to_merge_count,
             0,
             &ready_to_merge_cards,
-            "Nothing ready to merge."
+            "Nothing ready to merge.",
+            false
         ),
         archive_bar = bee_hub_archive_bar(finished_count, &finished_cards),
     )
@@ -4996,7 +5369,9 @@ pub fn bee_cross_project_features_section(
             todo_count,
             0,
             &todo_cards,
-            "Nothing in Todo."
+            "Nothing in Todo.",
+            // todo-column-collapse: Todo is the one column that ships folded.
+            true
         ),
         in_progress_group = bee_hub_group(
             "In Progress",
@@ -5004,7 +5379,8 @@ pub fn bee_cross_project_features_section(
             in_progress_count,
             in_progress_waiting_count,
             &in_progress_cards,
-            "Nothing in progress."
+            "Nothing in progress.",
+            false
         ),
         review_group = bee_hub_group(
             "Review",
@@ -5012,7 +5388,8 @@ pub fn bee_cross_project_features_section(
             review_count,
             0,
             &review_cards,
-            "Nothing in Review."
+            "Nothing in Review.",
+            false
         ),
         compound_group = bee_hub_group(
             "Compound",
@@ -5020,7 +5397,8 @@ pub fn bee_cross_project_features_section(
             compound_count,
             0,
             &compound_cards,
-            "Nothing in Compound."
+            "Nothing in Compound.",
+            false
         ),
         ready_to_merge_group = bee_hub_group(
             "Ready to merge",
@@ -5028,7 +5406,8 @@ pub fn bee_cross_project_features_section(
             ready_to_merge_count,
             0,
             &ready_to_merge_cards,
-            "Nothing ready to merge."
+            "Nothing ready to merge.",
+            false
         ),
         archive_bar = bee_hub_archive_bar(finished_count, &finished_cards),
     )
@@ -5154,6 +5533,17 @@ fn bee_hub_stat_tiles(working: usize, need_you: usize, mergeable: usize) -> Stri
 /// `data-hub-waiting="{waiting_count}"` restates the very number the waiting
 /// chip already draws so the phone stacking order can select "this group has
 /// someone waiting on you" in CSS alone, with no second markup shape.
+///
+/// todo-column-collapse: `collapsible` folds a column behind a native
+/// `<details>` that carries no `open`, so it ships closed and opens on a
+/// click with no JavaScript and nothing persisted -- a board refresh returns
+/// it to closed, exactly as the In Progress cards and the archive bar already
+/// behave. Only Todo passes `true` today: it is the column that grows without
+/// bound while the four beside it stay short, so it is the one whose length
+/// costs the reader the rest of the board. Everything a collapsed column must
+/// still say lives in the summary -- the lane dot, the label and the true
+/// count -- and both boards fold it identically, since they share this one
+/// function.
 fn bee_hub_group(
     label: &str,
     key: &str,
@@ -5161,6 +5551,7 @@ fn bee_hub_group(
     waiting_count: usize,
     cards_html: &str,
     empty_line: &str,
+    collapsible: bool,
 ) -> String {
     let body = bee_hub_group_body(cards_html, empty_line);
     let waiting_chip = if waiting_count > 0 {
@@ -5168,14 +5559,47 @@ fn bee_hub_group(
     } else {
         String::new()
     };
+    // todo-column-collapse: a folding column is the SAME header, wrapped. The
+    // h4 keeps its class, its anatomy and its order, so every header rule and
+    // every assertion pinning that anatomy reads a folded column exactly as it
+    // reads an open one; what changes is the element around it -- a `<details>`
+    // carrying no `open`, so the column ships closed -- plus the chevron the
+    // disclosure earns. `data-hub-group`/`data-hub-count`/`data-hub-waiting`
+    // and the anchor id stay on the outer element exactly where the div held
+    // them, which is what keeps the phone stacking rules and the stat tiles'
+    // in-page anchors reading a folded column unchanged. The count rides in
+    // the summary, so a closed column still states its true total
+    // (`docs/specs/bee-cockpit.md`, the same rule the archive bar answers to).
+    let chevron = if collapsible {
+        r#"<span class="bee-hub__chev" aria-hidden="true">›</span>"#
+    } else {
+        ""
+    };
+    let header = format!(
+        r#"<h4 class="bee-hub__group-header"><span class="bee-hub__group-dot" aria-hidden="true"></span><span class="bee-hub__group-label">{label}</span>{waiting_chip}<span class="bee-hub__group-count">{count}</span>{chevron}</h4>"#,
+        label = esc(label),
+        waiting_chip = waiting_chip,
+        count = count,
+        chevron = chevron,
+    );
+    let (open_tag, head, close_tag) = if collapsible {
+        (
+            r#"<details class="bee-hub__group bee-hub__group--fold""#,
+            format!(r#"<summary class="bee-hub__group-summary">{header}</summary>"#),
+            "</details>",
+        )
+    } else {
+        (r#"<div class="bee-hub__group""#, header, "</div>")
+    };
     format!(
-        r#"<div class="bee-hub__group" id="hub-{key}" data-hub-group="{key}" data-hub-count="{count}" data-hub-waiting="{waiting_count}"><h4 class="bee-hub__group-header"><span class="bee-hub__group-dot" aria-hidden="true"></span><span class="bee-hub__group-label">{label}</span>{waiting_chip}<span class="bee-hub__group-count">{count}</span></h4>{body}</div>"#,
+        r#"{open_tag} id="hub-{key}" data-hub-group="{key}" data-hub-count="{count}" data-hub-waiting="{waiting_count}">{head}{body}{close_tag}"#,
+        open_tag = open_tag,
         key = key,
         count = count,
         waiting_count = waiting_count,
-        label = esc(label),
-        waiting_chip = waiting_chip,
+        head = head,
         body = body,
+        close_tag = close_tag,
     )
 }
 
@@ -5384,9 +5808,13 @@ struct BeeCardAgent {
     /// alone.
     state_word: String,
     /// The held cell's title when this project's store still knows it, else
-    /// the bare cell id, else "—" (A1: an absent field renders as a dash,
-    /// never as an error and never as an empty gap).
-    cell_label: String,
+    /// the bare cell id. `None` when the session holds no claim at all —
+    /// the line then drops the segment rather than printing a bare dash
+    /// where a cell name would go (D2: cards render only data-backed
+    /// elements). A1's dash-never-an-error rule is about a field that has a
+    /// value to state; "no cell held" is the absence of the field itself,
+    /// and a lone "—" reads as a broken card, not as a reading.
+    cell_label: Option<String>,
     /// How long the record has been quiet: `"12s"`, `"3m"`, or `"—"` when
     /// the record carries no age at all.
     quiet_age: String,
@@ -5432,9 +5860,9 @@ fn bee_card_agent(entries: &[BeeActivityEntry]) -> Option<BeeCardAgent> {
         freshest.cell_title.as_deref(),
         freshest.activity.cell.as_deref(),
     ) {
-        (Some(title), _) if !title.is_empty() => title.to_string(),
-        (_, Some(id)) if !id.is_empty() => id.to_string(),
-        _ => "—".to_string(),
+        (Some(title), _) if !title.is_empty() => Some(title.to_string()),
+        (_, Some(id)) if !id.is_empty() => Some(id.to_string()),
+        _ => None,
     };
     Some(BeeCardAgent {
         tone,
@@ -5464,6 +5892,21 @@ fn bee_quiet_age(age_seconds: Option<f64>) -> String {
     }
 }
 
+/// agent-dot-owner-row: the state as ONE colour dot, for the collapsed
+/// card's owner row. It says exactly what [`bee_hub_agent_line`]'s state
+/// word says and takes its tone from the same `agent.tone`, so the two can
+/// never disagree — the dot is the glanceable spelling, the line in the
+/// body is the readable one. Decorative it is not: `role="img"` plus the
+/// state in `aria-label` means a screen reader hears the word, and `title`
+/// gives a pointer the same word on hover.
+fn bee_hub_agent_dot(agent: &BeeCardAgent) -> String {
+    format!(
+        r#"<span class="bee-hub__agent-dot bee-hub__agent-dot--{tone}" role="img" aria-label="agent: {word}" title="agent: {word}"></span>"#,
+        tone = agent.tone,
+        word = esc(&agent.state_word),
+    )
+}
+
 /// A6's line itself: state word in its own tone, the held cell, and how long
 /// the record has been quiet — plus the muted `no signal` marker when the
 /// freshest record has stopped speaking (A1).
@@ -5473,11 +5916,26 @@ fn bee_hub_agent_line(agent: &BeeCardAgent) -> String {
     } else {
         ""
     };
+    // A session holding no cell used to render `agent: working · — · quiet 2s`,
+    // and that lone dash read as a card that had failed to load rather than
+    // as "holds no cell". The segment carries its own leading separator so
+    // dropping it takes the separator with it, leaving the state word
+    // running straight into the quiet reading. It also un-strands the quiet
+    // reading: `.bee-hub__agent-cell` is the row's `flex: 1 1 auto` filler,
+    // so with a one-character label inside it the grow pushed `quiet 2s` to
+    // the far edge of the card, away from the run it belongs to.
+    let cell_html = match agent.cell_label.as_deref() {
+        Some(cell) => format!(
+            r#" · <span class="bee-hub__agent-cell">{cell}</span>"#,
+            cell = esc(cell)
+        ),
+        None => String::new(),
+    };
     format!(
-        r#"<p class="bee-hub__agent"><span class="bee-hub__agent-state bee-hub__agent-state--{tone}">agent: {word}</span> · <span class="bee-hub__agent-cell">{cell}</span> · <span class="bee-hub__agent-quiet">quiet {age}</span>{signal_html}</p>"#,
+        r#"<p class="bee-hub__agent"><span class="bee-hub__agent-state bee-hub__agent-state--{tone}">agent: {word}</span>{cell_html} · <span class="bee-hub__agent-quiet">quiet {age}</span>{signal_html}</p>"#,
         tone = agent.tone,
         word = esc(&agent.state_word),
-        cell = esc(&agent.cell_label),
+        cell_html = cell_html,
         age = esc(&agent.quiet_age),
         signal_html = signal_html,
     )
@@ -5833,13 +6291,33 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // project/slug line came back -- the description, branch row and the
     // rest stay in the body, so the collapsed header is still a name and
     // its owner, not the old bundled block.
-    // A6: the agent line rides in the collapsed `<summary>`, directly under
-    // the card's own name and before the badges — the whole point of the
-    // line is to be read without expanding the card, the same reason
-    // `run_state_html` already lives here.
+    //
+    // agent-dot-owner-row: A6 used to spend a SECOND full row of the
+    // collapsed summary on the agent line's words, so an in-progress card
+    // was four rows before it said anything about the work. The state now
+    // rides that same project row as a colour dot at its head — one row,
+    // `<dot> <project>` — and the line of words moves into the expandable
+    // body with the cell it holds and how long it has been quiet. What a
+    // glance needs is "is anyone on this, and how is it going": the dot
+    // answers that; the cell title and the quiet age are reading, not
+    // glancing, so they cost the expand they always should have.
     let agent_html = match agent {
         Some(agent) => bee_hub_agent_line(agent),
         None => String::new(),
+    };
+    // The owner row itself. It renders only when it has something to carry:
+    // no agent and no project label (a slug-only card whose title is its
+    // own feature name) is no row at all, never an empty one (D2).
+    let owner_html = {
+        let dot_html = match agent {
+            Some(agent) => bee_hub_agent_dot(agent),
+            None => String::new(),
+        };
+        if dot_html.is_empty() && subtitle_html.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<div class="bee-hub__owner">{dot_html}{subtitle_html}</div>"#)
+        }
     };
     let kind_html = bee_hub_kind_icon(group_key, panes);
     let title_html = match title {
@@ -6003,7 +6481,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
     // the top of the expandable body, since a `<details>`/`<summary>`
     // pair, unlike the old whole-card `<a>`, cannot itself be a link.
     format!(
-        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{subtitle_html}{agent_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{actions_html}{terminal_badges_html}{quiet_note_html}</div>"#,
+        r#"<div class="{shell_class}"><details class="bee-hub__card" data-hub-group="{group_key}"><summary class="bee-hub__summary">{kind_html}{title_html}{owner_html}{run_state_html}<span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/{pid}/_bee/feature/{feature_href}">Feature detail<span aria-hidden="true"> →</span></a>{agent_html}{desc_html}{branch_html}{reason_html}{blocked_reason_html}{deferred_html}{quiet_badges_html}{footer_html}</div></details>{actions_html}{terminal_badges_html}{quiet_note_html}</div>"#,
         shell_class = shell_class,
         group_key = group_key,
         title_html = title_html,
@@ -6011,7 +6489,7 @@ fn bee_hub_card(args: &BeeHubCardArgs<'_>) -> String {
         run_state_html = run_state_html,
         pid = esc(project_id),
         feature_href = esc(feature),
-        subtitle_html = subtitle_html,
+        owner_html = owner_html,
         desc_html = desc_html,
         branch_html = branch_html,
         reason_html = reason_html,
@@ -7775,12 +8253,12 @@ fn bee_feature_terminal_tab(project_id: &str, panes: &[TerminalPaneView]) -> Str
     let mut rows = String::new();
     for p in panes {
         rows.push_str(&format!(
-            r#"<a class="fg-card bee-cell bee-terminal-pane" href="/p/{pid}/_terminal/pane/{pane_id}"><div class="fg-card__title">{workspace} · {tab}</div><div class="bee-cell__meta">{program}</div><div class="bee-hub__chips">{status_pill}</div></a>"#,
+            r#"<a class="fg-card bee-cell bee-terminal-pane" href="/p/{pid}/_terminal/pane/{pane_id}"><div class="fg-card__title">{workspace} · {tab}</div><div class="bee-cell__meta">{mark}</div><div class="bee-hub__chips">{status_pill}</div></a>"#,
             pid = esc(project_id),
             pane_id = esc(&p.pane_id),
             workspace = esc(&p.workspace),
             tab = esc(&p.tab),
-            program = esc(&p.kind),
+            mark = pane_program_mark(&p.kind),
             status_pill = pane_status_pill(p),
         ));
     }
@@ -14568,12 +15046,212 @@ mod tests {
         );
     }
 
+    /// drawer-mark-sprite: the drawer is rendered in the browser, so the one
+    /// thing that must hold server-side is that every mark it can be asked
+    /// for is actually in the sprite, under the id the feed hands out. A mark
+    /// registered in the constants but missing from `AGENT_MARKS` would draw
+    /// an empty box in the drawer and nowhere else -- exactly the failure a
+    /// view test can catch and a browser cannot.
+    #[test]
+    fn every_mark_reaches_the_sprite_under_the_id_the_feed_hands_out() {
+        let sprite = agent_mark_sprite();
+        assert!(
+            sprite.starts_with(r#"<svg class="agent-mark-sprite" hidden aria-hidden="true""#),
+            "the sprite must never render or be spoken: {sprite}"
+        );
+
+        let mut ids: Vec<&str> = AGENT_MARKS.iter().map(|m| m.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "two marks must never share a symbol id");
+
+        for mark in AGENT_MARKS {
+            assert!(
+                sprite.contains(&format!(
+                    r#"<symbol id="agent-mark-{id}" viewBox="{vb}">"#,
+                    id = mark.id,
+                    vb = mark.view_box
+                )),
+                "mark `{}` must reach the sprite carrying its own viewBox: {sprite}",
+                mark.id
+            );
+            assert!(
+                sprite.contains(mark.body),
+                "mark `{}` must reach the sprite with its artwork: {sprite}",
+                mark.id
+            );
+        }
+
+        // The feed's id and the sprite's id are the same string, for every
+        // vendor the lookup can return -- that agreement is the whole
+        // contract between the server and the drawer's client-side renderer.
+        for kind in [
+            "claude",
+            "claude-code",
+            "anthropic",
+            "codex",
+            "opencode",
+            "gh-copilot",
+            "cursor",
+            "cline",
+            "goose",
+            "amp",
+            "kilocode",
+            "gemini",
+            "shell",
+            "some-home-grown-runner",
+        ] {
+            let id = agent_mark_id(kind);
+            assert!(
+                sprite.contains(&format!(r#"id="agent-mark-{id}""#)),
+                "`{kind}` resolves to `{id}`, which must exist in the sprite: {sprite}"
+            );
+        }
+
+        // The drawer's own markup carries the sprite: no sprite on the page,
+        // no mark in any drawer row.
+        let drawer = agent_switch_drawer(true);
+        assert!(
+            drawer.contains(r#"<svg class="agent-mark-sprite""#)
+                && drawer.contains("data-agent-drawer-list"),
+            "the sprite must ship with the drawer that needs it: {drawer}"
+        );
+    }
+
+    /// drawer-agent-mark: the Agents drawer reads in the same order as the
+    /// board's terminal badges -- the agent's own mark, then its status --
+    /// so one agent is recognised the same way in both places. Here the mark
+    /// is recognition only: the row prints its state in words and labels its
+    /// own dot, so a second spoken name would be repetition, and the mark
+    /// stays out of the accessibility tree while keeping its hover title.
+    #[test]
+    fn agents_drawer_rows_lead_with_the_agents_mark_ahead_of_its_status_dot() {
+        let mut pane = menu_pane("w1:p1", Some("proj-a"), "Proj One");
+        pane.view.kind = "opencode".into();
+        pane.view.status = "working".into();
+        let html = pinned_group(std::slice::from_ref(&pane), None);
+
+        assert!(
+            html.contains(AGENT_MARK_OPENCODE.body),
+            "a drawer row must draw the agent's real mark: {html}"
+        );
+        let mark_at = html
+            .find(r#"<span class="pane-mark" title="opencode">"#)
+            .unwrap_or_else(|| panic!("the mark must name the agent on hover: {html}"));
+        let dot_at = html
+            .find(r#"<span class="fg-status__dot proj-row__dot"#)
+            .unwrap_or_else(|| panic!("the status dot must render: {html}"));
+        assert!(
+            mark_at < dot_at,
+            "the mark must lead the status dot, as it does on a badge: {html}"
+        );
+        assert!(
+            html.contains(r#"class="pane-mark__svg" aria-hidden="true""#),
+            "the drawer's mark is decoration beside words that already speak: {html}"
+        );
+        // The dot must stay a DIRECT sibling of the state word: a CSS rule
+        // reaches the blocked state word through it, and wrapping the dot in
+        // with the mark would silently break how a blocked agent reads.
+        assert!(
+            html.contains(r#"aria-label="working"></span><span class="pinned-row__head">"#),
+            "the dot must remain an unwrapped child of the row link: {html}"
+        );
+    }
+
+    /// agent-marks-everywhere: wherever a pane's program is printed as
+    /// plain text, its own mark leads it -- the same mark the board card's
+    /// title glyph draws, at pill size. Three surfaces print that name (a
+    /// terminal badge, a pane tab, a feature's terminal row), and the bug
+    /// this guards is exactly the one where two of them get the mark and
+    /// the third keeps reading as bare text.
+    #[test]
+    fn every_surface_that_names_a_pane_program_draws_its_mark_first() {
+        let mut pane = pane_with_status("working");
+        pane.kind = "opencode".into();
+        pane.title = String::new();
+
+        let badge = project_badges("proj-a", std::slice::from_ref(&pane));
+        let tab = pane_tab("/p/proj-a/_terminal/pane/w1:working", &pane, false, "");
+        let feature_row = bee_feature_terminal_tab("proj-a", std::slice::from_ref(&pane));
+
+        for (surface, html) in [
+            ("badge", &badge),
+            ("pane tab", &tab),
+            ("feature row", &feature_row),
+        ] {
+            assert!(
+                html.contains(AGENT_MARK_OPENCODE.body),
+                "the {surface} must draw the real opencode mark: {html}"
+            );
+            assert!(
+                html.contains(r#"width="12" height="12""#),
+                "a pill-sized surface draws the small mark, not the card's 16px one: {html}"
+            );
+            // terminal-mark-only: the mark REPLACED the printed word, so it
+            // has to carry the name itself -- on hover and in the
+            // accessibility tree -- and the word must be gone from the page.
+            assert!(
+                html.contains(r#"<span class="pane-mark" title="opencode">"#),
+                "the mark must name the program on hover: {html}"
+            );
+            assert!(
+                html.contains(r#"role="img" aria-label="opencode""#),
+                "the mark must be readable, not decorative, now that it is the only name: {html}"
+            );
+            // mark-before-status: every surface reads icon first, then state.
+            let mark_at = html.find(r#"<span class="pane-mark""#).unwrap();
+            let status_at = html
+                .find(r#"<span class="fg-status"#)
+                .or_else(|| html.find(r#"<div class="bee-hub__chips">"#))
+                .unwrap_or_else(|| panic!("the {surface} must state a status: {html}"));
+            assert!(
+                mark_at < status_at,
+                "the mark must lead the status on the {surface}: {html}"
+            );
+            assert!(
+                !html.contains(">opencode<"),
+                "the program word must no longer be printed beside its own mark: {html}"
+            );
+        }
+    }
+
+    /// agent-marks-everywhere: a plain shell is not an agent, so it must
+    /// never borrow a vendor's logo -- it draws the terminal prompt, which
+    /// falls out of the same lookup with no special case.
+    #[test]
+    fn a_shell_pane_draws_the_terminal_prompt_not_an_agents_logo() {
+        let mut shell = pane_with_status("idle");
+        shell.kind = "shell".into();
+
+        let tab = pane_tab("/p/proj-a/_terminal/pane/w1:idle", &shell, false, "");
+        assert!(
+            tab.contains(AGENT_MARK_GENERIC.body),
+            "a shell must draw the prompt glyph: {tab}"
+        );
+        for vendor in [
+            AGENT_MARK_CLAUDE.body,
+            AGENT_MARK_CODEX.body,
+            AGENT_MARK_OPENCODE.body,
+        ] {
+            assert!(
+                !tab.contains(vendor),
+                "a shell must never wear a vendor's mark: {tab}"
+            );
+        }
+    }
+
     /// badge-title (D 6b39db89, touches D1a 7810e5ee), extending
     /// `board_badges_skip_plain_shell_panes`'s own panes: a pane whose
     /// title differs from its program renders a `.proj-row__badge-title`
-    /// span right after `.proj-row__badge-program`, HTML-escaped exactly
+    /// span right after the program's own identity, HTML-escaped exactly
     /// like every other user-supplied text this module renders -- and the
     /// pane's own `name` (D1a) still never reaches the markup.
+    ///
+    /// terminal-mark-only replaced the printed program word with its mark,
+    /// so the identity this orders against is now that mark. The claims are
+    /// unchanged: the program comes first, the title follows it escaped, and
+    /// the pane's internal name appears nowhere.
     #[test]
     fn badge_title_renders_after_the_program_span_when_it_says_something_new() {
         let pane = TerminalPaneView {
@@ -14591,8 +15269,12 @@ mod tests {
         };
         let html = project_badges("proj-a", &[pane]);
         let program_at = html
-            .find(r#"<span class="proj-row__badge-program">claude</span>"#)
-            .unwrap_or_else(|| panic!("program span must render: {html}"));
+            .find(r#"<span class="pane-mark" title="claude">"#)
+            .unwrap_or_else(|| panic!("the program's mark must render, naming it: {html}"));
+        assert!(
+            !html.contains(r#"<span class="proj-row__badge-program">"#),
+            "the program word must be gone -- the mark says it now: {html}"
+        );
         let title_at = html
             .find(
                 r#"<span class="proj-row__badge-title">&lt;script&gt;fixing bug&lt;/script&gt;</span>"#,
@@ -14600,7 +15282,7 @@ mod tests {
             .unwrap_or_else(|| panic!("title span must render, HTML-escaped: {html}"));
         assert!(
             title_at > program_at,
-            "the title span must render after the program span: {html}"
+            "the title span must render after the program's mark: {html}"
         );
         assert!(
             !html.contains("agent-name-must-not-appear"),
@@ -15781,7 +16463,7 @@ mod tests {
         });
         assert_eq!(
             card_html,
-            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><span class="bee-hub__kind bee-hub__kind--in-progress" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span><div class="fg-card__title">Human Title</div><div class="bee-hub__slug">feat-a</div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
+            r#"<div class="fg-card bee-hub__shell"><details class="bee-hub__card" data-hub-group="in-progress"><summary class="bee-hub__summary"><span class="bee-hub__kind bee-hub__kind--in-progress" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span><div class="fg-card__title">Human Title</div><div class="bee-hub__owner"><div class="bee-hub__slug">feat-a</div></div><span class="bee-hub__chev" aria-hidden="true">›</span></summary><div class="bee-hub__body"><a class="bee-hub__detail-link" href="/p/proj-a/_bee/feature/feat-a">Feature detail<span aria-hidden="true"> →</span></a><div class="bee-hub__branch"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg><span class="bee-hub__branch-name">wt/hold-holder-attribution</span></div><div class="bee-hub__footer"><span class="bee-hub__cells"><span class="bee-hub__cells-glyph bee-hub__cells-glyph--partial" aria-hidden="true"></span>1/2 cells</span><span class="bee-hub__activity-time">no activity</span></div></div></details></div>"#,
             "a card with no project label must keep the byte-identical shell/colour and now carry its worktree state on its own branch row: {card_html}"
         );
         // console-theme-kanban ctk-6 (D2): the five things the console
@@ -16369,18 +17051,48 @@ mod tests {
     /// -- while the tiles' wide-screen default (`display: none`) sits outside
     /// it, ahead of the query, so desktop keeps its five-column grid and
     /// draws no tiles at all.
-    /// agent-line-own-row (UAT on bee-agent-activity): the agent line is a
-    /// full-width second row of the summary, never a column beside the title.
+    /// agent-line-own-row (UAT on bee-agent-activity), as agent-dot-owner-row
+    /// left it: the full-width second row of the summary is now the OWNER
+    /// row — the state dot and the project it belongs to, on one line — and
+    /// the agent line's words no longer claim a summary row at all, having
+    /// moved into the expandable body.
     #[test]
-    fn bee_hub_agent_line_is_a_full_width_row_of_the_summary() {
+    fn bee_hub_owner_row_is_the_full_width_second_row_of_the_summary() {
         let css = bee_hub_style();
         assert!(
             css.contains(".bee-hub__summary { display: flex; flex-wrap: wrap;"),
-            "the summary must wrap so the agent line can drop to its own row: {css}"
+            "the summary must wrap so the owner row can drop to its own row: {css}"
         );
         assert!(
-            css.contains(".bee-hub__agent { flex: 1 0 100%; order: 10;"),
-            "the agent line must claim the whole width and sit last: {css}"
+            css.contains(".bee-hub__owner { flex: 1 0 100%; order: 5;"),
+            "the owner row must claim the whole width and sit under the title: {css}"
+        );
+        assert!(
+            !css.contains(".bee-hub__agent { flex:"),
+            "the agent line lives in the body now, so it claims no summary row: {css}"
+        );
+    }
+
+    /// agent-dot-owner-row: every tone [`bee_card_agent`] can produce has a
+    /// colour of its own, and the dot never speaks by colour alone — the
+    /// state word rides in `aria-label` and `title` on the dot itself, and
+    /// again as words on the agent line in the body.
+    #[test]
+    fn bee_hub_agent_dot_carries_a_tone_colour_and_the_state_in_words() {
+        let css = bee_hub_style();
+        for tone in ["working", "needs-you", "idle", "exited"] {
+            assert!(
+                css.contains(&format!(
+                    ".bee-hub__agent-dot--{tone} {{ color: var(--color-"
+                )),
+                "the {tone} dot must carry its own colour: {css}"
+            );
+        }
+        let dot = bee_hub_agent_dot(&blocked_card_agent());
+        assert_eq!(
+            dot,
+            r#"<span class="bee-hub__agent-dot bee-hub__agent-dot--needs-you" role="img" aria-label="agent: needs approval" title="agent: needs approval"></span>"#,
+            "the dot must name its state for a screen reader and on hover: {dot}"
         );
     }
 
@@ -16991,7 +17703,7 @@ mod tests {
         BeeCardAgent {
             tone: "needs-you",
             state_word: "needs approval".to_string(),
-            cell_label: "bap-2".to_string(),
+            cell_label: Some("bap-2".to_string()),
             quiet_age: "3s".to_string(),
             no_signal: false,
             blocked: true,
@@ -17305,8 +18017,14 @@ mod tests {
             html.contains(r#"data-hub-group="finished" data-hub-count="12""#),
             "{html}"
         );
+        // Scoped to the archive bar itself: todo-column-collapse gave the
+        // Todo column its own `<details>` up in the grid, so a page-wide
+        // count no longer isolates the archive's paging.
+        let archive = &html[html
+            .find(r#"<details class="bee-hub__archive""#)
+            .expect("the archive bar must render")..];
         assert_eq!(
-            html.matches("<details").count(),
+            archive.matches("<details").count(),
             2,
             "12 finished features must page into exactly one nested <details>, plus the archive bar's own outer <details>: {html}"
         );
@@ -17430,7 +18148,7 @@ mod tests {
     #[test]
     fn bee_hub_group_renders_console_header_anatomy_with_dot_label_waiting_chip_and_mono_count() {
         // Without waiting chip (waiting_count = 0)
-        let todo = bee_hub_group("Todo", "todo", 3, 0, "<p>card</p>", "Empty.");
+        let todo = bee_hub_group("Todo", "todo", 3, 0, "<p>card</p>", "Empty.", false);
         assert!(
             todo.contains(
                 r#"<div class="bee-hub__group" id="hub-todo" data-hub-group="todo" data-hub-count="3" data-hub-waiting="0">"#
@@ -17460,8 +18178,15 @@ mod tests {
         );
 
         // With waiting chip on In Progress (waiting_count > 0)
-        let in_progress =
-            bee_hub_group("In Progress", "in-progress", 5, 2, "<p>card</p>", "Empty.");
+        let in_progress = bee_hub_group(
+            "In Progress",
+            "in-progress",
+            5,
+            2,
+            "<p>card</p>",
+            "Empty.",
+            false,
+        );
         assert!(
             in_progress.contains(r#"<span class="bee-hub__group-waiting">2 waiting</span>"#),
             "waiting chip must render when waiting_count > 0: {in_progress}"
@@ -17484,6 +18209,282 @@ mod tests {
             dot_pos < label_pos && label_pos < waiting_pos && waiting_pos < count_pos,
             "header anatomy order must be dot -> label -> waiting chip -> count: {in_progress}"
         );
+    }
+
+    /// agent-logo-marks: a card's glyph is the agent's REAL mark, not a
+    /// hand-drawn stand-in. Nothing pinned these before, so this is the
+    /// whole contract: each vendor resolves to its own artwork, the mark
+    /// carries the source drawing's own viewBox (the set mixes 24- and
+    /// 250-unit boxes), and a filled logo is painted with `currentColor`
+    /// so `bee_hub_style` can tint it by vendor.
+    #[test]
+    fn bee_hub_agent_logo_resolves_each_vendor_to_its_own_real_mark() {
+        // The marks are distinct artwork, not one shape reused.
+        let bodies = [
+            AGENT_MARK_CLAUDE.body,
+            AGENT_MARK_CLAUDE_CODE.body,
+            AGENT_MARK_CODEX.body,
+            AGENT_MARK_OPENCODE.body,
+            AGENT_MARK_COPILOT.body,
+            AGENT_MARK_CURSOR.body,
+            AGENT_MARK_CLINE.body,
+            AGENT_MARK_GOOSE.body,
+            AGENT_MARK_AMP.body,
+            AGENT_MARK_KILOCODE.body,
+            AGENT_MARK_GEMINI.body,
+            AGENT_MARK_GENERIC.body,
+        ];
+        for (i, a) in bodies.iter().enumerate() {
+            assert!(
+                a.starts_with("<path") || a.starts_with("<polyline"),
+                "every mark must be raw geometry, no wrapper svg: {a}"
+            );
+            for b in bodies.iter().skip(i + 1) {
+                assert_ne!(a, b, "two vendors must never share one mark");
+            }
+        }
+
+        // Spelling is whatever the operator's preset used, so matching is by
+        // substring -- and the pairs that contain one another must not steal
+        // each other's mark.
+        for (kind, slug, want) in [
+            // A bare `claude` IS the Claude Code CLI -- the binary's own
+            // name, and what a bee pane reports -- so it draws Claude Code's
+            // mark; the product sunburst answers to the product's names.
+            ("claude", "anthropic", AGENT_MARK_CLAUDE_CODE.body),
+            ("claude-code", "anthropic", AGENT_MARK_CLAUDE_CODE.body),
+            (
+                "Claude Code (sonnet)",
+                "anthropic",
+                AGENT_MARK_CLAUDE_CODE.body,
+            ),
+            ("anthropic", "anthropic", AGENT_MARK_CLAUDE.body),
+            ("claude-app", "anthropic", AGENT_MARK_CLAUDE.body),
+            ("codex", "openai", AGENT_MARK_CODEX.body),
+            ("codex-cli --full-auto", "openai", AGENT_MARK_CODEX.body),
+            ("opencode", "opencode", AGENT_MARK_OPENCODE.body),
+            ("opencode-run", "opencode", AGENT_MARK_OPENCODE.body),
+            ("gh-copilot", "copilot", AGENT_MARK_COPILOT.body),
+            ("cursor", "cursor", AGENT_MARK_CURSOR.body),
+            ("cline", "cline", AGENT_MARK_CLINE.body),
+            ("goose", "goose", AGENT_MARK_GOOSE.body),
+            ("amp", "amp", AGENT_MARK_AMP.body),
+            ("kilocode", "kilocode", AGENT_MARK_KILOCODE.body),
+            ("gemini", "gemini", AGENT_MARK_GEMINI.body),
+            // Unknown, and the PNG-only agents the upstream set carries --
+            // both land on the prompt rather than on someone else's logo.
+            ("aider", "generic", AGENT_MARK_GENERIC.body),
+            ("grok", "generic", AGENT_MARK_GENERIC.body),
+            ("some-home-grown-runner", "generic", AGENT_MARK_GENERIC.body),
+        ] {
+            let (got_slug, mark) = bee_hub_agent_logo(kind);
+            assert_eq!(got_slug, slug, "`{kind}` must tint as {slug}");
+            assert_eq!(mark.body, want, "`{kind}` must draw its own vendor's mark");
+        }
+
+        // "amp" is short enough to sit inside ordinary words; it must match
+        // the whole field, never a fragment of one.
+        assert_eq!(bee_hub_agent_logo("example-runner").0, "generic");
+        assert_eq!(bee_hub_agent_logo("champion").0, "generic");
+
+        // Claude Code keeps Anthropic's tint but not Anthropic's drawing.
+        assert_ne!(AGENT_MARK_CLAUDE.body, AGENT_MARK_CLAUDE_CODE.body);
+    }
+
+    /// agent-logo-marks: the marks are drawn at their source viewBox and in
+    /// `currentColor` -- a filled logo and the generic line drawing need
+    /// opposite fill/stroke settings, and getting that backwards renders an
+    /// invisible or a solid-black glyph.
+    #[test]
+    fn bee_hub_agent_mark_svg_paints_filled_logos_and_the_stroked_fallback_apart() {
+        let codex = bee_hub_agent_mark_svg(&AGENT_MARK_CODEX);
+        assert!(
+            codex.starts_with(
+                r#"<svg aria-hidden="true" viewBox="0 0 250 250" width="16" height="16""#
+            ),
+            "a mark must keep the source drawing's own viewBox: {codex}"
+        );
+        assert!(
+            codex.contains(r#"fill="currentColor" stroke="none""#),
+            "a filled logo must paint with currentColor so its vendor tint applies: {codex}"
+        );
+
+        let claude = bee_hub_agent_mark_svg(&AGENT_MARK_CLAUDE);
+        assert!(
+            claude.starts_with(r#"<svg aria-hidden="true" viewBox="0 0 24 24""#)
+                && claude.contains(r#"fill="currentColor""#),
+            "{claude}"
+        );
+
+        let generic = bee_hub_agent_mark_svg(&AGENT_MARK_GENERIC);
+        assert!(
+            generic.contains(r#"fill="none" stroke="currentColor""#),
+            "the fallback is a line drawing, so it strokes instead of fills: {generic}"
+        );
+    }
+
+    /// agent-logo-marks: the card actually reaches for the mark. An attached
+    /// agent pane replaces the column's state glyph with that agent's own
+    /// artwork, names the raw kind in the title attribute, and stays
+    /// decorative (the column header already says the state).
+    #[test]
+    fn bee_hub_kind_icon_draws_the_attached_agents_own_mark() {
+        let mut pane = pane_with_status("running");
+        pane.kind = "opencode".into();
+        let icon = bee_hub_kind_icon("in-progress", std::slice::from_ref(&pane));
+        assert!(
+            icon.contains(r#"class="bee-hub__kind bee-hub__kind--agent bee-hub__kind--opencode""#),
+            "the glyph must carry the agent modifier and the vendor slug: {icon}"
+        );
+        assert!(
+            icon.contains(AGENT_MARK_OPENCODE.body),
+            "the real opencode mark must be what is drawn: {icon}"
+        );
+        assert!(
+            icon.contains(r#"title="opencode""#) && icon.contains(r#"aria-hidden="true""#),
+            "the raw kind names the glyph on hover, and it stays decorative: {icon}"
+        );
+
+        // No agent pane at all: the column's own state glyph stays.
+        let column = bee_hub_kind_icon("in-progress", &[]);
+        assert!(
+            column.contains(HUB_KIND_ICON_IN_PROGRESS) && !column.contains("bee-hub__kind--agent"),
+            "with no agent attached the column glyph must be untouched: {column}"
+        );
+    }
+
+    /// todo-column-collapse: the Todo column ships folded. A collapsible
+    /// group is a native `<details>` carrying no `open`, and everything a
+    /// closed column must still say -- lane dot, label, true count -- rides
+    /// in the summary, never behind the fold (`docs/specs/bee-cockpit.md`:
+    /// "collapsing a list is never allowed to understate what it holds").
+    /// The header's own anatomy is unchanged, which the anatomy test above
+    /// pins for the open shape; this is the gap it leaves.
+    #[test]
+    fn bee_hub_group_collapsible_renders_a_closed_details_that_still_states_its_count() {
+        let folded = bee_hub_group("Todo", "todo", 15, 0, "<p>card</p>", "Empty.", true);
+
+        let open_tag_end = folded.find('>').expect("opening tag must close");
+        let open_tag = &folded[..open_tag_end];
+        assert!(
+            open_tag.starts_with(r#"<details class="bee-hub__group bee-hub__group--fold""#),
+            "a collapsible column must be a <details> keeping its group class: {folded}"
+        );
+        assert!(
+            !open_tag.contains("open"),
+            "the column must ship collapsed, no `open` attribute: {folded}"
+        );
+        // The phone stacking rules and the stat tiles' anchors read these off
+        // the outer element -- they must not have moved inward with the fold.
+        assert!(
+            open_tag.contains(
+                r#"id="hub-todo" data-hub-group="todo" data-hub-count="15" data-hub-waiting="0""#
+            ),
+            "the anchor id and every data hook must stay on the outer element: {folded}"
+        );
+
+        let summary_end = folded.find("</summary>").expect("a summary must render");
+        let summary = &folded[..summary_end];
+        assert!(
+            summary.contains(
+                r#"<summary class="bee-hub__group-summary"><h4 class="bee-hub__group-header">"#
+            ),
+            "the existing h4 header must ride inside the summary, unchanged: {folded}"
+        );
+        assert!(
+            summary.contains(r#"<span class="bee-hub__group-count">15</span>"#),
+            "a closed column must still state its true count: {folded}"
+        );
+        assert!(
+            summary.contains(r#"<span class="bee-hub__group-label">Todo</span>"#)
+                && summary
+                    .contains(r#"<span class="bee-hub__group-dot" aria-hidden="true"></span>"#),
+            "the lane dot and label must stay visible while closed: {folded}"
+        );
+        assert!(
+            summary.contains(r#"<span class="bee-hub__chev" aria-hidden="true">"#),
+            "a disclosure must show its chevron: {folded}"
+        );
+        assert!(
+            folded.contains("<p>card</p>") && folded.ends_with("</details>"),
+            "the body it was handed must sit inside the details, past the summary: {folded}"
+        );
+
+        // A non-collapsible column is untouched: still a div, still no chevron.
+        let plain = bee_hub_group("Review", "review", 2, 0, "<p>card</p>", "Empty.", false);
+        assert!(
+            plain.starts_with(r#"<div class="bee-hub__group""#) && plain.ends_with("</div>"),
+            "a non-collapsible column must keep its wrapper div: {plain}"
+        );
+        assert!(
+            !plain.contains("bee-hub__chev") && !plain.contains("<summary"),
+            "only a folding column earns a chevron and a summary: {plain}"
+        );
+    }
+
+    /// todo-column-collapse: both boards fold the same one column. Todo is
+    /// the `<details>`; the four columns beside it stay open divs, so the
+    /// fold never spreads by accident when a column is added or reordered.
+    #[test]
+    fn both_boards_fold_todo_and_leave_the_other_four_columns_open() {
+        let root = std::env::temp_dir().join("wd-test-todo-fold");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+
+        let snapshot = waggledance_core::bee::read_snapshot(&root);
+        let mut project = sample_project();
+        project.root_path = root.clone();
+
+        let per_project = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
+        );
+
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let cross_project = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        for html in [&per_project, &cross_project] {
+            assert!(
+                html.contains(
+                    r#"<details class="bee-hub__group bee-hub__group--fold" id="hub-todo""#
+                ),
+                "Todo must render folded on the board: {html}"
+            );
+            for key in ["in-progress", "review", "compound", "ready-to-merge"] {
+                assert!(
+                    html.contains(&format!(r#"<div class="bee-hub__group" id="hub-{key}""#)),
+                    "the {key} column must stay an open div: {html}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// todo-column-collapse: the fold's own style rules live in
+    /// `bee_hub_style` beside the column header rules -- the summary strips
+    /// the browser's default marker (so only `.bee-hub__chev` marks the
+    /// disclosure) and the chevron turns off the native `[open]` attribute,
+    /// the same keying the cards and the archive bar already use.
+    #[test]
+    fn bee_hub_style_carries_the_todo_fold_summary_and_chevron_rules() {
+        let css = bee_hub_style();
+        for rule in [
+            ".bee-hub__group--fold > .bee-hub__group-summary { cursor: pointer; list-style: none;",
+            ".bee-hub__group--fold > .bee-hub__group-summary::-webkit-details-marker { display: none; }",
+            ".bee-hub__group--fold[open] > .bee-hub__group-summary .bee-hub__chev { transform: rotate(90deg); }",
+        ] {
+            assert!(css.contains(rule), "missing fold rule `{rule}` in: {css}");
+        }
     }
 
     /// (console-theme-kanban ctk-5, re-mapped by ctk-8) Column header style

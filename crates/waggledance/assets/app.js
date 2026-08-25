@@ -3028,6 +3028,31 @@
       // Status: bee's own state wins over herdr's screen-derived status
       // wherever both exist — the same precedence `views::pane_tone` /
       // `pane_status_word` apply server-side.
+      // drawer-mark-sprite: the agent's own program mark leads the row, the
+      // same order every server-rendered agent surface reads in (mark, then
+      // state, then what it is doing). The artwork lives in views.rs and is
+      // emitted once per page as a <symbol> sprite beside this drawer; the
+      // feed hands us only its id, so no path data is duplicated here and
+      // nothing from the feed is written as HTML. A row whose feed entry
+      // predates this field simply renders without a mark, as it did before.
+      if (agent.mark) {
+        var markBox = document.createElement("span");
+        markBox.className = "pane-mark";
+        markBox.title = agent.name;
+        var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.setAttribute("class", "pane-mark__svg");
+        // Decorative here, exactly like the rail's own agent rows: the pill
+        // beside it already states the status in words.
+        svg.setAttribute("aria-hidden", "true");
+        svg.setAttribute("width", "12");
+        svg.setAttribute("height", "12");
+        var use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+        use.setAttribute("href", "#agent-mark-" + agent.mark);
+        svg.appendChild(use);
+        markBox.appendChild(svg);
+        item.appendChild(markBox);
+      }
+
       var pill = document.createElement("span");
       pill.className = "fg-status" + pillModifier(pillStatus(agent));
       var dot = document.createElement("span");
