@@ -363,6 +363,60 @@ pub async fn start_agent_in_new_tab(
     cwd: Option<&str>,
     argv: &[String],
 ) -> Result<AgentStarted> {
+    let entry = waggledance_core::bee::BeeHerdingEntry {
+        argv: argv.to_vec(),
+        env: Vec::new(),
+        workspace_trust: None,
+    };
+    Ok(start_declared_agent(herdr, workspace_id, cwd, &entry)
+        .await?
+        .started)
+}
+
+/// What a spawn produced: the agent, and anything that went wrong on the way
+/// which did not stop it (herding-entry-conditions D9).
+///
+/// `warnings` is the reason this type exists. A trust seeding that fails is
+/// fail-open by design — but a warning that reaches only the daemon's log is
+/// indistinguishable from no warning at the moment an operator is staring at
+/// a pane that will not move. So it travels back to whoever asked for the
+/// spawn, in the same answer that says the agent started.
+#[derive(Debug, Clone)]
+pub struct SpawnOutcome {
+    pub started: AgentStarted,
+    pub warnings: Vec<String>,
+}
+
+/// Start an agent from a project's own declaration, honouring the conditions
+/// it carries: seed the tool's trust store, export its `env`, then start.
+///
+/// Order matters and is bee's: trust is seeded before the pane exists at all
+/// (nothing about it depends on the pane), `env` is exported into the pane
+/// **before** `agent.start` so the agent inherits it, and only then does the
+/// agent run.
+///
+/// The two failures are deliberately asymmetric, and that asymmetry is bee's
+/// rather than ours to tidy: a trust seeding that fails **warns and proceeds**
+/// (D5), while an `env` line that fails to send is **fatal** — the pane has
+/// already been made and the agent would start without the environment it was
+/// declared to have, which is a different program than the one asked for.
+pub async fn start_declared_agent(
+    herdr: &dyn Herdr,
+    workspace_id: &str,
+    cwd: Option<&str>,
+    entry: &waggledance_core::bee::BeeHerdingEntry,
+) -> Result<SpawnOutcome> {
+    let mut warnings = Vec::new();
+
+    // D3: the directory seeded is the one the caller already validated — this
+    // reaches for nothing else, and when the caller named no directory there
+    // is nothing here to trust.
+    if let (Some(trust), Some(dir)) = (entry.workspace_trust.as_ref(), cwd) {
+        if let Err(w) = seed_workspace_trust(trust, dir) {
+            warnings.push(w.0);
+        }
+    }
+
     let created = herdr.tab_create(workspace_id, cwd).await?;
     let pane_id = pane_of_tab(herdr, &created.tab_id).await?.ok_or_else(|| {
         HerdrError::TabPaneUnresolved {
@@ -383,6 +437,23 @@ pub async fn start_agent_in_new_tab(
     // unreachable socket or a refusal from the agent itself must surface at
     // once. And when the attempts run out, herdr's own last words come back:
     // never a summary, and never another pane.
+    // D6, bee's own rules: one export line before the agent starts, keys
+    // `[A-Za-z_][A-Za-z0-9_]*` and newline-free values, a violating entry
+    // dropped while the rest still go (the registry's fail-open-per-entry
+    // rule). A failed SEND is fatal, unlike a dropped entry.
+    let exports: Vec<String> = entry
+        .env
+        .iter()
+        .filter(|(k, v)| is_env_key(k) && !v.contains('\n'))
+        .map(|(k, v)| format!("export {k}='{}'", v.replace('\'', "'\\''")))
+        .collect();
+    if !exports.is_empty() {
+        herdr
+            .send_input(&pane_id, &exports.join("; "), true)
+            .await?;
+    }
+
+    let argv = &entry.argv;
     let mut attempt = 0;
     loop {
         match herdr.agent_start(&pane_id, argv).await {
@@ -390,9 +461,18 @@ pub async fn start_agent_in_new_tab(
                 attempt += 1;
                 tokio::time::sleep(PANE_READY_INTERVAL).await;
             }
-            other => return other,
+            Err(e) => return Err(e),
+            Ok(started) => return Ok(SpawnOutcome { started, warnings }),
         }
     }
+}
+
+/// bee's environment-key rule: `[A-Za-z_][A-Za-z0-9_]*`. A key outside it
+/// drops its own entry and nothing else.
+fn is_env_key(k: &str) -> bool {
+    let mut chars = k.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// How many times [`start_agent_in_new_tab`] will re-offer a freshly created
@@ -422,6 +502,126 @@ pub async fn pane_of_tab(herdr: &dyn Herdr, tab_id: &str) -> Result<Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D9, and it is the load-bearing one: fail-open must not mean fail-quiet.
+    /// The seeding fails, the agent still starts — and the answer that says so
+    /// also says the trust could not be seeded. Asserted on the returned
+    /// value, never on a log line, because a warning only in the daemon's log
+    /// is indistinguishable from no warning at the moment an operator is
+    /// looking at a pane that will not move.
+    #[tokio::test]
+    async fn a_failed_seeding_does_not_stop_the_spawn_and_does_not_go_quiet() {
+        let h = FlakyPane::refusing(0);
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["agy".to_string()],
+            env: Vec::new(),
+            workspace_trust: Some(waggledance_core::bee::BeeWorkspaceTrust {
+                file: "/definitely/not/here/settings.json".to_string(),
+                key: "trustedWorkspaces".to_string(),
+            }),
+        };
+
+        let outcome = start_declared_agent(&h, "w1", Some("/projects/beehive"), &entry)
+            .await
+            .expect("a trust failure must not stop the spawn");
+
+        assert_eq!(outcome.started.pane_id, "w1:new");
+        assert_eq!(
+            outcome.warnings.len(),
+            1,
+            "the failure must travel back with the answer: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome.warnings[0].contains("trust store"),
+            "the warning must say what could not be done: {}",
+            outcome.warnings[0]
+        );
+    }
+
+    /// D3's audit tie: the directory offered to the trust store is the one the
+    /// caller passed — the destination it already validated — and nothing
+    /// else. Proved by seeding a real temp store and reading back exactly what
+    /// arrived in it.
+    #[tokio::test]
+    async fn the_directory_seeded_is_the_one_the_caller_validated() {
+        let dir = std::env::temp_dir().join(format!("wd-tie-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("settings.json");
+        std::fs::write(&store, r#"{"trustedWorkspaces": []}"#).unwrap();
+
+        let h = FlakyPane::refusing(0);
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["agy".to_string()],
+            env: Vec::new(),
+            workspace_trust: Some(waggledance_core::bee::BeeWorkspaceTrust {
+                file: store.to_string_lossy().into_owned(),
+                key: "trustedWorkspaces".to_string(),
+            }),
+        };
+
+        let outcome = start_declared_agent(&h, "w1", Some("/projects/beehive"), &entry)
+            .await
+            .unwrap();
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+        assert_eq!(
+            doc["trustedWorkspaces"],
+            serde_json::json!(["/projects/beehive"]),
+            "exactly the caller's directory, and nothing else"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D6: env is exported before the agent starts, and bee's key rule drops a
+    /// violating entry while the rest still go — fail-open per entry, not per
+    /// declaration.
+    #[tokio::test]
+    async fn env_is_exported_before_the_agent_starts_and_a_bad_key_drops_only_itself() {
+        let h = FlakyPane::refusing(0);
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["agy".to_string()],
+            env: vec![
+                ("GOOD_KEY".to_string(), "yes".to_string()),
+                ("bad key".to_string(), "dropped".to_string()),
+                ("ALSO_GOOD".to_string(), "kept".to_string()),
+            ],
+            workspace_trust: None,
+        };
+
+        start_declared_agent(&h, "w1", None, &entry).await.unwrap();
+
+        let sent = h.inputs.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one export line, before the agent: {sent:?}");
+        assert!(sent[0].contains("export GOOD_KEY='yes'"), "{}", sent[0]);
+        assert!(sent[0].contains("export ALSO_GOOD='kept'"), "{}", sent[0]);
+        assert!(
+            !sent[0].contains("bad key"),
+            "a key outside bee's rule drops its own entry only: {}",
+            sent[0]
+        );
+    }
+
+    /// An entry with no conditions costs nothing extra — no store touched, no
+    /// line sent. The common case must not pay for the rare one.
+    #[tokio::test]
+    async fn an_entry_with_no_conditions_sends_nothing_extra() {
+        let h = FlakyPane::refusing(0);
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["claude".to_string()],
+            env: Vec::new(),
+            workspace_trust: None,
+        };
+
+        start_declared_agent(&h, "w1", Some("/projects/beehive"), &entry)
+            .await
+            .unwrap();
+
+        assert!(h.inputs.lock().unwrap().is_empty(), "no export line");
+    }
 
     fn trust_file(tag: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("wd-trust-{tag}-{}", std::process::id()));
@@ -533,6 +733,7 @@ mod tests {
         other_error: Option<&'static str>,
         starts: std::sync::Mutex<u32>,
         snapshots: std::sync::Mutex<u32>,
+        inputs: std::sync::Mutex<Vec<String>>,
     }
 
     impl FlakyPane {
@@ -542,6 +743,7 @@ mod tests {
                 other_error: None,
                 starts: std::sync::Mutex::new(0),
                 snapshots: std::sync::Mutex::new(0),
+                inputs: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -551,6 +753,7 @@ mod tests {
                 other_error: Some(code),
                 starts: std::sync::Mutex::new(0),
                 snapshots: std::sync::Mutex::new(0),
+                inputs: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -576,8 +779,9 @@ mod tests {
         async fn read_pane(&self, _: &str, _: ReadSource, _: usize) -> Result<ScreenRead> {
             unreachable!()
         }
-        async fn send_input(&self, _: &str, _: &str, _: bool) -> Result<()> {
-            unreachable!()
+        async fn send_input(&self, _: &str, text: &str, _: bool) -> Result<()> {
+            self.inputs.lock().unwrap().push(text.to_string());
+            Ok(())
         }
         async fn send_text(&self, _: &str, _: &str) -> Result<()> {
             unreachable!()
