@@ -2115,6 +2115,35 @@ pub fn herding_argv_for_label(root: &Path, label: &str) -> Option<Vec<String>> {
     herding_entry_for_label(root, label).map(|e| e.argv)
 }
 
+/// The whole entry a project's `herding.agent_command` names — the board's
+/// resolver, and the entry-shaped sibling of [`herding_agent_argv`]
+/// (board-entry-conditions D1).
+///
+/// An **array** `agent_command` is an inline command: it names no label, so it
+/// declares nothing around itself and yields an entry with no conditions (D2).
+/// A **string** resolves through [`herding_entry_for_label`] and keeps whatever
+/// that entry declares — an `env` map, a trust store, or neither.
+///
+/// This exists because the board and the dispatch path must honour the same
+/// declaration. Resolving only the argv here, as the board used to, meant one
+/// `herding.agents` entry behaved differently depending on which button
+/// started it: `env` unset and a trust prompt waiting, on a path where nobody
+/// asked for anything different.
+pub fn herding_default_entry(root: &Path) -> Option<BeeHerdingEntry> {
+    let raw = fs::read_to_string(root.join(".bee").join("config.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let herding = value.get("herding")?;
+    match herding.get("agent_command")? {
+        Value::Array(tokens) => Some(BeeHerdingEntry {
+            argv: argv_tokens(tokens)?,
+            env: Vec::new(),
+            workspace_trust: None,
+        }),
+        Value::String(label) => herding_entry_for_label_from_config(&value, label),
+        _ => None,
+    }
+}
+
 /// Everything a project declares about ONE agent kind: the command, and the
 /// conditions bee applies around it (herding-entry-conditions D1).
 ///
@@ -8643,6 +8672,86 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// board-entry-conditions D1: the board's own resolver reads the whole
+    /// declaration, so an `agent_command` naming a conditioned label carries
+    /// those conditions to the spawn. Before this, one entry behaved
+    /// differently depending on which button started it — `env` unset and a
+    /// trust prompt waiting, on a path where nobody asked for anything else.
+    #[test]
+    fn the_default_entry_keeps_the_conditions_of_the_label_it_names() {
+        let root = fresh_root("board-default-entry");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agent_command": "agy-flash",
+                    "agents": {
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "env": {"AGY_MODE": "flash"},
+                            "workspace_trust": {
+                                "file": "~/.gemini/antigravity-cli/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let entry = herding_default_entry(&root).expect("a named label resolves");
+        assert_eq!(entry.argv, vec!["agy", "--dangerously-skip-permissions"]);
+        assert_eq!(
+            entry.env,
+            vec![("AGY_MODE".to_string(), "flash".to_string())]
+        );
+        assert!(entry.workspace_trust.is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D2: an inline command names no label, so it declares nothing around
+    /// itself — and that path must stay exactly as cheap as it was.
+    #[test]
+    fn an_inline_default_command_carries_no_conditions() {
+        let root = fresh_root("board-default-inline");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{"herding": {"agent_command": ["codex", "--full-auto"]}}"#,
+        );
+
+        let entry = herding_default_entry(&root).expect("an inline command resolves");
+        assert_eq!(entry.argv, vec!["codex", "--full-auto"]);
+        assert!(entry.env.is_empty());
+        assert!(entry.workspace_trust.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every way a project declares no default answers the same `None`, so the
+    /// board keeps its one named refusal instead of guessing at a command.
+    #[test]
+    fn a_project_with_no_declared_default_yields_no_entry() {
+        let bare = fresh_root("board-default-none");
+        assert!(herding_default_entry(&bare).is_none(), "no config.json");
+
+        let root = fresh_root("board-default-empty");
+        for body in [
+            r#"{"gate_bypass": false}"#,
+            r#"{"herding": {"agents": {"a": ["x"]}}}"#,
+            r#"{"herding": {"agent_command": "missing", "agents": {"a": ["x"]}}}"#,
+            r#"{"herding": {"agent_command": []}}"#,
+        ] {
+            write(&root, ".bee/config.json", body);
+            assert!(herding_default_entry(&root).is_none(), "{body}");
+        }
+
+        std::fs::remove_dir_all(&bare).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 
