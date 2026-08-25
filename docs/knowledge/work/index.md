@@ -42,6 +42,7 @@ never a generation timestamp or any other wall-clock value.
 - [ctrl-c-key/](ctrl-c-key/index.md) — 1 concept(s)
 - [detail-desc-wrap/](detail-desc-wrap/index.md) — 1 concept(s)
 - [dispatch-blocked-notify/](dispatch-blocked-notify/index.md) — 1 concept(s)
+- [dispatch-project-presets/](dispatch-project-presets/index.md) — 1 concept(s)
 - [doctor-preserve-order/](doctor-preserve-order/index.md) — 1 concept(s)
 - [feature-hub/](feature-hub/index.md) — 1 concept(s)
 - [feature-titles/](feature-titles/index.md) — 1 concept(s)
