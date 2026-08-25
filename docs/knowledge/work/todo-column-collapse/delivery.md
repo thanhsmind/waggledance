@@ -51,8 +51,9 @@ the pairing that carries the whole point of the feature: Todo ships closed while
 still stating its true count. The four unfolded columns are asserted to keep
 their previous shape.
 
-Not yet confirmed against a running daemon — the recorded next step is a daemon
-restart to see the folded column on the live board.
+Accepted by the owner at the uat gate on 2026-08-25. That acceptance is the
+owner's own; this record does not claim a separate observation of the live board
+by the agent.
 
 ## Deviations
 
