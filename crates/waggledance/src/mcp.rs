@@ -214,7 +214,16 @@ fn ask_state_schema() -> Value {
         "description": "Ask waggledance for a project's parsed bee state (active feature, \
     phase, open/blocked cells, recent decisions, sessions, handoff, attention) \
     without reading any .bee file yourself. Omit `project` to get a rollup across \
-    every registered project.",
+    every registered project. Two fields describe the fleet rather than the store: \
+    `herding` names the agent kinds this project offers — {default, agents, resolvable} \
+    as LABELS, never the argv behind them, and a label listed in `agents` but absent \
+    from `resolvable` is one that will not start today; `panes` is the project's own \
+    live pane inventory (pane_id, kind, status, bee_state, bee_feature, workspace, tab), \
+    which is how you find an idle pane to reuse instead of spawning a new one. `panes` \
+    is ABSENT when the terminal surface is switched off, `null` beside a `panes_error` \
+    reason when herdr cannot be read — the bee state is complete either way — and an \
+    array otherwise. Seeing a pane grants nothing: dispatching still requires the \
+    project's own orchestration opt-in.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1153,6 +1162,31 @@ mod tests {
         let pa = engine.register(&dir_a, None).unwrap();
         let pb = engine.register(&dir_b, None).unwrap();
         (engine, pa, pb)
+    }
+
+    #[test]
+    /// A published field nobody can discover is not published: an agent
+    /// learns what `ask_state` answers with from this description and
+    /// nowhere else. Pinned so a later trim cannot quietly drop the two
+    /// fleet fields back out of the contract while the payload still
+    /// carries them.
+    #[test]
+    fn ask_state_description_names_both_fleet_fields_and_the_absent_panes_case() {
+        let description = ask_state_schema()["description"]
+            .as_str()
+            .expect("the tool carries a description")
+            .to_string();
+
+        for promised in ["herding", "resolvable", "panes", "panes_error"] {
+            assert!(
+                description.contains(promised),
+                "{promised:?} is answered but never described: {description}"
+            );
+        }
+        assert!(
+            description.contains("ABSENT"),
+            "the terminal-off case is the one a caller gets wrong by guessing: {description}"
+        );
     }
 
     #[test]
