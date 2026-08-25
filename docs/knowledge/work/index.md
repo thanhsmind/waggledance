@@ -75,6 +75,7 @@ never a generation timestamp or any other wall-clock value.
 - [scroll-keep-position/](scroll-keep-position/index.md) — 1 concept(s)
 - [settle-test-gaps/](settle-test-gaps/index.md) — 1 concept(s)
 - [shell-input-newline/](shell-input-newline/index.md) — 1 concept(s)
+- [spawn-destination-fallback/](spawn-destination-fallback/index.md) — 1 concept(s)
 - [status-wildcard-host/](status-wildcard-host/index.md) — 1 concept(s)
 - [tabbar-collapse/](tabbar-collapse/index.md) — 1 concept(s)
 - [term-frame-blocks/](term-frame-blocks/index.md) — 1 concept(s)
