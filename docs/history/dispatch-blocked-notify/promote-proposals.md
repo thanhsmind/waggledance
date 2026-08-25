@@ -95,3 +95,20 @@ Switch wiring stands; the end-to-end link it claimed shipped as dbn-4, and merge
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 5 capped cell(s) mined, 1 delivery draft, 10 area bullet(s), 1 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed against the spec
+
+Reviewed in the sweep of the unapplied-proposal backlog. The generated bullets
+are each cell's outcome in implementation vocabulary, which a spec never carries
+outside its Pointers, so each was checked as behaviour rather than pasted in.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/dispatch-blocked-notify/delivery.md`
+  already exists as a curated record.
+- **(b) Area updates** — **merged into `docs/specs/agent-terminal.md`** as what a dispatched run adds to the notification duty: one alert per run per human-blocking state, raised from the single place the transition is recorded, naming project, pane and run and nothing else, with the older pane-status alert suppressed while a run owns that pane, and armed by the same opt-in switch.
+- **(c) Pattern candidates** — none promoted from here.
+
+<!-- /bee:not-a-deferral -->

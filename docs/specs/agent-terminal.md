@@ -1,7 +1,7 @@
 ---
 area: agent-terminal
 updated: 2026-08-25
-sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact, herdr-protocol-20, terminal-image-attach, terminal-button-surface, unassigned-poller-guard, scroll-keep-position, terminal-scroll-perf, scroll-fab, term-frame-blocks, bundle-mono-font, terminal-pane-scope, home-terminal-header, pane-bar-mobile-menu, screen-revision]
+sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact, herdr-protocol-20, herding-entry-conditions, terminal-image-attach, terminal-button-surface, unassigned-poller-guard, scroll-keep-position, terminal-scroll-perf, scroll-fab, term-frame-blocks, bundle-mono-font, terminal-pane-scope, home-terminal-header, pane-bar-mobile-menu, screen-revision]
 decisions: [D1, D2, D3, D4, D5, D6, D7, D8, D9, D10]
 coverage: partial
 ---
@@ -298,10 +298,35 @@ implementation. Code entry points are listed in `reading-map.md`.
   declining) surfaces on the first attempt and is never retried. When the
   waiting runs out, the operator is shown the host's own last words rather
   than a rewritten message.
+- **What a project declares about an agent is honoured, not just its
+  command.** A project's own record of an agent kind may carry more than the
+  program to run: environment the agent should inherit, and a note that the
+  tool keeps a per-workspace trust list of its own. Both are applied before
+  the agent runs — the environment is set in the session it will occupy, and
+  the workspace is added to that tool's trust list — because an agent started
+  without them either runs as a different program than the one declared, or
+  stops at a trust question the operator never sees.
+- **What is never done to a trust list.** Only the one folder the agent is
+  about to start in is added, and only after that folder has been proven to
+  belong to this project. Nothing is ever removed, no other setting is
+  rewritten, and a folder already trusted is left exactly as it is — starting
+  an agent is not an occasion to edit somebody's settings.
+- **A trust list that cannot be updated does not stop the agent, and does not
+  go quiet.** The agent starts anyway, and the same answer that reports it
+  started also reports that the trust could not be set. Refusing instead would
+  strand every agent whose tool keeps such a list; staying silent would be
+  worse than either, because the operator would then meet a session that
+  simply sits there with nothing to attribute it to. Environment is the
+  opposite case and deliberately so: if it cannot be set, the start fails,
+  since an agent running without its declared environment is not the agent
+  that was asked for.
 - **Blocked when:** no such destination can be found under this project's
   boundary, the named preset is not one an operator configured, or the
   underlying start attempt itself fails — each of these is refused
-  distinctly, with nothing started in any case.
+  distinctly, with nothing started in any case. A named agent that the project
+  declares but that carries no runnable command is refused as that, and never
+  as an unknown name: the name exists, so calling it unknown sends the reader
+  looking for a spelling mistake that is not there.
 - **Where each control appears:** the project terminal page offers both the
   presets and the plain shell; the homepage's Terminals tab offers the
   presets only — no plain-shell control there. When a surface would show no
@@ -537,6 +562,15 @@ authentication, and each still holds:
   keeps waggledance silent about panes another operator's run owns reaches
   these messages too, on the session's own pane when it has one. A project
   registered while the daemon is already running is picked up on the next tick.
+- **What a dispatched run adds to that duty:** a run started through the agent-facing
+  tool surface raises its own alert the moment it reaches a state only a person can
+  clear. It is raised exactly once per run per state, from the single place that
+  transition is already recorded, so a retry or a second reader cannot double it,
+  and the message names the project, the pane and the run and nothing else. While a
+  dispatched run owns a pane, the older pane-status alert for that pane stays
+  silent — one event reaches the person once, not twice from two duties. The alert
+  is armed and disarmed by this same switch, so an installation that never turned
+  notification on stays as silent about dispatched runs as about everything else.
 - Both duties, together with the notification destination and credential,
   are switched on and changed from the settings page, the same as every
   other setting on that same page (see Actors & Access) — no separate

@@ -51,3 +51,20 @@ area system-overview:
 None: no capped cell trace carries a deviation or a failure signature.
 
 knowledge promote: 2 capped cell(s) mined, 1 delivery draft, 1 area bullet(s), 0 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed against the spec
+
+Reviewed in the sweep of the unapplied-proposal backlog. The generated bullets
+are each cell's outcome in implementation vocabulary, which a spec never carries
+outside its Pointers, so each was checked as behaviour rather than pasted in.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/backlog-groom-1/delivery.md`
+  already exists as a curated record.
+- **(b) Area updates** — already stated in `docs/specs/system-overview.md`: the live-reload signal fires only when a reindexed file's content actually changed. The other cell added a test, which is proof rather than behaviour.
+- **(c) Pattern candidates** — none promoted from here.
+
+<!-- /bee:not-a-deferral -->

@@ -147,3 +147,24 @@ Cockpit spec now describes the handset shell, bottom bar, stat figures and stack
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 3 capped cell(s) mined, 1 delivery draft, 2 area bullet(s), 3 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, the spec already records this feature
+
+Reviewed in the sweep of the unapplied-proposal backlog.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/console-phone-layout/delivery.md`
+  already exists as a curated record.
+- **(b) Area updates** — not applied. `docs/specs/bee-cockpit.md` names `console-phone-layout` in its own
+  `sources`, which is the receipt that this feature's behaviour was merged into
+  the spec when it closed. The generated bullets restate the same work in
+  implementation vocabulary — function and type names — which a spec carries only
+  in its Pointers, so applying them would add nothing the spec does not say and
+  would break its vocabulary rule. This resolution rests on that receipt and on
+  the spec owning the area, not on a line-by-line re-reading of every bullet.
+- **(c) Pattern candidates** — none promoted from here.
+
+<!-- /bee:not-a-deferral -->

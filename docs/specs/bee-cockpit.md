@@ -44,14 +44,15 @@ never rendered as an empty dashboard.
 
 A qualifying project gains an entry point on its home page leading to its board.
 
-The home page carries two of these surfaces rather than stacking them: a strip at
-its top offers the cross-project board and the list of registered projects, and only
-the chosen one is built, so the page never pays to render the half nobody asked for.
-Each choice is a real address of its own — copying the address shares the surface it
-was on, the browser's back button steps between them, and the choice survives the
-page reloading itself. The strip is always present, including when the chosen
-surface has nothing to show, so an empty board never strands the reader with no way
-to reach the other one.
+The home page's surfaces are chosen by a strip at its top, and each choice is a
+real address of its own — copying the address shares the surface it was on, the
+browser's back button steps between them, and the choice survives the page
+reloading itself. Only the chosen surface is built, so the page never pays to
+render the one nobody asked for. The strip is always present, including when the
+chosen surface has nothing to show, so an empty board never strands the reader
+with no way to reach another. The registered-project list is *not* one of these
+choices: it sits in the rail beside the board rather than behind a choice of its
+own (see `web-interface.md`, which owns those rows).
 
 On a wide desktop screen the board pages — the home board and a project's own
 bee board — span the full width of the window instead of stopping at the reading

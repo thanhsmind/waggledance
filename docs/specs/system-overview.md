@@ -18,6 +18,12 @@ Agent terminal spec.
 
 ## Core invariant
 
+The data directory is `~/.waggledance`. An installation carrying the directory the
+project used under its former name is migrated into it once, by whichever process
+resolves the path first; a racing process that finds the old directory already gone
+treats that as success rather than as an error. The attach cache is deliberately not
+migrated — nothing in it outlives a session.
+
 **At most one daemon** owns the registry (`~/.waggledance/registry.db`). Every
 launcher — CLI, MCP, future desktop — coordinates through `~/.waggledance/daemon.lock`
 (pid + port). No second server ever writes the same registry.

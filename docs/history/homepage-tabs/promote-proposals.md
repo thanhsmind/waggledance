@@ -67,7 +67,7 @@ bullet against what the spec already states rather than pasting it in.
 - **(b) Area updates** — the generated bullets are each cell's outcome in
   implementation vocabulary (function and type names), which a spec never carries
   outside its Pointers section, so none was applied as written. What the reader
-  actually gained: **merged into `docs/specs/bee-cockpit.md`** — merged into "Where it appears": the home page offers the board and the project list as two addressable surfaces, only the chosen one is built, and the strip survives an empty surface.
+  actually gained: **merged into `docs/specs/bee-cockpit.md`** — **partly merged, and partly retired.** What survives is stated in `docs/specs/bee-cockpit.md` under "Where it appears": the home page's surfaces are chosen by an always-present strip, each choice is a real address, and only the chosen one is built. What this feature originally shipped — *Kanban* and *Projects* as the two choices — no longer ships: checked against the running board on 2026-08-25, the home page renders the cross-project board and the registered-project list together (the list is in the rail), and the strip's choices are the board and the terminals surface. `docs/specs/web-interface.md` already records that there is no longer a separate Projects tab. The spec states the surviving rule and names where the project list actually lives, rather than the shape this feature shipped.
 - **(c) Pattern candidates** — none proposed for this feature.
 
 <!-- /bee:not-a-deferral -->
