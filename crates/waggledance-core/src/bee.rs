@@ -2089,14 +2089,41 @@ pub fn herding_agent_argv(root: &Path) -> Option<Vec<String>> {
 fn herding_agent_argv_from_config(config: &Value) -> Option<Vec<String>> {
     let herding = config.get("herding")?;
     match herding.get("agent_command")? {
+        // An inline argv names no label; it IS the command.
         Value::Array(tokens) => argv_tokens(tokens),
-        Value::String(name) => {
-            let agents = herding.get("agents")?;
-            match agents.get(name.as_str())? {
-                Value::Array(tokens) => argv_tokens(tokens),
-                _ => None,
-            }
-        }
+        Value::String(label) => herding_argv_for_label_from_config(config, label),
+        _ => None,
+    }
+}
+
+/// The argv a project declares for ONE named agent kind, or `None` when this
+/// reader cannot build one for that label (dispatch-project-presets D2).
+///
+/// This is the single answer to "can this label start?" — the one
+/// [`herding_agent_argv_from_config`] resolves its default through, the one
+/// [`herding_registry_from_config`] marks `resolvable` with, and the one a
+/// dispatch caller's label is resolved by (D6). Kept as one implementation
+/// because two would agree on the day they were written and drift after: the
+/// drift's shape is a tool that publishes a label as usable and then refuses
+/// it, which is worse than either answer alone.
+///
+/// `None` covers every way a label yields no command: no `herding` block, no
+/// `agents` map, no entry under that label, an entry in a shape this reader
+/// does not understand (bee's own `{argv, workspace_trust}` object form), or
+/// an argv that is empty or holds a non-string token. The caller refuses —
+/// resolving a label to the label itself would run `claude-sonnet` as a
+/// command.
+pub fn herding_argv_for_label(root: &Path, label: &str) -> Option<Vec<String>> {
+    let raw = fs::read_to_string(root.join(".bee").join("config.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    herding_argv_for_label_from_config(&value, label)
+}
+
+/// [`herding_argv_for_label`]'s pure half, over an already-parsed
+/// `.bee/config.json`.
+fn herding_argv_for_label_from_config(config: &Value, label: &str) -> Option<Vec<String>> {
+    match config.get("herding")?.get("agents")?.get(label)? {
+        Value::Array(tokens) => argv_tokens(tokens),
         _ => None,
     }
 }
@@ -2120,12 +2147,13 @@ fn herding_registry_from_config(config: &Value) -> Option<BeeHerdingRegistry> {
     let mut agents = Vec::new();
     let mut resolvable = Vec::new();
     if let Some(Value::Object(entries)) = herding.get("agents") {
-        for (label, entry) in entries {
+        for label in entries.keys() {
             agents.push(label.clone());
-            // Resolvability is asked of the argv reader's own rule, never
+            // Resolvability is asked of the argv resolver itself, never
             // re-implemented here — a second copy would be free to drift
-            // into claiming a label works when the spawn path refuses it.
-            if matches!(entry, Value::Array(tokens) if argv_tokens(tokens).is_some()) {
+            // into claiming a label works when the spawn path refuses it
+            // (dispatch-project-presets D6).
+            if herding_argv_for_label_from_config(config, label).is_some() {
                 resolvable.push(label.clone());
             }
         }
@@ -8315,6 +8343,94 @@ mod tests {
                 .is_none(),
             "a config with no herding block must report no registry"
         );
+
+        std::fs::remove_dir_all(&bare).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// dispatch-project-presets D2/D6: the by-label resolver is the one
+    /// answer to "can this label start?". It resolves an array entry, and
+    /// refuses every other shape — including bee's own object form, which is
+    /// the case that matters, because a label that EXISTS but cannot start is
+    /// the one a caller would otherwise be told is a typo.
+    #[test]
+    fn a_label_resolves_only_when_its_entry_is_an_argv_this_reader_understands() {
+        let root = fresh_root("herding-by-label");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agent_command": "claude-sonnet",
+                    "agents": {
+                        "claude-sonnet": ["claude", "--model", "sonnet"],
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "workspace_trust": {"file": "~/.gemini/settings.json"}
+                        },
+                        "empty": [],
+                        "holed": ["claude", 7]
+                    }
+                }
+            }"#,
+        );
+
+        assert_eq!(
+            herding_argv_for_label(&root, "claude-sonnet"),
+            Some(vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string()
+            ])
+        );
+        for (case, label) in [
+            ("bee's object form", "agy-flash"),
+            ("an empty argv", "empty"),
+            ("an argv with a non-string token", "holed"),
+            ("a label absent from the map", "no-such-agent"),
+        ] {
+            assert_eq!(
+                herding_argv_for_label(&root, label),
+                None,
+                "{case} must resolve to nothing"
+            );
+        }
+
+        // The registry publishes exactly what this resolver accepts — one
+        // predicate, so `resolvable` can never advertise a label dispatch
+        // would then refuse (D6).
+        let registry = read_snapshot(&root)
+            .config
+            .and_then(|c| c.herding)
+            .expect("a herding block yields a registry");
+        assert_eq!(registry.resolvable, vec!["claude-sonnet"]);
+        for label in &registry.agents {
+            assert_eq!(
+                herding_argv_for_label(&root, label).is_some(),
+                registry.resolvable.contains(label),
+                "registry and resolver disagree about {label:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A store with no `herding` block, and one with no `agents` map, each
+    /// answer `None` for any label rather than failing differently — the
+    /// caller has one refusal to write, not three.
+    #[test]
+    fn a_label_resolves_to_nothing_when_the_store_declares_no_registry() {
+        let bare = fresh_root("herding-by-label-none");
+        assert_eq!(herding_argv_for_label(&bare, "claude-sonnet"), None);
+
+        let root = fresh_root("herding-by-label-no-agents");
+        for body in [
+            r#"{"gate_bypass": false}"#,
+            r#"{"herding": {"agent_command": ["codex", "--full-auto"]}}"#,
+        ] {
+            write(&root, ".bee/config.json", body);
+            assert_eq!(herding_argv_for_label(&root, "claude-sonnet"), None);
+        }
 
         std::fs::remove_dir_all(&bare).ok();
         std::fs::remove_dir_all(&root).ok();
