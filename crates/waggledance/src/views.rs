@@ -930,23 +930,6 @@ fn pane_mark_tone_class(tone: &str) -> &'static str {
     }
 }
 
-/// [`pane_program_mark`] where the mark is recognition only, not the name:
-/// the Agents drawer (drawer-agent-mark). A drawer row already prints its
-/// state in words and labels its own status dot, so the mark is read by the
-/// eye and skipped by a screen reader -- the hover title still gives a mouse
-/// the program's name. `tone` is the row's own already-computed
-/// [`pane_tone`], passed in rather than re-derived so the mark and the dot
-/// beside it can never disagree about what state they are drawing.
-fn pane_program_mark_decorative(kind: &str, tone: &str) -> String {
-    let (_, mark) = bee_hub_agent_logo(kind);
-    format!(
-        r#"<span class="pane-mark{tone_class}" title="{label}">{svg}</span>"#,
-        tone_class = pane_mark_tone_class(tone),
-        label = esc(kind),
-        svg = bee_hub_agent_mark_svg_sized(mark, 12, "pane-mark__svg", None),
-    )
-}
-
 /// The state glyph a hub card's title leads with, keyed by the column the
 /// card sits in. Decorative: the column header already names the state,
 /// so the glyph is `aria-hidden` and carries no text alternative.
@@ -1120,7 +1103,7 @@ fn project_sidebar(
                 branches.push_str(&format!(
                     r#"<li class="proj-row proj-row--branch">
   <a class="proj-row__link" href="/p/{id}/">
-    {dot}<span class="proj-row__name">{label}</span>
+    <span class="proj-row__name">{label}</span>
     {meta}
   </a>
   {badges}
@@ -1131,7 +1114,6 @@ fn project_sidebar(
                     meta = proj_row_meta(*bcount, &bp.last_seen_at),
                     badges = project_badges(&bp.id, bpanes),
                     row_menu = proj_row_menu(&bp.id, &bp.name),
-                    dot = project_row_dot(bpanes),
                 ));
             }
             // A project with nothing branching off it emits no branch list
@@ -1162,7 +1144,7 @@ fn project_sidebar(
                 r#"<li class="proj-row proj-group__row">
   <details class="proj-group" open data-project-id="{id}">
     <summary class="proj-group__summary">
-      <a class="proj-row__link" href="/p/{id}/">{folder}{dot}<span class="proj-row__name">{label}</span></a>
+      <a class="proj-row__link" href="/p/{id}/">{folder}<span class="proj-row__name">{label}</span></a>
       {row_menu}
     </summary>
     <div class="proj-group__body">
@@ -1175,7 +1157,6 @@ fn project_sidebar(
                 id = esc(&p.id),
                 label = esc(&p.name),
                 folder = RAIL_ICON_FOLDER,
-                dot = project_row_dot(panes),
                 row_menu = proj_row_menu(&p.id, &p.name),
                 meta = proj_row_meta(*count, &p.last_seen_at),
                 badges = project_badges(&p.id, panes),
@@ -1327,12 +1308,6 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
         let mut rows = String::new();
         for pane in panes {
             let on = selected == Some(pane.view.pane_id.as_str());
-            // The same three tones [`project_row_dot`] maps a project's
-            // whole pane set onto, applied to this one pane: blocked and
-            // working name themselves, everything else (idle, done,
-            // unknown) reads quiet rather than borrowing another state's
-            // colour.
-            let tone = pane_tone(&pane.view);
             // A6: a row of a pane a live bee session claims says that
             // session's own state word (at the right end of line one) and
             // the feature lane it is bound to (all of line two). Absent
@@ -1369,7 +1344,7 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
             rows.push_str(&format!(
                 r#"<li class="pinned-row">
   <a class="pinned-row__link{on_class}" href="{href}"{aria}>
-    {mark}<span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" role="img" aria-label="{status}"></span><span class="pinned-row__head"><span class="pinned-row__name">{label}</span> <span class="pinned-row__meta">{meta}</span></span>{bee_state_html}{bee_feature_html}
+    {mark}<span class="pinned-row__head"><span class="pinned-row__name">{label}</span> <span class="pinned-row__meta">{meta}</span></span>{bee_state_html}{bee_feature_html}
   </a>
 </li>"#,
                 on_class = if on { " pinned-row__link--on" } else { "" },
@@ -1377,19 +1352,15 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
                 aria = if on { r#" aria-current="page""# } else { "" },
                 // drawer-agent-mark: the drawer reads like the board's own
                 // terminal badges -- mark first, then state -- so the same
-                // agent is recognised the same way in both places. Here the
-                // mark stays decorative: unlike a badge, this row prints its
-                // state in words and its dot already carries a label, so a
-                // second spoken name would only be repetition.
-                mark = pane_program_mark_decorative(&pane.view.kind, tone),
-                tone = tone,
-                // Unlike a project row — which prints its statuses as
-                // `status_pill` words on its own next line, letting its dot
-                // be purely decorative — an agent row prints no status
-                // words of its own anywhere. So the dot carries its text
-                // alternative rather than being `aria-hidden`: the status
-                // is never spoken by colour alone.
-                status = esc(pane_status_word(&pane.view)),
+                // agent is recognised the same way in both places.
+                // dots-off-marks-on: the mark is READABLE here, not
+                // decorative. The dot that used to stand beside it carried
+                // this row's only text alternative (a row whose pane has no
+                // bee record prints no state word at all), so when the dot
+                // went the name had to go somewhere -- and it went where
+                // every other markless surface already keeps it, in the
+                // mark's own `title` and `aria-label`.
+                mark = pane_program_mark_stateful(&pane.view),
                 label = esc(&pane.project_label),
                 meta = meta,
                 bee_state_html = bee_state_html,
@@ -1500,43 +1471,6 @@ fn proj_row_menu(id: &str, name: &str) -> String {
   </details>"#,
         id = esc(id),
         name = esc(name),
-    )
-}
-
-/// console-theme-kanban (ctk-12): the digest's status dot on a rail row.
-/// It is the design system's own `.fg-status__dot` rather than a second dot
-/// vocabulary declared beside it — that component already ships the size,
-/// the pill radius, the status glow and the three tone colours this needs,
-/// so the rail contributes only the tone class and the alignment.
-///
-/// Colour never carries the meaning on its own: the dot is `aria-hidden`,
-/// and the words it summarises are the [`project_badges`] pills the same
-/// row renders on its next line, each one a [`status_pill`] printing its
-/// status as text. A row with no agent pane renders neither the dot nor the
-/// pills, so the two can never disagree.
-fn project_row_dot(panes: &[TerminalPaneView]) -> String {
-    // The same `kind != "shell"` filter the badges themselves apply: a
-    // plain shell is not an agent, and a dot for one would claim work that
-    // is not happening.
-    let agents: Vec<&TerminalPaneView> = panes.iter().filter(|p| p.kind != "shell").collect();
-    if agents.is_empty() {
-        return String::new();
-    }
-    // Worst news first, the same precedence the board's own In Progress
-    // ordering uses: blocked outranks working, which outranks quiet.
-    // A3: bee's own state wins over herdr's screen-derived status for any
-    // pane a live bee session claims — [`pane_tone`] is that one precedence,
-    // and the pills on the row's next line say the same words through
-    // [`pane_status_pill`], so dot and words still cannot disagree.
-    let tone = if agents.iter().any(|p| pane_tone(p) == "blocked") {
-        "blocked"
-    } else if agents.iter().any(|p| pane_tone(p) == "working") {
-        "working"
-    } else {
-        "idle"
-    };
-    format!(
-        r#"<span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" aria-hidden="true"></span>"#
     )
 }
 
@@ -2300,7 +2234,7 @@ pub type BeeFeatureActivity = std::collections::HashMap<String, Vec<BeeActivityE
 /// A3's precedence, in ONE place: bee's own state wins over herdr's
 /// screen-derived status wherever both exist for a pane. Answers the three
 /// tone keys every status surface here already speaks — the rail dot
-/// ([`project_row_dot`]), the rail agent row, the badge pill ([`status_pill`]),
+/// (the rail agent row's mark), the badge mark, the pill ([`status_pill`]),
 /// the In Progress tier ([`bee_hub_in_progress_tier`]) and
 /// `server.rs::terminals_status_rank` — so none of them can drift from
 /// another. Both need-you states read `blocked` (that is the tone the board
@@ -2598,16 +2532,27 @@ fn status_pill_toned(tone: &str, word: &str) -> String {
     )
 }
 
-/// One pane's status pill under A3's precedence: bee's own state colours
-/// AND names the pill when the session record has one — a `blocked` bee
-/// session reads "needs approval" in the blocked tone even while herdr's
-/// screen scrape still says `idle` — and herdr's status renders exactly as
-/// before when it does not.
+/// One pane's status pill under A3's precedence: bee's own state word when
+/// the session record has one -- a `blocked` bee session reads "needs
+/// approval" even while herdr's screen scrape still says `idle` -- and
+/// herdr's status verbatim when it does not.
+///
+/// dots-off-marks-on: a TERMINAL's pill prints no dot. Every surface that
+/// draws one draws the pane's agent mark right beside it, and that mark now
+/// wears the state's own tone -- so the dot was the second telling of a
+/// colour already on the row. What is left is the word, which is the half
+/// the dot could never carry anyway. [`status_pill`] itself is untouched:
+/// its other callers describe cells and features, not sessions, and have no
+/// mark to lean on.
 fn pane_status_pill(pane: &TerminalPaneView) -> String {
-    match &pane.bee_state {
-        Some(state) => status_pill_toned(pane_tone(pane), state.word()),
-        None => status_pill(&pane.status),
-    }
+    let word = match &pane.bee_state {
+        Some(state) => state.word(),
+        None => pane.status.as_str(),
+    };
+    format!(
+        r#"<span class="fg-status">{status}</span>"#,
+        status = esc(word),
+    )
 }
 
 /// Shared by [`terminal_page`] and [`unassigned_terminal_page`]: one pane's
@@ -10252,48 +10197,38 @@ mod tests {
             pinned_block.find("w1:p1").unwrap() < pinned_block.find("w1:p2").unwrap(),
             "the pinned rows must keep the order server.rs handed them in: {pinned_block}"
         );
-        // Colour-only meaning on a pinned row: the dot names its own status,
-        // since a pinned row has no badge pills to carry the words for it.
+        // dots-off-marks-on: no status dot survives anywhere in the rail.
+        // The claim this test has always made -- status is never spoken by
+        // colour alone -- is unchanged; what carries it moved from the dot
+        // to the agent mark, whose tone IS the colour and whose accessible
+        // name IS the word, on a pinned row and on a project row's badges
+        // alike.
         assert!(
-            on_terminals.contains(
-                r#"<span class="fg-status__dot proj-row__dot proj-row__dot--working" role="img" aria-label="working"></span>"#
-            ),
-            "a pinned row's dot must carry its status as text, not as colour alone: {on_terminals}"
+            !rail.contains("fg-status__dot") && !on_terminals.contains("fg-status__dot"),
+            "no status dot may survive on a rail that draws toned agent marks: {rail}"
         );
-
-        // Colour-only meaning on a project row: every dot is aria-hidden,
-        // and a dot only ever appears on a row whose badges carry that same
-        // status as words. badge-mark-is-status moved those words out of a
-        // printed pill and into the badge mark's own accessible name --
-        // still text, still in the tree, still on this row -- so the claim
-        // this test makes is unchanged and only its spelling moves.
-        assert_eq!(
-            rail.matches(r#"class="fg-status__dot proj-row__dot"#)
-                .count(),
-            2,
-            "a dot must render for the two rows with an agent pane, and only those: {rail}"
+        assert!(
+            on_terminals.contains(r#"role="img" aria-label="claude — working""#),
+            "a pinned row's mark must carry its status as text, not as colour alone: {on_terminals}"
         );
         assert_eq!(
-            rail.matches("proj-row__dot--").count(),
+            rail.matches("pane-mark--").count(),
             2,
-            "every dot must carry a tone modifier: {rail}"
+            "a toned mark must render for the two rows with an agent pane, and only those: {rail}"
         );
         for tone in ["working", "blocked"] {
-            let dot = format!(
-                r#"<span class="fg-status__dot proj-row__dot proj-row__dot--{tone}" aria-hidden="true"></span>"#
-            );
             assert!(
-                rail.contains(&dot),
-                "the {tone} dot must render, and must be aria-hidden: {rail}"
+                rail.contains(&format!(r#"<span class="pane-mark pane-mark--{tone}""#)),
+                "the {tone} row's mark must wear the {tone} tone: {rail}"
             );
             assert!(
                 rail.contains(&format!(r#"aria-label="claude — {tone}""#)),
-                "the {tone} dot's meaning must also be present as words: {rail}"
+                "the {tone} mark's meaning must also be present as words: {rail}"
             );
         }
         assert!(
-            !rail.contains("proj-row__dot--idle"),
-            "the quiet project has no agent pane, so it must carry no dot at all: {rail}"
+            !rail.contains("pane-mark--idle"),
+            "a quiet mark must borrow no state's colour: {rail}"
         );
 
         // Nothing in the rail is a div pretending to be a control: the only
@@ -15184,14 +15119,15 @@ mod tests {
         );
     }
 
-    /// drawer-agent-mark: the Agents drawer reads in the same order as the
-    /// board's terminal badges -- the agent's own mark, then its status --
-    /// so one agent is recognised the same way in both places. Here the mark
-    /// is recognition only: the row prints its state in words and labels its
-    /// own dot, so a second spoken name would be repetition, and the mark
-    /// stays out of the accessibility tree while keeping its hover title.
+    /// drawer-agent-mark, as dots-off-marks-on left it: an Agents rail row
+    /// opens with the agent's own mark and NOTHING between that mark and
+    /// the name it belongs to. The dot that used to stand there is gone,
+    /// and with it the row's only text alternative -- a row whose pane has
+    /// no bee record prints no state word at all -- so the claim this test
+    /// makes is that the mark took both jobs: it wears the tone, and it
+    /// carries the state in its own name.
     #[test]
-    fn agents_drawer_rows_lead_with_the_agents_mark_ahead_of_its_status_dot() {
+    fn an_agent_rail_row_opens_with_the_agents_mark_and_no_status_dot() {
         let mut pane = menu_pane("w1:p1", Some("proj-a"), "Proj One");
         pane.view.kind = "opencode".into();
         pane.view.status = "working".into();
@@ -15201,26 +15137,26 @@ mod tests {
             html.contains(AGENT_MARK_OPENCODE.body),
             "a drawer row must draw the agent's real mark: {html}"
         );
-        let mark_at = html
-            .find(r#"<span class="pane-mark pane-mark--working" title="opencode">"#)
-            .unwrap_or_else(|| panic!("the mark must name the agent on hover: {html}"));
-        let dot_at = html
-            .find(r#"<span class="fg-status__dot proj-row__dot"#)
-            .unwrap_or_else(|| panic!("the status dot must render: {html}"));
         assert!(
-            mark_at < dot_at,
-            "the mark must lead the status dot, as it does on a badge: {html}"
+            !html.contains("fg-status__dot"),
+            "no status dot may survive beside a mark that already wears the tone: {html}"
         );
         assert!(
-            html.contains(r#"class="pane-mark__svg" aria-hidden="true""#),
-            "the drawer's mark is decoration beside words that already speak: {html}"
+            html.contains(
+                r#"<span class="pane-mark pane-mark--working" title="opencode — working">"#
+            ),
+            "the mark must name the agent AND its state on hover: {html}"
         );
-        // The dot must stay a DIRECT sibling of the state word: a CSS rule
-        // reaches the blocked state word through it, and wrapping the dot in
-        // with the mark would silently break how a blocked agent reads.
         assert!(
-            html.contains(r#"aria-label="working"></span><span class="pinned-row__head">"#),
-            "the dot must remain an unwrapped child of the row link: {html}"
+            html.contains(r#"role="img" aria-label="opencode — working""#),
+            "with the dot gone the mark is the row's only text alternative: {html}"
+        );
+        // The mark must stay a DIRECT sibling of the state word: the CSS
+        // rule that reddens a blocked agent's word reaches it through the
+        // mark, exactly as it used to reach it through the dot.
+        assert!(
+            html.contains(r#"</span><span class="pinned-row__head">"#),
+            "the mark must remain an unwrapped child of the row link: {html}"
         );
     }
 

@@ -3054,8 +3054,8 @@
         markBox.title = agent.name;
         var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         svg.setAttribute("class", "pane-mark__svg");
-        // Decorative here, exactly like the rail's own agent rows: the pill
-        // beside it already states the status in words.
+        // Decorative here: the pill beside it still states the status in
+        // words, so the mark adds recognition rather than the only reading.
         svg.setAttribute("aria-hidden", "true");
         svg.setAttribute("width", "12");
         svg.setAttribute("height", "12");
@@ -3069,16 +3069,17 @@
       // drawer-row-stack: status and name are one cluster of stacked lines,
       // not two things side by side — the state reads as a caption over the
       // name it qualifies, and the name (the only part that differs between
-      // rows) is the largest thing in the row. The pill keeps its coloured
-      // dot: the state is never carried by the word alone.
+      // rows) is the largest thing in the row.
+      // dots-off-marks-on: the pill prints the word and nothing else. The
+      // mark two elements to its left already wears this exact state's tone
+      // (`markToneClass` above, off the same `pillStatus`), so the dot was
+      // repeating a colour the row had — and the word, which the dot could
+      // never carry, is what is left.
       var text = document.createElement("span");
       text.className = "agent-drawer__text";
 
       var pill = document.createElement("span");
       pill.className = "agent-drawer__status fg-status" + pillModifier(pillStatus(agent));
-      var dot = document.createElement("span");
-      dot.className = "fg-status__dot";
-      pill.appendChild(dot);
       pill.appendChild(document.createTextNode(agent.bee_state ? beeStateWord(agent.bee_state) : agent.status));
       text.appendChild(pill);
 

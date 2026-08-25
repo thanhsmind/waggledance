@@ -1268,13 +1268,15 @@ html[data-scheme="dark"] .topbar .home {
    agent is aimed at, rendered only when a live session names one. */
 .pinned-row__link {
   display: grid;
-  /* drawer-agent-mark added the leading column: the agent's own program mark,
-     ahead of the status dot, so this drawer reads in the same order as the
-     board's terminal badges. It is its own column rather than a wrapper
-     around the dot on purpose — `.proj-row__dot--blocked ~ .pinned-row__state`
-     below reaches the state word through the dot as a direct sibling, and
-     wrapping the dot would quietly break how a blocked agent reads. */
-  grid-template-columns: auto auto 1fr auto;
+  /* dots-off-marks-on: three columns — 1 the agent's own program mark,
+     2 the name and its address, 3 the state word. The status dot that used
+     to sit between the mark and the name is gone: the mark wears the state's
+     tone itself, so the dot was drawing a colour the row already had. Any
+     column added or removed here must renumber `.pinned-row__head`,
+     `__state` and `__purpose` below in the same edit — an explicit
+     `grid-column` pointing at a cell an auto-placed item has already taken
+     does not overlap it, it wraps to the next row. */
+  grid-template-columns: auto 1fr auto;
   align-items: baseline;
   column-gap: var(--space-2);
   row-gap: var(--space-1);
@@ -1313,7 +1315,7 @@ html[data-scheme="dark"] .topbar .home {
    sitting alone above their own name. The numbers here now match
    `grid-template-columns` above: 1 mark, 2 dot, 3 name, 4 state. */
 .pinned-row__head {
-  grid-column: 3;
+  grid-column: 2;
   min-width: 0;
   overflow-wrap: anywhere;
 }
@@ -1336,7 +1338,7 @@ html[data-scheme="dark"] .topbar .home {
    the two need-you states, so the row says the same thing its dot does, in
    words. */
 .pinned-row__state {
-  grid-column: 4;
+  grid-column: 3;
   justify-self: end;
   font-family: var(--font-mono, monospace);
   font-size: var(--type-caption-size);
@@ -1345,7 +1347,9 @@ html[data-scheme="dark"] .topbar .home {
   color: var(--color-text-muted);
   white-space: nowrap;
 }
-.proj-row__dot--blocked ~ .pinned-row__state {
+/* dots-off-marks-on: the blocked state word takes its red from the mark
+   that now carries the tone, the sibling the dot used to be. */
+.pane-mark--blocked ~ .pinned-row__state {
   color: var(--color-danger);
 }
 /* Line two: the feature lane this agent is bound to, led by the crosshair
@@ -1353,9 +1357,9 @@ html[data-scheme="dark"] .topbar .home {
    the name and state columns so the feature has the whole width the name
    had, and it is absent entirely when no live session names a feature. */
 .pinned-row__purpose {
-  /* Columns 3 through 4: the full width the name and the state word share
+  /* Columns 2 through 3: the full width the name and the state word share
      on line one, starting under the name rather than under the mark. */
-  grid-column: 3 / -1;
+  grid-column: 2 / -1;
   min-width: 0;
 }
 .pinned-row__purpose-icon {
@@ -1498,27 +1502,6 @@ html[data-scheme="dark"] .topbar .home {
 .home-sidebar .proj-row__badge {
   max-width: 100%;
   min-width: 0;
-}
-/* The digest's status dot, on a row that has an agent running in it. The
-   element is the design system's own `.fg-status__dot` (size, pill radius,
-   status glow, `background: currentColor`), so all this adds is the tone
-   and the alignment against a baseline-aligned row — no second dot
-   vocabulary, and no literal where the component already carries one.
-   Decorative by construction: `views::project_row_dot` marks it
-   `aria-hidden`, and the row's own badge pills on the line below print the
-   same status as words. */
-.proj-row__dot {
-  align-self: center;
-  color: var(--color-text-disabled);
-}
-.proj-row__dot--working {
-  color: var(--color-warning);
-}
-.proj-row__dot--blocked {
-  color: var(--color-danger);
-}
-.proj-row__dot--idle {
-  color: var(--color-text-disabled);
 }
 
 .sidebar,

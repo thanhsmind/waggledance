@@ -25151,7 +25151,7 @@ mod bee_route_tests {
     /// `/p/:id/_terminal/pane/:pane_id` page rather than by slicing four
     /// cards out of one shared body.
     #[tokio::test]
-    async fn terminal_page_renders_a_distinct_status_pill_class_per_status() {
+    async fn terminal_page_tones_the_mark_per_status_and_prints_the_word() {
         let dir = fresh_root("scope-status-pill-data");
         enable_terminal(&dir);
         let root = fresh_root("scope-status-pill-project");
@@ -25212,31 +25212,45 @@ mod bee_route_tests {
             body[start..end].to_string()
         };
 
+        // dots-off-marks-on: a terminal's pill is the WORD and nothing
+        // else -- the tone that used to reach it as a dot modifier is on
+        // the agent's mark beside it now. So each status is checked in the
+        // two places it actually lives: the mark's tone class, and the
+        // pill's own text.
         let working_body = pane_page(app.clone(), &project.id, &working.pane_id).await;
+        let working_card = card(&working_body, &working.pane_id);
         assert!(
-            card(&working_body, &working.pane_id).contains("class=\"fg-status fg-status--warn\""),
-            "working must render the warn pill: {working_body}"
+            working_card.contains("pane-mark pane-mark--working")
+                && working_card.contains("class=\"fg-status\">working</span>"),
+            "working must tone the mark and print its word: {working_body}"
         );
         let blocked_body = pane_page(app.clone(), &project.id, &blocked.pane_id).await;
+        let blocked_card = card(&blocked_body, &blocked.pane_id);
         assert!(
-            card(&blocked_body, &blocked.pane_id)
-                .contains("class=\"fg-status fg-status--blocked\""),
-            "blocked must render the blocked pill: {blocked_body}"
+            blocked_card.contains("pane-mark pane-mark--blocked")
+                && blocked_card.contains("class=\"fg-status\">blocked</span>"),
+            "blocked must tone the mark and print its word: {blocked_body}"
         );
+        // `done` and `idle` are both quiet: a state a mark does not have is
+        // never borrowed from another state's colour, so neither tones the
+        // mark -- and the word is the whole difference between them.
         let done_body = pane_page(app.clone(), &project.id, &done.pane_id).await;
+        let done_card = card(&done_body, &done.pane_id);
         assert!(
-            card(&done_body, &done.pane_id).contains("class=\"fg-status fg-status--ready\""),
-            "done must render the ready pill: {done_body}"
+            !done_card.contains("pane-mark--")
+                && done_card.contains("class=\"fg-status\">done</span>"),
+            "done must stay quiet on the mark and print its word: {done_body}"
         );
         let idle_body = pane_page(app, &project.id, &idle.pane_id).await;
         let idle_card = card(&idle_body, &idle.pane_id);
         assert!(
-            idle_card.contains("class=\"fg-status\">"),
-            "idle must render the neutral, unmodified pill: {idle_body}"
+            !idle_card.contains("pane-mark--")
+                && idle_card.contains("class=\"fg-status\">idle</span>"),
+            "idle must stay quiet on the mark and print its word: {idle_body}"
         );
         assert!(
-            !idle_card.contains("fg-status--"),
-            "idle must not borrow another status's modifier: {idle_body}"
+            !idle_card.contains("fg-status--") && !idle_card.contains("fg-status__dot"),
+            "a terminal pill borrows no modifier and carries no dot: {idle_body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -27461,9 +27475,11 @@ mod bee_route_tests {
             home.contains(r#"<span class="pinned-row__feature">agent-feat</span>"#),
             "a Pinned row says which feature the session is bound to (A6): {home}"
         );
+        // dots-off-marks-on: the row's dot is gone; its mark took both the
+        // tone and the text alternative the dot used to carry.
         assert!(
-            home.contains(r#"proj-row__dot--blocked" role="img" aria-label="needs approval""#),
-            "the Pinned row's dot takes bee's tone and its text alternative says the same word: {home}"
+            home.contains(r#"<span class="pane-mark pane-mark--blocked" title="claude — needs approval">"#),
+            "the Pinned row's mark takes bee's tone and its text alternative says the same word: {home}"
         );
 
         let agents = get_body(&app, "/api/agents").await;
