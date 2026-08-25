@@ -1,7 +1,7 @@
 ---
 area: agent-terminal
-updated: 2026-08-23
-sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact]
+updated: 2026-08-25
+sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact, herdr-protocol-20]
 decisions: [D1, D2, D3, D4, D5, D6, D7, D8, D9, D10]
 coverage: partial
 ---
@@ -269,6 +269,21 @@ implementation. Code entry points are listed in `reading-map.md`.
   A preset-started agent appears in the Terminal tab's listing on its next
   poll; a plain shell does not, because that listing enumerates agents, and
   a plain shell has no agent record (see Open Gaps).
+- **Where it lands:** a started agent gets a **tab of its own**, never a split
+  of whichever tab the operator happened to be looking at. The session host
+  creates the tab, the pane inside it is found, and the agent starts in that
+  pane; a tab that yields no pane is refused outright, naming the empty tab,
+  and nothing is started in some other pane instead. One consequence is
+  visible on the card: a started session is labelled by its workspace and the
+  shell it occupies, not by the tab the operator was on.
+- **A pane that is not ready yet is waited for, briefly.** For a fraction of a
+  second after a new pane exists, the host can still answer that it is not an
+  available shell. That one answer alone is retried — a handful of attempts a
+  fifth of a second apart — because it means "not yet" rather than "no". Every
+  other refusal (a name already taken, an unreachable host, the agent itself
+  declining) surfaces on the first attempt and is never retried. When the
+  waiting runs out, the operator is shown the host's own last words rather
+  than a rewritten message.
 - **Blocked when:** no such destination can be found under this project's
   boundary, the named preset is not one an operator configured, or the
   underlying start attempt itself fails — each of these is refused
