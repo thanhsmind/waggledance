@@ -1304,9 +1304,16 @@ html[data-scheme="dark"] .topbar .home {
   font-weight: var(--weight-semibold);
 }
 /* The name and its address share one grid cell, so they read as one line
-   rather than as two competing columns. */
+   rather than as two competing columns.
+   rail-row-one-line: column 3, not 2. When drawer-agent-mark added the
+   mark's own leading column it pushed every named column one to the right,
+   but these rules kept their old numbers — and an explicit `grid-column: 2`
+   on a cell the auto-placed dot has already taken does not overlap it, it
+   wraps to the next ROW. That is the whole reason the mark and the dot were
+   sitting alone above their own name. The numbers here now match
+   `grid-template-columns` above: 1 mark, 2 dot, 3 name, 4 state. */
 .pinned-row__head {
-  grid-column: 2;
+  grid-column: 3;
   min-width: 0;
   overflow-wrap: anywhere;
 }
@@ -1329,7 +1336,7 @@ html[data-scheme="dark"] .topbar .home {
    the two need-you states, so the row says the same thing its dot does, in
    words. */
 .pinned-row__state {
-  grid-column: 3;
+  grid-column: 4;
   justify-self: end;
   font-family: var(--font-mono, monospace);
   font-size: var(--type-caption-size);
@@ -1346,8 +1353,8 @@ html[data-scheme="dark"] .topbar .home {
    the name and state columns so the feature has the whole width the name
    had, and it is absent entirely when no live session names a feature. */
 .pinned-row__purpose {
-  /* Column 3: under the name, exactly where it sat before the mark's column
-     was added ahead of the dot. */
+  /* Columns 3 through 4: the full width the name and the state word share
+     on line one, starting under the name rather than under the mark. */
   grid-column: 3 / -1;
   min-width: 0;
 }
