@@ -246,6 +246,96 @@ pub trait Herdr: Send + Sync {
     async fn agent_start(&self, pane_id: &str, argv: &[String]) -> Result<AgentStarted>;
 }
 
+/// Why a trust seeding did not happen. Never fatal — see
+/// [`seed_workspace_trust`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustSeedWarning(pub String);
+
+impl std::fmt::Display for TrustSeedWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Add ONE directory to a foreign tool's own per-workspace trust list, so an
+/// agent that gates on it does not stop at a trust prompt the operator never
+/// sees (herding-entry-conditions D2).
+///
+/// This is waggledance's only write outside a repository, and the only one
+/// into another program's settings. What keeps that narrow enough to audit is
+/// not this function's care but its arguments: it is handed **one absolute
+/// directory**, by a caller that has already validated it against the
+/// project's own boundary, and it invents no path and reads none from
+/// anywhere else (D3). It cannot trust a folder nobody was about to start an
+/// agent in, because it is never told about one.
+///
+/// - **Adds only.** An entry is never removed, and no other key is rewritten.
+///   The file round-trips through `Value`, not through a typed struct that
+///   would silently drop whatever it does not model.
+/// - **Idempotent.** An already-trusted directory is a no-op that does not
+///   touch the file at all (D4).
+/// - **Fail-open.** Every failure — no file, unreadable, unparseable, the key
+///   absent or not an array, a write denied — returns a warning and leaves the
+///   file exactly as it was. It never blocks a spawn (D5). bee's own
+///   `preflight_workspace_trust` is fail-open, and diverging here would make
+///   one declaration behave differently depending on which spawner ran it.
+///   The tempting reading of "security" is to refuse; bee does not, and a
+///   refusal would strand every agent that declares a trust store.
+pub fn seed_workspace_trust(
+    trust: &waggledance_core::bee::BeeWorkspaceTrust,
+    directory: &str,
+) -> std::result::Result<(), TrustSeedWarning> {
+    let path = expand_home(&trust.file);
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        TrustSeedWarning(format!(
+            "could not read trust store {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut doc: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        TrustSeedWarning(format!(
+            "could not parse trust store {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let Some(list) = doc.get_mut(&trust.key).and_then(|v| v.as_array_mut()) else {
+        return Err(TrustSeedWarning(format!(
+            "trust store {} has no array at key {:?}",
+            path.display(),
+            trust.key
+        )));
+    };
+    if list.iter().any(|e| e.as_str() == Some(directory)) {
+        // Already trusted: not a write. A spawn is not a config edit, and
+        // running one twice must not churn the operator's file.
+        return Ok(());
+    }
+    list.push(serde_json::Value::String(directory.to_string()));
+
+    let rendered = serde_json::to_string_pretty(&doc)
+        .map_err(|e| TrustSeedWarning(format!("could not render trust store: {e}")))?;
+    std::fs::write(&path, rendered + "\n").map_err(|e| {
+        TrustSeedWarning(format!(
+            "could not write trust store {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Expand a leading `~` against the current user's home. Any other path is
+/// returned as given — this resolves a prefix, it does not search.
+fn expand_home(raw: &str) -> std::path::PathBuf {
+    match raw.strip_prefix("~/") {
+        Some(rest) => match dirs::home_dir() {
+            Some(home) => home.join(rest),
+            None => std::path::PathBuf::from(raw),
+        },
+        None => std::path::PathBuf::from(raw),
+    }
+}
+
 /// Start an agent in a pane of its own: create a tab at `cwd`, find the pane
 /// that tab brought with it, and start the agent there.
 ///
@@ -332,6 +422,108 @@ pub async fn pane_of_tab(herdr: &dyn Herdr, tab_id: &str) -> Result<Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn trust_file(tag: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wd-trust-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn trust_decl(path: &std::path::Path) -> waggledance_core::bee::BeeWorkspaceTrust {
+        waggledance_core::bee::BeeWorkspaceTrust {
+            file: path.to_string_lossy().into_owned(),
+            key: "trustedWorkspaces".to_string(),
+        }
+    }
+
+    /// D3: the write adds EXACTLY the directory it was handed, and touches
+    /// nothing else — not another entry, not another key. This is the whole
+    /// audit story for waggledance's only write outside a repository.
+    #[test]
+    fn seeding_adds_exactly_the_one_directory_and_disturbs_nothing_else() {
+        let path = trust_file(
+            "add",
+            r#"{"trustedWorkspaces": ["/already/here"], "otherSetting": {"keep": true}}"#,
+        );
+        let decl = trust_decl(&path);
+
+        seed_workspace_trust(&decl, "/projects/beehive").expect("an untrusted path is added");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["trustedWorkspaces"],
+            serde_json::json!(["/already/here", "/projects/beehive"]),
+            "the existing entry survives and exactly one is appended"
+        );
+        assert_eq!(
+            doc["otherSetting"],
+            serde_json::json!({"keep": true}),
+            "an unrelated key must survive a write untouched"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// D4: a spawn is not a config edit. Seeding an already-trusted directory
+    /// leaves the file alone — not rewritten, not reformatted.
+    #[test]
+    fn seeding_an_already_trusted_directory_does_not_touch_the_file() {
+        let body = r#"{"trustedWorkspaces":["/projects/beehive"],"style":"preserved"}"#;
+        let path = trust_file("idem", body);
+        let decl = trust_decl(&path);
+
+        seed_workspace_trust(&decl, "/projects/beehive").expect("already trusted is fine");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            body,
+            "an already-trusted path is a no-op, byte for byte"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// D5: every failure warns and leaves the file exactly as it was. The
+    /// tempting reading of "security" here is to refuse the spawn; bee does
+    /// not, and a refusal would strand every agent that declares a trust
+    /// store. Nothing here returns an error the caller must treat as fatal.
+    #[test]
+    fn every_failure_warns_and_leaves_the_store_untouched() {
+        // No file at all.
+        let missing = waggledance_core::bee::BeeWorkspaceTrust {
+            file: "/definitely/not/here/settings.json".to_string(),
+            key: "trustedWorkspaces".to_string(),
+        };
+        assert!(seed_workspace_trust(&missing, "/projects/beehive").is_err());
+
+        for (tag, body, why) in [
+            ("badjson", "{not json", "unparseable"),
+            ("nokey", r#"{"somethingElse": []}"#, "the key is absent"),
+            (
+                "notarray",
+                r#"{"trustedWorkspaces": "nope"}"#,
+                "the key is not a list",
+            ),
+        ] {
+            let path = trust_file(tag, body);
+            let decl = trust_decl(&path);
+            let before = std::fs::read_to_string(&path).unwrap();
+
+            let warning = seed_workspace_trust(&decl, "/projects/beehive")
+                .expect_err(&format!("{why} must warn"));
+            assert!(!warning.0.is_empty(), "a warning must say what happened");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "{why}: the store must be left exactly as it was, never half-written"
+            );
+
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+    }
 
     /// A herdr whose `agent_start` refuses `agent_pane_busy` a fixed number
     /// of times before succeeding — the startup race, made deterministic.
