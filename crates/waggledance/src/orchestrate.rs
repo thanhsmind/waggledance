@@ -325,8 +325,12 @@ pub async fn dispatch_run(
             // feature's granted worktree, which is a sibling of the root
             // the workspace resolved under.
             let dir = cwd.unwrap_or(anchor);
-            let started = herdr
-                .agent_start(&workspace_id, Some(&dir), &argv)
+            // Protocol 20 split this in two: `agent.start` attaches to a
+            // pane that already exists, so the pane has to be made first.
+            // The shared helper owns that hop — including its refusal when
+            // the new tab yields no pane, which must never be softened into
+            // "use another pane" here.
+            let started = herdr::start_agent_in_new_tab(herdr, &workspace_id, Some(&dir), &argv)
                 .await
                 .map_err(|e| DispatchRefusal::AgentStartFailed(e.to_string()))?;
             started.pane_id

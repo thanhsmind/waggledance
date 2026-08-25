@@ -856,8 +856,7 @@ mod terminal_background_tests {
         }
         async fn agent_start(
             &self,
-            _workspace_id: &str,
-            _cwd: Option<&str>,
+            _pane_id: &str,
             _argv: &[String],
         ) -> crate::herdr::Result<crate::herdr::AgentStarted> {
             unimplemented!("not exercised by the supervisor")

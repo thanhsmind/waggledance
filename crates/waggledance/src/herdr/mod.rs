@@ -54,6 +54,21 @@ pub enum HerdrError {
     },
     #[error("invalid agent argv: {0}")]
     InvalidAgentArgv(String),
+    /// `tab.create` succeeded but no pane carrying that tab could be found
+    /// in the snapshot that followed. Protocol 20 does not hand the pane back
+    /// with the tab, so this is the one hop that can come up empty — and it
+    /// is reported rather than papered over, because the tempting recovery
+    /// (use some other pane) means starting an agent on top of work somebody
+    /// else has open. The tab id rides along so a human can find and close
+    /// what was left behind.
+    #[error(
+        "tab {tab_id} was created in workspace {workspace_id} but no pane for it appeared; \
+         started nothing, and the tab is still open"
+    )]
+    TabPaneUnresolved {
+        tab_id: String,
+        workspace_id: String,
+    },
     #[error("herdr refused the request ({code}): {message}")]
     Remote { code: String, message: String },
 }
@@ -85,7 +100,6 @@ impl ReadSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabCreated {
     pub tab_id: String,
-    pub pane_id: String,
 }
 
 /// Result of `agent.start` — the new agent's pane/tab ids, plus the name
@@ -196,38 +210,88 @@ pub trait Herdr: Send + Sync {
     async fn send_keys(&self, pane_id: &str, keys: &[String]) -> Result<()>;
 
     /// Create a plain shell tab in `workspace_id`, never stealing the
-    /// desktop's focus (`focus: false`). Returns the new tab's id and its
-    /// root pane's id.
+    /// desktop's focus (`focus: false`). Returns the new tab's id.
+    ///
+    /// **It does not return a pane.** Protocol 20's `tab_created` carries
+    /// `{type, tab}` and its `TabInfo` has no pane id of any kind, so the
+    /// pane a caller wants must be found afterwards by matching this
+    /// `tab_id` against a fresh snapshot (`pane.list` filters by workspace
+    /// only). That hop is the caller's, deliberately: it is where the
+    /// "no pane for this tab" failure has to be decided, and it must fail
+    /// loudly rather than settle for a neighbouring pane.
     ///
     /// `cwd` is optional: `Some(path)` seeds that exact directory; `None`
     /// omits the key and lets herdr resolve the **workspace's own anchor**
     /// (its focused pane's folder), which is exactly what the desktop does.
-    /// Omitting it here is safe — see the asymmetry warning on
-    /// [`Herdr::agent_start`].
     async fn tab_create(&self, workspace_id: &str, cwd: Option<&str>) -> Result<TabCreated>;
 
-    /// Start a named agent in `workspace_id`, never stealing the desktop's
-    /// focus (`focus: false`). No `tab_id`/`split` is sent — upstream's
-    /// default placement (split Right off the workspace's active tab) is
-    /// accepted as-is. The name is auto-generated and a collision retried
-    /// transparently (see `retry_on_name_collision`): callers never see
-    /// `AgentNameTaken` themselves. Returns the new pane's and tab's ids plus
-    /// the name that actually succeeded.
+    /// Start a named agent **in an existing pane**. The name is
+    /// auto-generated and a collision retried transparently (see
+    /// `retry_on_name_collision`): callers never see `AgentNameTaken`
+    /// themselves. Returns the pane's and tab's ids plus the name that
+    /// actually succeeded.
     ///
-    /// **`cwd` is asymmetric with [`Herdr::tab_create`] — do not assume they
-    /// fall back alike.** `Some(path)` seeds that exact directory. `None`
-    /// omits the key, but herdr does **not** resolve the workspace anchor for
-    /// `agent.start`: it falls back to the **herdr process's own current
-    /// directory**, an arbitrary folder unrelated to the destination.
-    /// Starting an agent there is the silent wrong-repo start a caller must
-    /// refuse rather than pass `None` here — unlike `tab_create`, where
-    /// omitting is safe.
-    async fn agent_start(
-        &self,
-        workspace_id: &str,
-        cwd: Option<&str>,
-        argv: &[String],
-    ) -> Result<AgentStarted>;
+    /// `argv` is split the way herdr's own protocol wants it and the way bee
+    /// already writes it: **`argv[0]` is the agent `kind`** (`claude`, `pi`,
+    /// `codex`, `agy`) and the rest are its `args`. An empty `argv` is
+    /// refused before anything reaches the socket.
+    ///
+    /// There is no `cwd` here, and that is protocol 20's doing rather than a
+    /// simplification: `agent.start` no longer creates anything, so the
+    /// directory question is settled earlier, when the pane is made. The
+    /// caller creates a tab at the destination it has already validated,
+    /// resolves that tab's pane, and passes it here — which also removes the
+    /// old hazard this doc used to warn about, where omitting `cwd` started
+    /// an agent in herdr's own process directory.
+    async fn agent_start(&self, pane_id: &str, argv: &[String]) -> Result<AgentStarted>;
+}
+
+/// Start an agent in a pane of its own: create a tab at `cwd`, find the pane
+/// that tab brought with it, and start the agent there.
+///
+/// This is what protocol 20 turned `agent.start` into. Before it, one call
+/// both made a pane and launched into it; now `agent.start` only ever
+/// attaches to an existing pane, and `tab_created` does not say which pane it
+/// just made — `TabInfo` carries no pane id, and `pane.list` filters by
+/// workspace, not tab. So the hop goes through a fresh snapshot, matching on
+/// `tab_id`.
+///
+/// **Matched on `tab_id` alone.** Not the newest pane, not the focused one,
+/// not the last in the list: each of those picks the wrong pane on a busy
+/// machine, and the cost of picking wrong is an agent typing into somebody
+/// else's session. When no pane matches, this returns
+/// [`HerdrError::TabPaneUnresolved`] and starts nothing — the tab is left
+/// standing and named in the error rather than quietly reused.
+///
+/// One implementation for every caller (the board's spawn, the board's
+/// shell-create, and MCP dispatch) on purpose: a second copy of this hop
+/// would be free to drift into a friendlier fallback, and friendlier is
+/// exactly wrong here.
+pub async fn start_agent_in_new_tab(
+    herdr: &dyn Herdr,
+    workspace_id: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> Result<AgentStarted> {
+    let created = herdr.tab_create(workspace_id, cwd).await?;
+    let pane_id = pane_of_tab(herdr, &created.tab_id).await?.ok_or_else(|| {
+        HerdrError::TabPaneUnresolved {
+            tab_id: created.tab_id.clone(),
+            workspace_id: workspace_id.to_string(),
+        }
+    })?;
+    herdr.agent_start(&pane_id, argv).await
+}
+
+/// The pane belonging to `tab_id`, read from a fresh snapshot. `None` when
+/// the tab has no pane yet — the caller decides what that means.
+pub async fn pane_of_tab(herdr: &dyn Herdr, tab_id: &str) -> Result<Option<String>> {
+    let snapshot = herdr.snapshot().await?;
+    Ok(snapshot
+        .panes
+        .iter()
+        .find(|p| p.tab_id == tab_id)
+        .map(|p| p.pane_id.clone()))
 }
 
 #[cfg(test)]
