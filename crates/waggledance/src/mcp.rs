@@ -687,8 +687,17 @@ fn read_fleet_panes(engine: &Engine, orchestration: &mut Option<Orchestration>) 
     if !engine.config.terminal.enabled {
         return FleetPanes::Off;
     }
-    let Some(orch) = orchestration.as_ref() else {
-        return FleetPanes::Unreachable("herdr client unavailable".to_string());
+    // Through the LAZY builder, never `orchestration.as_ref()`: in a session
+    // that only ever calls ask_state, nothing else builds the handle, so
+    // reading the slot directly answers "no client" on every call and the
+    // whole feature degrades to null forever. Caught by running the built
+    // binary against the real registry — the unit tests could not see it,
+    // because they hand this function the slot they want.
+    let orch = match orchestration_handle(orchestration, &engine.config.terminal) {
+        Ok(orch) => orch,
+        // A handle that will not build is D5 like any other unreachable
+        // transport, carrying the init error's own words.
+        Err(e) => return FleetPanes::Unreachable(e),
     };
     match orch.runtime.block_on(orch.herdr.snapshot()) {
         Ok(snapshot) => FleetPanes::Snapshot(Box::new(snapshot)),
@@ -1593,49 +1602,37 @@ mod tests {
     /// D5: an unreadable transport nulls the pane list and names why, and
     /// leaves the bee half of the answer whole. Losing herdr must never cost
     /// a caller the state it actually asked for.
+    ///
+    /// Proved on `attach_panes` rather than through the handler on purpose.
+    /// An earlier version drove the handler with an empty orchestration slot
+    /// and passed — but only because the code was reading that slot directly
+    /// instead of building the handle, which is exactly the bug asfr-4 fixed.
+    /// Now that the handler builds a real client, the same test would pass or
+    /// fail depending on whether a herdr socket happens to be alive on the
+    /// machine running it. The shape belongs here, where it depends on nothing.
     #[test]
-    fn ask_state_nulls_panes_with_a_reason_when_herdr_cannot_be_read() {
-        let dir = std::env::temp_dir().join(format!("wd-panes-down-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        write(&dir, "docs/a.md", "# Project");
-        write(
-            &dir,
-            ".bee/state.json",
-            r#"{"feature": "widget-polish", "phase": "execution", "mode": "standard"}"#,
+    fn unreachable_herdr_nulls_panes_with_a_reason_and_leaves_bee_state_whole() {
+        let mut digest = json!({
+            "project_id": "widgets",
+            "feature": "widget-polish",
+            "phase": "execution"
+        });
+        attach_panes(
+            &mut digest,
+            std::path::Path::new("/nonexistent"),
+            &FleetPanes::Unreachable("herdr snapshot failed: connection refused".to_string()),
         );
-        let mut config = Config::default();
-        config.terminal.enabled = true;
-        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
-        let project = engine.register(&dir, None).unwrap();
 
-        // No Orchestration: the switch is on, but there is no herdr client to
-        // ask — the same shape a caller sees when the socket is dead.
-        let resp = call_tool_with_orchestration(
-            &engine,
-            &mut None,
-            "waggledance_ask_state",
-            json!({ "project": project.id }),
-        );
-        let digest = &resp["result"]["structuredContent"]["project"];
         assert!(digest["panes"].is_null(), "{digest}");
-        assert!(
-            digest["panes_error"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()),
-            "the reason must be named, never a bare null: {digest}"
-        );
         assert_eq!(
-            resp["result"]["isError"].as_bool(),
-            None,
-            "a dead transport is never a tool error: {resp}"
+            digest["panes_error"], "herdr snapshot failed: connection refused",
+            "the transport's own words, never a bare null: {digest}"
         );
         assert_eq!(
             digest["feature"], "widget-polish",
             "the bee half of the answer is untouched: {digest}"
         );
         assert_eq!(digest["phase"], "execution");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
