@@ -1,5 +1,5 @@
-promote proposal for work item "todo-column-collapse" (.bee/logs/scribing-runs.jsonl + .bee/lanes/todo-column-collapse.json) — 1 capped cell(s): tcc-1
-anchor: ledger — .bee/logs/scribing-runs.jsonl, .bee/lanes/todo-column-collapse.json
+promote proposal for work item "todo-column-collapse" (.bee/logs/scribing-runs.jsonl + .bee/lanes/todo-column-collapse.json + docs/history/todo-column-collapse/promote-proposals.md) — 1 capped cell(s): tcc-1
+anchor: ledger — .bee/logs/scribing-runs.jsonl, .bee/lanes/todo-column-collapse.json, docs/history/todo-column-collapse/promote-proposals.md
 PROPOSAL ONLY — nothing was written. Applying any section below is a human or agent decision.
 
 (a) DELIVERY DRAFT — save as docs/knowledge/work/todo-column-collapse/delivery.md
@@ -13,8 +13,8 @@ bee:
   id: todo-column-collapse-delivery
   lifecycle: active
   areas: [bee-cockpit, web-interface]
-  required_context: [.bee/logs/scribing-runs.jsonl, .bee/lanes/todo-column-collapse.json]
-  sources: [.bee/logs/scribing-runs.jsonl, .bee/lanes/todo-column-collapse.json, .bee/cells/tcc-1.json]
+  required_context: [.bee/logs/scribing-runs.jsonl, .bee/lanes/todo-column-collapse.json, docs/history/todo-column-collapse/promote-proposals.md]
+  sources: [.bee/logs/scribing-runs.jsonl, .bee/lanes/todo-column-collapse.json, docs/history/todo-column-collapse/promote-proposals.md, .bee/cells/archive/todo-column-collapse/tcc-1.json]
 ---
 
 # todo-column-collapse — Delivery
@@ -37,7 +37,7 @@ Each cell below was capped only against a recorded passing verify result — bee
 
 ## Provenance
 
-Proposed by `bee knowledge promote --work todo-column-collapse` from 1 capped cell trace(s) in `.bee/cells/` and the anchor `.bee/logs/scribing-runs.jsonl`, `.bee/lanes/todo-column-collapse.json`. Every line above is copied from a trace or from the work item; nothing here is curated truth until a human or agent accepts it.
+Proposed by `bee knowledge promote --work todo-column-collapse` from 1 capped cell trace(s) in `.bee/cells/` and the anchor `.bee/logs/scribing-runs.jsonl`, `.bee/lanes/todo-column-collapse.json`, `docs/history/todo-column-collapse/promote-proposals.md`. Every line above is copied from a trace or from the work item; nothing here is curated truth until a human or agent accepts it.
 
 (b) AREA UPDATES — candidate spec-sync bullets, each citing its cell
 
@@ -62,7 +62,7 @@ bee:
   id: todo-column-collapse-tcc-1-pitfall
   lifecycle: draft
   areas: [bee-cockpit, web-interface]
-  sources: [.bee/cells/tcc-1.json]
+  sources: [.bee/cells/archive/todo-column-collapse/tcc-1.json]
   polarity: pitfall
 ---
 
@@ -72,7 +72,7 @@ bee:
 
 The board's Todo column now ships folded behind a native disclosure on both boards
 
-## Recorded evidence (verbatim from .bee/cells/tcc-1.json)
+## Recorded evidence (verbatim from .bee/cells/archive/todo-column-collapse/tcc-1.json)
 
 - **deviation** — Left the change uncommitted: views.rs already carried unrelated in-flight edits, and one commit per cell cannot be honoured without sweeping them in.
 - **deviation** — No commit: views.rs held substantial unrelated uncommitted work before this cell started, so committing the file would have swept it in; left staged-free for the user to split.
@@ -83,12 +83,16 @@ The board's Todo column now ships folded behind a native disclosure on both boar
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 1 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 1 pattern candidate(s), 0 file(s) written.
+
 ---
+
+<!-- bee:not-a-deferral: this section records a completed review, not a promise to act later. The word "deferring" below is the TITLE of an already-active pattern, and every section it discusses is already settled. -->
 
 ## Resolution — 2026-08-25, nothing left to apply
 
 Reviewed at feature close. All three sections are already covered; none is
-applied from here.
+applied from here. Also logged as a decision, because `bee close` regenerates
+this file and erases anything appended to it.
 
 - **(a) Delivery draft** — not applied. `docs/knowledge/work/todo-column-collapse/delivery.md`
   already exists as a curated record and says more than this draft: why the
@@ -99,7 +103,6 @@ applied from here.
 - **(b) Area updates** — nothing proposed. The generator found no capped
   `behavior_change` cell for either `bee-cockpit` or `web-interface`, so there
   is no candidate bullet to sync.
-<!-- bee:not-a-deferral: this bullet names the already-active pattern "Deferring a commit on a contended file does not protect the boundary" and quotes its practice. The word "deferring" is that pattern's subject, not a promise to act later — the work it describes is done. -->
 - **(c) Pattern candidate** — already promoted, not from here. The three
   recorded deviations are one phenomenon, and it landed as
   `docs/knowledge/patterns/deferring-a-commit-on-a-contended-file.md`
@@ -107,4 +110,5 @@ applied from here.
   source and generalizes past this cell into a practice: prefer a path-scoped
   commit of your own paths over deferring. Saving the draft candidate beside it
   would duplicate it at a lower quality.
+
 <!-- /bee:not-a-deferral -->
