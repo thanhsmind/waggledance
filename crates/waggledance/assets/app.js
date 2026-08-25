@@ -3011,6 +3011,15 @@
       return "idle";
     }
 
+    // mark-state-tone: the tone the agent's own mark takes, the mirror of
+    // `views.rs::pane_mark_tone_class`. Only working and blocked are toned;
+    // idle and anything unrecognised keep `.pane-mark`'s muted ink.
+    function markToneClass(status) {
+      if (status === "working") return " pane-mark--working";
+      if (status === "blocked") return " pane-mark--blocked";
+      return "";
+    }
+
     function agentRow(agent) {
       var item = document.createElement("a");
       item.className = "fg-menu__item agent-drawer__item";
@@ -3037,7 +3046,11 @@
       // predates this field simply renders without a mark, as it did before.
       if (agent.mark) {
         var markBox = document.createElement("span");
-        markBox.className = "pane-mark";
+        // mark-state-tone: the mark wears the tone of the state beside it —
+        // `views.rs::pane_mark_tone_class`'s client half, keyed off the same
+        // `pillStatus` this row's own pill uses, so the mark and the pill can
+        // never disagree. Idle adds no class and keeps the muted ink.
+        markBox.className = "pane-mark" + markToneClass(pillStatus(agent));
         markBox.title = agent.name;
         var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         svg.setAttribute("class", "pane-mark__svg");

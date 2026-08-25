@@ -696,9 +696,9 @@ html[data-scheme="dark"] .topbar .home {
    belongs to. Every surface that prints a program name uses this one class —
    a project row's badge, a board card's badge, a pane tab above a terminal,
    and a feature's terminal list — so the mark reads the same size and weight
-   in all four. It takes the ink of the text beside it rather than a vendor
-   tint: the terminal page never loads the board's own stylesheet, and a mark
-   coloured on some pages and grey on others reads as two marks, not one.
+   in all four. It never takes a vendor tint: the terminal page never loads
+   the board's own stylesheet, and a mark wearing Claude's orange on one page
+   and grey on another reads as two marks, not one.
    `flex: none` keeps it from being squeezed by a long terminal title, and
    `display: block` on the svg drops the inline baseline gap that would
    otherwise push it off the badge's centre line. */
@@ -708,6 +708,19 @@ html[data-scheme="dark"] .topbar .home {
   flex: none;
   color: var(--color-text-muted);
   margin-inline: 1px;
+}
+/* mark-state-tone: what the mark DOES take is the tone of the state standing
+   beside it, the same two tokens `.fg-status--warn`/`--blocked` give the dot
+   a few pixels away (atelier/components.css). Grey on a working session and
+   grey on a quiet one made the board's central distinction invisible; these
+   are the state's own colours, not a second vocabulary, so the mark and the
+   dot always agree. An idle or unknown state adds no class and keeps the
+   muted ink above — a state a mark does not have borrows no colour. */
+.pane-mark--working {
+  color: var(--color-warning);
+}
+.pane-mark--blocked {
+  color: var(--color-danger);
 }
 .pane-mark__svg {
   display: block;

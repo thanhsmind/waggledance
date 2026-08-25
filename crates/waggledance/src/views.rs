@@ -868,7 +868,8 @@ pub fn agent_mark_id(kind: &str) -> &'static str {
 /// A plain shell pane is not an agent and has no vendor mark; it falls
 /// through [`bee_hub_agent_logo`] to the generic terminal prompt, which is
 /// exactly the right glyph for a shell, so this needs no special case.
-fn pane_program_mark(kind: &str) -> String {
+fn pane_program_mark(pane: &TerminalPaneView) -> String {
+    let kind = pane.kind.as_str();
     let (_, mark) = bee_hub_agent_logo(kind);
     // terminal-mark-only: the mark no longer sits beside the program's name,
     // it IS the name -- so it stops being decorative. `title` gives a mouse
@@ -877,21 +878,43 @@ fn pane_program_mark(kind: &str) -> String {
     // The label is the pane's own `kind` verbatim, escaped like every other
     // operator-authored string this module renders.
     format!(
-        r#"<span class="pane-mark" title="{label}">{svg}</span>"#,
+        r#"<span class="pane-mark{tone}" title="{label}">{svg}</span>"#,
+        tone = pane_mark_tone_class(pane_tone(pane)),
         label = esc(kind),
         svg = bee_hub_agent_mark_svg_sized(mark, 12, "pane-mark__svg", Some(kind)),
     )
+}
+
+/// mark-state-tone: the tone a mark takes from the state standing next to
+/// it. A mark drawn beside the word `working` and inked the same muted grey
+/// as one drawn beside `idle` makes the two read alike at a glance -- the
+/// one distinction the board exists to draw. So the mark borrows the tone
+/// its neighbouring dot already carries (`status_pill_toned`'s own mapping):
+/// `working` reads warning, `blocked` reads danger. `idle` and every unknown
+/// state keep the base muted ink and add no class at all, which is why a
+/// quiet pane still renders exactly the `class="pane-mark"` it always did --
+/// a state a mark does not have is never borrowed from another state's
+/// colour, the same rule [`status_pill_toned`] holds itself to.
+fn pane_mark_tone_class(tone: &str) -> &'static str {
+    match tone {
+        "working" => " pane-mark--working",
+        "blocked" => " pane-mark--blocked",
+        _ => "",
+    }
 }
 
 /// [`pane_program_mark`] where the mark is recognition only, not the name:
 /// the Agents drawer (drawer-agent-mark). A drawer row already prints its
 /// state in words and labels its own status dot, so the mark is read by the
 /// eye and skipped by a screen reader -- the hover title still gives a mouse
-/// the program's name.
-fn pane_program_mark_decorative(kind: &str) -> String {
+/// the program's name. `tone` is the row's own already-computed
+/// [`pane_tone`], passed in rather than re-derived so the mark and the dot
+/// beside it can never disagree about what state they are drawing.
+fn pane_program_mark_decorative(kind: &str, tone: &str) -> String {
     let (_, mark) = bee_hub_agent_logo(kind);
     format!(
-        r#"<span class="pane-mark" title="{label}">{svg}</span>"#,
+        r#"<span class="pane-mark{tone_class}" title="{label}">{svg}</span>"#,
+        tone_class = pane_mark_tone_class(tone),
         label = esc(kind),
         svg = bee_hub_agent_mark_svg_sized(mark, 12, "pane-mark__svg", None),
     )
@@ -1331,7 +1354,7 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
                 // mark stays decorative: unlike a badge, this row prints its
                 // state in words and its dot already carries a label, so a
                 // second spoken name would only be repetition.
-                mark = pane_program_mark_decorative(&pane.view.kind),
+                mark = pane_program_mark_decorative(&pane.view.kind, tone),
                 tone = tone,
                 // Unlike a project row — which prints its statuses as
                 // `status_pill` words on its own next line, letting its dot
@@ -1646,7 +1669,7 @@ fn terminal_badges_nav_from_refs(
             r#"<a class="proj-row__badge" href="/p/{pid}/_terminal/pane/{pane_id}">{mark}{status_pill}{title_span}</a>"#,
             pid = pid,
             pane_id = esc(&p.pane_id),
-            mark = pane_program_mark(&p.kind),
+            mark = pane_program_mark(p),
             status_pill = pane_status_pill(p),
         ));
     }
@@ -2076,7 +2099,7 @@ fn pane_tab(link: &str, p: &TerminalPaneView, active: bool, extra: &str) -> Stri
         href = esc(link),
         workspace = esc(&p.workspace),
         tab = esc(&p.tab),
-        mark = pane_program_mark(&p.kind),
+        mark = pane_program_mark(p),
         status_pill = pane_status_pill(p),
     )
 }
@@ -8258,7 +8281,7 @@ fn bee_feature_terminal_tab(project_id: &str, panes: &[TerminalPaneView]) -> Str
             pane_id = esc(&p.pane_id),
             workspace = esc(&p.workspace),
             tab = esc(&p.tab),
-            mark = pane_program_mark(&p.kind),
+            mark = pane_program_mark(p),
             status_pill = pane_status_pill(p),
         ));
     }
@@ -15137,7 +15160,7 @@ mod tests {
             "a drawer row must draw the agent's real mark: {html}"
         );
         let mark_at = html
-            .find(r#"<span class="pane-mark" title="opencode">"#)
+            .find(r#"<span class="pane-mark pane-mark--working" title="opencode">"#)
             .unwrap_or_else(|| panic!("the mark must name the agent on hover: {html}"));
         let dot_at = html
             .find(r#"<span class="fg-status__dot proj-row__dot"#)
@@ -15192,7 +15215,7 @@ mod tests {
             // has to carry the name itself -- on hover and in the
             // accessibility tree -- and the word must be gone from the page.
             assert!(
-                html.contains(r#"<span class="pane-mark" title="opencode">"#),
+                html.contains(r#"<span class="pane-mark pane-mark--working" title="opencode">"#),
                 "the mark must name the program on hover: {html}"
             );
             assert!(
@@ -15200,7 +15223,7 @@ mod tests {
                 "the mark must be readable, not decorative, now that it is the only name: {html}"
             );
             // mark-before-status: every surface reads icon first, then state.
-            let mark_at = html.find(r#"<span class="pane-mark""#).unwrap();
+            let mark_at = html.find(r#"<span class="pane-mark"#).unwrap();
             let status_at = html
                 .find(r#"<span class="fg-status"#)
                 .or_else(|| html.find(r#"<div class="bee-hub__chips">"#))
@@ -15213,6 +15236,62 @@ mod tests {
                 !html.contains(">opencode<"),
                 "the program word must no longer be printed beside its own mark: {html}"
             );
+        }
+    }
+
+    /// mark-state-tone: a mark inked the same grey whether its session is
+    /// working or quiet hides the one distinction the board exists to draw.
+    /// The bug this guards is a mark that keeps its muted ink on a working
+    /// pane -- so the claim is per state, on every surface that draws a
+    /// mark, and it pins the QUIET case just as hard: an idle mark must add
+    /// no class at all rather than borrow a colour it has no state for.
+    #[test]
+    fn a_marks_colour_follows_the_state_standing_beside_it() {
+        for (status, expected) in [
+            ("working", " pane-mark--working"),
+            ("blocked", " pane-mark--blocked"),
+            ("idle", ""),
+        ] {
+            let pane = pane_with_status(status);
+            let mut drawer_pane = menu_pane(&pane.pane_id, Some("proj-a"), "Proj One");
+            drawer_pane.view = pane.clone();
+
+            let surfaces = [
+                (
+                    "badge",
+                    project_badges("proj-a", std::slice::from_ref(&pane)),
+                ),
+                (
+                    "pane tab",
+                    pane_tab(
+                        &format!("/p/proj-a/_terminal/pane/{}", pane.pane_id),
+                        &pane,
+                        false,
+                        "",
+                    ),
+                ),
+                (
+                    "feature row",
+                    bee_feature_terminal_tab("proj-a", std::slice::from_ref(&pane)),
+                ),
+                (
+                    "drawer row",
+                    pinned_group(std::slice::from_ref(&drawer_pane), None),
+                ),
+            ];
+
+            for (surface, html) in surfaces {
+                assert!(
+                    html.contains(&format!(r#"<span class="pane-mark{expected}" title=""#)),
+                    "a {status} pane's mark must read `pane-mark{expected}` on the {surface}: {html}"
+                );
+                if expected.is_empty() {
+                    assert!(
+                        !html.contains("pane-mark--"),
+                        "a quiet mark must borrow no state's colour on the {surface}: {html}"
+                    );
+                }
+            }
         }
     }
 
@@ -15269,7 +15348,7 @@ mod tests {
         };
         let html = project_badges("proj-a", &[pane]);
         let program_at = html
-            .find(r#"<span class="pane-mark" title="claude">"#)
+            .find(r#"<span class="pane-mark pane-mark--working" title="claude">"#)
             .unwrap_or_else(|| panic!("the program's mark must render, naming it: {html}"));
         assert!(
             !html.contains(r#"<span class="proj-row__badge-program">"#),
