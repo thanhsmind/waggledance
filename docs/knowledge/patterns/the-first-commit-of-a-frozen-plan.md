@@ -41,3 +41,12 @@ revision occurred.
   history; spend it only when the shape actually changed.
 - Better still: commit the plan in the same move that renders it, before the gate is
   approved, so the freeze never meets an unborn file.
+
+## Recurrence
+
+- **2026-08-25, herdr-protocol-20.** Hit independently, in another session, on the
+  same day this was promoted, and resolved the same way: *"Committed through a temp
+  index because the plan-freeze guard reads any git path mention of an approved
+  plan.md as an edit."* Two features reaching the identical workaround without
+  consulting each other is the signal that the guard's path match, not the workflow,
+  is what needs changing.
