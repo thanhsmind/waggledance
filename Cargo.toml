@@ -56,3 +56,16 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Local dev loop. `release` stays tuned for the shipped binary (fat LTO,
+# codegen-units = 1) — both of which force the final codegen onto a single
+# thread and pin one core for minutes. `fast` trades binary size and a little
+# runtime speed for a build that actually uses every core.
+# Build with: cargo build --profile fast -p waggledance  (binary at target/fast/)
+[profile.fast]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16
+incremental = true
+strip = "debuginfo"

@@ -26,6 +26,17 @@ cargo build --release -p waggledance     # binary at target/release/waggledance
 ```
 The CLI/daemon does **not** need any GUI system libraries.
 
+**Iterating on the code?** Use the `fast` profile instead. `release` is tuned for
+the shipped binary — fat LTO plus `codegen-units = 1` force the final codegen onto
+a single thread, so a one-line change costs ~43 s pinning one core. `fast` spreads
+the work across every core:
+```bash
+cargo build --profile fast -p waggledance    # binary at target/fast/waggledance
+```
+Measured on a 16-core machine: ~43 s -> ~1 s for a one-line change (~39 s from a
+cold target). The binary is larger (21 MB vs 14 MB) and marginally slower at
+runtime, which is why releases still go out on `release`.
+
 ---
 
 ## 2. Web mode (recommended)
