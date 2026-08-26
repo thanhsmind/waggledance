@@ -2,6 +2,7 @@
 //! Theme is CSS-variable driven (no-flash head script); code colors come from
 //! `/highlight.css` (syntect class-based), so themes switch without re-render.
 
+use crate::guide;
 use waggledance_core::bee::{
     feature_cell_span, list_archived_feature_dirs, BeeActivity, BeeActivityState, BeeApprovedGates,
     BeeBacklog, BeeBuckets, BeeCell, BeeDecisionSummary, BeeDeferredEntry, BeeFeaturePhase, BeePbi,
@@ -473,10 +474,13 @@ const HOME_RAIL_BACKDROP: &str =
     r#"<label for="rail-toggle" class="home-rail__backdrop" aria-hidden="true"></label>"#;
 
 /// console-phone-layout (P2): the handset's bottom bar — `Board` · `Agents`
-/// · `Projects` · `Settings`, in that order, hidden above 700px by
-/// `app.css` and never rendered conditionally (see [`home_page`]'s call).
+/// · `Projects` · `Hướng dẫn` · `Settings`, in that order, hidden above
+/// 700px by `app.css` and never rendered conditionally (see [`home_page`]'s
+/// call). guide-vi added the fourth destination: the built-in guide is
+/// reachable from a phone without opening the top bar's menu, and the CSS
+/// grid widened to five columns in the same edit.
 ///
-/// Three of the four are real anchors, for the same reason every other
+/// Four of the five are real anchors, for the same reason every other
 /// navigation control on this page is: they have to survive the full page
 /// reload and work with scripting off. `Projects` is the exception, and
 /// cannot be an anchor — there is no separate projects route to point at
@@ -487,7 +491,7 @@ const HOME_RAIL_BACKDROP: &str =
 /// Accessibility: the bar is a named `<nav>` landmark, separate from the
 /// topbar's own; exactly one item claims `aria-current="page"` — `Board` on
 /// the board, `Agents` on the terminals view, and neither `Projects` (which
-/// navigates nowhere) nor `Settings` (a different page) ever. The current
+/// navigates nowhere) nor `Settings`/`Hướng dẫn` (other pages) ever. The current
 /// item is not marked by colour alone: it also carries a heavier top rule
 /// (`.home-tabbar__item--on` in app.css). Each glyph is decorative and the
 /// visible label beside it is the accessible name.
@@ -504,7 +508,7 @@ const HOME_RAIL_BACKDROP: &str =
 ///
 /// That order is also the whole scripting-off fallback: with no script the
 /// bar stays visible and the handle stays `hidden`, so a phone without
-/// JavaScript keeps all four destinations and is never offered a control
+/// JavaScript keeps every destination and is never offered a control
 /// that does nothing. Both chevrons ride in the markup and CSS shows exactly
 /// one, so a flip is a class on the `<nav>`, never a script rewriting an
 /// icon.
@@ -525,6 +529,7 @@ fn home_tabbar(tab: HomeTab) -> String {
 <a class="home-tabbar__item{board_class}" href="/?tab=kanban"{board_aria}>{board_icon}<span class="home-tabbar__label">Board</span></a>
 <a class="home-tabbar__item{agents_class}" href="/?tab=terminals"{agents_aria}>{agents_icon}<span class="home-tabbar__label">Agents</span></a>
 <label class="home-tabbar__item" for="rail-toggle">{projects_icon}<span class="home-tabbar__label">Projects</span></label>
+<a class="home-tabbar__item" href="/guide">{guide_icon}<span class="home-tabbar__label">Hướng dẫn</span></a>
 <a class="home-tabbar__item" href="/settings">{settings_icon}<span class="home-tabbar__label">Settings</span></a>
 </nav>
 <button type="button" class="home-tabbar__toggle" hidden aria-controls="home-tabbar" aria-expanded="false">{show_icon}{hide_icon}</button>"#,
@@ -535,6 +540,7 @@ fn home_tabbar(tab: HomeTab) -> String {
         board_icon = TABBAR_ICON_BOARD,
         agents_icon = TABBAR_ICON_AGENTS,
         projects_icon = TABBAR_ICON_PROJECTS,
+        guide_icon = TABBAR_ICON_GUIDE,
         settings_icon = TABBAR_ICON_SETTINGS,
         show_icon = TABBAR_ICON_SHOW,
         hide_icon = TABBAR_ICON_HIDE,
@@ -553,6 +559,10 @@ const TABBAR_ICON_AGENTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 
 const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>"#;
 /// The topbar gear's own outline, so Settings is the same mark wherever the
 /// reader meets it.
+/// guide-vi: the built-in guide's own mark — an open book, the same
+/// 1.5-weight outline every other tab bar glyph is drawn at.
+const TABBAR_ICON_GUIDE: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>"#;
+
 const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>"#;
 
 /// The handle's two chevrons, drawn to the same recipe as the four tab
@@ -8947,8 +8957,8 @@ fn copy_md_button() -> &'static str {
 }
 
 /// Shared top bar for every page: brand, a page-specific center slot (crumb or
-/// empty), the Settings link, and the theme toggle. Keeps the Settings link on
-/// all pages and stops each view re-inventing its own header.
+/// empty), the Hướng dẫn and Settings links, and the theme toggle. Keeps both
+/// links on all pages and stops each view re-inventing its own header.
 fn topbar(center: &str) -> String {
     topbar_full("", center, "", "")
 }
@@ -8966,7 +8976,8 @@ fn topbar(center: &str) -> String {
 /// on these pages is "Waggle Dance" by a locked decision (`bee-cockpit.md`),
 /// never the identifier the command line uses.
 ///
-/// The nav slot and the Settings link share one menu. On a wide screen the
+/// The nav slot, the Hướng dẫn link (guide-vi) and the Settings link share
+/// one menu. On a wide screen the
 /// stylesheet hides its control and lays the panel out inline, so the bar
 /// reads exactly as it did before this existed. On a narrow one the control
 /// becomes the only visible affordance and the panel drops full-width under
@@ -9011,6 +9022,7 @@ fn topbar_full(lead: &str, center: &str, actions: &str, nav: &str) -> String {
       <label class="topbar-menu__button" for="topbar-menu-toggle" title="Menu"><span class="menu-label">Menu</span><span aria-hidden="true">☰</span></label>
       <div class="topbar-menu__panel">
         {nav}
+        <a class="nav-link nav-link--icon" href="/guide" title="Hướng dẫn"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg><span class="nav-link__txt">Hướng dẫn</span></a>
         <a class="nav-link nav-link--icon" href="/settings" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg><span class="nav-link__txt">Settings</span></a>
       </div>
     </div>
@@ -9282,6 +9294,147 @@ pub fn settings_page(
         orchestration_rows = orchestration_rows,
     );
     layout_with_drawer("Settings", "", &body, false)
+}
+
+/// guide-vi: the built-in guide's own chapter rail, on every guide page.
+///
+/// It reuses the file page's `.sidebar` shell (and so its handset drawer, its
+/// backdrop and the `#sidebar-toggle` in the top bar) rather than growing a
+/// second navigation column with its own breakpoint — a reader on a phone
+/// already knows how this one opens.
+///
+/// `current` is the slug being read, or the empty string on the index, where
+/// nothing is marked.
+fn guide_rail(current: &str) -> String {
+    let mut items = String::new();
+    items.push_str(&format!(
+        r#"<a class="guide-rail__item guide-rail__item--home{on}" href="/guide">Bức tranh lớn</a>"#,
+        on = if current.is_empty() {
+            " guide-rail__item--on"
+        } else {
+            ""
+        },
+    ));
+    for c in guide::CHAPTERS {
+        items.push_str(&format!(
+            r#"<a class="guide-rail__item{on}" href="/guide/{slug}"{aria}><span class="guide-rail__num">{num}</span><span class="guide-rail__title">{title}</span></a>"#,
+            on = if c.slug == current {
+                " guide-rail__item--on"
+            } else {
+                ""
+            },
+            aria = if c.slug == current {
+                r#" aria-current="page""#
+            } else {
+                ""
+            },
+            slug = c.slug,
+            num = c.number,
+            title = esc(c.title),
+        ));
+    }
+    format!(
+        r#"<nav class="guide-rail" aria-label="Chương">
+  <div class="guide-rail__head">Hướng dẫn bee</div>
+  {items}
+</nav>"#
+    )
+}
+
+/// The guide's landing page: the whole map in one diagram, then a card per
+/// chapter. `guide::OVERVIEW` is the authored fragment above the cards.
+pub fn guide_index_page() -> String {
+    let mut cards = String::new();
+    for c in guide::CHAPTERS {
+        cards.push_str(&format!(
+            r#"<a class="guide-card" href="/guide/{slug}">
+  <span class="guide-card__num">{num}</span>
+  <span class="guide-card__title">{title}</span>
+  <span class="guide-card__blurb">{blurb}</span>
+</a>"#,
+            slug = c.slug,
+            num = c.number,
+            title = esc(c.title),
+            blurb = esc(c.blurb),
+        ));
+    }
+    let body = format!(
+        r#"{topbar}
+<div class="layout layout--guide">
+  <aside id="sidebar" class="sidebar">{rail}</aside>
+  <div class="sidebar-backdrop"></div>
+  <main class="content">
+    <article class="fg-prose guide-prose">
+      {overview}
+      <div class="guide-cards">{cards}</div>
+    </article>
+  </main>
+</div>"#,
+        topbar = topbar_full(
+            sidebar_toggle(),
+            "<span class=\"crumb\">Hướng dẫn</span>",
+            "",
+            "",
+        ),
+        rail = guide_rail(""),
+        overview = guide::OVERVIEW,
+        cards = cards,
+    );
+    layout_with_drawer("Hướng dẫn bee", "", &body, false)
+}
+
+/// One chapter. The body is authored HTML embedded verbatim — see
+/// [`crate::guide`]'s module docs for why it is never sanitized and why
+/// nothing outside `assets/guide/` may ever reach here.
+pub fn guide_chapter_page(chapter: &guide::Chapter) -> String {
+    let (prev, next) = guide::neighbours(chapter.slug);
+    let step = |c: Option<&guide::Chapter>, rel: &str, label: &str| match c {
+        Some(c) => format!(
+            r#"<a class="guide-step guide-step--{rel}" href="/guide/{slug}"><span class="guide-step__rel">{label}</span><span class="guide-step__title">{num}. {title}</span></a>"#,
+            rel = rel,
+            slug = c.slug,
+            label = label,
+            num = c.number,
+            title = esc(c.title),
+        ),
+        None => String::new(),
+    };
+    let body = format!(
+        r#"{topbar}
+<div class="layout layout--guide">
+  <aside id="sidebar" class="sidebar">{rail}</aside>
+  <div class="sidebar-backdrop"></div>
+  <main class="content">
+    <article class="fg-prose guide-prose">
+      <header class="guide-head">
+        <div class="guide-head__eyebrow">Chương {num} / {total}</div>
+        <h1 class="guide-head__title">{title}</h1>
+        <p class="guide-head__blurb">{blurb}</p>
+      </header>
+      {chapter_body}
+      <nav class="guide-steps" aria-label="Chương trước và sau">{prev}{next}</nav>
+    </article>
+  </main>
+</div>"#,
+        topbar = topbar_full(
+            sidebar_toggle(),
+            &format!(
+                "<span class=\"crumb\"><a href=\"/guide\">Hướng dẫn</a> · {}</span>",
+                esc(chapter.title)
+            ),
+            "",
+            "",
+        ),
+        rail = guide_rail(chapter.slug),
+        num = chapter.number,
+        total = guide::CHAPTERS.len(),
+        title = esc(chapter.title),
+        blurb = esc(chapter.blurb),
+        chapter_body = chapter.body,
+        prev = step(prev, "prev", "Chương trước"),
+        next = step(next, "next", "Chương sau"),
+    );
+    layout_with_drawer(&format!("{} · Hướng dẫn", chapter.title), "", &body, false)
 }
 
 pub fn error_page(status: u16, msg: &str) -> String {
@@ -10945,6 +11098,108 @@ mod tests {
             !html.contains("agent-drawer__tab"),
             "the floating agent-drawer pill is retired; the on-bar toggle is the only affordance now: {html}"
         );
+    }
+
+    /// guide-vi: the guide is a *menu* entry, which is only true if it rides
+    /// the shared bar rather than being linked from one page that happens to
+    /// know about it. `topbar_full` renders it beside Settings, so every page
+    /// built on the shared bar carries it — asserted here on three unrelated
+    /// pages so a future view that hand-rolls its own header is caught.
+    #[test]
+    fn every_page_offers_the_guide_from_the_shared_top_bar_menu() {
+        let project = sample_project();
+        let pages = [
+            ("settings", settings_page(
+                &Config::default(),
+                false,
+                false,
+                NotifyCredentialView::NotConfigured,
+                &[],
+            )),
+            ("terminal", terminal_page(&project, &[], None, &[])),
+            ("guide index", guide_index_page()),
+            (
+                "guide chapter",
+                guide_chapter_page(&guide::CHAPTERS[0]),
+            ),
+        ];
+        for (what, html) in pages {
+            let menu_start = html
+                .find(r#"<div class="topbar-menu js-menu">"#)
+                .unwrap_or_else(|| panic!("{what} has no top bar menu: {html}"));
+            let menu_end = html[menu_start..]
+                .find("</header>")
+                .map(|i| menu_start + i)
+                .unwrap_or_else(|| panic!("{what} has an unclosed top bar"));
+            let menu = &html[menu_start..menu_end];
+            assert!(
+                menu.contains(r#"href="/guide""#),
+                "{what} must offer the guide from inside the bar's own menu: {menu}"
+            );
+        }
+    }
+
+    /// The chapter rail marks exactly the chapter being read, and never marks
+    /// one on the index — a rail that marks nothing on a chapter page leaves
+    /// the reader unable to see where they are in fourteen entries.
+    #[test]
+    fn the_guide_rail_marks_the_chapter_being_read_and_nothing_on_the_index() {
+        let index = guide_index_page();
+        assert_eq!(
+            index.matches(r#"aria-current="page""#).count(),
+            0,
+            "no chapter is current on the guide's own index: {index}"
+        );
+        for chapter in guide::CHAPTERS {
+            let html = guide_chapter_page(chapter);
+            assert_eq!(
+                html.matches(r#"aria-current="page""#).count(),
+                1,
+                "exactly one rail entry may be current on /guide/{}",
+                chapter.slug
+            );
+            assert!(
+                html.contains(&format!(
+                    r#"href="/guide/{}" aria-current="page""#,
+                    chapter.slug
+                )),
+                "the current entry must be this chapter's own: /guide/{}",
+                chapter.slug
+            );
+            // Every chapter is reachable from every other chapter's rail, so
+            // the reader never has to go back to the index to move sideways.
+            for other in guide::CHAPTERS {
+                assert!(
+                    html.contains(&format!(r#"href="/guide/{}""#, other.slug)),
+                    "/guide/{} must list /guide/{} in its rail",
+                    chapter.slug,
+                    other.slug
+                );
+            }
+        }
+    }
+
+    /// The index lists every chapter as a card — a chapter that exists in the
+    /// registry but never appears on the landing page is a chapter nobody
+    /// finds.
+    #[test]
+    fn the_guide_index_offers_a_card_for_every_chapter() {
+        let html = guide_index_page();
+        for chapter in guide::CHAPTERS {
+            assert!(
+                html.contains(&format!(
+                    r#"<a class="guide-card" href="/guide/{}">"#,
+                    chapter.slug
+                )),
+                "the guide index must card /guide/{}: {html}",
+                chapter.slug
+            );
+            assert!(
+                html.contains(&esc(chapter.title)),
+                "the card for /guide/{} must carry its title",
+                chapter.slug
+            );
+        }
     }
 
     /// Everything in the bar that navigates away from this page — the section

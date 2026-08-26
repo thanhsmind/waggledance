@@ -431,6 +431,12 @@ fn router(state: AppState) -> Router {
         // the terminal family (`api_agents`'s own doc comment).
         .route("/api/agents", get(api_agents))
         .route("/settings", get(settings_page_handler))
+        // guide-vi: the built-in guide, reached from the top bar menu on
+        // every page. It reads nothing — no store, no project, no disk — so
+        // it answers on a host with nothing registered, and stays outside
+        // every containment boundary the project routes below live inside.
+        .route("/guide", get(guide_index_handler))
+        .route("/guide/:slug", get(guide_chapter_handler))
         .route("/api/config", get(api_config).post(update_config))
         // toa-1 (D5/D11): the method-mismatch-oracle this family used to
         // close with an extra method-checking extractor existed only to
@@ -1259,6 +1265,30 @@ struct SavedFlag {
     /// (that would put the secret in the redirect target, which this cell's
     /// own prohibition forbids).
     notify_error: Option<String>,
+}
+
+/// guide-vi: the guide's landing page. Takes no state and touches no
+/// filesystem — the chapters are compiled into the binary — so it is the one
+/// page in this router that cannot fail for a reason outside itself.
+async fn guide_index_handler() -> Response {
+    Html(views::guide_index_page()).into_response()
+}
+
+/// One chapter. An unknown slug answers 404 rather than redirecting to the
+/// index: a stale or mistyped link should say so, not silently land the
+/// reader somewhere plausible and let them believe they arrived.
+async fn guide_chapter_handler(Path(slug): Path<String>) -> Response {
+    match crate::guide::find(&slug) {
+        Some(chapter) => Html(views::guide_chapter_page(chapter)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Html(views::error_page(
+                404,
+                "Không có chương hướng dẫn nào tên như vậy.",
+            )),
+        )
+            .into_response(),
+    }
 }
 
 async fn settings_page_handler(
@@ -12675,6 +12705,67 @@ mod bee_route_tests {
             real_before, real_after,
             "the real ~/.waggledance/config.toml was read or written by a route test"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// guide-vi: the guide answers on a host with nothing registered at all.
+    /// That is the whole point of compiling the chapters into the binary —
+    /// the one place a new operator goes to find out what any of this means
+    /// is the one place that must not depend on having set anything up yet.
+    /// Every chapter is walked, not a sample: a slug that made it into the
+    /// registry with a missing route is invisible until someone clicks it.
+    #[tokio::test]
+    async fn the_guide_answers_every_chapter_on_a_host_with_no_projects() {
+        let dir = fresh_root("guide-empty-host");
+        let app = router(build_state_with_dir(&dir));
+
+        let resp = get(app.clone(), "/guide").await;
+        assert_eq!(resp.status(), StatusCode::OK, "/guide must answer");
+        let index = body_string(resp).await;
+        for chapter in crate::guide::CHAPTERS {
+            assert!(
+                index.contains(&format!(r#"href="/guide/{}""#, chapter.slug)),
+                "the index must link /guide/{}",
+                chapter.slug
+            );
+        }
+
+        for chapter in crate::guide::CHAPTERS {
+            let resp = get(app.clone(), &format!("/guide/{}", chapter.slug)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "/guide/{} must answer",
+                chapter.slug
+            );
+            let body = body_string(resp).await;
+            assert!(
+                body.contains(&format!("Chương {} / ", chapter.number)),
+                "/guide/{} must head itself as chapter {}",
+                chapter.slug,
+                chapter.number
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A slug that names no chapter is a 404, never a quiet redirect to the
+    /// index: a stale bookmark that lands on chapter one looks like it worked.
+    #[tokio::test]
+    async fn an_unknown_guide_chapter_is_a_404_not_a_redirect() {
+        let dir = fresh_root("guide-unknown-slug");
+        let app = router(build_state_with_dir(&dir));
+
+        for slug in ["khong-ton-tai", "config.html", "BEE-LA-GI"] {
+            let resp = get(app.clone(), &format!("/guide/{slug}")).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "/guide/{slug} names no chapter and must 404"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
