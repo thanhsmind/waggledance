@@ -140,7 +140,7 @@ plain JSON; `bee status --json` shows the derived gate_bypass_level</pre>
 </table>
 </div>
 
-<p>Một khoá là một trong bốn hình dạng: một chuỗi tên model (<code>"haiku"</code>); một object <code>{"model": "sonnet", "effort": "medium"}</code>; một object <code>{"kind": "cli", …}</code> gọi ra một chương trình ngoài (chỉ dùng được cho gather/review/advisor, không dùng để thực thi cell); một object <code>{"kind": "herding", …}</code> đẩy việc qua một pane bên ngoài; hoặc <code>null</code> — nghĩa là "chưa cấu hình", subagent thừa kế thẳng model của phiên đang chạy. Một tên vai trò lạ không bị từ chối, nó chỉ rơi xuống vai trò kế tiếp mà dispatch cần và cảnh báo một dòng. <a href="/guide/giao-viec">Chương 10</a> nói tiếp cơ chế dispatch dùng bảng này ra sao.</p>
+<p>Một khoá là một trong bốn hình dạng: một chuỗi tên model (<code>"haiku"</code>); một object <code>{"model": "sonnet", "effort": "medium"}</code>; một object <code>{"kind": "cli", …}</code> gọi ra một chương trình ngoài (chỉ dùng được cho gather/review/advisor, không dùng để thực thi cell); một object <code>{"kind": "herding", …}</code> đẩy việc qua một pane bên ngoài; hoặc <code>null</code> — nghĩa là "chưa cấu hình", subagent thừa kế thẳng model của phiên đang chạy. Một tên vai trò lạ không bị từ chối, nó chỉ rơi xuống vai trò kế tiếp mà dispatch cần và cảnh báo một dòng. <a href="/guide/giao-viec">Chương 11</a> nói tiếp cơ chế dispatch dùng bảng này ra sao.</p>
 
 <h3><code>guards.*</code></h3>
 
@@ -166,7 +166,7 @@ plain JSON; `bee status --json` shows the derived gate_bypass_level</pre>
     <tr>
       <td><code>guards.write_policy</code></td>
       <td><code>"isolated"</code> (và cũng là cách đọc cho bất kỳ giá trị lạ nào)</td>
-      <td><code>"isolated"</code>: một checkout chỉ có một phiên được ghi; phiên thứ hai bị từ chối ghi source cho tới khi phiên đầu giải phóng. <code>"shared-disjoint"</code>: hai phiên được ghi cùng một checkout, nhưng chỉ trên đúng đường dẫn mỗi bên đã <code>reserve</code> — một reserve kiểu glob hay quá rộng không đủ. <code>"observe"</code>: chỉ đo, không chặn gì — mọi lệnh ghi đều đi qua. <a href="/guide/phoi-hop">Chương 11</a> nói kỹ về claim/reservation/hold.</td>
+      <td><code>"isolated"</code>: một checkout chỉ có một phiên được ghi; phiên thứ hai bị từ chối ghi source cho tới khi phiên đầu giải phóng. <code>"shared-disjoint"</code>: hai phiên được ghi cùng một checkout, nhưng chỉ trên đúng đường dẫn mỗi bên đã <code>reserve</code> — một reserve kiểu glob hay quá rộng không đủ. <code>"observe"</code>: chỉ đo, không chặn gì — mọi lệnh ghi đều đi qua. <a href="/guide/phoi-hop">Chương 12</a> nói kỹ về claim/reservation/hold.</td>
     </tr>
     <tr>
       <td><code>guards.exclusive_paths</code></td>
@@ -254,7 +254,7 @@ plain JSON; `bee status --json` shows the derived gate_bypass_level</pre>
 
 <h3><code>herding.*</code></h3>
 
-<p>Khối này cấu hình cỗ máy dispatch không người trực tiếp cầm lái — <a href="/guide/giao-viec">Chương 10</a> nói bối cảnh, ở đây chỉ là các khoá.</p>
+<p>Khối này cấu hình cỗ máy dispatch không người trực tiếp cầm lái — <a href="/guide/giao-viec">Chương 11</a> nói bối cảnh, ở đây chỉ là các khoá.</p>
 
 <div class="guide-table-wrap">
 <table class="guide-table">
@@ -298,7 +298,7 @@ plain JSON; `bee status --json` shows the derived gate_bypass_level</pre>
     <tr><td><code>cells_archive_on_close</code></td><td>bật</td><td>Một lần <code>close</code> xanh sẽ chuyển các cell đã cap của feature vào <code>.bee/cells/archive/&lt;feature&gt;/</code>, không còn nằm trên đường mà <code>bee status</code>/<code>bee orient</code> phải đọc mỗi lần.</td></tr>
     <tr><td><code>worktree_cleanup_on_merge</code></td><td>bật</td><td>Một merge có gộp được gì đó sẽ tự xoá thư mục worktree, xoá branch, bỏ grant. Một giá trị không phải boolean bị từ chối thẳng thay vì đoán mò.</td></tr>
     <tr><td><code>product_root</code></td><td>không đặt (= gốc bee)</td><td>Nơi tài liệu sản phẩm nằm khi nó KHÔNG nằm cạnh <code>.bee/</code>. Một giá trị không phải chuỗi, hoặc một đường dẫn không tồn tại, sẽ cảnh báo và dùng gốc bee thay thế.</td></tr>
-    <tr><td><code>capture_queue_threshold</code></td><td><code>{"count": 5, "days": 7}</code></td><td>Ngưỡng áp lực khiến lời nhắc "hàng đợi ghi nhận" đổi giọng gắt hơn. Không bao giờ chặn hẳn việc gì — chỉ đổi giọng nhắc. <a href="/guide/bo-nho">Chương 12</a> sở hữu ý nghĩa của việc ghi nhận.</td></tr>
+    <tr><td><code>capture_queue_threshold</code></td><td><code>{"count": 5, "days": 7}</code></td><td>Ngưỡng áp lực khiến lời nhắc "hàng đợi ghi nhận" đổi giọng gắt hơn. Không bao giờ chặn hẳn việc gì — chỉ đổi giọng nhắc. <a href="/guide/bo-nho">Chương 13</a> sở hữu ý nghĩa của việc ghi nhận.</td></tr>
     <tr><td><code>retry.fallbackChains</code></td><td>không có gì mặc định — phải tự gõ</td><td>Map từ tên vai trò, tên model cụ thể, hoặc <code>"provider/*"</code>, sang một danh sách model dự phòng thử theo thứ tự khi model gốc gặp lỗi tạm thời (quá tải, lỗi 5xx…). Không bao giờ nhảy dự phòng vì test đỏ hay kết quả sai — chỉ vì lỗi hạ tầng.</td></tr>
     <tr><td><code>dogfood_repos</code></td><td><code>[]</code></td><td>Chỉ dùng trong chính repo bee cho vòng tự-cải-thiện. Dự án của bạn cứ để trống.</td></tr>
   </tbody>
@@ -405,7 +405,7 @@ plain JSON; `bee status --json` shows the derived gate_bypass_level</pre>
 <h2>Đọc tiếp</h2>
 <ul>
   <li><a href="/guide/cong-gate">Chương 3 — Năm cái cổng</a>: ý nghĩa đầy đủ của từng cổng mà <code>gate_bypass</code> chỉ nói tới bằng con số.</li>
-  <li><a href="/guide/giao-viec">Chương 10 — Giao việc cho subagent</a>: <code>models.&lt;runtime&gt;.&lt;role&gt;</code> và <code>herding.*</code> quyết định ai chạy việc, ở đây chỉ là bảng khoá.</li>
-  <li><a href="/guide/phoi-hop">Chương 11 — Nhiều phiên cùng lúc</a>: <code>guards.write_policy</code> và <code>guards.exclusive_paths</code> nói kỹ hơn ở đó, cùng claim/reservation/hold.</li>
-  <li><a href="/guide/dung-hieu-qua">Chương 14 — Dùng bee cho hiệu quả</a>: công thức thực chiến khi bạn đã biết mọi khoá nhưng chưa chắc chọn khoá nào.</li>
+  <li><a href="/guide/giao-viec">Chương 11 — Giao việc cho subagent</a>: <code>models.&lt;runtime&gt;.&lt;role&gt;</code> và <code>herding.*</code> quyết định ai chạy việc, ở đây chỉ là bảng khoá.</li>
+  <li><a href="/guide/phoi-hop">Chương 12 — Nhiều phiên cùng lúc</a>: <code>guards.write_policy</code> và <code>guards.exclusive_paths</code> nói kỹ hơn ở đó, cùng claim/reservation/hold.</li>
+  <li><a href="/guide/dung-hieu-qua">Chương 15 — Dùng bee cho hiệu quả</a>: công thức thực chiến khi bạn đã biết mọi khoá nhưng chưa chắc chọn khoá nào.</li>
 </ul>
