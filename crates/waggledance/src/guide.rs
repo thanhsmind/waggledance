@@ -246,6 +246,56 @@ mod tests {
         }
     }
 
+    /// D2: a chapter opens on a picture. That is the guide's whole method, and
+    /// a method that lives only in a CONTEXT.md sentence is one the next
+    /// chapter quietly drops — so it is a test. Each figure must also carry
+    /// its own `<title>`, since a diagram doing the explaining is unreadable
+    /// to a screen reader without one.
+    #[test]
+    fn every_chapter_opens_on_a_figure_and_every_figure_names_itself() {
+        for c in CHAPTERS.iter().chain(std::iter::once(&Chapter {
+            slug: "_index",
+            number: 0,
+            title: "Bức tranh lớn",
+            blurb: "",
+            body: OVERVIEW,
+        })) {
+            let figures = c.body.matches(r#"<figure class="guide-fig">"#).count();
+            assert!(
+                figures > 0,
+                "chapter {} explains without a single picture",
+                c.slug
+            );
+            assert_eq!(
+                c.body.matches("<svg").count(),
+                c.body.matches("</svg>").count(),
+                "chapter {} has an unclosed svg",
+                c.slug
+            );
+            assert!(
+                c.body.matches("<svg").count() >= figures,
+                "chapter {} has a guide-fig with no drawing in it",
+                c.slug
+            );
+            assert_eq!(
+                c.body.matches("<svg").count(),
+                c.body.matches("<title id=").count(),
+                "every svg in chapter {} must carry its own <title id=…> for a screen reader",
+                c.slug
+            );
+            // A literal colour or an inline style in a diagram is a diagram
+            // that goes blind on the other side of the theme toggle. The
+            // `fig-*` classes are the whole palette (see app.css).
+            for banned in ["fill=\"#", "stroke=\"#", "style=\"", "fill=\"rgb", "stroke=\"rgb"] {
+                assert!(
+                    !c.body.contains(banned),
+                    "chapter {} hard-codes {banned} — use the fig-* classes so both themes work",
+                    c.slug
+                );
+            }
+        }
+    }
+
     /// A fragment is embedded verbatim into a page that already has a `<main>`
     /// and a `<h1>` of its own, so one that ships its own document scaffolding
     /// would nest a second one inside the first.
