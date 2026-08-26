@@ -2,6 +2,7 @@
 
 mod cli;
 mod doctor;
+mod guide;
 mod herdr;
 mod mcp;
 mod notify;
