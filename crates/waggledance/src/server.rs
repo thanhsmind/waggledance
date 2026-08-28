@@ -17618,51 +17618,85 @@ mod bee_route_tests {
         };
         let screen = at("class=\"term-screen\"");
         let scroll = at("class=\"term-scroll\"");
-        let arrows = at("class=\"term-keys term-keys--move\"");
+        let keys = at("class=\"term-keys\"");
         let reply = at("class=\"term-reply\"");
         let actions = at("class=\"term-reply__actions\"");
         assert!(
-            screen < scroll && scroll < arrows && arrows < reply && reply < actions,
-            "pane controls out of order (screen {screen}, scroll {scroll}, arrows {arrows}, reply {reply}, actions {actions}): {body}"
+            screen < scroll && scroll < keys && keys < reply && reply < actions,
+            "pane controls out of order (screen {screen}, scroll {scroll}, keys {keys}, reply {reply}, actions {actions}): {body}"
         );
         // The scroll pair belongs to the screen, inside its wrapper — not to
-        // the key row, which is where it used to live.
+        // the key grid, which is where it used to live.
         assert!(
             at("class=\"term-screen-wrap\"") < screen && scroll < at("class=\"term-controls\""),
-            "the scroll pair must ride on the screen, not sit in the key row: {body}"
+            "the scroll pair must ride on the screen, not sit in the key grid: {body}"
         );
-        // The arrows and the named keys now share one line inside a single
-        // control block — the second row they used to sit in is gone, and its
-        // wrapper must not come back, or the line splits in two again.
+        // The one 2×6 grid (tkg-1/D1) sits inside a single control block —
+        // the two-group wrapper it replaced must not come back.
         assert!(
             body.contains("class=\"term-controls\"") && !body.contains("term-controls__row"),
             "the controls must sit in one single-row block: {body}"
         );
-        // Both key groups are inside that block, the arrows first.
-        let named = body[arrows + 1..]
-            .find("class=\"term-keys\"")
-            .unwrap_or_else(|| panic!("missing the named-key group: {body}"))
-            + arrows
-            + 1;
+        // tkg-1/D1: the grid renders in one fixed order — row 1 Esc, Tab,
+        // Ctrl, ↑, Shift, Ctrl+C; row 2 Alt, Paste, ←, ↓, →, Enter — so a
+        // script that walks `.term-keys` children in DOM order tags each
+        // one correctly.
+        let esc_pos = at("data-key=\"escape\"");
+        let tab_pos = at("data-key=\"tab\"");
+        let ctrl_pos = at("data-mod=\"ctrl\"");
+        let up_pos = at("data-key=\"up\"");
+        let shift_pos = at("data-mod=\"shift\"");
+        let ctrlc_pos = at("data-key=\"ctrl+c\"");
+        let alt_pos = at("data-mod=\"alt\"");
+        let paste_pos = at("class=\"term-keys__paste\"");
+        let left_pos = at("data-key=\"left\"");
+        let down_pos = at("data-key=\"down\"");
+        let right_pos = at("data-key=\"right\"");
+        let enter_pos = at("data-key=\"enter\"");
         assert!(
-            named < reply,
-            "the named keys must sit in the control block, above the reply box: {body}"
+            esc_pos < tab_pos
+                && tab_pos < ctrl_pos
+                && ctrl_pos < up_pos
+                && up_pos < shift_pos
+                && shift_pos < ctrlc_pos
+                && ctrlc_pos < alt_pos
+                && alt_pos < paste_pos
+                && paste_pos < left_pos
+                && left_pos < down_pos
+                && down_pos < right_pos
+                && right_pos < enter_pos,
+            "the 2x6 grid must render Esc,Tab,Ctrl,↑,Shift,Ctrl+C / Alt,Paste,←,↓,→,Enter in that order: {body}"
         );
+        // The three modifier buttons (Ctrl/Shift/Alt) carry no data-key —
+        // they latch instead of posting a wire name of their own.
+        for m in ["ctrl", "shift", "alt"] {
+            let start = body
+                .find(&format!("data-mod=\"{m}\""))
+                .unwrap_or_else(|| panic!("missing the {m} modifier button: {body}"));
+            let end = body[start..]
+                .find("</button>")
+                .map(|i| start + i)
+                .unwrap_or_else(|| panic!("the {m} modifier button must close: {body}"));
+            assert!(
+                !body[start..end].contains("data-key"),
+                "the {m} modifier button must carry no data-key: {body}"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// ctrl-c-key-1: the named-key row ends with Ctrl+C, the one key an
-    /// operator watching a runaway command reaches for. It carries the wire
-    /// name herdr's key channel accepts for an interrupt — `ctrl+c`, never
-    /// tmux's `C-c` — and it sits in the SAME group as Enter/Esc/Tab, after
-    /// Tab: the arrow group above it is styled for glyph keys, and a key that
-    /// stops the agent belongs beside the keys that answer it. No separate
-    /// wiring is asserted because none exists: `assets/app.js` binds every
-    /// `button[data-key]` in a key group, so the markup IS the feature.
+    /// ctrl-c-key-1, amended by tkg-1 for the 2×6 grid (D1): Ctrl+C keeps
+    /// its own dedicated slot — the interrupt path an operator watching a
+    /// runaway command reaches for — closing row 1 (Esc, Tab, Ctrl, ↑,
+    /// Shift, Ctrl+C) right after Tab and Shift and right before row 2
+    /// opens with Alt. It carries the wire name herdr's key channel accepts
+    /// for an interrupt — `ctrl+c`, never tmux's `C-c`. No separate wiring
+    /// is asserted because none exists: `assets/app.js` binds every
+    /// `button[data-key]` in the grid, so the markup IS the feature.
     #[tokio::test]
-    async fn the_key_row_ends_with_an_interrupt() {
+    async fn ctrl_c_closes_the_first_grid_row() {
         let dir = fresh_root("terminal-ctrl-c-key");
         enable_terminal(&dir);
         let root = fresh_root("terminal-ctrl-c-key-project");
@@ -17687,32 +17721,25 @@ mod bee_route_tests {
 
         let interrupt = body
             .find("<button type=\"button\" data-key=\"ctrl+c\">Ctrl+C</button>")
-            .unwrap_or_else(|| panic!("no interrupt key in the row: {body}"));
+            .unwrap_or_else(|| panic!("no interrupt key in the grid: {body}"));
         assert!(
             !body.contains("data-key=\"C-c\"") && !body.contains("data-key=\"ctrl-c\""),
             "the wire name is ctrl+c; tmux spelling would be sent verbatim and ignored: {body}"
         );
-        // Same group as the other named keys, last in it: the named-key group
-        // opens after the arrow group, and the interrupt falls between Tab and
-        // that group's close.
-        let arrows = body
-            .find("class=\"term-keys term-keys--move\"")
-            .unwrap_or_else(|| panic!("no arrow group: {body}"));
-        let named = body[arrows + 1..]
+        // Same grid as every other key: Ctrl+C is the sixth button — row 1's
+        // last — sitting right after Tab and right before row 2's Alt opens.
+        let keys = body
             .find("class=\"term-keys\"")
-            .unwrap_or_else(|| panic!("no named-key group: {body}"))
-            + arrows
-            + 1;
+            .unwrap_or_else(|| panic!("no key grid: {body}"));
         let tab = body
             .find("data-key=\"tab\"")
             .unwrap_or_else(|| panic!("no Tab key: {body}"));
-        let group_end = body[named..]
-            .find("</div>")
-            .map(|i| named + i)
-            .unwrap_or_else(|| panic!("the named-key group must close: {body}"));
+        let alt = body
+            .find("data-mod=\"alt\"")
+            .unwrap_or_else(|| panic!("no Alt modifier: {body}"));
         assert!(
-            named < tab && tab < interrupt && interrupt < group_end,
-            "the interrupt must be the last key in the named-key group (group {named}, tab {tab}, interrupt {interrupt}, end {group_end}): {body}"
+            keys < tab && tab < interrupt && interrupt < alt,
+            "Ctrl+C must close row 1, right after Tab and before Alt opens row 2 (grid {keys}, tab {tab}, interrupt {interrupt}, alt {alt}): {body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -21676,10 +21703,10 @@ mod bee_route_tests {
         );
         assert!(
             project_body.contains(&format!(
-                r#"<div class="term-keys term-keys--move" data-pane-id="{}" data-term-base="{}""#,
+                r#"<div class="term-keys" data-pane-id="{}" data-term-base="{}""#,
                 project_agent.pane_id, project_base
             )),
-            "a project pane's move keys must carry the same base: {project_body}"
+            "a project pane's key grid must carry the same base: {project_body}"
         );
         assert!(
             project_body.contains(r#"data-key="enter">Enter</button>"#)
@@ -21705,10 +21732,10 @@ mod bee_route_tests {
         );
         assert!(
             unassigned_body.contains(&format!(
-                r#"<div class="term-keys term-keys--move" data-pane-id="{}" data-term-base="{}""#,
+                r#"<div class="term-keys" data-pane-id="{}" data-term-base="{}""#,
                 unassigned_agent.pane_id, unassigned_base
             )),
-            "an unassigned pane's move keys must carry the Unassigned base: {unassigned_body}"
+            "an unassigned pane's key grid must carry the Unassigned base: {unassigned_body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
