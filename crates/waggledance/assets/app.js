@@ -2959,8 +2959,14 @@
       // alongside it.
       if (!hasTarget(base, projectId)) return;
       var input = form.querySelector(".term-reply__text");
-      var stageBtn = form.querySelector(".term-reply__stage");
-      var approveBtn = form.querySelector(".term-reply__approve");
+      // trc-2: Approve/Stage now render in the key grid, not inside this
+      // form — found via the shared `.term-pane` card ancestor both
+      // `views.rs::pane_controls` and `views.rs::screen_frame` wrap every
+      // pane's controls in (same lookup `wireTermKeysPaste` above already
+      // uses to find the reply textarea from the key grid's own side).
+      var card = form.closest(".term-pane");
+      var stageBtn = card && card.querySelector(".term-reply__stage");
+      var approveBtn = card && card.querySelector(".term-reply__approve");
       var attachBox = form.querySelector(".term-attach[data-pane-id]");
       var fileInput = attachBox && attachBox.querySelector(".term-attach__input");
       var attachBtn = attachBox && attachBox.querySelector(".term-attach__btn");
@@ -3170,8 +3176,12 @@
       .forEach(function (form) {
         var paneId = form.getAttribute("data-pane-id");
         var input = form.querySelector(".term-reply__text");
-        var stageBtn = form.querySelector(".term-reply__stage");
-        var approveBtn = form.querySelector(".term-reply__approve");
+        // trc-2: same move as the shared wiring above — Approve/Stage now
+        // render in the key grid, a sibling of this form under the same
+        // `.term-pane` card, not a descendant of the form itself.
+        var card = form.closest(".term-pane");
+        var stageBtn = card && card.querySelector(".term-reply__stage");
+        var approveBtn = card && card.querySelector(".term-reply__approve");
         form.addEventListener("submit", function (ev) {
           ev.preventDefault();
           sendReply(paneId, input.value, true, input);

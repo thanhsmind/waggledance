@@ -17637,15 +17637,16 @@ mod bee_route_tests {
             body.contains("class=\"term-controls\"") && !body.contains("term-controls__row"),
             "the controls must sit in one single-row block: {body}"
         );
-        // tkg-1/D1: the grid renders in one fixed order — row 1 Esc, Tab,
-        // Ctrl, ↑, Shift, Ctrl+C; row 2 Alt, Paste, ←, ↓, →, Enter — so a
-        // script that walks `.term-keys` children in DOM order tags each
-        // one correctly.
+        // tkg-1/D1, amended by trc-2 (UAT round): the grid renders in one
+        // fixed order — row 1 Esc, Tab, Approve, ↑, Stage, Ctrl+C; row 2
+        // Alt, Paste, ←, ↓, →, Enter. Ctrl and Shift are gone outright,
+        // their slots taken by Approve and Stage — so a script that walks
+        // `.term-keys` children in DOM order tags each one correctly.
         let esc_pos = at("data-key=\"escape\"");
         let tab_pos = at("data-key=\"tab\"");
-        let ctrl_pos = at("data-mod=\"ctrl\"");
+        let approve_pos = at("class=\"term-reply__approve\"");
         let up_pos = at("data-key=\"up\"");
-        let shift_pos = at("data-mod=\"shift\"");
+        let stage_pos = at("class=\"term-reply__stage\"");
         let ctrlc_pos = at("data-key=\"ctrl+c\"");
         let alt_pos = at("data-mod=\"alt\"");
         let paste_pos = at("class=\"term-keys__paste\"");
@@ -17655,33 +17656,35 @@ mod bee_route_tests {
         let enter_pos = at("data-key=\"enter\"");
         assert!(
             esc_pos < tab_pos
-                && tab_pos < ctrl_pos
-                && ctrl_pos < up_pos
-                && up_pos < shift_pos
-                && shift_pos < ctrlc_pos
+                && tab_pos < approve_pos
+                && approve_pos < up_pos
+                && up_pos < stage_pos
+                && stage_pos < ctrlc_pos
                 && ctrlc_pos < alt_pos
                 && alt_pos < paste_pos
                 && paste_pos < left_pos
                 && left_pos < down_pos
                 && down_pos < right_pos
                 && right_pos < enter_pos,
-            "the 2x6 grid must render Esc,Tab,Ctrl,↑,Shift,Ctrl+C / Alt,Paste,←,↓,→,Enter in that order: {body}"
+            "the 2x6 grid must render Esc,Tab,Approve,↑,Stage,Ctrl+C / Alt,Paste,←,↓,→,Enter in that order: {body}"
         );
-        // The three modifier buttons (Ctrl/Shift/Alt) carry no data-key —
-        // they latch instead of posting a wire name of their own.
-        for m in ["ctrl", "shift", "alt"] {
-            let start = body
-                .find(&format!("data-mod=\"{m}\""))
-                .unwrap_or_else(|| panic!("missing the {m} modifier button: {body}"));
-            let end = body[start..]
-                .find("</button>")
-                .map(|i| start + i)
-                .unwrap_or_else(|| panic!("the {m} modifier button must close: {body}"));
-            assert!(
-                !body[start..end].contains("data-key"),
-                "the {m} modifier button must carry no data-key: {body}"
-            );
-        }
+        // Ctrl and Shift are removed outright — Alt is the grid's only
+        // latching modifier now, and it still carries no data-key.
+        assert!(
+            !body.contains("data-mod=\"ctrl\"") && !body.contains("data-mod=\"shift\""),
+            "the Ctrl/Shift soft keys must be gone, replaced by Approve/Stage: {body}"
+        );
+        let start = body
+            .find("data-mod=\"alt\"")
+            .unwrap_or_else(|| panic!("missing the alt modifier button: {body}"));
+        let end = body[start..]
+            .find("</button>")
+            .map(|i| start + i)
+            .unwrap_or_else(|| panic!("the alt modifier button must close: {body}"));
+        assert!(
+            !body[start..end].contains("data-key"),
+            "the alt modifier button must carry no data-key: {body}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
@@ -17689,9 +17692,10 @@ mod bee_route_tests {
 
     /// ctrl-c-key-1, amended by tkg-1 for the 2×6 grid (D1): Ctrl+C keeps
     /// its own dedicated slot — the interrupt path an operator watching a
-    /// runaway command reaches for — closing row 1 (Esc, Tab, Ctrl, ↑,
-    /// Shift, Ctrl+C) right after Tab and Shift and right before row 2
-    /// opens with Alt. It carries the wire name herdr's key channel accepts
+    /// runaway command reaches for — closing row 1 (Esc, Tab, Approve, ↑,
+    /// Stage, Ctrl+C, amended by trc-2's UAT round: Approve/Stage took
+    /// Ctrl/Shift's slots) right after Tab and right before row 2 opens
+    /// with Alt. It carries the wire name herdr's key channel accepts
     /// for an interrupt — `ctrl+c`, never tmux's `C-c`. No separate wiring
     /// is asserted because none exists: `assets/app.js` binds every
     /// `button[data-key]` in the grid, so the markup IS the feature.
