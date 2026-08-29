@@ -56,6 +56,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+ incremental = false # Tắt incremental trong release để không tạo 1.4GB cache
 
 # Local dev loop. `release` stays tuned for the shipped binary (fat LTO,
 # codegen-units = 1) — both of which force the final codegen onto a single
@@ -69,3 +70,5 @@ lto = false
 codegen-units = 16
 incremental = true
 strip = "debuginfo"
+
+
