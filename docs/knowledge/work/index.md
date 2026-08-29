@@ -93,6 +93,7 @@ never a generation timestamp or any other wall-clock value.
 - [term-frame-blocks/](term-frame-blocks/index.md) — 1 concept(s)
 - [term-keys-grid/](term-keys-grid/index.md) — 1 concept(s)
 - [term-keys-one-row/](term-keys-one-row/index.md) — 1 concept(s)
+- [term-reply-composer/](term-reply-composer/index.md) — 1 concept(s)
 - [term-url-links/](term-url-links/index.md) — 1 concept(s)
 - [terminal-approve-button/](terminal-approve-button/index.md) — 1 concept(s)
 - [terminal-attach-submit-race/](terminal-attach-submit-race/index.md) — 1 concept(s)
