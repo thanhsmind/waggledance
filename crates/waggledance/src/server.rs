@@ -1286,13 +1286,40 @@ fn project_summary_json(id: &str, name: &str, file_count: usize) -> serde_json::
 /// would read every pane on the host as unassigned. A herdr snapshot failure
 /// answers the same `herdr_down_response` `terminal_screen` gives any other
 /// data route: a `502` naming the reason, never a `200` with an empty array
-/// that would be indistinguishable from a host that genuinely has no agents.
+/// that would be indistinguishable from a host that genuinely has no agents
+/// — UNLESS a live paseo agent exists (paseo-support ps-4): that agent's
+/// row needs no herdr data at all, so a herdr-down host with one or more
+/// live paseo agents still answers `200` with those rows, the same
+/// down-survives-it rule ps-2 already gave the Suggested-projects block
+/// (`untracked_paseo_suggestion_survives_herdr_being_down`) — never
+/// `herdr_down_response`, which would hide them for the identical reason.
 async fn api_agents(State(st): State<AppState>) -> Response {
     if !terminal_family_enabled(&st) {
         return terminal_disabled_json_404();
     }
     let Ok(projects) = st.engine.list_projects() else {
         return Json(json!([])).into_response();
+    };
+    // paseo-support ps-4: live paseo agents, read through the SAME seam
+    // ps-2's `index_page` read uses (`AppState.paseo_store_root` or
+    // `default_store_root`, sync filesystem work off the request thread in
+    // `spawn_blocking`) — already gated by the `terminal_family_enabled`
+    // check above, so a switched-off host makes no paseo read at all. Read
+    // before the herdr snapshot below so a herdr-down answer can still
+    // carry these rows.
+    let paseo_agents: Vec<waggledance_core::paseo::PaseoAgent> = {
+        let root = st
+            .paseo_store_root
+            .clone()
+            .or_else(waggledance_core::paseo::default_store_root);
+        match root {
+            Some(root) => tokio::task::spawn_blocking(move || {
+                waggledance_core::paseo::list_live_agents(&root)
+            })
+            .await
+            .unwrap_or_default(),
+            None => Vec::new(),
+        }
     };
     // A2/A3: the drawer says bee's own state where there is one, so this
     // feed carries it. Read through the same cached rollup path every other
@@ -1307,10 +1334,19 @@ async fn api_agents(State(st): State<AppState>) -> Response {
     // herdr first: its hosted session ids are the second liveness witness
     // `project_bee_activity` joins on, so the snapshot has to exist before
     // the bee join runs. herdr down still answers `herdr_down_response`
-    // with no rollup read at all.
+    // with no rollup read at all — unless a live paseo agent exists (see
+    // this function's own doc comment above), in which case the paseo rows
+    // alone still answer.
     let snapshot = match st.herdr.snapshot().await {
         Ok(snapshot) => snapshot,
-        Err(_) => return herdr_down_response(),
+        Err(_) => {
+            if paseo_agents.is_empty() {
+                return herdr_down_response();
+            }
+            let mut rows = Vec::new();
+            push_paseo_rows(&mut rows, &paseo_agents, &projects);
+            return Json(json!(rows)).into_response();
+        }
     };
     let herdr_sessions = herdr_session_ids(Some(&snapshot));
     let bee: std::collections::HashMap<String, ProjectBeeActivity> = if bee_projects.is_empty() {
@@ -1322,7 +1358,13 @@ async fn api_agents(State(st): State<AppState>) -> Response {
             .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r, &herdr_sessions)))
             .collect()
     };
-    Json(json!(agent_pane_rows(&snapshot, &projects, &bee))).into_response()
+    Json(json!(agent_pane_rows(
+        &snapshot,
+        &projects,
+        &bee,
+        &paseo_agents
+    )))
+    .into_response()
 }
 
 async fn api_config(State(st): State<AppState>) -> impl IntoResponse {
@@ -5357,10 +5399,16 @@ fn agent_title_for(snapshot: &herdr::Snapshot, pane_id: &str) -> String {
 /// `terminal_page_inner` applies), and — per `unassigned_panes`'s own doc
 /// comment — empties the Unassigned half too, rather than risk leaking that
 /// project's panes into it.
+///
+/// paseo-support ps-4: every LIVE paseo agent (`waggledance_core::paseo`)
+/// is appended after the herdr rows above, via [`push_paseo_rows`] — never
+/// interleaved with them, so the herdr rows' own dedup (`seen`) and
+/// ordering are untouched by this addition.
 fn agent_pane_rows(
     snapshot: &herdr::Snapshot,
     projects: &[waggledance_core::domain::Project],
     bee: &std::collections::HashMap<String, ProjectBeeActivity>,
+    paseo_agents: &[waggledance_core::paseo::PaseoAgent],
 ) -> Vec<AgentPaneRow> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rows = Vec::new();
@@ -5430,7 +5478,97 @@ fn agent_pane_rows(
         });
     }
 
+    push_paseo_rows(&mut rows, paseo_agents, projects);
+
     rows
+}
+
+/// paseo-support ps-4 (D1): the `/api/agents` row for one live paseo
+/// agent. `url` is deliberately empty — a paseo agent has no herdr pane
+/// and no page to open, so this row must carry no link/open/send-input
+/// affordance at all; `assets/app.js`'s `agentRow` renders a row whose
+/// `url` is empty as a plain (non-anchor) element rather than an
+/// `<a href>`. `title` stays empty rather than the paseo record's own
+/// `title`, which is prompt text — the same rule ps-2's project-row badge
+/// already applies to the same field — and `name` carries provider and
+/// model instead, the vocabulary the drawer falls back to display
+/// (`agent.title || agent.name` client-side). `pane_id` is a synthetic,
+/// `paseo:`-prefixed value: no herdr pane backs this row, but the
+/// client's own dedup/keying still wants a stable id, and the prefix can
+/// never collide with a real herdr pane id (herdr's own ids are tmux/screen
+/// pane ids, never this string). `bee_state`/`feature` stay `None` — no
+/// `.bee/` store maps onto a paseo agent.
+fn paseo_agent_row(
+    agent: &waggledance_core::paseo::PaseoAgent,
+    project_id: Option<String>,
+    project_name: String,
+) -> AgentPaneRow {
+    let name = match &agent.model {
+        Some(model) => format!("{} · {}", agent.provider, model),
+        None => agent.provider.clone(),
+    };
+    AgentPaneRow {
+        bee_state: None,
+        feature: None,
+        mark: views::agent_mark_id(&agent.provider),
+        project_id,
+        project_name,
+        url: String::new(),
+        title: String::new(),
+        pane_id: format!("paseo:{}", agent.id),
+        name,
+        status: agent.last_status.clone(),
+        workspace: String::new(),
+        tab: String::new(),
+    }
+}
+
+/// paseo-support ps-4: assigns every live paseo agent to at most one row —
+/// the first project (in `projects`' own order) whose D5 boundary claims
+/// its `cwd` (`Boundary::validate_existing`, never the raw
+/// `is_contained_in_root` second guard), mirroring the "first project
+/// wins" rule [`agent_pane_rows`] already applies to its own `seen` set
+/// for herdr panes — a SEPARATE dedup set here, since a paseo agent id and
+/// a herdr pane id share no namespace. An agent no project's boundary
+/// claims joins the existing `(unassigned)` group, exactly like an
+/// unassigned herdr pane — reusing [`unassigned_paseo_agents`]'s own
+/// fail-closed complement rather than re-deriving it.
+///
+/// Shared by [`agent_pane_rows`] (herdr reachable) and `api_agents`'s own
+/// herdr-down fallback (no snapshot at all): a paseo agent's row needs no
+/// herdr data of its own, so the same assembly serves both call sites.
+fn push_paseo_rows(
+    rows: &mut Vec<AgentPaneRow>,
+    paseo_agents: &[waggledance_core::paseo::PaseoAgent],
+    projects: &[waggledance_core::domain::Project],
+) {
+    if paseo_agents.is_empty() {
+        return;
+    }
+    let mut claimed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for project in projects {
+        let Ok(boundary) =
+            waggledance_core::paths_boundary::Boundary::new(vec![project.root_path.clone()])
+        else {
+            continue;
+        };
+        for agent in paseo_agents {
+            if claimed.contains(agent.id.as_str()) {
+                continue;
+            }
+            if boundary.validate_existing(&agent.cwd).is_ok() {
+                claimed.insert(agent.id.as_str());
+                rows.push(paseo_agent_row(
+                    agent,
+                    Some(project.id.clone()),
+                    project.name.clone(),
+                ));
+            }
+        }
+    }
+    for agent in unassigned_paseo_agents(paseo_agents, projects) {
+        rows.push(paseo_agent_row(agent, None, "(unassigned)".to_string()));
+    }
 }
 
 /// project-suggestions (D1, D4, D6): every folder an agent-backed herdr
@@ -27534,6 +27672,141 @@ mod bee_route_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// paseo-support ps-4: the user-visible bug this cell exists to close —
+    /// the Agents drawer (`GET /api/agents`) said "No agents" while a live
+    /// paseo agent was running, because the herdr snapshot it read from
+    /// never carried paseo agents at all. A live paseo agent whose `cwd`
+    /// resolves inside a tracked project's own D5 boundary
+    /// (`Boundary::validate_existing`, the same join ps-2 uses for the
+    /// board row's own badge) now appears as a row under that project,
+    /// carrying no `url` (D1: a paseo agent has no pane and no page to
+    /// open) and never the agent's own `title` (prompt text).
+    #[tokio::test]
+    async fn api_agents_lists_a_live_paseo_agent_row() {
+        let dir = fresh_root("agents-feed-paseo-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("agents-feed-paseo-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+
+        let paseo_store = fresh_root("agents-feed-paseo-store");
+        let slug_dir = paseo_store.join("tracked-slug");
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        std::fs::write(
+            slug_dir.join("agent-1.json"),
+            format!(
+                r#"{{
+                    "id": "agent-1",
+                    "provider": "claude",
+                    "cwd": {cwd},
+                    "title": "do the secret thing",
+                    "lastStatus": "running",
+                    "lastActivityAt": "2026-08-29T12:00:00Z",
+                    "config": {{"model": "claude-sonnet-5"}}
+                }}"#,
+                cwd = serde_json::to_string(&tracked_root.to_string_lossy().into_owned()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(paseo_store.clone());
+        let project = register(&st, &tracked_root, "agents-feed-tracked");
+        let app = router(st);
+
+        let resp = get(app, "/api/agents").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+
+        let row = rows.iter().find(|r| r["project_id"] == project.id).unwrap_or_else(|| {
+            panic!(
+                "a live paseo agent mapped to a tracked project must appear in the drawer feed: {body}"
+            )
+        });
+        assert_eq!(
+            row["url"], "",
+            "a paseo row must carry no link, open, or send-input affordance (D1): {body}"
+        );
+        assert_eq!(
+            row["title"], "",
+            "a paseo row must never render the agent's own title (prompt text): {body}"
+        );
+        assert!(
+            !body.contains("do the secret thing"),
+            "the paseo agent's prompt-text title must never reach the feed at all: {body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&paseo_store).ok();
+    }
+
+    /// paseo-support ps-4: the SAME herdr-down survival ps-2 already proved
+    /// for the Suggested-projects block
+    /// (`untracked_paseo_suggestion_survives_herdr_being_down`) — a live
+    /// paseo agent's row needs no herdr data of its own, so `api_agents`
+    /// must not fall back to `herdr_down_response` while one exists, or the
+    /// drawer would say "No agents" for the exact reason this cell exists
+    /// to fix.
+    #[tokio::test]
+    async fn api_agents_paseo_row_survives_herdr_being_down() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("agents-feed-paseo-herdr-down-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("agents-feed-paseo-herdr-down-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+
+        let paseo_store = fresh_root("agents-feed-paseo-herdr-down-store");
+        let slug_dir = paseo_store.join("tracked-slug");
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        std::fs::write(
+            slug_dir.join("agent-1.json"),
+            format!(
+                r#"{{
+                    "id": "agent-1",
+                    "provider": "codex",
+                    "cwd": {cwd},
+                    "title": "explore",
+                    "lastStatus": "running",
+                    "lastActivityAt": "2026-08-29T12:00:00Z"
+                }}"#,
+                cwd = serde_json::to_string(&tracked_root.to_string_lossy().into_owned()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        fake.set_available(false);
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        st.paseo_store_root = Some(paseo_store.clone());
+        let project = register(&st, &tracked_root, "agents-feed-tracked-down");
+        let app = router(st);
+
+        let resp = get(app, "/api/agents").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a live paseo agent must still answer the drawer feed, never herdr_down_response, \
+             when herdr is down"
+        );
+        let body = body_string(resp).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r["project_id"] == project.id && r["url"] == ""),
+            "the paseo row must still carry no link even when herdr is down: {body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&paseo_store).ok();
     }
 
     // ── stale-index-refresh-2: the 404 page's Refresh index button ─────────
