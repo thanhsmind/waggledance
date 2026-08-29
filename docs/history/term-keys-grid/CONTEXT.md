@@ -46,9 +46,10 @@ tests pin the old two-group markup), product files=3.
 
 ## Outstanding Questions
 
-- Deferred to execution: verify herdr accepts `shift+tab` / `alt+<key>` /
-  `ctrl+<arrow>` spellings; if a combo is ignored by herdr it still must not
-  break the bare keys.
+- Deferred to execution (trigger [[trigger:a-live-herdr-session-exercises-a-shift-o__a8710cfd]]):
+  verify herdr accepts `shift+tab` / `alt+<key>` / `ctrl+<arrow>` spellings; if
+  a combo is ignored by herdr it still must not break the bare keys — the
+  bare-key half is already proven by the grid's tests.
 
 ## Handoff Note
 

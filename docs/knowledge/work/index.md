@@ -91,6 +91,7 @@ never a generation timestamp or any other wall-clock value.
 - [status-wildcard-host/](status-wildcard-host/index.md) — 1 concept(s)
 - [tabbar-collapse/](tabbar-collapse/index.md) — 1 concept(s)
 - [term-frame-blocks/](term-frame-blocks/index.md) — 1 concept(s)
+- [term-keys-grid/](term-keys-grid/index.md) — 1 concept(s)
 - [term-keys-one-row/](term-keys-one-row/index.md) — 1 concept(s)
 - [term-url-links/](term-url-links/index.md) — 1 concept(s)
 - [terminal-approve-button/](terminal-approve-button/index.md) — 1 concept(s)
