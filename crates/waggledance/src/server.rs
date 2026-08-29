@@ -595,6 +595,16 @@ fn router(state: AppState) -> Router {
             "/paseo/:agent_id/conversation",
             get(paseo_agent_conversation),
         )
+        // paseo-control pc-4: sends one message to the agent. The per-route
+        // `DefaultBodyLimit` layer here sits above `PASEO_SEND_MAX_BYTES` for
+        // the same reason `terminal_attach`'s own layer sits above
+        // `ATTACH_MAX_BYTES` above — a body up to, and a little past, the app
+        // cap still reaches this handler's own JSON-shaped refusal instead of
+        // axum's plain-text 413.
+        .route(
+            "/paseo/:agent_id/send",
+            post(paseo_agent_send).layer(DefaultBodyLimit::max(PASEO_SEND_BODY_LIMIT_BYTES)),
+        )
         .route("/p/:id/_code/", get(code_root))
         .route("/p/:id/_code/*path", get(code_dir_or_file))
         .route("/p/:id/*path", get(project_path))
@@ -3672,6 +3682,86 @@ async fn paseo_agent_conversation(
         Err(e) => views::paseo_conversation_error_fragment(e),
     };
     Json(json!({ "html": html })).into_response()
+}
+
+/// paseo-control pc-4: the app-level cap on one sent message's byte length —
+/// named so the refusal above the transport layer is the message the user
+/// actually sees. Mirrors `ATTACH_MAX_BYTES`'s own relationship to
+/// `ATTACH_BODY_LIMIT_BYTES` below (fact 11 / plan.md pc-4 section).
+const PASEO_SEND_MAX_BYTES: usize = 32 * 1024;
+
+/// The send route's own `DefaultBodyLimit` layer (see the route
+/// registration in `router`) — comfortably above `PASEO_SEND_MAX_BYTES`, the
+/// same relationship `ATTACH_BODY_LIMIT_BYTES` holds to `ATTACH_MAX_BYTES`.
+const PASEO_SEND_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
+/// `POST /paseo/:agent_id/send` body. **S3**: `Json<PaseoSendBody>` is the
+/// ONLY extractor this route ever uses — never `Form`, never a `text/plain`
+/// tolerance — for exactly the reason D10 already documents on
+/// `update_terminal_config` (`server.rs`, above): a JSON body is not a CORS
+/// *simple* request, so with no CORS layer anywhere in this router (grep
+/// `CorsLayer`: none), a browser refuses to send this cross-origin at all,
+/// preflight or otherwise. Proven two ways in this module's tests — a
+/// form-encoded POST is refused, AND an `OPTIONS` request to this exact
+/// route returns no `access-control-allow-origin` header and no successful
+/// status — because the extractor test alone would stay green even if a
+/// permissive CORS layer were added anywhere else in the router later.
+#[derive(serde::Deserialize)]
+struct PaseoSendBody {
+    text: String,
+}
+
+/// `POST /paseo/:agent_id/send` (paseo-control D1/D3/D5) — sends one
+/// message to a live paseo agent via `crate::paseo_cli::PaseoCli::send`
+/// (pc-1's own single door to the binary; nothing else in this codebase
+/// calls it). Guarded identically to `paseo_agent_page`/
+/// `paseo_agent_conversation` above (S7's switch, then S4/S5's
+/// `resolve_controllable_paseo_agent`) — authorization is checked on this
+/// write path too, never only on the page that links to it.
+///
+/// **D5**: a failed send never renders as a success — every `PaseoCliError`
+/// state answers its own named, static message (`PaseoCliError::Display`,
+/// S6: kind only, never captured stdout/stderr). **S6** also holds
+/// structurally here: this handler makes no `tracing` call at all, so
+/// neither the prompt text nor any CLI output can reach a log line through
+/// it.
+async fn paseo_agent_send(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(body): Json<PaseoSendBody>,
+) -> Response {
+    if !terminal_family_enabled(&st) {
+        return terminal_disabled_json_404();
+    }
+    let agent = match resolve_controllable_paseo_agent(&st, &agent_id).await {
+        Ok(agent) => agent,
+        Err(PaseoAgentRefusal::NotLive) => return not_found("paseo agent not found"),
+        Err(PaseoAgentRefusal::NotControlled { cwd }) => {
+            return action_error(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "this agent is outside every project Waggle Dance tracks — register {} as a project to take control of it",
+                    cwd.display()
+                ),
+            );
+        }
+    };
+    if body.text.trim().is_empty() {
+        return action_error(StatusCode::BAD_REQUEST, "message is empty");
+    }
+    if body.text.len() > PASEO_SEND_MAX_BYTES {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            format!("message exceeds the {PASEO_SEND_MAX_BYTES}-byte limit"),
+        );
+    }
+    match paseo_cli(&st).send(&agent.id, &body.text).await {
+        // S6: `send`'s captured stdout is discarded unread here — it is
+        // never echoed back to the client, matching the kind-only
+        // discipline `PaseoCliError` already holds on the failure side.
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => action_error(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
 }
 
 /// The Telegram credentials to build a live notifier from — `Some((token,
@@ -28078,6 +28168,25 @@ mod bee_route_tests {
         bin
     }
 
+    /// pc-4: like `fake_paseo`, but also appends one argument per line to
+    /// `log` on every invocation (the `fake_bee`/board-new-task idiom
+    /// above) — this is how the send tests below prove BOTH that the CLI
+    /// was reached with the right argv on a live send AND, via the log
+    /// file's absence, that it was never reached on a refused one.
+    #[cfg(unix)]
+    fn fake_paseo_recording(dir: &Path, log: &Path, stdout: &str, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = dir.join("paseo");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{log}'\nprintf '%s' '{stdout}'\nexit {code}\n",
+            log = log.display(),
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
     #[tokio::test]
     async fn paseo_page_switch_off_gives_disabled_shapes_with_no_cli_call() {
         let dir = fresh_root("paseo-switch-off");
@@ -28410,29 +28519,17 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&cli_dir).ok();
     }
 
-    /// Seam proof: the write routes this cell deliberately does not add —
-    /// pc-4's send and pc-5's permit answer land in their own later cells,
-    /// on top of the read path this cell proves first.
+    /// Seam proof: the one write route this cell still deliberately does
+    /// not add — pc-5's permit answer lands in its own later cell, on top of
+    /// pc-4's send route this cell adds. (pc-4 landed: `POST
+    /// /paseo/:id/send` now exists — see the `paseo_send_*` tests below —
+    /// which is what makes the old half of this assertion obsolete.)
     #[tokio::test]
-    async fn paseo_send_and_permit_routes_do_not_exist_yet() {
+    async fn paseo_permit_route_does_not_exist_yet() {
         let dir = fresh_root("paseo-seam-proof");
         enable_terminal(&dir);
         let st = build_state_with_dir(&dir);
         let app = router(st);
-
-        let send_req = Request::builder()
-            .header(header::HOST, "127.0.0.1")
-            .method("POST")
-            .uri("/paseo/agent-1/send")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({ "text": "hi" }).to_string()))
-            .unwrap();
-        let resp = app.clone().oneshot(send_req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "pc-4 has not landed yet — POST /paseo/:id/send must not exist"
-        );
 
         let permit_req = Request::builder()
             .header(header::HOST, "127.0.0.1")
@@ -28449,6 +28546,419 @@ mod bee_route_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── pc-4: `POST /paseo/:agent_id/send` ──────────────────────────────
+
+    /// S7: switch off gives the disabled JSON 404, identically to the read
+    /// routes — the fixture `paseo` binary would announce itself via
+    /// `fake_paseo_recording`'s log file if it were ever reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_send_switch_off_gives_disabled_json_404_with_no_cli_call() {
+        let dir = fresh_root("paseo-send-switch-off");
+        // `terminal.enabled` left at its default (false).
+        let store = fresh_root("paseo-send-switch-off-store");
+        let scratch = fresh_root("paseo-send-switch-off-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-send-switch-off-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_recording(&cli_dir, &log, "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "text": "hi" }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("disabled"), "{body}");
+        assert!(!log.exists(), "the switch being off must never reach the CLI");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S4: an id naming no live agent is refused before the CLI is ever
+    /// reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_send_refuses_an_unknown_agent_id_and_never_reaches_the_cli() {
+        let dir = fresh_root("paseo-send-unknown-id-data");
+        enable_terminal(&dir);
+        let store = fresh_root("paseo-send-unknown-id-store");
+        std::fs::create_dir_all(&store).unwrap();
+        let cli_dir = fresh_root("paseo-send-unknown-id-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_recording(&cli_dir, &log, "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/does-not-exist/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "text": "hi" }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !log.exists(),
+            "an id naming no live agent must never reach the CLI"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S5: a live agent outside every registered project is refused, names
+    /// the per-agent remedy, and never reaches the CLI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_send_refuses_an_unregistered_agent_and_names_the_remedy() {
+        let dir = fresh_root("paseo-send-s5-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-send-s5-scratch");
+        let untracked_root = scratch.join("untracked-project");
+        std::fs::create_dir_all(&untracked_root).unwrap();
+        let store = fresh_root("paseo-send-s5-store");
+        write_paseo_agent(&store, "slug", "agent-1", &untracked_root, "claude");
+        let cli_dir = fresh_root("paseo-send-s5-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_recording(&cli_dir, &log, "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "text": "hi" }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let msg = v["error"].as_str().unwrap();
+        assert!(
+            msg.contains("register") && msg.contains(&untracked_root.display().to_string()),
+            "the refusal must name registering this exact folder: {msg}"
+        );
+        assert!(
+            !log.exists(),
+            "an agent outside every registered project must never reach the CLI"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// The whole-path proof: a message sent from the page reaches the
+    /// agent — `PaseoCli::send`'s own argv shape (pc-1's own suite) arrives
+    /// with this exact agent id and this exact text, and the page's answer
+    /// is the named success shape, never an echo of the CLI's own captured
+    /// stdout (S6).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_send_delivers_the_message_and_reaches_the_cli_with_the_right_argv() {
+        let dir = fresh_root("paseo-send-happy-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-send-happy-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-send-happy-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-send-happy-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_recording(&cli_dir, &log, "SECRET-STDOUT-CANARY", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-send-happy-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "text": "hello there" }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("SECRET-STDOUT-CANARY"),
+            "S6: captured stdout must never reach the client: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{body}");
+
+        let argv = std::fs::read_to_string(&log).expect("the CLI must have been invoked");
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["send", "agent-1", "--prompt", "hello there", "--no-wait", "--json"],
+            "argv must match PaseoCli::send's own shape (S1/S2)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// D5/input-extremes: an empty message is refused before the CLI is
+    /// ever reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_send_refuses_an_empty_message_without_reaching_the_cli() {
+        let dir = fresh_root("paseo-send-empty-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-send-empty-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-send-empty-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-send-empty-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_recording(&cli_dir, &log, "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-send-empty-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "text": "   " }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("empty"), "{body}");
+        assert!(!log.exists(), "an empty message must never reach the CLI");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// Input extremes: a message over `PASEO_SEND_MAX_BYTES` is refused with
+    /// the app's own named message — never axum's bare plain-text 413 —
+    /// because `PASEO_SEND_BODY_LIMIT_BYTES` sits above the app cap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_send_refuses_an_oversized_message_with_its_own_named_message() {
+        let dir = fresh_root("paseo-send-oversize-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-send-oversize-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-send-oversize-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-send-oversize-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_recording(&cli_dir, &log, "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-send-oversize-project");
+        let app = router(st);
+
+        let oversized = "a".repeat(PASEO_SEND_MAX_BYTES + 1);
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "text": oversized }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("32768-byte limit"),
+            "the app's own named refusal must name the byte limit, never axum's bare 413: {body}"
+        );
+        assert!(!log.exists(), "an oversized message must never reach the CLI");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S3, proof one of two: a form-encoded POST — a CORS *simple* request —
+    /// is refused by the `Json<PaseoSendBody>` extractor before the handler
+    /// body ever runs, so it never reaches the CLI. The assertion is on the
+    /// CLI's own invocation log, not the response status, per
+    /// `docs/history/learnings/20260805-toothless-security-assertions.md`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_send_refuses_a_form_encoded_body_without_reaching_the_cli() {
+        let dir = fresh_root("paseo-send-form-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-send-form-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-send-form-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-send-form-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_recording(&cli_dir, &log, "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-send-form-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/send")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("text=hi"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "a form-encoded POST must be refused: {}",
+            resp.status()
+        );
+        assert!(
+            !log.exists(),
+            "a form-encoded POST must never reach the CLI"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S3, proof two of two: an `OPTIONS` request to this exact route —
+    /// the shape a browser sends as a CORS preflight — gets no successful
+    /// status and no `access-control-allow-origin` header, because no CORS
+    /// layer exists anywhere in this router. This is the test that fails the
+    /// day someone adds a permissive CORS layer anywhere in the router,
+    /// which the form-encoded test above would not catch.
+    #[tokio::test]
+    async fn paseo_send_options_request_gets_no_cors_preflight() {
+        let dir = fresh_root("paseo-send-options-data");
+        enable_terminal(&dir);
+        let st = build_state_with_dir(&dir);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("OPTIONS")
+            .uri("/paseo/agent-1/send")
+            .header(header::ORIGIN, "https://evil.example")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_METHOD,
+                "POST",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "an OPTIONS preflight must never succeed: {}",
+            resp.status()
+        );
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "no access-control-allow-origin header may ever be present: {:?}",
+            resp.headers()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D5: a non-zero CLI exit renders its own named failure — never a
+    /// success shape, and never leaking captured stderr (S6).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_send_renders_a_failed_cli_exit_as_a_named_failure_never_a_sent_shape() {
+        let dir = fresh_root("paseo-send-failed-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-send-failed-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-send-failed-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-send-failed-cli");
+        let bin = fake_paseo(&cli_dir, "", "SECRET-STDERR-CANARY", 3);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-send-failed-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "text": "hello" }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "a failed send must never render as a success"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("SECRET-STDERR-CANARY"),
+            "S6: captured stderr must never leak into the response: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("exited with status"),
+            "{body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
     }
 
     // ── stale-index-refresh-2: the 404 page's Refresh index button ─────────

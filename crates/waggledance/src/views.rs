@@ -3348,15 +3348,50 @@ pub fn terminal_down_page(project: &Project) -> String {
     layout_with_drawer(&format!("{} · terminal", project.name), "", &body, false)
 }
 
+/// paseo-control pc-4: the composer's own markup — extracted from
+/// `pane_controls`' non-attach `field` branch (a textarea plus a round Send
+/// button, nothing else). The REST of `pane_controls` — the soft-key grid,
+/// Approve, Stage, Paste and the attach card — posts to herdr routes that do
+/// not exist for a paseo agent, and its `data-agent-state` Approve gating is
+/// bee-session-derived and meaningless here, so this cell's own action item
+/// (1) drops them rather than carrying them. Reuses the `.term-reply`/
+/// `.term-reply__field`/`.term-reply__text`/`.term-reply__send` classes
+/// (`PROJECT_TAB_STYLE`, included by [`paseo_agent_page`] below) so the
+/// composer matches the established idiom exactly rather than inventing a
+/// new one — `.paseo-composer` is the extra class `assets/app.js`'s own
+/// scoped IIFE finds this form by, and carries no `data-pane-id` so the
+/// pane-scoped reply wiring in `assets/app.js` never also binds to it. The
+/// error paragraph reuses `.term-attach__error` (`app.css`) for D5's named
+/// failure state, found by `assets/app.js` via `data-paseo-send-error`.
+fn paseo_composer(name: &str) -> String {
+    format!(
+        r#"<form class="term-reply paseo-composer">
+    <div class="term-reply__field">
+      <textarea class="term-reply__text" rows="3" placeholder="Type a message… (Ctrl+Enter to send)" aria-label="Message {name}" autocomplete="off"></textarea>
+      <div class="term-reply__actions">
+        <button type="submit" class="term-reply__send" aria-label="Send">↑</button>
+      </div>
+    </div>
+    <p class="term-attach__error" data-paseo-send-error role="alert" hidden></p>
+  </form>"#,
+        name = esc(name),
+    )
+}
+
 /// `GET /paseo/:agent_id` (paseo-control D1/D2/D4) — one live paseo agent's
-/// own read-only page: a heading naming the agent, and a conversation
-/// container this page's own inline `<script>` fills in by polling
-/// `paseo_agent_conversation` (`server.rs`) at the same 1500ms cadence
-/// every other terminal-family screen uses (`POLL_MS`, `assets/app.js`) —
-/// inline rather than added to `assets/app.js` itself, since that file is
-/// outside this cell's own file list. `assets/app.js` is still loaded on
-/// this page like every other (`layout`'s own `<script src>`), it just adds
-/// no poller of its own for this route.
+/// own page: a heading naming the agent, the conversation container, and
+/// (pc-4) the composer that sends it a message. `data-paseo-base` on
+/// `<main>` carries this agent's own route prefix (`/paseo/<id>`) for
+/// `assets/app.js`'s own scoped IIFE to build both the conversation-poll and
+/// send URLs from — the `data-unassigned-base` precedent
+/// (`unassigned_terminal_page`), never `validTermBase`'s `/p/` shape (fact 5:
+/// that gate is not widened).
+///
+/// pc-4 deviation: pc-2 put the conversation poller in this page's own
+/// inline `<script>` because `assets/app.js` was outside its own file list;
+/// pc-4's file list DOES include `assets/app.js`, so the poller moves there
+/// alongside the new composer wiring — one client-side story for this page,
+/// not two.
 pub fn paseo_agent_page(agent: &waggledance_core::paseo::PaseoAgent) -> String {
     let heading = match &agent.model {
         Some(model) => format!("{} · {}", agent.provider, model),
@@ -3364,33 +3399,20 @@ pub fn paseo_agent_page(agent: &waggledance_core::paseo::PaseoAgent) -> String {
     };
     let heading_esc = esc(&heading);
     let agent_id_esc = esc(&agent.id);
+    let base_esc = esc(&format!("/paseo/{}", agent.id));
     let body = format!(
         r#"{topbar}
-<main class="fg-page fg-page--tight">
+{tab_style}
+<main class="fg-page fg-page--tight" data-paseo-base="{base_esc}">
   <h2 class="fg-pagehead__title">{heading_esc}</h2>
   <div class="fg-card term-pane">
     <div id="paseo-conversation" class="paseo-conversation" data-agent-id="{agent_id_esc}" aria-live="polite">Loading conversation…</div>
+    {composer}
   </div>
-</main>
-<script>
-(function () {{
-  var el = document.getElementById('paseo-conversation');
-  if (!el) return;
-  var url = '/paseo/' + encodeURIComponent(el.getAttribute('data-agent-id')) + '/conversation';
-  var POLL_MS = 1500;
-  function poll() {{
-    fetch(url, {{ credentials: 'same-origin' }})
-      .then(function (res) {{ return res.ok ? res.json() : null; }})
-      .then(function (data) {{
-        if (data && typeof data.html === 'string') {{ el.innerHTML = data.html; }}
-      }})
-      .catch(function () {{}});
-  }}
-  poll();
-  setInterval(poll, POLL_MS);
-}})();
-</script>"#,
+</main>"#,
         topbar = topbar(&format!("<span class=\"crumb\">{heading_esc}</span>")),
+        tab_style = PROJECT_TAB_STYLE,
+        composer = paseo_composer(&heading_esc),
     );
     layout_with_drawer(&format!("{heading} · paseo"), "", &body, false)
 }

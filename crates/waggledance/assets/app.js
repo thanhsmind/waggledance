@@ -3611,4 +3611,125 @@
       }, 0);
     });
   })();
+
+  // paseo-control pc-4: the paseo agent page's own conversation poller and
+  // send composer — scoped to `data-paseo-base` on `<main>`, the
+  // `data-unassigned-base` precedent above (`views.rs::paseo_composer`'s own
+  // doc). `validTermBase`'s `/p/` gate is never widened to admit this route
+  // (plan.md fact 5); this page reaches its own base directly instead.
+  //
+  // pc-4 deviation: pc-2 (`views.rs::paseo_agent_page`) put the conversation
+  // poller in this page's own inline `<script>` because this file sat
+  // outside pc-2's own file list. It moves here now that this cell's file
+  // list includes `assets/app.js`, so the page has one client-side story
+  // instead of two.
+  //
+  // `sending` is this composer's own version of the outstanding-request
+  // guard the project terminal transcript poller documents shipping without
+  // once, above (search that IIFE's own doc comment): a send in flight
+  // disables the composer AND skips a poll tick, since the conversation is
+  // about to change underneath it anyway and a stray poll mid-send could
+  // otherwise repaint over what the user just typed.
+  (function () {
+    var main = document.querySelector("main[data-paseo-base]");
+    if (!main) return;
+    var BASE = main.getAttribute("data-paseo-base");
+    var el = document.getElementById("paseo-conversation");
+    var form = main.querySelector(".paseo-composer");
+    var POLL_MS = 1500;
+    var sending = false;
+
+    function conversationUrl() {
+      return BASE + "/conversation";
+    }
+    function sendUrl() {
+      return BASE + "/send";
+    }
+
+    function poll() {
+      if (!el || sending) return;
+      fetch(conversationUrl(), { credentials: "same-origin" })
+        .then(function (res) {
+          return res.ok ? res.json() : null;
+        })
+        .then(function (data) {
+          if (data && typeof data.html === "string") el.innerHTML = data.html;
+        })
+        .catch(function () {});
+    }
+    poll();
+    setInterval(poll, POLL_MS);
+
+    if (!form) return;
+    var input = form.querySelector(".term-reply__text");
+    var sendBtn = form.querySelector(".term-reply__send");
+    var errorEl = form.querySelector("[data-paseo-send-error]");
+
+    function showSendError(message) {
+      if (!errorEl) return;
+      errorEl.textContent = message;
+      errorEl.hidden = false;
+    }
+    function clearSendError() {
+      if (!errorEl) return;
+      errorEl.hidden = true;
+      errorEl.textContent = "";
+    }
+
+    // D5: a failed send is NEVER left looking sent — the composer only
+    // clears the textarea on `res.ok`, and every other outcome (a non-ok
+    // JSON body naming one of the four `PaseoCliError` states, or the fetch
+    // itself throwing) shows a named failure instead.
+    function submitCompose() {
+      if (sending) return;
+      var text = input ? input.value : "";
+      if (!text) return;
+      sending = true;
+      if (input) input.disabled = true;
+      if (sendBtn) sendBtn.disabled = true;
+      clearSendError();
+      fetch(sendUrl(), {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text }),
+      })
+        .then(function (res) {
+          return res
+            .json()
+            .catch(function () {
+              return null;
+            })
+            .then(function (body) {
+              if (res.ok) {
+                if (input) input.value = "";
+              } else {
+                showSendError((body && body.error) || "could not send this message");
+              }
+            });
+        })
+        .catch(function () {
+          showSendError("could not send this message");
+        })
+        .then(function () {
+          sending = false;
+          if (input) input.disabled = false;
+          if (sendBtn) sendBtn.disabled = false;
+        });
+    }
+
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      submitCompose();
+    });
+
+    if (input) {
+      input.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+          ev.preventDefault();
+          submitCompose();
+        }
+      });
+    }
+  })();
 })();
