@@ -2646,8 +2646,8 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 3.5rem;
-  height: 3.5rem;
+  width: 45px;
+  height: 45px;
   padding: 0;
   border: var(--border-width-hairline) solid var(--color-border);
   border-radius: 50%;
