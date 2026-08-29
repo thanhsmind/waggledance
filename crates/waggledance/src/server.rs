@@ -827,16 +827,21 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
             // this one surface) — deliberately not also on
             // `unassigned_group_enabled`, which every other reader of
             // `unassigned_panes`'s complement checks. With the switch off,
-            // `snapshot` is `None` and this is `Vec::new()` with no herdr
-            // call and no filesystem path in reach of the page at all.
-            // paseo-support ps-2 (D3): untracked paseo cwds fold into this
-            // same aggregation (`suggested_projects`'s own new parameter)
-            // rather than a second block — but only when a herdr snapshot
-            // was actually taken, matching this call's existing gate.
-            let suggestions: Vec<views::ProjectSuggestion> = snapshot
-                .as_ref()
-                .map(|snap| suggested_projects(snap, &projects, &paseo_agents))
-                .unwrap_or_default();
+            // `snapshot` is `None` and `paseo_agents` is already `Vec::new()`
+            // (both computed under the same `badges_enabled` gate above), so
+            // this still resolves to `Vec::new()` with no herdr call and no
+            // filesystem path in reach of the page at all.
+            // paseo-support ps-2 (D3, revised): untracked paseo cwds fold
+            // into this same aggregation regardless of whether a herdr
+            // snapshot was actually taken — `suggested_projects` now takes
+            // the snapshot as `Option<&herdr::Snapshot>` and treats a `None`
+            // snapshot as an EMPTY pane set (never as "skip the whole
+            // call"), so a herdr-down page still surfaces its live paseo
+            // agents' Register invitation. The pane half's own fail-closed
+            // semantics (`unassigned_panes`, called only when `Some`) are
+            // untouched.
+            let suggestions: Vec<views::ProjectSuggestion> =
+                suggested_projects(snapshot.as_ref(), &projects, &paseo_agents);
             let mut with_counts: Vec<_> = projects
                 .into_iter()
                 .map(|p| {
@@ -5516,15 +5521,27 @@ fn unassigned_paseo_agents<'a>(
         .collect()
 }
 
+/// paseo-support ps-2 (revision): `snapshot` is `Option<&herdr::Snapshot>`
+/// rather than a required reference — a `None` snapshot (herdr down or
+/// timed out, `index_page`'s own D6 remedy) means an EMPTY pane set for
+/// this call only, never "skip suggestions altogether". The pane half keeps
+/// `unassigned_panes`'s existing fail-closed semantics exactly: it only
+/// ever runs when a snapshot was actually taken. The paseo half never
+/// depended on herdr at all, so it now runs unconditionally on whatever
+/// live paseo agents were passed in.
 fn suggested_projects(
-    snapshot: &herdr::Snapshot,
+    snapshot: Option<&herdr::Snapshot>,
     projects: &[waggledance_core::domain::Project],
     paseo_agents: &[waggledance_core::paseo::PaseoAgent],
 ) -> Vec<views::ProjectSuggestion> {
     // Never re-derive the assigned set by hand: `unassigned_panes` already
     // is the fail-closed complement this list aggregates over (D6: agents
-    // only, since it reads `snapshot.agents`).
-    let unassigned = unassigned_panes(snapshot, projects);
+    // only, since it reads `snapshot.agents`). A `None` snapshot yields an
+    // empty pane set — never a panicked or a skipped call.
+    let unassigned = match snapshot {
+        Some(snap) => unassigned_panes(snap, projects),
+        None => Vec::new(),
+    };
     // paseo-support ps-2 (D3): the same D5 partition, mirrored for paseo
     // agents rather than herdr panes.
     let unassigned_paseo = unassigned_paseo_agents(paseo_agents, projects);
@@ -20528,6 +20545,93 @@ mod bee_route_tests {
         assert!(
             !body.contains("proj-suggestions"),
             "no suggestion block may render with the terminal switch off: {body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&paseo_store).ok();
+    }
+
+    /// paseo-support ps-2 (revision, goal-check NEEDS_REVISION): the
+    /// suggestion half of `index_page` used to be gated on `snapshot` being
+    /// `Some` — an errored or timed-out herdr (`FakeHerdr::set_available(false)`,
+    /// the same double `home_page_renders_plain_rows_when_herdr_is_down`
+    /// uses) made `suggestions` an empty `Vec` unconditionally, so a live
+    /// paseo agent in an untracked cwd never got its Register invitation
+    /// even though the paseo half never touched herdr at all. Proves the
+    /// fix: with the switch on and herdr down, the untracked agent's row
+    /// still renders and its form still posts to the existing register
+    /// route.
+    #[tokio::test]
+    async fn untracked_paseo_suggestion_survives_herdr_being_down() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("paseo-suggestion-herdr-down");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-suggestion-herdr-down-scratch");
+        let untracked_root = scratch.join("untracked-folder");
+        std::fs::create_dir_all(&untracked_root).unwrap();
+
+        let paseo_store = fresh_root("paseo-suggestion-herdr-down-store");
+        let untracked_dir = paseo_store.join("untracked-slug");
+        std::fs::create_dir_all(&untracked_dir).unwrap();
+        std::fs::write(
+            untracked_dir.join("agent-1.json"),
+            format!(
+                r#"{{
+                    "id": "agent-1",
+                    "provider": "codex",
+                    "cwd": {cwd},
+                    "title": "explore",
+                    "lastStatus": "running",
+                    "lastActivityAt": "2026-08-29T12:00:00Z"
+                }}"#,
+                cwd =
+                    serde_json::to_string(&untracked_root.to_string_lossy().into_owned()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        fake.set_available(false);
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        st.paseo_store_root = Some(paseo_store.clone());
+        let app = router(st);
+
+        let body = body_string(get(app, "/").await).await;
+
+        assert!(
+            !body.contains("proj-row__badges--paseo"),
+            "a down herdr must still render plain rows, no badge container: {body}"
+        );
+
+        let path_str = untracked_root.to_string_lossy().into_owned();
+        let row_start = body.find(&path_str).unwrap_or_else(|| {
+            panic!(
+                "an untracked paseo cwd must surface as a suggestion row even when herdr is \
+                 down: {body}"
+            )
+        });
+        let row_end = body[row_start..]
+            .find("</li>")
+            .map(|i| row_start + i)
+            .unwrap_or_else(|| panic!("suggestion row never closes: {body}"));
+        let row = &body[row_start..row_end];
+        assert!(
+            row.contains(r#"action="/api/projects/register""#),
+            "the untracked cwd's suggestion row must post to the EXISTING register route, \
+             never a new one, even when herdr is down: {row}"
+        );
+        assert!(
+            row.contains("1 paseo agent"),
+            "a paseo-only row (no herdr panes reachable) must state the paseo agent count \
+             without a zero pane count: {row}"
+        );
+        assert!(
+            !row.contains("pane"),
+            "no herdr snapshot was taken, so the row must never claim a pane count: {row}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

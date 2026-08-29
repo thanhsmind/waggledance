@@ -1317,20 +1317,43 @@ fn project_sidebar(
             // a second one — only when a paseo agent actually shares this
             // untracked folder, so every existing pane-only suggestion row
             // stays byte-identical to before this feature.
-            let paseo_suffix = if s.paseo_count == 0 {
+            // paseo-support ps-2 (revision): a paseo-only row (no herdr
+            // panes at all, `s.pane_count == 0`) omits the pane segment
+            // entirely — "1 paseo agent" alone, never "0 panes, 1 paseo
+            // agent". A row that HAS panes builds its meta text exactly as
+            // before this change: the pane segment first, the paseo suffix
+            // (with its own leading ", ") appended only when a paseo agent
+            // shares the row.
+            let pane_segment = if s.pane_count == 0 {
                 String::new()
             } else {
                 format!(
-                    ", {n} paseo agent{plural}",
+                    "{count} pane{plural}",
+                    count = s.pane_count,
+                    plural = if s.pane_count == 1 { "" } else { "s" },
+                )
+            };
+            let paseo_segment = if s.paseo_count == 0 {
+                String::new()
+            } else {
+                format!(
+                    "{n} paseo agent{plural}",
                     n = s.paseo_count,
                     plural = if s.paseo_count == 1 { "" } else { "s" },
                 )
+            };
+            let meta = if pane_segment.is_empty() {
+                paseo_segment
+            } else if paseo_segment.is_empty() {
+                pane_segment
+            } else {
+                format!("{pane_segment}, {paseo_segment}")
             };
             rows.push_str(&format!(
                 r#"<li class="proj-row proj-suggestion">
   <div class="proj-row__link proj-suggestion__info">
     <span class="proj-row__name proj-suggestion__path">{path}</span>
-    <span class="proj-row__meta">{count} pane{plural}{paseo_suffix}</span>
+    <span class="proj-row__meta">{meta}</span>
   </div>
   <form class="proj-suggestion__register" method="post" action="/api/projects/register">
     <input type="hidden" name="path" value="{path}">
@@ -1338,9 +1361,7 @@ fn project_sidebar(
   </form>
 </li>"#,
                 path = path,
-                count = s.pane_count,
-                plural = if s.pane_count == 1 { "" } else { "s" },
-                paseo_suffix = paseo_suffix,
+                meta = meta,
             ));
         }
         format!(
