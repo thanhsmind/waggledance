@@ -50,6 +50,16 @@ pub struct AppState {
     /// transcript reader then resolves the root exactly where Claude Code
     /// itself writes it.
     pub transcript_root: Option<PathBuf>,
+    /// paseo-support ps-2's test seam: overrides
+    /// `waggledance_core::paseo::default_store_root()` for `index_page`'s
+    /// paseo-agent read, the exact shape `transcript_root` above already
+    /// gives the transcript reader — `None` in production resolves through
+    /// `default_store_root()` (`~/.paseo/agents`, when a home directory is
+    /// resolvable); every route test that exercises paseo agents points
+    /// this at a fixture store directory instead of the developer's real
+    /// one. An axum handler takes no extra argument, so this field is the
+    /// only way a test can hand `index_page` a fixture store.
+    pub paseo_store_root: Option<PathBuf>,
     /// terminal-image-attach D3's storage-root test seam: overrides where
     /// `terminal_attach` stores uploaded images, the same shape
     /// `config_data_dir`/`transcript_root` give other terminal routes above.
@@ -267,6 +277,7 @@ pub async fn serve() -> Result<()> {
         config_data_dir: None,
         herdr: Arc::new(herdr::socket::SocketHerdr::new(herdr_socket_path)),
         transcript_root: None,
+        paseo_store_root: None,
         attach_root: None,
         terminal_background: Arc::new(crate::TerminalBackground::new()),
         notify_store,
@@ -787,17 +798,50 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
             } else {
                 None
             };
+            // paseo-support ps-2 (D1/D2): gated on the SAME switch as the
+            // herdr snapshot just above — off, this makes no paseo store
+            // read at all, so a switched-off page renders exactly as it
+            // did before this feature, byte-identical. Sync filesystem
+            // work runs in `spawn_blocking`, off the request thread, the
+            // same discipline `register_project` already uses (borrowed
+            // precedent — `index_page` itself does no `spawn_blocking`
+            // before this).
+            let paseo_agents: Vec<waggledance_core::paseo::PaseoAgent> = if badges_enabled {
+                let root = st
+                    .paseo_store_root
+                    .clone()
+                    .or_else(waggledance_core::paseo::default_store_root);
+                match root {
+                    Some(root) => tokio::task::spawn_blocking(move || {
+                        waggledance_core::paseo::list_live_agents(&root)
+                    })
+                    .await
+                    .unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
             // project-suggestions S1/S3: gated on `terminal_family_enabled`
             // alone (the plan's locked narrowing of toa-4/D9's scope for
             // this one surface) — deliberately not also on
             // `unassigned_group_enabled`, which every other reader of
             // `unassigned_panes`'s complement checks. With the switch off,
-            // `snapshot` is `None` and this is `Vec::new()` with no herdr
-            // call and no filesystem path in reach of the page at all.
-            let suggestions: Vec<views::ProjectSuggestion> = snapshot
-                .as_ref()
-                .map(|snap| suggested_projects(snap, &projects))
-                .unwrap_or_default();
+            // `snapshot` is `None` and `paseo_agents` is already `Vec::new()`
+            // (both computed under the same `badges_enabled` gate above), so
+            // this still resolves to `Vec::new()` with no herdr call and no
+            // filesystem path in reach of the page at all.
+            // paseo-support ps-2 (D3, revised): untracked paseo cwds fold
+            // into this same aggregation regardless of whether a herdr
+            // snapshot was actually taken — `suggested_projects` now takes
+            // the snapshot as `Option<&herdr::Snapshot>` and treats a `None`
+            // snapshot as an EMPTY pane set (never as "skip the whole
+            // call"), so a herdr-down page still surfaces its live paseo
+            // agents' Register invitation. The pane half's own fail-closed
+            // semantics (`unassigned_panes`, called only when `Some`) are
+            // untouched.
+            let suggestions: Vec<views::ProjectSuggestion> =
+                suggested_projects(snapshot.as_ref(), &projects, &paseo_agents);
             let mut with_counts: Vec<_> = projects
                 .into_iter()
                 .map(|p| {
@@ -823,6 +867,42 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                     (p, c, panes)
                 })
                 .collect();
+            // paseo-support ps-2 (D1/D5): every live paseo agent already
+            // mapped to a tracked project, keyed by project id — the SAME
+            // D5 mapping test the row above just used for herdr panes
+            // (`Boundary::validate_existing`, never the raw
+            // `is_contained_in_root` predicate, which documents itself as
+            // a second guard only). A project with no live paseo agent is
+            // simply absent from the map, matching `views::home_page`'s own
+            // "absent means byte-identical" rule for this join.
+            let paseo_by_project: std::collections::HashMap<String, Vec<views::PaseoAgentBadge>> =
+                if paseo_agents.is_empty() {
+                    std::collections::HashMap::new()
+                } else {
+                    with_counts
+                        .iter()
+                        .filter_map(|(p, _, _)| {
+                            let boundary = waggledance_core::paths_boundary::Boundary::new(vec![p
+                                .root_path
+                                .clone()])
+                            .ok()?;
+                            let matched: Vec<views::PaseoAgentBadge> = paseo_agents
+                                .iter()
+                                .filter(|agent| boundary.validate_existing(&agent.cwd).is_ok())
+                                .map(|agent| views::PaseoAgentBadge {
+                                    provider: agent.provider.clone(),
+                                    model: agent.model.clone(),
+                                    last_activity_at: agent.last_activity_at.clone(),
+                                })
+                                .collect();
+                            if matched.is_empty() {
+                                None
+                            } else {
+                                Some((p.id.clone(), matched))
+                            }
+                        })
+                        .collect()
+                };
             // D5/D4: presence only, never contents. Stale to say "no herdr
             // call" here (project-suggestions correction): the snapshot
             // above is taken whenever `badges_enabled`, for badges and, per
@@ -968,6 +1048,7 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 flag.pane.as_deref(),
                 terminals_herdr_ok,
                 &terminals_presets,
+                &paseo_by_project,
             ))
             .into_response()
         }
@@ -5406,41 +5487,108 @@ fn agent_pane_rows(
 /// path carrying a traversal component before it ever reaches the deny-list
 /// gate, so such a row's own register button could never succeed, whatever
 /// its path resolves to.
-fn suggested_projects(
-    snapshot: &herdr::Snapshot,
+/// paseo-support ps-2's D5 partition mirror for paseo agents: every live
+/// paseo agent whose `cwd` sits under **no** registered project's own D5
+/// containment boundary — `Boundary::validate_existing`, the exact
+/// membership test `project_panes`/`unassigned_panes` already use for
+/// herdr panes, never the raw `is_contained_in_root` predicate, which is a
+/// second guard only (see this module's `is_contained_in_root` callers'
+/// own doc comments). Fails closed the same way `unassigned_panes` does: a
+/// project whose own boundary cannot be constructed empties the whole
+/// result rather than risk leaking that project's own agents in as
+/// "untracked".
+fn unassigned_paseo_agents<'a>(
+    agents: &'a [waggledance_core::paseo::PaseoAgent],
     projects: &[waggledance_core::domain::Project],
+) -> Vec<&'a waggledance_core::paseo::PaseoAgent> {
+    if agents.is_empty() {
+        return Vec::new();
+    }
+    let mut boundaries = Vec::with_capacity(projects.len());
+    for p in projects {
+        match waggledance_core::paths_boundary::Boundary::new(vec![p.root_path.clone()]) {
+            Ok(boundary) => boundaries.push(boundary),
+            Err(_) => return Vec::new(),
+        }
+    }
+    agents
+        .iter()
+        .filter(|agent| {
+            !boundaries
+                .iter()
+                .any(|boundary| boundary.validate_existing(&agent.cwd).is_ok())
+        })
+        .collect()
+}
+
+/// paseo-support ps-2 (revision): `snapshot` is `Option<&herdr::Snapshot>`
+/// rather than a required reference — a `None` snapshot (herdr down or
+/// timed out, `index_page`'s own D6 remedy) means an EMPTY pane set for
+/// this call only, never "skip suggestions altogether". The pane half keeps
+/// `unassigned_panes`'s existing fail-closed semantics exactly: it only
+/// ever runs when a snapshot was actually taken. The paseo half never
+/// depended on herdr at all, so it now runs unconditionally on whatever
+/// live paseo agents were passed in.
+fn suggested_projects(
+    snapshot: Option<&herdr::Snapshot>,
+    projects: &[waggledance_core::domain::Project],
+    paseo_agents: &[waggledance_core::paseo::PaseoAgent],
 ) -> Vec<views::ProjectSuggestion> {
     // Never re-derive the assigned set by hand: `unassigned_panes` already
     // is the fail-closed complement this list aggregates over (D6: agents
-    // only, since it reads `snapshot.agents`).
-    let unassigned = unassigned_panes(snapshot, projects);
+    // only, since it reads `snapshot.agents`). A `None` snapshot yields an
+    // empty pane set — never a panicked or a skipped call.
+    let unassigned = match snapshot {
+        Some(snap) => unassigned_panes(snap, projects),
+        None => Vec::new(),
+    };
+    // paseo-support ps-2 (D3): the same D5 partition, mirrored for paseo
+    // agents rather than herdr panes.
+    let unassigned_paseo = unassigned_paseo_agents(paseo_agents, projects);
 
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut pane_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut paseo_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut paths: Vec<String> = Vec::new();
-    for pane in &unassigned {
-        if pane.cwd.is_empty() {
-            continue;
+
+    // D1: trim exactly one trailing slash so `/a/b` and `/a/b/` dedup to
+    // one row — never canonicalized, never walked up. Shared by both loops
+    // below so a herdr pane and a paseo agent sharing the exact same
+    // folder fold into the one row (D3: "folds into").
+    fn normalize(raw: &str) -> Option<&str> {
+        let trimmed = raw.strip_suffix('/').unwrap_or(raw);
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
         }
-        // D1: trim exactly one trailing slash so `/a/b` and `/a/b/` dedup
-        // to one row — never canonicalized, never walked up.
-        let normalized = pane.cwd.strip_suffix('/').unwrap_or(&pane.cwd);
-        if normalized.is_empty() {
-            continue;
-        }
-        let cwd_path = std::path::Path::new(normalized);
-        // project-suggestions-3: a raw traversal component is dropped
-        // before the second guard runs — a candidate carrying one can
-        // resolve to anywhere, including inside a registered project by a
-        // route `is_contained_in_root`'s raw component match cannot see
-        // (the doc comment above this function has the full story), and
-        // its own register button could never succeed regardless.
-        let has_traversal = cwd_path.components().any(|c| {
+    }
+
+    // project-suggestions-3: a raw traversal component is dropped before
+    // the second guard runs — a candidate carrying one can resolve to
+    // anywhere, including inside a registered project by a route
+    // `is_contained_in_root`'s raw component match cannot see (the doc
+    // comment above this function has the full story), and its own
+    // register button could never succeed regardless.
+    fn has_traversal(cwd_path: &std::path::Path) -> bool {
+        cwd_path.components().any(|c| {
             matches!(
                 c,
                 std::path::Component::ParentDir | std::path::Component::CurDir
             )
-        });
-        if has_traversal {
+        })
+    }
+
+    for pane in &unassigned {
+        if pane.cwd.is_empty() {
+            continue;
+        }
+        let Some(normalized) = normalize(&pane.cwd) else {
+            continue;
+        };
+        let cwd_path = std::path::Path::new(normalized);
+        if has_traversal(cwd_path) {
             continue;
         }
         // Owned-subtree second guard: a candidate that equals or sits
@@ -5453,10 +5601,37 @@ fn suggested_projects(
         {
             continue;
         }
-        if !counts.contains_key(normalized) {
+        if !pane_counts.contains_key(normalized) && !paseo_counts.contains_key(normalized) {
             paths.push(normalized.to_string());
         }
-        *counts.entry(normalized.to_string()).or_insert(0) += 1;
+        *pane_counts.entry(normalized.to_string()).or_insert(0) += 1;
+    }
+
+    // paseo-support ps-2 (D3): untracked paseo cwds fold into this SAME
+    // aggregation, through the SAME traversal-drop and owned-subtree
+    // guards above — never a second block, never auto-registered.
+    for agent in &unassigned_paseo {
+        let cwd_string = agent.cwd.to_string_lossy();
+        if cwd_string.is_empty() {
+            continue;
+        }
+        let Some(normalized) = normalize(&cwd_string) else {
+            continue;
+        };
+        let cwd_path = std::path::Path::new(normalized);
+        if has_traversal(cwd_path) {
+            continue;
+        }
+        if projects
+            .iter()
+            .any(|p| waggledance_core::paths_boundary::is_contained_in_root(cwd_path, &p.root_path))
+        {
+            continue;
+        }
+        if !pane_counts.contains_key(normalized) && !paseo_counts.contains_key(normalized) {
+            paths.push(normalized.to_string());
+        }
+        *paseo_counts.entry(normalized.to_string()).or_insert(0) += 1;
     }
 
     paths.sort();
@@ -5464,8 +5639,13 @@ fn suggested_projects(
     paths
         .into_iter()
         .map(|path| {
-            let pane_count = counts[&path];
-            views::ProjectSuggestion { path, pane_count }
+            let pane_count = pane_counts.get(&path).copied().unwrap_or(0);
+            let paseo_count = paseo_counts.get(&path).copied().unwrap_or(0);
+            views::ProjectSuggestion {
+                path,
+                pane_count,
+                paseo_count,
+            }
         })
         .collect()
 }
@@ -6745,6 +6925,17 @@ mod bee_route_tests {
             // transcript tests set this explicitly (see
             // `transcript_root_dir` below).
             transcript_root: None,
+            // Deliberately NOT `None`: unlike `transcript_root` above,
+            // `index_page` reads this store on every render whenever
+            // `terminal_family_enabled` — most `enable_terminal(&dir)`
+            // route tests in this module hit that path, so `None` here
+            // would let a developer's real, currently-live
+            // `~/.paseo/agents` store (this very repo has one) leak stray
+            // agents into dozens of unrelated tests' rendered bodies. A
+            // fixed, guaranteed-nonexistent path keeps every route test
+            // isolated by default; a paseo-route test sets this explicitly
+            // to its own fixture store dir instead.
+            paseo_store_root: Some(PathBuf::from("/nonexistent/waggledance-test-paseo-store")),
             // No route test writes into the developer's real
             // `~/.cache/waggledance/attach` — attach-route tests set this
             // explicitly to a scratch dir (see `attach_fixture` below).
@@ -20207,6 +20398,245 @@ mod bee_route_tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// paseo-support ps-2 (prove-the-whole-path): the one route test
+    /// through `router(st)` + a real `GET /`. A live paseo agent whose
+    /// `cwd` resolves inside a tracked project's own D5 boundary badges
+    /// that project's row (D1: provider/model/age only, never the agent's
+    /// own `title` — prompt text); a second agent whose `cwd` matches no
+    /// tracked project folds into the EXISTING Suggested-projects block
+    /// (D3), whose Register form still posts to the pre-existing
+    /// `/api/projects/register` route — no new route, no auto-register.
+    #[tokio::test]
+    async fn paseo_agents_badge_their_project_and_fold_untracked_cwds_into_suggestions() {
+        let dir = fresh_root("paseo-board-route");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-board-route-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let untracked_root = scratch.join("untracked-folder");
+        std::fs::create_dir_all(&untracked_root).unwrap();
+
+        let paseo_store = fresh_root("paseo-board-route-store");
+        let matched_dir = paseo_store.join("tracked-slug");
+        std::fs::create_dir_all(&matched_dir).unwrap();
+        std::fs::write(
+            matched_dir.join("agent-1.json"),
+            format!(
+                r#"{{
+                    "id": "agent-1",
+                    "provider": "claude",
+                    "cwd": {cwd},
+                    "title": "do the secret thing",
+                    "lastStatus": "running",
+                    "lastActivityAt": "2026-08-29T12:00:00Z",
+                    "config": {{"model": "claude-sonnet-5"}}
+                }}"#,
+                cwd = serde_json::to_string(&tracked_root.to_string_lossy().into_owned()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let untracked_dir = paseo_store.join("untracked-slug");
+        std::fs::create_dir_all(&untracked_dir).unwrap();
+        std::fs::write(
+            untracked_dir.join("agent-2.json"),
+            format!(
+                r#"{{
+                    "id": "agent-2",
+                    "provider": "codex",
+                    "cwd": {cwd},
+                    "title": "explore",
+                    "lastStatus": "running",
+                    "lastActivityAt": "2026-08-29T12:00:00Z"
+                }}"#,
+                cwd =
+                    serde_json::to_string(&untracked_root.to_string_lossy().into_owned()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(paseo_store.clone());
+        register(&st, &tracked_root, "tracked-project");
+        let app = router(st);
+
+        let body = body_string(get(app, "/").await).await;
+
+        assert!(
+            body.contains("proj-row__badges--paseo"),
+            "a live paseo agent inside a tracked project must badge that project's row: {body}"
+        );
+        assert!(
+            body.contains("claude-sonnet-5"),
+            "the badge must name the agent's own model: {body}"
+        );
+        assert!(
+            !body.contains("do the secret thing"),
+            "the agent's title is prompt text and must never render: {body}"
+        );
+
+        let path_str = untracked_root.to_string_lossy().into_owned();
+        let row_start = body.find(&path_str).unwrap_or_else(|| {
+            panic!("an untracked paseo cwd must surface as a suggestion row: {body}")
+        });
+        let row_end = body[row_start..]
+            .find("</li>")
+            .map(|i| row_start + i)
+            .unwrap_or_else(|| panic!("suggestion row never closes: {body}"));
+        let row = &body[row_start..row_end];
+        assert!(
+            row.contains(r#"action="/api/projects/register""#),
+            "the untracked cwd's suggestion row must post to the EXISTING register route, \
+             never a new one: {row}"
+        );
+        assert!(
+            row.contains("paseo agent"),
+            "the suggestion row must say a paseo agent is running there: {row}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&paseo_store).ok();
+    }
+
+    /// paseo-support ps-2: with `terminal_family_enabled` off, the page
+    /// makes no paseo store read at all (the same gate the herdr snapshot
+    /// itself rides) — byte-identical to the page before this feature.
+    /// This fixture store carries a live agent that WOULD badge and WOULD
+    /// suggest if read; the assertions below prove neither happens.
+    #[tokio::test]
+    async fn paseo_agents_are_invisible_with_the_terminal_switch_off() {
+        let dir = fresh_root("paseo-switch-off-route");
+        let scratch = fresh_root("paseo-switch-off-route-scratch");
+        let root = scratch.join("some-project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let paseo_store = fresh_root("paseo-switch-off-route-store");
+        let slug_dir = paseo_store.join("slug");
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        std::fs::write(
+            slug_dir.join("agent-1.json"),
+            format!(
+                r#"{{
+                    "id": "agent-1",
+                    "provider": "claude",
+                    "cwd": {cwd},
+                    "title": "do the thing",
+                    "lastStatus": "running",
+                    "lastActivityAt": "2026-08-29T12:00:00Z"
+                }}"#,
+                cwd = serde_json::to_string(&root.to_string_lossy().into_owned()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(paseo_store.clone());
+        register(&st, &root, "some-project");
+        let app = router(st);
+
+        let body = body_string(get(app, "/").await).await;
+
+        assert!(
+            !body.contains("proj-row__badges--paseo"),
+            "no paseo badge may render with the terminal switch off: {body}"
+        );
+        assert!(
+            !body.contains("proj-suggestions"),
+            "no suggestion block may render with the terminal switch off: {body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&paseo_store).ok();
+    }
+
+    /// paseo-support ps-2 (revision, goal-check NEEDS_REVISION): the
+    /// suggestion half of `index_page` used to be gated on `snapshot` being
+    /// `Some` — an errored or timed-out herdr (`FakeHerdr::set_available(false)`,
+    /// the same double `home_page_renders_plain_rows_when_herdr_is_down`
+    /// uses) made `suggestions` an empty `Vec` unconditionally, so a live
+    /// paseo agent in an untracked cwd never got its Register invitation
+    /// even though the paseo half never touched herdr at all. Proves the
+    /// fix: with the switch on and herdr down, the untracked agent's row
+    /// still renders and its form still posts to the existing register
+    /// route.
+    #[tokio::test]
+    async fn untracked_paseo_suggestion_survives_herdr_being_down() {
+        use crate::herdr::fake::FakeHerdr;
+
+        let dir = fresh_root("paseo-suggestion-herdr-down");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-suggestion-herdr-down-scratch");
+        let untracked_root = scratch.join("untracked-folder");
+        std::fs::create_dir_all(&untracked_root).unwrap();
+
+        let paseo_store = fresh_root("paseo-suggestion-herdr-down-store");
+        let untracked_dir = paseo_store.join("untracked-slug");
+        std::fs::create_dir_all(&untracked_dir).unwrap();
+        std::fs::write(
+            untracked_dir.join("agent-1.json"),
+            format!(
+                r#"{{
+                    "id": "agent-1",
+                    "provider": "codex",
+                    "cwd": {cwd},
+                    "title": "explore",
+                    "lastStatus": "running",
+                    "lastActivityAt": "2026-08-29T12:00:00Z"
+                }}"#,
+                cwd =
+                    serde_json::to_string(&untracked_root.to_string_lossy().into_owned()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let fake = std::sync::Arc::new(FakeHerdr::new());
+        fake.set_available(false);
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        st.paseo_store_root = Some(paseo_store.clone());
+        let app = router(st);
+
+        let body = body_string(get(app, "/").await).await;
+
+        assert!(
+            !body.contains("proj-row__badges--paseo"),
+            "a down herdr must still render plain rows, no badge container: {body}"
+        );
+
+        let path_str = untracked_root.to_string_lossy().into_owned();
+        let row_start = body.find(&path_str).unwrap_or_else(|| {
+            panic!(
+                "an untracked paseo cwd must surface as a suggestion row even when herdr is \
+                 down: {body}"
+            )
+        });
+        let row_end = body[row_start..]
+            .find("</li>")
+            .map(|i| row_start + i)
+            .unwrap_or_else(|| panic!("suggestion row never closes: {body}"));
+        let row = &body[row_start..row_end];
+        assert!(
+            row.contains(r#"action="/api/projects/register""#),
+            "the untracked cwd's suggestion row must post to the EXISTING register route, \
+             never a new one, even when herdr is down: {row}"
+        );
+        assert!(
+            row.contains("1 paseo agent"),
+            "a paseo-only row (no herdr panes reachable) must state the paseo agent count \
+             without a zero pane count: {row}"
+        );
+        assert!(
+            !row.contains("pane"),
+            "no herdr snapshot was taken, so the row must never claim a pane count: {row}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&paseo_store).ok();
     }
 
     /// The two home-page behaviors that live in `assets/app.js` reach the
