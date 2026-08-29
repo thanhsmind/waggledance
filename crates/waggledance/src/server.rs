@@ -620,12 +620,21 @@ fn router(state: AppState) -> Router {
 /// `Host` header is rejected the same way: a real browser always sends one
 /// on HTTP/1.1, so its absence is never a legitimate local client, only a
 /// crafted request trying to dodge the check.
+///
+/// paseo-control S8: also carries the `Sec-Fetch-Site` assertion
+/// (`sec_fetch_site_is_allowed`), refused with this same status and body so
+/// callers see one consistent behaviour rather than two dialects. `Host`
+/// alone stops DNS rebinding, not a cross-site request aimed at this
+/// daemon's own configured hostname (fact 6 / D10) -- the `Sec-Fetch-Site`
+/// check closes that gap for every route the router serves, in one place.
 async fn require_loopback_host(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if !host_is_allowed(req.headers(), &state.engine.config.server.hostname) {
+    if !host_is_allowed(req.headers(), &state.engine.config.server.hostname)
+        || !sec_fetch_site_is_allowed(req.headers())
+    {
         return (
             StatusCode::MISDIRECTED_REQUEST,
             "misdirected request: unrecognized Host header\n",
@@ -671,6 +680,28 @@ fn strip_host_port(host: &str) -> &str {
         Some((h, _port)) => h,
         None => host,
     }
+}
+
+/// paseo-control S8: the `Sec-Fetch-Site` allowlist, split out from
+/// `require_loopback_host` the same way `host_is_allowed` is, so a unit test
+/// can drive it directly against a bare `HeaderMap`. An ABSENT header is
+/// ALLOWED -- deliberately, not an oversight: every browser capable of
+/// mounting a cross-site attack against this router always sends
+/// `Sec-Fetch-Site` on fetches and navigations, while a non-browser client
+/// (curl, the `paseo` CLI, this crate's own tests) never sends it at all.
+/// Refusing an absent header would break every non-browser caller for zero
+/// security gain against the one actor the header exists to constrain. When
+/// the header IS present, only `same-origin` and `none` (a typed-URL or
+/// bookmark navigation, not a cross-site fetch) are allowed --
+/// `same-site` is refused too: a sibling subdomain sharing this
+/// deployment's parent domain is not this origin. Do not "tighten" the
+/// absent case into a refusal; that would lock out every non-browser client
+/// this daemon serves.
+fn sec_fetch_site_is_allowed(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get("sec-fetch-site") else {
+        return true;
+    };
+    matches!(value.to_str(), Ok("same-origin") | Ok("none"))
 }
 
 /// D1/D6: the bound on `index_page`'s one herdr snapshot. `SocketHerdr::call`
@@ -28658,6 +28689,45 @@ mod bee_route_tests {
         );
     }
 
+    /// S8 must-have: an ABSENT `Sec-Fetch-Site` header is allowed, so every
+    /// non-browser client (curl, the `paseo` CLI) keeps working unchanged.
+    #[test]
+    fn sec_fetch_site_is_allowed_when_the_header_is_absent() {
+        let headers = HeaderMap::new();
+        assert!(
+            sec_fetch_site_is_allowed(&headers),
+            "an absent Sec-Fetch-Site header must be allowed"
+        );
+    }
+
+    /// S8 must-have: `same-origin` and `none` are allowed.
+    #[test]
+    fn sec_fetch_site_is_allowed_for_same_origin_and_none() {
+        for value in ["same-origin", "none"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", value.parse().unwrap());
+            assert!(
+                sec_fetch_site_is_allowed(&headers),
+                "Sec-Fetch-Site {value:?} must be allowed"
+            );
+        }
+    }
+
+    /// S8 must-have: `cross-site` is refused, and `same-site` is refused
+    /// too -- a sibling subdomain under this deployment's shared parent
+    /// domain is not this origin.
+    #[test]
+    fn sec_fetch_site_is_refused_for_cross_site_and_same_site() {
+        for value in ["cross-site", "same-site"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", value.parse().unwrap());
+            assert!(
+                !sec_fetch_site_is_allowed(&headers),
+                "Sec-Fetch-Site {value:?} must be refused"
+            );
+        }
+    }
+
     /// D1 must-have 1: a loopback Host — in every spelling the decision
     /// names — passes an ordinary GET route through unchanged.
     #[tokio::test]
@@ -28740,6 +28810,66 @@ mod bee_route_tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    /// S8: a request with no `Sec-Fetch-Site` header at all -- every
+    /// non-browser client -- still reaches an ordinary GET route unchanged,
+    /// same as before this assertion existed.
+    #[tokio::test]
+    async fn absent_sec_fetch_site_reaches_a_plain_get_route_unchanged() {
+        let app = router(build_state());
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7700")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an absent Sec-Fetch-Site header must reach /health unchanged"
+        );
+    }
+
+    /// S8: `same-origin` and `none` reach an ordinary GET route unchanged.
+    #[tokio::test]
+    async fn same_origin_and_none_sec_fetch_site_reach_a_plain_get_route() {
+        for value in ["same-origin", "none"] {
+            let app = router(build_state());
+            let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7700")
+                .header("sec-fetch-site", value)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "Sec-Fetch-Site {value:?} must reach /health unchanged"
+            );
+        }
+    }
+
+    /// S8: `cross-site` and `same-site` are refused with the same 421 shape
+    /// the Host guard uses -- one consistent behaviour, not two dialects.
+    #[tokio::test]
+    async fn cross_site_and_same_site_sec_fetch_site_are_refused_with_421() {
+        for value in ["cross-site", "same-site"] {
+            let app = router(build_state());
+            let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7700")
+                .header("sec-fetch-site", value)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "Sec-Fetch-Site {value:?} must be refused with 421"
+            );
+        }
     }
 
     /// D1 must-have 2, the CSRF-on-`/api/config` finding itself: a foreign
