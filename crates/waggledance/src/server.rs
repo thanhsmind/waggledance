@@ -3795,25 +3795,34 @@ async fn paseo_agent_send(
 /// authoritatively, immediately before `paseo_agent_permit` issues an
 /// answer (pc-5's own stale-`req_id` guard, plan.md pc-5 section).
 ///
-/// `permit_ls` is verified (CONTEXT.md, this machine) to print `[]` (this
-/// binary's actual plain-format invocation — `PaseoCli::permit_ls` issues no
-/// `--json` flag — in fact prints nothing at all for the empty case, which
-/// this parser also recognizes) when nothing is pending. Neither this
-/// codebase nor CONTEXT.md carries a VERIFIED populated shape — producing
-/// one needs a live agent to actually hit a permission gate, which this
-/// route's own tests cannot force — so a non-empty, non-`[]` payload is
-/// trusted only as a clean JSON array of objects, each carrying an agent
-/// field (`agentId`/`agent_id`/`agent`, matched against the agent's own id
-/// OR its `paseo ls`-style short-id prefix — `permit allow --help` calls its
-/// own `<agent>` argument "Agent ID (or prefix)") and a request-id field
-/// (`requestId`/`reqId`/`req_id`/`request_id`/`id`). Anything else —
-/// non-JSON text (the shape this binary's real ASCII TABLE format would
-/// actually emit for a populated list, since `permit_ls` passes no format
-/// flag) or a JSON entry missing either field — is `UnrecognizedFormat`,
-/// which NEVER reads as "nothing pending": the caller must render or refuse
-/// on a NAMED failure instead, because silently showing no control when a
-/// request IS pending is exactly the failure mode this feature exists to
-/// prevent (S9's own fail-closed precedent, `paseo_conversation_unrecognized_
+/// `permit_ls` (**pc-6**: `PaseoCli::permit_ls` now issues `paseo permit ls
+/// --json`, a documented option of that subcommand — the flagless call it
+/// issued through pc-1 and pc-5 rendered an ASCII TABLE for a populated
+/// list, which this parser could never read, so the Allow/Deny control
+/// could never appear the moment a request was actually pending; see
+/// `PaseoCli::permit_ls`'s own doc comment) is verified (CONTEXT.md, this
+/// machine) to print `[]` when nothing is pending — this parser also
+/// recognizes an entirely empty string for the same case, matching the
+/// flagless invocation's own empty-case behavior in case a future
+/// regression ever drops `--json` again. Neither this codebase nor
+/// CONTEXT.md carries a VERIFIED populated `--json` shape — producing one
+/// needs a live agent to actually hit a permission gate, which this route's
+/// own tests cannot force, and no live pending permission was triggered to
+/// confirm it (see `PaseoCli::permit_ls`'s caveat) — so a non-empty, non-`[]`
+/// payload is trusted only as a clean JSON array of objects, each carrying
+/// an agent field (`agentId`/`agent_id`/`agent`, matched against the
+/// agent's own id OR its `paseo ls`-style short-id prefix — `permit allow
+/// --help` calls its own `<agent>` argument "Agent ID (or prefix)") and a
+/// request-id field (`requestId`/`reqId`/`req_id`/`request_id`/`id`); these
+/// field names are a documented guess, not a verified contract (owed: one
+/// real-binary verification once a pending permission can be observed
+/// safely). Anything else — non-JSON text (still possible: a `--json`
+/// flag paseo does not honor on some path, or an upstream format drift) or
+/// a JSON entry missing either field — is `UnrecognizedFormat`, which NEVER
+/// reads as "nothing pending": the caller must render or refuse on a NAMED
+/// failure instead, because silently showing no control when a request IS
+/// pending is exactly the failure mode this feature exists to prevent (S9's
+/// own fail-closed precedent, `paseo_conversation_unrecognized_
 /// format_state`, applied here to a security-relevant read instead of a
 /// display-only one).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29197,6 +29206,32 @@ mod bee_route_tests {
         json!([{ "agentId": agent_id, "requestId": req_id }]).to_string()
     }
 
+    /// **pc-6's own whole-path fixture.** Like `fake_paseo_dual`, but the
+    /// `permit ls` branch answers JSON only when `--json` is present in its
+    /// own argv — otherwise it prints ASCII table text, the shape the real,
+    /// FLAGLESS `paseo permit ls` actually emits for a populated list
+    /// (verified against the real binary, this cell's own defect writeup;
+    /// `PaseoCli::permit_ls`'s doc comment). Every OTHER `fake_paseo_dual`
+    /// fixture in this suite answers `permit_ls_stdout` regardless of argv,
+    /// so none of them could ever catch `permit_ls` regressing back to the
+    /// flagless call — this fixture is the one that can.
+    #[cfg(unix)]
+    fn fake_paseo_dual_json_gated_permit_ls(
+        dir: &Path,
+        logs_stdout: &str,
+        json_stdout: &str,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = dir.join("paseo");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = logs ]; then\n  printf '%s' '{logs_stdout}'\n  exit 0\nfi\nif [ \"$1\" = permit ] && [ \"$2\" = ls ]; then\n  for a in \"$@\"; do\n    if [ \"$a\" = '--json' ]; then\n      printf '%s' '{json_stdout}'\n      exit 0\n    fi\n  done\n  printf '%s' 'ID      AGENT     STATUS\\nreq-9   agent-1   pending\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
     #[test]
     fn parse_pending_permissions_recognizes_both_empty_shapes() {
         assert_eq!(
@@ -29661,7 +29696,7 @@ mod bee_route_tests {
         let lines: Vec<&str> = argv.lines().collect();
         assert_eq!(
             lines,
-            vec!["permit", "ls"],
+            vec!["permit", "ls", "--json"],
             "the answer subcommand must never be reached on a stale id: {lines:?}"
         );
 
@@ -29713,7 +29748,7 @@ mod bee_route_tests {
         );
 
         let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
-        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls"]);
+        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls", "--json"]);
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -29763,7 +29798,7 @@ mod bee_route_tests {
         );
 
         let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
-        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls"]);
+        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls", "--json"]);
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -30041,6 +30076,112 @@ mod bee_route_tests {
             html.contains("was not recognized"),
             "an unrecognized payload must name the failure, never render as silently absent: {html}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    // ── pc-6: the whole path — `--json` is what lets the control appear ──
+
+    /// **The proof this cell exists for.** `paseo_conversation_route_shows_
+    /// the_permit_banner_when_pending_for_this_agent` above already proves
+    /// the parser-to-banner seam, but its `fake_paseo_dual` fixture answers
+    /// JSON regardless of argv — it could not see `permit_ls` calling
+    /// `paseo permit ls` without `--json`, which is exactly the production
+    /// defect this cell fixes (a populated list rendering as an ASCII
+    /// table, which `parse_pending_permissions` cannot read, so the
+    /// Allow/Deny control never appeared). This test's fixture
+    /// (`fake_paseo_dual_json_gated_permit_ls`) answers table text unless
+    /// `--json` is actually present in argv, closing that gap: it proves
+    /// the whole path from `PaseoCli::permit_ls` issuing `--json` through
+    /// `parse_pending_permissions` to the rendered control, across the seam
+    /// pc-1 and pc-5 share.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_renders_allow_deny_control_only_when_json_requested() {
+        let dir = fresh_root("paseo-conv-permit-json-gated-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-conv-permit-json-gated-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-conv-permit-json-gated-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-conv-permit-json-gated-cli");
+        let bin = fake_paseo_dual_json_gated_permit_ls(
+            &cli_dir,
+            "[User] hi\nok",
+            &pending_permission_json("agent-1", "req-9"),
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-conv-permit-json-gated-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let html = v["html"].as_str().unwrap();
+        assert!(
+            html.contains(r#"data-paseo-permit-action="allow""#),
+            "a populated permit-ls JSON payload must render the Allow control: {html}"
+        );
+        assert!(
+            html.contains(r#"data-paseo-permit-action="deny""#),
+            "a populated permit-ls JSON payload must render the Deny control: {html}"
+        );
+        assert!(html.contains(r#"data-req-id="req-9""#), "{html}");
+        assert!(
+            !html.contains("was not recognized"),
+            "requesting --json must not fall into the unrecognized-format state: {html}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// The empty side of the same gated fixture: an EMPTY `--json` payload
+    /// still renders no control and no error, mirroring `paseo_conversation_
+    /// route_shows_no_permit_banner_when_nothing_pending` above but through
+    /// the `--json`-gated fixture so this cell's own change is proven not to
+    /// regress the ordinary, nothing-pending case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_shows_no_control_for_an_empty_json_gated_payload() {
+        let dir = fresh_root("paseo-conv-permit-json-gated-empty-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-conv-permit-json-gated-empty-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-conv-permit-json-gated-empty-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-conv-permit-json-gated-empty-cli");
+        let bin = fake_paseo_dual_json_gated_permit_ls(&cli_dir, "[User] hi\nok", "[]");
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(
+            &st,
+            &tracked_root,
+            "paseo-conv-permit-json-gated-empty-project",
+        );
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let html = v["html"].as_str().unwrap();
+        assert!(!html.contains("data-paseo-permit"), "{html}");
+        assert!(!html.contains("was not recognized"), "{html}");
+        assert!(html.contains("hi"), "the conversation body must still render: {html}");
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();

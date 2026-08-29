@@ -148,9 +148,25 @@ impl PaseoCli {
             .await
     }
 
-    /// `paseo permit ls` — the pending-permission list (`[]` when empty).
+    /// `paseo permit ls --json` — the pending-permission list (`[]` when
+    /// empty). **pc-6**: the flagless call this method issued through pc-1
+    /// and pc-5 renders an ASCII TABLE for a populated list — verified
+    /// against the real binary on this machine — which the banner parser in
+    /// `server.rs` (`parse_pending_permissions`) cannot read; it fails
+    /// closed on that shape by design, so the Allow/Deny control could never
+    /// appear the moment a request was actually pending. `--json` is a
+    /// documented option of this subcommand (`paseo permit ls --help`) and
+    /// is what makes the populated case machine-readable, matching
+    /// `PaseoCli::send`'s own `--json` usage above. **Caveat**: no live
+    /// pending permission has been triggered against the real daemon to
+    /// observe this flag's actual POPULATED JSON shape — the field names
+    /// `parse_pending_permissions` trusts (`agentId`/`agent_id`/`agent`,
+    /// `requestId`/`reqId`/`req_id`/`request_id`/`id`) are a documented
+    /// guess, not a verified contract. A future cell owes one real-binary
+    /// verification of this shape once a pending permission can be observed
+    /// safely.
     pub async fn permit_ls(&self) -> Result<String, PaseoCliError> {
-        self.run(["permit", "ls"]).await
+        self.run(["permit", "ls", "--json"]).await
     }
 
     /// `paseo permit allow <agent> <req>`. Operand order matters — a
@@ -352,7 +368,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cli = PaseoCli::new(echo_argv_script(dir.path()));
         let out = cli.permit_ls().await.unwrap();
-        assert_eq!(argv_lines(&out), vec!["permit", "ls"]);
+        assert_eq!(argv_lines(&out), vec!["permit", "ls", "--json"]);
     }
 
     #[cfg(unix)]
