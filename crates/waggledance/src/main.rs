@@ -7,6 +7,7 @@ mod herdr;
 mod mcp;
 mod notify;
 mod orchestrate;
+mod paseo_cli;
 mod runtime;
 mod server;
 mod supervisor;
