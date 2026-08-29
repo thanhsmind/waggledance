@@ -1955,16 +1955,12 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
   .term-keys button, .term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-2) var(--space-3); }
   .term-reply__actions { justify-content: stretch; }
   .term-reply__actions button { flex: 1; }
-  /* term-keys-one-row: on a handset all eight keys share ONE line — the two
-     groups stop wrapping and every key takes an equal share of the width,
-     so the arrows and the named keys read as one band instead of two rows
-     with a gap. The 44px minimum the arrows keep at desktop width would
-     push the row past a 390px screen, so it yields to the equal share here;
-     the 44px height stays. */
-  .term-controls { flex-wrap: nowrap; gap: var(--space-1); }
-  .term-keys { flex: 1 1 0; flex-wrap: nowrap; min-width: 0; }
-  .term-keys button { flex: 1 1 0; min-width: 0; padding-inline: var(--space-1); }
-  .term-controls .term-keys--move button { min-width: 0; }
+  /* term-keys-grid (D1): the 2×6 grid holds its shape on a handset too —
+     six columns, two rows, never collapsing into the old one-row band —
+     because the base `.term-keys` rule's own column tracks
+     (`repeat(6, minmax(44px, 1fr))`) already floor every key at the touch
+     target whatever the card's own width is; nothing here needs to
+     override that layout. */
 }
 /* The controls read top to bottom in the order they are reached: the screen,
    then the two controls that move the screen, then the keys that drive the
@@ -2006,21 +2002,25 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
 .term-reply__approve:disabled { opacity: .5; cursor: not-allowed; }
 /* Send is the primary of the pair — Stage beside it stays the quiet one. */
 .term-reply__send { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); }
-/* One tight control block under the screen, on a single line: the arrows and
-   the named keys read as one row of controls rather than two bands with a
-   gap between them. The row carries no margin of its own and wraps only when
-   the card is too narrow to hold both groups. */
-.term-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: 0; }
-.term-keys { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+/* tkg-1 (D1): the two key groups merge into one 2×6 grid, so the wrapper
+   holds just that single grid now — no more "wrap only when too narrow to
+   hold both groups" balancing act the two-group layout used to need. */
+.term-controls { display: flex; align-items: center; gap: var(--space-2); margin-top: 0; }
+/* D5/tkg-1: `minmax(44px, 1fr)` floors every column at the 44px touch
+   target and lets it grow to share the row evenly — one rule now covers the
+   width floor every key used to need its own `--move`-only modifier for,
+   because the merge (D1) makes every key in the grid equally "the direct
+   child of `.term-controls`". */
+.term-keys { display: grid; grid-template-columns: repeat(6, minmax(44px, 1fr)); gap: var(--space-1); }
 .term-keys button { padding: var(--space-1) var(--space-2); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; font-size: var(--type-caption-size); }
-/* D5, amended 2026-08-08: every key in the row stands 44px tall so the row
-   reads as one control band — Enter, Esc and Tab match the arrows. The
-   arrows alone keep the 44px minimum WIDTH and the body-size glyph (pressed
-   repeatedly, often with a thumb); the named keys keep their padding-driven
-   width. The `--move` modifier picks the arrows out rather than position:
-   once both groups share one row, "the direct child of `.term-controls`"
-   reaches the named keys too. */
-.term-keys--move button { min-width: 44px; font-size: var(--type-body-size); }
+/* D2: a latched modifier (Ctrl/Shift/Alt) reads the same way Send already
+   does — filled with the action colour — so the one lit key is obvious
+   before the next tap combines with it and clears the latch. */
+.term-keys button[aria-pressed="true"] { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); }
+/* D3: Paste dims exactly like Approve does when it is withheld — the same
+   rule, the same reason: a control that cannot act yet must look like it
+   cannot. */
+.term-keys__paste:disabled { opacity: .5; cursor: not-allowed; }
 /* scroll-fab: the three screen-moving controls (Older, Newer, Live) belong
    to the screen, not to the keys that type into the pane, so they ride on
    it as a small round-button column in its lower-right corner. Two elements
@@ -2763,17 +2763,19 @@ fn pane_controls(
     };
     format!(
         r#"<div class="term-controls">
-    <div class="term-keys term-keys--move" data-pane-id="{pane_id}"{base_attr} aria-label="Move around {name}'s screen">
-      <button type="button" data-key="up">↑</button>
-      <button type="button" data-key="down">↓</button>
-      <button type="button" data-key="left">←</button>
-      <button type="button" data-key="right">→</button>
-    </div>
     <div class="term-keys" data-pane-id="{pane_id}"{base_attr} aria-label="Send a key to {name}">
-      <button type="button" data-key="enter">Enter</button>
       <button type="button" data-key="escape">Esc</button>
       <button type="button" data-key="tab">Tab</button>
+      <button type="button" data-mod="ctrl" aria-pressed="false">Ctrl</button>
+      <button type="button" data-key="up">↑</button>
+      <button type="button" data-mod="shift" aria-pressed="false">Shift</button>
       <button type="button" data-key="ctrl+c">Ctrl+C</button>
+      <button type="button" data-mod="alt" aria-pressed="false">Alt</button>
+      <button type="button" class="term-keys__paste" aria-label="Paste into the reply to {name}">Paste</button>
+      <button type="button" data-key="left">←</button>
+      <button type="button" data-key="down">↓</button>
+      <button type="button" data-key="right">→</button>
+      <button type="button" data-key="enter">Enter</button>
     </div>
   </div>
   <form class="term-reply" data-pane-id="{pane_id}"{base_attr}{state_attr}>{field}
@@ -11573,38 +11575,34 @@ mod tests {
         );
     }
 
-    /// D5 (terminal-pane-scope), amended 2026-08-08 (term-key-height):
-    /// every key in the row — Enter, Esc, Tab and the arrows — stands 44px
-    /// tall, so the row reads as one band. The arrows alone keep the 44px
-    /// minimum WIDTH and the body-size glyph (pressed repeatedly, often
-    /// with a thumb); they are picked out by their own `.term-keys--move`
-    /// modifier rather than by being a direct child of `.term-controls`,
-    /// which since the merge reaches the named keys too. The scroll pair
+    /// D5 (terminal-pane-scope), amended 2026-08-08 (term-key-height),
+    /// amended again by tkg-1 for the 2×6 grid (D1): every key in the grid
+    /// stands 44px tall AND floors at 44px wide via the grid's own
+    /// `grid-template-columns: repeat(6, minmax(44px, 1fr))` — one rule now
+    /// covers the width floor every key used to need its own
+    /// `.term-keys--move`-only modifier for, because the merge makes every
+    /// key equally "the direct child of `.term-controls`". The scroll pair
     /// (`.term-scroll`) and the reply buttons
     /// (`.term-reply__send`/`.term-reply__stage`) carry no such rule.
     #[test]
-    fn terminal_key_rows_share_one_height_and_arrows_keep_the_wider_box() {
+    fn terminal_key_rows_share_one_height_and_are_never_narrower_than_44px() {
         let project = sample_project();
         let html = terminal_page(&project, &[], None, &[]);
         assert!(
             html.contains(
                 ".term-keys button { padding: var(--space-1) var(--space-2); min-height: 44px;"
             ),
-            "the whole key row must stand 44px tall: {html}"
+            "the whole key grid must stand 44px tall: {html}"
         );
         assert!(
             html.contains(
-                ".term-keys--move button { min-width: 44px; font-size: var(--type-body-size); }"
+                ".term-keys { display: grid; grid-template-columns: repeat(6, minmax(44px, 1fr)); gap: var(--space-1); }"
             ),
-            "the arrow group must keep its 44px minimum width at body-size type: {html}"
+            "every column in the grid must floor at 44px wide: {html}"
         );
-        // The markup carrying that modifier is pinned by the route test
-        // `terminal_page_renders_the_reply_bar_and_key_buttons`; this fixture
-        // has no panes, so only the stylesheet is in reach here.
         assert!(
-            !html.contains(".term-controls > .term-keys button { min-width: 44px")
-                && !html.contains(".term-controls .term-keys button { min-width: 44px"),
-            "a positional rule would reach the named keys too, so it must not exist: {html}"
+            !html.contains(".term-keys--move"),
+            "the arrows-only modifier is gone now that one grid replaces both key groups: {html}"
         );
         assert!(
             !html.contains(".term-scroll button { min-width: 44px")
@@ -11757,33 +11755,32 @@ mod tests {
         );
     }
 
-    /// term-keys-one-row: on a handset the arrows and the named keys share
-    /// one line — both groups stop wrapping and every key takes an equal
-    /// share, inside the tab's own narrow block and nowhere else.
+    /// term-keys-grid (D1): the 2×6 grid is a base rule, not a narrow-only
+    /// override — it holds six columns, two rows, at every width, so a
+    /// handset never collapses it into a single overflowing line the way
+    /// the old flex row (term-keys-one-row) used to force.
     #[test]
-    fn term_keys_share_one_row_only_inside_the_narrow_media_query() {
+    fn term_keys_grid_holds_its_shape_at_every_width() {
         let html = PROJECT_TAB_STYLE;
+        assert!(
+            html.contains(
+                ".term-keys { display: grid; grid-template-columns: repeat(6, minmax(44px, 1fr)); gap: var(--space-1); }"
+            ),
+            "the 2x6 grid rule must ship as a base rule: {html}"
+        );
         let start = html
             .find("@media (max-width: 720px) {")
             .expect("the narrow block must exist");
         let tail = &html[start..];
         let end = tail.find("\n}\n").expect("the narrow block must close");
         let narrow = &tail[..end];
-        for rule in [
-            ".term-controls { flex-wrap: nowrap;",
-            ".term-keys { flex: 1 1 0; flex-wrap: nowrap; min-width: 0; }",
-            ".term-keys button { flex: 1 1 0; min-width: 0;",
-            ".term-controls .term-keys--move button { min-width: 0; }",
-        ] {
-            assert!(
-                narrow.contains(rule),
-                "narrow block must carry `{rule}`: {narrow}"
-            );
-        }
-        let outside = format!("{}{}", &html[..start], &tail[end..]);
         assert!(
-            !outside.contains("flex-wrap: nowrap"),
-            "the one-row rule is a handset rule only: {outside}"
+            !narrow.contains("grid-template-columns"),
+            "the grid shape must not be re-declared inside the narrow block — it already holds at every width: {narrow}"
+        );
+        assert!(
+            !html.contains("term-keys--move"),
+            "the arrows-only modifier is gone now that one grid replaces both key groups: {html}"
         );
     }
 
@@ -12007,8 +12004,8 @@ mod tests {
             "the Older/Newer/Live history controls must render: {html}"
         );
         assert!(
-            html.contains("term-keys--move") && html.contains(r#"class="term-reply""#),
-            "the movement keys and reply form must render: {html}"
+            html.contains(r#"class="term-keys""#) && html.contains(r#"class="term-reply""#),
+            "the key grid and reply form must render: {html}"
         );
 
         // agents-drawer-global: no drawer here — `home_page` (this tab's

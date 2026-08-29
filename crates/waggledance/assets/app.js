@@ -43,6 +43,82 @@
     return base != null || projectId != null;
   }
 
+  // tkg-1 (D1/D2): the 2×6 key grid's modifier buttons latch one at a
+  // time — aria-pressed marks which one, if any, is lit — and the next
+  // data-key tap combines with it as "<mod>+<key>" before the latch clears,
+  // exactly once. A second modifier tap replaces the first rather than
+  // stacking; tapping the SAME modifier again just clears it. With no
+  // latch, a bare key sends unchanged. Shared by the project-page wiring
+  // and the Unassigned page's own copy below so the combine/clear rule
+  // lives in exactly one place.
+  function wireTermKeysGrid(group, sendKeys) {
+    var modButtons = Array.prototype.slice.call(group.querySelectorAll("button[data-mod]"));
+    function clearLatch() {
+      modButtons.forEach(function (b) { b.setAttribute("aria-pressed", "false"); });
+    }
+    modButtons.forEach(function (modBtn) {
+      modBtn.addEventListener("click", function () {
+        var wasLatched = modBtn.getAttribute("aria-pressed") === "true";
+        clearLatch();
+        if (!wasLatched) modBtn.setAttribute("aria-pressed", "true");
+      });
+    });
+    Array.prototype.slice.call(group.querySelectorAll("button[data-key]")).forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var key = btn.getAttribute("data-key");
+        if (!key) return;
+        var latched = modButtons.filter(function (b) {
+          return b.getAttribute("aria-pressed") === "true";
+        })[0];
+        var mod = latched ? latched.getAttribute("data-mod") : null;
+        if (mod) clearLatch();
+        // ctrl-c-no-double: the Ctrl+C button's own key already IS "ctrl+c"
+        // — latching Ctrl first and tapping it would double the prefix into
+        // a wire name herdr refuses, so a key that already opens with the
+        // latched modifier's own prefix rides unchanged.
+        var wire = mod && key.indexOf(mod + "+") !== 0 ? mod + "+" + key : key;
+        sendKeys(wire);
+      });
+    });
+  }
+
+  // tkg-1 (D3): Paste reads the clipboard and inserts at the cursor of the
+  // nearest `.term-reply__text` — the SAME pane's own reply box, found via
+  // the shared `.fg-card.term-pane` ancestor both `views.rs::pane_controls`
+  // and `views.rs::screen_frame` wrap every pane's controls in — never
+  // posted straight into the pane (D3: review before send). Renders
+  // disabled the moment the clipboard read API turns out unavailable,
+  // matching the dimmed reference state — feature detection can only run
+  // in the browser, so the button always ships enabled from the server.
+  function wireTermKeysPaste(group) {
+    var pasteBtn = group.querySelector(".term-keys__paste");
+    if (!pasteBtn) return;
+    if (!navigator.clipboard || typeof navigator.clipboard.readText !== "function") {
+      pasteBtn.disabled = true;
+      return;
+    }
+    pasteBtn.addEventListener("click", function () {
+      var card = pasteBtn.closest(".term-pane");
+      var textarea = card ? card.querySelector(".term-reply__text") : null;
+      if (!textarea) return;
+      navigator.clipboard
+        .readText()
+        .then(function (text) {
+          if (!text) return;
+          var start = textarea.selectionStart;
+          var end = textarea.selectionEnd;
+          var hasSelection = typeof start === "number" && typeof end === "number";
+          var from = hasSelection ? start : textarea.value.length;
+          var to = hasSelection ? end : textarea.value.length;
+          textarea.value = textarea.value.slice(0, from) + text + textarea.value.slice(to);
+          var caret = from + text.length;
+          textarea.focus();
+          textarea.setSelectionRange(caret, caret);
+        })
+        .catch(function () {});
+    });
+  }
+
   // One-shot storage-key migration (D5 of the waggledance rename): the old
   // "mdview-theme" / "mdview-folders-open" key is read exactly once, copied
   // to its new "waggledance-*" key, then deleted — so neither the user's
@@ -2974,15 +3050,14 @@
     Array.prototype.slice.call(keyGroups).forEach(function (group) {
       var paneId = group.getAttribute("data-pane-id");
       var base = validTermBase(group.getAttribute("data-term-base"));
+      // Paste is a local clipboard→textarea action, never a `/keys` post,
+      // so it wires up whether or not this group has a posting target.
+      wireTermKeysPaste(group);
       // unassigned-poller-guard D1: same bail-out as the reply form above —
       // no target, no key posts wired for this group.
       if (!hasTarget(base, projectId)) return;
-      Array.prototype.slice.call(group.querySelectorAll("button[data-key]")).forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          var key = btn.getAttribute("data-key");
-          if (!key) return;
-          postJson(keysUrl(paneId, base), { keys: [key] }).catch(function () {});
-        });
+      wireTermKeysGrid(group, function (wire) {
+        postJson(keysUrl(paneId, base), { keys: [wire] }).catch(function () {});
       });
     });
   })();
@@ -3128,12 +3203,9 @@
       .call(document.querySelectorAll(".unassigned-panes .term-keys[data-pane-id]"))
       .forEach(function (group) {
         var paneId = group.getAttribute("data-pane-id");
-        Array.prototype.slice.call(group.querySelectorAll("button[data-key]")).forEach(function (btn) {
-          btn.addEventListener("click", function () {
-            var key = btn.getAttribute("data-key");
-            if (!key) return;
-            postJson(keysUrl(paneId), { keys: [key] }).catch(function () {});
-          });
+        wireTermKeysPaste(group);
+        wireTermKeysGrid(group, function (wire) {
+          postJson(keysUrl(paneId), { keys: [wire] }).catch(function () {});
         });
       });
   })();
