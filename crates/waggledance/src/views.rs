@@ -1964,22 +1964,27 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
 }
 /* The controls read top to bottom in the order they are reached: the screen,
    then the two controls that move the screen, then the keys that drive the
-   agent, then the box you write in with its own send row under it. The reply
-   box owns the full width — squeezing it beside two buttons left barely a
-   phone's worth of room for the one field an operator actually types into. */
+   agent, then the composer card you write and send in. The reply card owns
+   the full width — squeezing it beside two buttons left barely a phone's
+   worth of room for the one field an operator actually types into. */
 .term-reply { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); }
-/* compact-attach: the box an operator writes in is drawn by this wrapper,
-   not by the textarea, so the attach icon can sit inside the same outline
-   instead of taking a row of its own beneath it. The icon is pinned to the
-   top-left and the textarea takes the rest of the width; both stay on one
-   line however tall the textarea is dragged. `align-items: flex-start`
-   keeps the icon by the first line of type rather than floating to the
-   middle of a resized box. */
-.term-reply__field { display: flex; align-items: flex-start; gap: var(--space-1); width: 100%; min-width: 0; box-sizing: border-box; padding: var(--space-1) var(--space-2); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-bg); }
-/* The field wrapper owns the focus ring the textarea's own outline used to
-   give, so focusing the box still reads as focused. */
-.term-reply__field:focus-within { border-color: var(--color-action); }
-.term-reply__text { flex: 1 1 auto; width: auto; min-width: 0; box-sizing: border-box; padding: 0; border: 0; border-radius: 0; font-family: var(--font-mono, monospace); font-size: var(--type-body-sm-size); line-height: 1.35; background: transparent; color: var(--color-text); resize: vertical; outline: none; }
+/* paseo-composer (D1, term-reply-composer): the whole composer is one
+   bordered rounded card, never a field with a separate actions row sitting
+   under it — the shape a chat composer takes. `.term-attach` draws that
+   card directly for attach-capable panes: its picker, chip list and error
+   banner already have to nest under it for `assets/app.js`'s own
+   `attachBox.querySelector(...)` lookups, so the card boundary and the
+   attach boundary are the same element there (its own base layout lives in
+   `app.css`; this re-declares the shared box and layers the border on top,
+   since this block is inlined after that stylesheet and wins the cascade).
+   `.term-reply__field` draws the identical card for panes with no attach
+   control. Rounded large, like the reference — `--radius-lg`, not the
+   hairline `--radius-sm` the rest of this page's chrome uses. */
+.term-attach, .term-reply__field { display: flex; flex-direction: column; gap: var(--space-2); width: 100%; min-width: 0; box-sizing: border-box; padding: var(--space-2) var(--space-3); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-bg); }
+/* The card owns the focus ring the textarea's own outline used to give, so
+   focusing the box still reads as focused. */
+.term-attach:focus-within, .term-reply__field:focus-within { border-color: var(--color-action); }
+.term-reply__text { width: 100%; min-width: 0; box-sizing: border-box; padding: 0; border: 0; border-radius: 0; font-family: var(--font-mono, monospace); font-size: var(--type-body-sm-size); line-height: 1.35; background: transparent; color: var(--color-text); resize: vertical; outline: none; }
 /* Safari on iOS zooms the page whenever it focuses a control smaller than
    16px, and the zoom sticks — on a phone, one tap into the reply box left
    the operator looking at a magnified card. The box is deliberately 13px on
@@ -1994,7 +1999,11 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
 @media (pointer: coarse) {
   .term-reply__text { font-size: 16px; }
 }
-.term-reply__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
+/* The controls row sits at the bottom of the card, inside its border — the
+   attach icon (attach-capable panes only) pinned to the left via its own
+   `margin-right: auto`, Approve/Stage/Send crowding the right edge. */
+.term-reply__actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2); }
+.term-attach__btn { margin-right: auto; }
 .term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-1) var(--space-3); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; }
 /* A4: Approve is withheld unless bee says this agent is at a permission
    prompt. It stays in place, same size, so the row never reflows as a state
@@ -2728,37 +2737,53 @@ fn pane_controls(
         ),
         _ => r#"<button type="button" class="term-reply__approve">Approve</button>"#.to_string(),
     };
-    // compact-attach: the picker is an icon that rides INSIDE the writing
-    // box, on its left edge, rather than a labelled button parked under it —
-    // the shape every chat composer has settled on. The wrapper that draws
-    // the box is `.term-reply__field`; the textarea inside it gives up its
-    // own border so the two read as one control. Everything the attach
-    // wiring in `assets/app.js` looks up still hangs off the same
-    // `.term-attach[data-pane-id]` box (input, button, chips, error), so
-    // only the nesting moved, never a selector.
+    // paseo-composer (D1, term-reply-composer): the whole composer — the
+    // writing surface AND every control — reads as one bordered rounded
+    // card, never a field with a separate actions row sitting under it.
+    // `.term-attach` draws that card directly for attach-capable panes: its
+    // picker, chip list and error banner already have to nest under it for
+    // `assets/app.js`'s own `attachBox.querySelector(...)` lookups
+    // (`.term-attach[data-pane-id]` stays the box those four live in), so
+    // the card boundary and the attach boundary are the same element there.
+    // `.term-reply__field` draws the identical card for panes with no
+    // attach control. Either way the bottom row keeps the
+    // `.term-reply__actions` class — attach's `+` leads it, left-aligned,
+    // Approve/Stage/Send trail it, right-aligned — so every existing CSS
+    // rule and `assets/app.js` selector for those buttons keeps working
+    // unchanged; only the nesting moved.
     let field = if attach {
         format!(
             r#"
     <div class="term-attach" data-pane-id="{pane_id}"{base_attr}>
       <input type="file" class="term-attach__input" data-pane-id="{pane_id}" accept="image/*" multiple aria-label="Attach images to send to {name}" hidden>
       <ul class="term-attach__chips" data-pane-id="{pane_id}"></ul>
-      <div class="term-reply__field">
-        <button type="button" class="term-attach__btn" data-pane-id="{pane_id}" title="Attach images" aria-label="Attach images to send to {name}">+</button>
-        <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
-      </div>
+      <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
       <p class="term-attach__error" data-pane-id="{pane_id}" role="alert" hidden></p>
+      <div class="term-reply__actions">
+        <button type="button" class="term-attach__btn" data-pane-id="{pane_id}" title="Attach images" aria-label="Attach images to send to {name}">+</button>
+        {approve_btn}
+        <button type="button" class="term-reply__stage">Stage</button>
+        <button type="submit" class="term-reply__send">Send</button>
+      </div>
     </div>"#,
             pane_id = esc(pane_id),
             name = esc(name),
             base_attr = base_attr,
+            approve_btn = approve_btn,
         )
     } else {
         format!(
             r#"
     <div class="term-reply__field">
       <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
+      <div class="term-reply__actions">
+        {approve_btn}
+        <button type="button" class="term-reply__stage">Stage</button>
+        <button type="submit" class="term-reply__send">Send</button>
+      </div>
     </div>"#,
             name = esc(name),
+            approve_btn = approve_btn,
         )
     };
     format!(
@@ -2779,18 +2804,12 @@ fn pane_controls(
     </div>
   </div>
   <form class="term-reply" data-pane-id="{pane_id}"{base_attr}{state_attr}>{field}
-    <div class="term-reply__actions">
-      {approve_btn}
-      <button type="button" class="term-reply__stage">Stage</button>
-      <button type="submit" class="term-reply__send">Send</button>
-    </div>
   </form>"#,
         pane_id = esc(pane_id),
         name = esc(name),
         field = field,
         base_attr = base_attr,
         state_attr = state_attr,
-        approve_btn = approve_btn,
     )
 }
 
@@ -10913,8 +10932,12 @@ mod tests {
         );
 
         let unassigned_html = unassigned_terminal_page(&panes);
+        // paseo-composer: a bare "term-attach" substring now also matches the
+        // shared `.term-attach` card rule in `PROJECT_TAB_STYLE` (every page
+        // inlines that one stylesheet, attach-capable or not) — this checks
+        // the markup itself, the opening tag the attach-only div renders.
         assert!(
-            !unassigned_html.contains("term-attach"),
+            !unassigned_html.contains("class=\"term-attach\""),
             "the Unassigned page has no project-scoped attach route, so it must render no attach markup: {unassigned_html}"
         );
     }
@@ -11614,6 +11637,71 @@ mod tests {
                 && !html.contains(".term-reply__stage { min-width: 44px"),
             "the reply buttons must carry no such rule: {html}"
         );
+    }
+
+    /// paseo-composer (D1, term-reply-composer): the actions row is the
+    /// card's own last child, not a sibling block rendered below it —
+    /// proven by literal nesting, not left-to-right ordering (which the old
+    /// split layout satisfied too): the `</div>` closing
+    /// `.term-reply__actions` is immediately followed by the `</div>`
+    /// closing the card, and only then does the form itself close. True for
+    /// both the attach-capable card (`.term-attach`) and the no-attach card
+    /// (`.term-reply__field`).
+    #[test]
+    fn pane_controls_actions_row_closes_inside_the_card() {
+        let with_attach = pane_controls("pane-1", "Agent One", true, None, None);
+        assert!(
+            with_attach.contains("      </div>\n    </div>\n  </form>"),
+            "the actions row must close inside the attach card, before the form closes: {with_attach}"
+        );
+        let without_attach = pane_controls("pane-1", "Agent One", false, None, None);
+        assert!(
+            without_attach.contains("      </div>\n    </div>\n  </form>"),
+            "the actions row must close inside the field card, before the form closes: {without_attach}"
+        );
+    }
+
+    /// paseo-composer (D1): the restructure must not have cost
+    /// `assets/app.js` a single selector — every class name the old split
+    /// layout rendered still renders somewhere in the new single-card
+    /// composer (markup for the attach-capable variant, CSS for
+    /// `.term-reply__field`, which only the no-attach variant's markup
+    /// uses).
+    #[test]
+    fn pane_controls_keeps_every_pre_existing_class_name() {
+        let project = sample_project();
+        let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
+            pane_id: "w1:p1".into(),
+            kind: "claude".into(),
+            name: "one".into(),
+            status: "working".into(),
+            cwd: String::new(),
+            workspace: "w1".into(),
+            tab: "t1".into(),
+            title: String::new(),
+        }];
+        let html = terminal_page(&project, &panes, Some("w1:p1"), &[]);
+        for class in [
+            "term-reply__field",
+            "term-reply__text",
+            "term-reply__actions",
+            "term-reply__approve",
+            "term-reply__stage",
+            "term-reply__send",
+            "term-attach",
+            "term-attach__input",
+            "term-attach__chips",
+            "term-attach__btn",
+            "term-attach__error",
+        ] {
+            assert!(
+                html.contains(class),
+                "the composer must still carry {class}: {html}"
+            );
+        }
     }
 
     /// D1 (terminal-approve-button): Approve leads the row — Approve,

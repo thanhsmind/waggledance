@@ -21887,8 +21887,12 @@ mod bee_route_tests {
             .await,
         )
         .await;
+        // paseo-composer: a bare "term-attach" substring also matches the
+        // shared `.term-attach` card rule the inlined stylesheet now carries
+        // on every page — this checks the markup itself, the div's own
+        // opening tag.
         assert!(
-            !unassigned_body.contains("term-attach"),
+            !unassigned_body.contains("class=\"term-attach\""),
             "an unassigned pane must render no attach control: {unassigned_body}"
         );
 
