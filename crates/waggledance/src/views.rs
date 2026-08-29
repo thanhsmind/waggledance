@@ -3655,6 +3655,38 @@ fn paseo_collapse_phrase(verb: &str, paths: &[String]) -> String {
     }
 }
 
+/// Which kind of entry [`paseo_conversation_fragment`] is currently
+/// mid-way through, for classifying the NEXT unlabeled line as this
+/// entry's wrapped continuation rather than a new one of its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaseoOpenEntry {
+    /// Nothing open — the next unlabeled line starts a fresh reply.
+    None,
+    /// An agent reply paragraph is accumulating; its wrapped tail is
+    /// appended to the SAME paragraph.
+    Reply,
+    /// A collapsed tool call (`[Read]`/`[Shell]`/etc., or an unrecognized
+    /// label under S9) is open; its wrapped tail is dropped — it is
+    /// exactly the technical detail D2 already collapsed away.
+    Tool,
+    /// A withheld `[Thought]` is open; its wrapped tail is dropped too —
+    /// otherwise a multi-line Thought would leak its own continuation as
+    /// a rendered agent reply.
+    Thought,
+}
+
+/// Flushes an in-progress reply paragraph (if one is open) onto `html` and
+/// clears the buffer either way — shared by every place that closes out
+/// whatever was previously open before starting something new.
+fn paseo_flush_reply(html: &mut String, open: PaseoOpenEntry, reply_buf: &mut String) {
+    if open == PaseoOpenEntry::Reply && !reply_buf.is_empty() {
+        html.push_str(&format!(
+            r#"<p class="paseo-line paseo-line--reply">{reply_buf}</p>"#
+        ));
+    }
+    reply_buf.clear();
+}
+
 /// paseo-control D2/S9: parses `paseo logs`' raw text stream by LINE PREFIX
 /// ONLY (plan.md fact 2 — there is no JSON form) and collapses it to human
 /// phrasing. `[Thought]` is withheld entirely (D2) — not even a
@@ -3665,19 +3697,40 @@ fn paseo_collapse_phrase(verb: &str, paths: &[String]) -> String {
 /// waggle.gogl.be, since a renamed label falls through to exactly this
 /// branch rather than a body-rendering one.
 ///
-/// Attribution beyond a line's own prefix is BEST-EFFORT (plan.md fact 2):
-/// paseo owns this grammar and gives us no structure past a line prefix.
-/// The one added protection is narrow and deliberate, named for the two
-/// labels the paseo-control plan itself calls out (`User`, `Shell`): a line
-/// that would otherwise match one of THOSE two labels is instead kept as
-/// reply text when it directly follows an unlabeled reply line with
-/// nothing between them, so an agent's own reply that happens to start a
-/// line with `[User] ` or `[Shell] ` is never mis-attributed as a real user
-/// turn or tool call. This protection stays narrow rather than general:
-/// the verified real transcript (plan.md fact 1) shows a reply immediately
-/// followed by a tool-call label with NO separator, so gating every label
-/// the same way would swallow a genuine `[Read]`/`[Edit]` call that
-/// happens to follow a reply.
+/// A line starting with `[Label] ` at line-start ALWAYS opens a new entry
+/// — no exception (an earlier revision suppressed a `[User]`/`[Shell]`
+/// label that directly followed a reply line, to protect against an
+/// agent's own reply text that happened to start with one of those two
+/// prefixes; that suppression instead let a GENUINE `[User]`/`[Shell]`
+/// entry render verbatim, raw bracket and all, whenever it followed a
+/// reply with no separator — the common case on real transcripts. Cure
+/// worse than disease; removed).
+///
+/// Real `paseo logs` output is MULTI-LINE — a long `[Shell]` command wraps,
+/// an agent's reply paragraph spans lines — with no marker for a wrapped
+/// continuation beyond "this line has no `[Label]` prefix". A wrapped
+/// physical line never itself contains a blank row (a terminal wraps one
+/// continuous string across its width; it does not insert a blank line
+/// mid-wrap), so a blank line is the one signal this text stream gives for
+/// "the open entry's own text is done" — it closes whatever is open before
+/// the next line is classified. Within that boundary, an unlabeled
+/// non-empty line is a CONTINUATION of whatever entry is currently open:
+///   - continuation of a reply → appended to that SAME paragraph
+///     (space-joined), never rendered as a second one;
+///   - continuation of a tool entry → DROPPED — the call is already
+///     collapsed to "ran a command"/etc., and its wrapped tail is exactly
+///     the technical detail D2 forbids;
+///   - continuation of a `[Thought]` entry → DROPPED — without this, a
+///     multi-line Thought would render its wrapped tail as an agent
+///     reply, leaking private reasoning onto a page reachable from the
+///     internet; a captured transcript with no multi-line Thought in it
+///     hides that leak by luck, never guarantees its absence;
+///   - a continuation line before any entry has opened (the transcript
+///     starts mid-entry, because `--tail` cuts arbitrarily) is treated as
+///     a reply.
+/// Attribution past a line's own prefix is otherwise BEST-EFFORT
+/// (plan.md fact 2): paseo owns this grammar and gives us no structure
+/// past a line prefix.
 pub fn paseo_conversation_fragment(raw: &str) -> String {
     if raw.trim().is_empty() {
         return paseo_conversation_empty_state();
@@ -3688,39 +3741,34 @@ pub fn paseo_conversation_fragment(raw: &str) -> String {
 
     let lines: Vec<&str> = raw.lines().collect();
     let mut html = String::new();
-    let mut after_reply = false;
+    let mut open = PaseoOpenEntry::None;
+    let mut reply_buf = String::new();
     let mut i = 0;
     while i < lines.len() {
-        let raw_label = parse_paseo_label(lines[i]);
-        let effective = match raw_label {
-            Some((label, _)) if after_reply && (label == "User" || label == "Shell") => None,
-            other => other,
-        };
-        match effective {
-            None => {
-                let text = lines[i].trim();
-                if !text.is_empty() {
-                    html.push_str(&format!(
-                        r#"<p class="paseo-line paseo-line--reply">{}</p>"#,
-                        esc(text)
-                    ));
-                }
-                after_reply = true;
-                i += 1;
-            }
+        let line = lines[i];
+        if line.trim().is_empty() {
+            paseo_flush_reply(&mut html, open, &mut reply_buf);
+            open = PaseoOpenEntry::None;
+            i += 1;
+            continue;
+        }
+        match parse_paseo_label(line) {
             Some(("User", body)) => {
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 html.push_str(&format!(
                     r#"<p class="paseo-line paseo-line--user"><strong>You:</strong> {}</p>"#,
                     esc(body)
                 ));
-                after_reply = false;
+                open = PaseoOpenEntry::None;
                 i += 1;
             }
             Some(("Thought", _)) => {
-                after_reply = false;
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
+                open = PaseoOpenEntry::Thought;
                 i += 1;
             }
             Some(("Read", body)) => {
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 let mut paths = vec![paseo_path_basename(body)];
                 let mut j = i + 1;
                 loop {
@@ -3736,10 +3784,11 @@ pub fn paseo_conversation_fragment(raw: &str) -> String {
                     }
                 }
                 html.push_str(&paseo_tool_line(&paseo_collapse_phrase("read", &paths)));
-                after_reply = false;
+                open = PaseoOpenEntry::Tool;
                 i = j;
             }
             Some(("Edit", body)) | Some(("Write", body)) => {
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 let mut paths = vec![paseo_path_basename(body)];
                 let mut j = i + 1;
                 loop {
@@ -3755,32 +3804,37 @@ pub fn paseo_conversation_fragment(raw: &str) -> String {
                     }
                 }
                 html.push_str(&paseo_tool_line(&paseo_collapse_phrase("edited", &paths)));
-                after_reply = false;
+                open = PaseoOpenEntry::Tool;
                 i = j;
             }
             Some(("Shell", _)) | Some(("Bash", _)) => {
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 html.push_str(&paseo_tool_line("ran a command"));
-                after_reply = false;
+                open = PaseoOpenEntry::Tool;
                 i += 1;
             }
             Some(("Grep", _)) | Some(("ToolSearch", _)) => {
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 html.push_str(&paseo_tool_line("searched the code"));
-                after_reply = false;
+                open = PaseoOpenEntry::Tool;
                 i += 1;
             }
             Some(("Task", _)) => {
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 html.push_str(&paseo_tool_line("delegated a task"));
-                after_reply = false;
+                open = PaseoOpenEntry::Tool;
                 i += 1;
             }
             Some(("Task Notification", _)) => {
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 html.push_str(&paseo_tool_line("a task finished"));
-                after_reply = false;
+                open = PaseoOpenEntry::Tool;
                 i += 1;
             }
             Some(("Skill", _)) => {
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 html.push_str(&paseo_tool_line("loaded a skill"));
-                after_reply = false;
+                open = PaseoOpenEntry::Tool;
                 i += 1;
             }
             Some((label, _)) => {
@@ -3789,12 +3843,34 @@ pub fn paseo_conversation_fragment(raw: &str) -> String {
                 // (`AskUserQuestion`, `EnterWorktree`, `ExitWorktree`) —
                 // D2's table gives them no phrasing, so they render here
                 // too, not as a silently dropped body.
+                paseo_flush_reply(&mut html, open, &mut reply_buf);
                 html.push_str(&paseo_tool_line(&esc(label)));
-                after_reply = false;
+                open = PaseoOpenEntry::Tool;
+                i += 1;
+            }
+            None => {
+                let text = line.trim();
+                match open {
+                    PaseoOpenEntry::Reply => {
+                        if !reply_buf.is_empty() {
+                            reply_buf.push(' ');
+                        }
+                        reply_buf.push_str(&esc(text));
+                    }
+                    PaseoOpenEntry::Tool | PaseoOpenEntry::Thought => {
+                        // Wrapped tail of a collapsed tool call or a
+                        // withheld Thought — drop it (D2/S9).
+                    }
+                    PaseoOpenEntry::None => {
+                        reply_buf.push_str(&esc(text));
+                        open = PaseoOpenEntry::Reply;
+                    }
+                }
                 i += 1;
             }
         }
     }
+    paseo_flush_reply(&mut html, open, &mut reply_buf);
     html
 }
 
@@ -20284,25 +20360,31 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_line_beginning_with_a_label_string_is_not_mis_attributed() {
-        // The agent's own reply, immediately following another reply line
-        // with nothing between them, happens to start with the exact
-        // prefixes paseo uses for real entries. Neither must be
-        // reclassified as a real user turn or tool call (paseo-control
-        // plan.md fact 2 / this function's own doc comment).
+    fn a_label_at_line_start_always_opens_a_new_entry_even_right_after_a_reply() {
+        // A prior revision suppressed a `[User]`/`[Shell]` label that
+        // directly followed a reply line with nothing between them, to
+        // guard against an agent's own reply text coincidentally starting
+        // with one of those prefixes. That suppression instead let a
+        // GENUINE `[User]`/`[Shell]` entry — the common real-transcript
+        // case, a reply immediately followed by the next entry with no
+        // separator — render verbatim, raw bracket and all. The
+        // suppression is gone: a line starting with `[Label] ` always
+        // opens a new entry, full stop.
         let html = paseo_conversation_fragment(
-            "Let me recap what happened.\n[User] this is quoted text, not a real turn\n[Shell] this is quoted too, not a real command",
+            "Let me recap what happened.\n[User] pick up from here\n[Shell] cargo test --workspace",
         );
         assert!(
-            !html.contains("paseo-line--user"),
-            "the coincidental '[User] ' reply line must not render as a user turn: {html}"
+            html.contains("paseo-line--user") && html.contains("pick up from here"),
+            "a genuine [User] entry right after a reply must still render as a user turn: {html}"
         );
         assert!(
-            !html.contains("ran a command"),
-            "the coincidental '[Shell] ' reply line must not render as a tool call: {html}"
+            html.contains("ran a command"),
+            "a genuine [Shell] entry right after a reply must still collapse to a tool line: {html}"
         );
-        assert!(html.contains("this is quoted text, not a real turn"), "{html}");
-        assert!(html.contains("this is quoted too, not a real command"), "{html}");
+        assert!(
+            !html.contains('['),
+            "no raw bracketed label may reach the page: {html}"
+        );
     }
 
     #[test]
@@ -20315,6 +20397,72 @@ mod tests {
             "Some paragraph of the agent's own reply text.\n[Read] /a/process.rs",
         );
         assert!(html.contains("read <code>process.rs</code>"), "{html}");
+    }
+
+    /// A slice of REAL `paseo logs <id> --tail 200` output, captured
+    /// read-only from a live agent on this machine (`paseo ls --json` to
+    /// find the id) rather than hand-written one-line-per-entry like every
+    /// other fixture in this module. Real output is multi-line: a
+    /// `[Shell]` command's own captured line can be followed by an
+    /// unlabeled wrapped-tail line (here, the closing ` ``` ` of the
+    /// agent's own markdown, immediately after `[Shell] cargo test
+    /// --workspace` with no blank between them), and a reply paragraph
+    /// spans multiple physical lines too. This is the exact seam the
+    /// previous revision never crossed with a test.
+    const PASEO_REAL_CAPTURE_SLICE: &str = "[User] Làm tiếp tính năng paseo support\n...văn bản trả lời của agent...\n[Read] crates/.../process.rs\n[Shell] cargo test --workspace\n```\n\nTức là tin nhắn của anh/chị, câu trả lời của agent, và mỗi lần gọi công cụ đã là một dòng ngắn — paseo làm sẵn phần khó nhất. Việc còn lại chủ yếu là dựng trang và đường gửi ngược lại.\n\n▸ Đang chờ khảo sát cách waggledance gọi tiến trình con và bộ soạn tin nhắn sẵn có, rồi tôi viết kế hoạch và trình cổng duyệt shape.\n[Read] /home/thanhsmind/Projects/goglbe/waggledance/.claude/skills/bee-planning/references/edge-dimensions.md\nĐủ dữ kiện. Viết kế hoạch.\n[Write] /home/thanhsmind/Projects/goglbe/waggledance/docs/history/paseo-control/plan.md";
+
+    #[test]
+    fn a_known_multi_line_shell_entry_in_real_output_collapses_exactly_once() {
+        let html = paseo_conversation_fragment(PASEO_REAL_CAPTURE_SLICE);
+        assert!(
+            !html.contains('['),
+            "no raw bracketed technical line may survive real multi-line input: {html}"
+        );
+        assert!(
+            !html.contains("```"),
+            "the [Shell] entry's wrapped markdown-fence tail must never render: {html}"
+        );
+        assert_eq!(
+            html.matches("ran a command").count(),
+            1,
+            "the [Shell] entry plus its wrapped continuation must collapse to ONE tool line, \
+             never one plus a verbatim continuation: {html}"
+        );
+        assert!(
+            html.contains("paseo-line--user") && html.contains("Làm tiếp tính năng paseo support"),
+            "{html}"
+        );
+        assert!(html.contains("read <code>process.rs</code>"), "{html}");
+        assert!(
+            html.contains("read <code>edge-dimensions.md</code>"),
+            "{html}"
+        );
+        assert!(html.contains("edited <code>plan.md</code>"), "{html}");
+    }
+
+    #[test]
+    fn a_multi_line_thoughts_wrapped_continuation_never_renders_as_a_reply() {
+        // Real captured output never happened to include a multi-line
+        // [Thought] — that is luck, not a guarantee (this function's own
+        // doc comment), so this fixture is deliberately constructed to
+        // prove the case a lucky capture cannot: a Thought's own wrapped
+        // tail line must never leak as a rendered agent reply.
+        let html = paseo_conversation_fragment(
+            "[User] go\n[Thought] the user seems annoyed\nI should be careful here\n\nOkay, on it.",
+        );
+        assert!(
+            !html.to_lowercase().contains("annoyed"),
+            "a [Thought] line's own body must never reach the page: {html}"
+        );
+        assert!(
+            !html.contains("I should be careful here"),
+            "a [Thought] entry's wrapped continuation must never render as an agent reply: {html}"
+        );
+        assert!(!html.contains("Thought"), "{html}");
+        assert!(
+            html.contains("Okay, on it."),
+            "a genuine reply past the blank line that closes the Thought must still render: {html}"
+        );
     }
 
     #[test]
@@ -20357,8 +20505,28 @@ mod tests {
         );
     }
 
+    /// Two-sided handshake test, same precedent as
+    /// `mermaid_done_event_name_matches_between_dispatch_and_listener`
+    /// above: assert the page carries the hooks `assets/app.js`'s own
+    /// poller actually reads (`main[data-paseo-base]` at app.js:3634,
+    /// `#paseo-conversation` at app.js:3637 — search those literal
+    /// strings, never a line number, since this file's own line numbers
+    /// shift). The prior version of this test asserted
+    /// `data-agent-id="agent-42"`, an attribute nothing in `APP_JS` reads
+    /// — a leftover from before pc-4 moved the poller into `app.js`. This
+    /// stays scoped to the page/poller side only; pc-4's own revision
+    /// covers the composer-class hooks.
     #[test]
-    fn agent_page_carries_the_agent_id_for_its_own_poller() {
+    fn agent_page_carries_the_hooks_its_own_poller_reads() {
+        assert!(
+            APP_JS.contains(r#"document.querySelector("main[data-paseo-base]")"#),
+            "app.js must still bind its poller off main[data-paseo-base]"
+        );
+        assert!(
+            APP_JS.contains(r#"document.getElementById("paseo-conversation")"#),
+            "app.js must still bind its poller off #paseo-conversation"
+        );
+
         let agent = waggledance_core::paseo::PaseoAgent {
             id: "agent-42".to_string(),
             provider: "claude".to_string(),
@@ -20369,7 +20537,14 @@ mod tests {
             model: Some("claude-sonnet-5".to_string()),
         };
         let html = paseo_agent_page(&agent);
-        assert!(html.contains("data-agent-id=\"agent-42\""), "{html}");
+        assert!(
+            html.contains(r#"data-paseo-base="/paseo/agent-42""#),
+            "the page must carry the data-paseo-base hook the poller reads: {html}"
+        );
+        assert!(
+            html.contains(r#"id="paseo-conversation""#),
+            "the page must carry the #paseo-conversation hook the poller reads: {html}"
+        );
         assert!(
             !html.contains("do the secret thing"),
             "the agent's own title is prompt text and must never render: {html}"
