@@ -2010,11 +2010,11 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    and Stage moved into the key grid, so this row is `+` and Send only). */
 .term-reply__actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2); }
 .term-attach__btn { margin-right: auto; }
-/* trc-2/trc-4: Send reads as a round paseo-style send button — a fixed
-   45px circle (equal to the attach + button) filled with the action
+/* trc-2/trc-5: Send reads as a round paseo-style send button — a fixed
+   39px circle (equal to the attach + button) filled with the action
    colour, carrying an up-arrow glyph instead of the word "Send" (the
    accessible name moves to `aria-label`). */
-.term-reply__send { display: flex; align-items: center; justify-content: center; flex: none; width: 45px; height: 45px; padding: 0; border: var(--border-width-hairline) solid var(--color-action); border-radius: 50%; background: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); font-size: var(--type-body-size); cursor: pointer; }
+.term-reply__send { display: flex; align-items: center; justify-content: center; flex: none; width: 39px; height: 39px; padding: 0; border: var(--border-width-hairline) solid var(--color-action); border-radius: 50%; background: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); font-size: var(--type-body-size); cursor: pointer; }
 /* A4: Approve is withheld unless bee says this agent is at a permission
    prompt. It stays in place, same size, so the grid never reflows as a
    state changes — only its weight drops, and its `title` says why. Its
