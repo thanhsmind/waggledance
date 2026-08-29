@@ -2010,10 +2010,11 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    and Stage moved into the key grid, so this row is `+` and Send only). */
 .term-reply__actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2); }
 .term-attach__btn { margin-right: auto; }
-/* trc-2: Send reads as a round paseo-style send button — a fixed 44px
-   circle filled with the action colour, carrying an up-arrow glyph instead
-   of the word "Send" (the accessible name moves to `aria-label`). */
-.term-reply__send { display: flex; align-items: center; justify-content: center; flex: none; width: 44px; height: 44px; padding: 0; border: var(--border-width-hairline) solid var(--color-action); border-radius: 50%; background: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); font-size: var(--type-body-size); cursor: pointer; }
+/* trc-2/trc-3: Send reads as a round paseo-style send button — a fixed
+   3.5rem circle (equal to the attach + button) filled with the action
+   colour, carrying an up-arrow glyph instead of the word "Send" (the
+   accessible name moves to `aria-label`). */
+.term-reply__send { display: flex; align-items: center; justify-content: center; flex: none; width: 3.5rem; height: 3.5rem; padding: 0; border: var(--border-width-hairline) solid var(--color-action); border-radius: 50%; background: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); font-size: var(--type-body-size); cursor: pointer; }
 /* A4: Approve is withheld unless bee says this agent is at a permission
    prompt. It stays in place, same size, so the grid never reflows as a
    state changes — only its weight drops, and its `title` says why. Its

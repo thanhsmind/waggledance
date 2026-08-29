@@ -2646,8 +2646,8 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 1.75rem;
-  height: 1.75rem;
+  width: 3.5rem;
+  height: 3.5rem;
   padding: 0;
   border: var(--border-width-hairline) solid var(--color-border);
   border-radius: 50%;
@@ -2655,7 +2655,7 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   color: var(--color-text);
   cursor: pointer;
   line-height: 1;
-  font-size: var(--type-body-size);
+  font-size: var(--type-title-size, 1.25rem);
 }
 .term-attach__btn:hover { border-color: var(--color-action); color: var(--color-action); }
 .term-attach__chips {
