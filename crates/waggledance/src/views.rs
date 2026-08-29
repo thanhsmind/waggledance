@@ -3348,6 +3348,302 @@ pub fn terminal_down_page(project: &Project) -> String {
     layout_with_drawer(&format!("{} · terminal", project.name), "", &body, false)
 }
 
+/// `GET /paseo/:agent_id` (paseo-control D1/D2/D4) — one live paseo agent's
+/// own read-only page: a heading naming the agent, and a conversation
+/// container this page's own inline `<script>` fills in by polling
+/// `paseo_agent_conversation` (`server.rs`) at the same 1500ms cadence
+/// every other terminal-family screen uses (`POLL_MS`, `assets/app.js`) —
+/// inline rather than added to `assets/app.js` itself, since that file is
+/// outside this cell's own file list. `assets/app.js` is still loaded on
+/// this page like every other (`layout`'s own `<script src>`), it just adds
+/// no poller of its own for this route.
+pub fn paseo_agent_page(agent: &waggledance_core::paseo::PaseoAgent) -> String {
+    let heading = match &agent.model {
+        Some(model) => format!("{} · {}", agent.provider, model),
+        None => agent.provider.clone(),
+    };
+    let heading_esc = esc(&heading);
+    let agent_id_esc = esc(&agent.id);
+    let body = format!(
+        r#"{topbar}
+<main class="fg-page fg-page--tight">
+  <h2 class="fg-pagehead__title">{heading_esc}</h2>
+  <div class="fg-card term-pane">
+    <div id="paseo-conversation" class="paseo-conversation" data-agent-id="{agent_id_esc}" aria-live="polite">Loading conversation…</div>
+  </div>
+</main>
+<script>
+(function () {{
+  var el = document.getElementById('paseo-conversation');
+  if (!el) return;
+  var url = '/paseo/' + encodeURIComponent(el.getAttribute('data-agent-id')) + '/conversation';
+  var POLL_MS = 1500;
+  function poll() {{
+    fetch(url, {{ credentials: 'same-origin' }})
+      .then(function (res) {{ return res.ok ? res.json() : null; }})
+      .then(function (data) {{
+        if (data && typeof data.html === 'string') {{ el.innerHTML = data.html; }}
+      }})
+      .catch(function () {{}});
+  }}
+  poll();
+  setInterval(poll, POLL_MS);
+}})();
+</script>"#,
+        topbar = topbar(&format!("<span class=\"crumb\">{heading_esc}</span>")),
+    );
+    layout_with_drawer(&format!("{heading} · paseo"), "", &body, false)
+}
+
+/// `GET /paseo/:agent_id` and `/conversation` (S5) — a live agent whose
+/// `cwd` sits outside every registered project's own D5 boundary, with the
+/// `unassigned_group_enabled` escape hatch off: never a bare not-found, S5
+/// requires naming the per-agent remedy — registering `cwd` as a project —
+/// so control is a project-registration grant, never the coarse switch.
+pub fn paseo_agent_unregistered_page(cwd: &std::path::Path) -> String {
+    let body = format!(
+        r#"{topbar}
+<main class="fg-page">
+  <h2 class="fg-pagehead__title">Not registered</h2>
+  <div class="fg-card term-pane">
+    <div class="fg-card__title">This paseo agent is outside every tracked project</div>
+    <div class="term-pane__meta">Register <code>{cwd}</code> as a project from the home page to take control of this agent.</div>
+    <p><a href="/">Back to projects</a></p>
+  </div>
+</main>"#,
+        topbar = topbar("<span class=\"crumb\">Paseo agent</span>"),
+        cwd = esc(&cwd.display().to_string()),
+    );
+    layout_with_drawer("Paseo agent", "", &body, false)
+}
+
+/// paseo-control D5: the four `PaseoCliError` states, rendered where the
+/// conversation itself would go — never a silent no-op, never a shape a
+/// poller could mistake for a genuinely empty conversation
+/// (`paseo_conversation_empty_state`'s wording is deliberately different
+/// from every branch here). S6 holds on the page too: none of these
+/// messages ever echoes the CLI's own captured stdout/stderr, only the
+/// fixed, static wording `PaseoCliError`'s own `Display` impl already uses
+/// for the same reason.
+pub fn paseo_conversation_error_fragment(err: crate::paseo_cli::PaseoCliError) -> String {
+    use crate::paseo_cli::PaseoCliError::{BinaryNotFound, DaemonUnreachable, Failed, TimedOut};
+    let msg = match err {
+        BinaryNotFound => "The paseo CLI is not installed on this machine.",
+        DaemonUnreachable => "The paseo daemon is not reachable right now.",
+        TimedOut => "Reading this conversation timed out.",
+        Failed { .. } => "The paseo CLI could not read this conversation.",
+    };
+    format!(r#"<p class="fg-empty">{}</p>"#, esc(msg))
+}
+
+fn paseo_conversation_empty_state() -> String {
+    r#"<p class="fg-empty">No conversation recorded for this agent yet.</p>"#.to_string()
+}
+
+/// S9: a NON-EMPTY transcript in which no line matched any known
+/// `[Label]` grammar at all — a wall of paragraphs that would all read as
+/// agent replies is the exact silent failure S9 forbids; this state names
+/// it instead, the canary an upstream paseo format change would trip.
+fn paseo_conversation_unrecognized_format_state() -> String {
+    r#"<p class="fg-empty">paseo's conversation format was not recognized — no line in this transcript matched a known entry.</p>"#
+        .to_string()
+}
+
+/// Splits one `paseo logs` line into `(label, body)` when it starts with a
+/// bracketed label at column 0 — `[Label] body` or a bare `[Label]` with
+/// nothing after it. Anything else (no leading `[`, or a `]` not followed
+/// by either end-of-line or exactly one space) is not a label match at
+/// all. A captured `body` is never re-scanned for a nested label once
+/// returned — [`paseo_conversation_fragment`] escapes and renders it
+/// verbatim — so an embedded label-looking substring inside a message
+/// payload (e.g. a `[User]` message that itself reads `[Shell] rm -rf /`)
+/// can never be mis-attributed as a second, separate entry.
+fn parse_paseo_label(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let label = &rest[..close];
+    if label.is_empty() {
+        return None;
+    }
+    let after = &rest[close + 1..];
+    if after.is_empty() {
+        Some((label, ""))
+    } else {
+        after.strip_prefix(' ').map(|body| (label, body))
+    }
+}
+
+/// `[Read]`/`[Edit]`/`[Write]` bodies are paths; D2 renders only the
+/// basename, never the full path. Falls back to the trimmed body when it
+/// has no path separator (a bare filename, or an empty/whitespace body) —
+/// never panics either way.
+fn paseo_path_basename(body: &str) -> String {
+    let trimmed = body.trim();
+    std::path::Path::new(trimmed)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn paseo_tool_line(escaped_text: &str) -> String {
+    format!(r#"<p class="paseo-line paseo-line--tool">{escaped_text}</p>"#)
+}
+
+/// "read `file.rs`" for one path, "read 3 files" for more than one —
+/// [`paseo_conversation_fragment`]'s own adjacent-`[Read]`/adjacent-`[Edit]`
+/// `/[Write]` collapsing (D2).
+fn paseo_collapse_phrase(verb: &str, paths: &[String]) -> String {
+    if paths.len() == 1 {
+        format!("{verb} <code>{}</code>", esc(&paths[0]))
+    } else {
+        format!("{verb} {} files", paths.len())
+    }
+}
+
+/// paseo-control D2/S9: parses `paseo logs`' raw text stream by LINE PREFIX
+/// ONLY (plan.md fact 2 — there is no JSON form) and collapses it to human
+/// phrasing. `[Thought]` is withheld entirely (D2) — not even a
+/// placeholder that would confirm the agent was thinking. An unrecognized
+/// `[Label]` renders as the label ALONE, never its body (S9): if paseo ever
+/// renames `[Thought]` to `[Thinking]`, this is the fallback that keeps
+/// that rename from leaking private reasoning onto a page reachable at
+/// waggle.gogl.be, since a renamed label falls through to exactly this
+/// branch rather than a body-rendering one.
+///
+/// Attribution beyond a line's own prefix is BEST-EFFORT (plan.md fact 2):
+/// paseo owns this grammar and gives us no structure past a line prefix.
+/// The one added protection is narrow and deliberate, named for the two
+/// labels the paseo-control plan itself calls out (`User`, `Shell`): a line
+/// that would otherwise match one of THOSE two labels is instead kept as
+/// reply text when it directly follows an unlabeled reply line with
+/// nothing between them, so an agent's own reply that happens to start a
+/// line with `[User] ` or `[Shell] ` is never mis-attributed as a real user
+/// turn or tool call. This protection stays narrow rather than general:
+/// the verified real transcript (plan.md fact 1) shows a reply immediately
+/// followed by a tool-call label with NO separator, so gating every label
+/// the same way would swallow a genuine `[Read]`/`[Edit]` call that
+/// happens to follow a reply.
+pub fn paseo_conversation_fragment(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return paseo_conversation_empty_state();
+    }
+    if !raw.lines().any(|line| parse_paseo_label(line).is_some()) {
+        return paseo_conversation_unrecognized_format_state();
+    }
+
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut html = String::new();
+    let mut after_reply = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let raw_label = parse_paseo_label(lines[i]);
+        let effective = match raw_label {
+            Some((label, _)) if after_reply && (label == "User" || label == "Shell") => None,
+            other => other,
+        };
+        match effective {
+            None => {
+                let text = lines[i].trim();
+                if !text.is_empty() {
+                    html.push_str(&format!(
+                        r#"<p class="paseo-line paseo-line--reply">{}</p>"#,
+                        esc(text)
+                    ));
+                }
+                after_reply = true;
+                i += 1;
+            }
+            Some(("User", body)) => {
+                html.push_str(&format!(
+                    r#"<p class="paseo-line paseo-line--user"><strong>You:</strong> {}</p>"#,
+                    esc(body)
+                ));
+                after_reply = false;
+                i += 1;
+            }
+            Some(("Thought", _)) => {
+                after_reply = false;
+                i += 1;
+            }
+            Some(("Read", body)) => {
+                let mut paths = vec![paseo_path_basename(body)];
+                let mut j = i + 1;
+                loop {
+                    if j >= lines.len() {
+                        break;
+                    }
+                    match parse_paseo_label(lines[j]) {
+                        Some(("Read", b2)) => {
+                            paths.push(paseo_path_basename(b2));
+                            j += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                html.push_str(&paseo_tool_line(&paseo_collapse_phrase("read", &paths)));
+                after_reply = false;
+                i = j;
+            }
+            Some(("Edit", body)) | Some(("Write", body)) => {
+                let mut paths = vec![paseo_path_basename(body)];
+                let mut j = i + 1;
+                loop {
+                    if j >= lines.len() {
+                        break;
+                    }
+                    match parse_paseo_label(lines[j]) {
+                        Some(("Edit", b2)) | Some(("Write", b2)) => {
+                            paths.push(paseo_path_basename(b2));
+                            j += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                html.push_str(&paseo_tool_line(&paseo_collapse_phrase("edited", &paths)));
+                after_reply = false;
+                i = j;
+            }
+            Some(("Shell", _)) | Some(("Bash", _)) => {
+                html.push_str(&paseo_tool_line("ran a command"));
+                after_reply = false;
+                i += 1;
+            }
+            Some(("Grep", _)) | Some(("ToolSearch", _)) => {
+                html.push_str(&paseo_tool_line("searched the code"));
+                after_reply = false;
+                i += 1;
+            }
+            Some(("Task", _)) => {
+                html.push_str(&paseo_tool_line("delegated a task"));
+                after_reply = false;
+                i += 1;
+            }
+            Some(("Task Notification", _)) => {
+                html.push_str(&paseo_tool_line("a task finished"));
+                after_reply = false;
+                i += 1;
+            }
+            Some(("Skill", _)) => {
+                html.push_str(&paseo_tool_line("loaded a skill"));
+                after_reply = false;
+                i += 1;
+            }
+            Some((label, _)) => {
+                // S9: unrecognized — the label alone, never its body. Also
+                // the fallback for every OTHER observed-but-unmapped label
+                // (`AskUserQuestion`, `EnterWorktree`, `ExitWorktree`) —
+                // D2's table gives them no phrasing, so they render here
+                // too, not as a silently dropped body.
+                html.push_str(&paseo_tool_line(&esc(label)));
+                after_reply = false;
+                i += 1;
+            }
+        }
+    }
+    html
+}
+
 /// The read-only bee cell board (D4/D5). feature-hub D1 replaces the
 /// cell-centric Kanban board (`bee_agent_board_section`, agent-board
 /// ab-1/ab-2 — now retired) with a FEATURE-centric grouped list
@@ -19738,5 +20034,192 @@ mod tests {
             dispatch_event, listen_event,
             "the mermaid-done event name must be identical on both sides of the handshake"
         );
+    }
+
+    // ── paseo-control pc-2: conversation collapsing (D2/S9) ─────────────
+
+    #[test]
+    fn empty_transcript_renders_the_empty_state_not_an_error() {
+        let html = paseo_conversation_fragment("");
+        assert!(html.contains("No conversation recorded"), "{html}");
+        let html_ws = paseo_conversation_fragment("   \n  \n");
+        assert!(html_ws.contains("No conversation recorded"), "{html_ws}");
+    }
+
+    #[test]
+    fn a_user_line_and_a_plain_reply_render_distinctly() {
+        let html = paseo_conversation_fragment("[User] hello there\nSure, on it.");
+        assert!(
+            html.contains("paseo-line--user") && html.contains("hello there"),
+            "{html}"
+        );
+        assert!(
+            html.contains("paseo-line--reply") && html.contains("Sure, on it."),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn thought_lines_are_never_rendered() {
+        let html = paseo_conversation_fragment(
+            "[User] go\n[Thought] the user seems annoyed, I should be careful\nOkay.",
+        );
+        assert!(
+            !html.to_lowercase().contains("annoyed"),
+            "a [Thought] line's body must never reach the page: {html}"
+        );
+        assert!(
+            !html.contains("Thought"),
+            "a [Thought] line must not even render its own label: {html}"
+        );
+    }
+
+    #[test]
+    fn tool_calls_collapse_to_short_human_lines_never_the_raw_bracketed_line() {
+        let html = paseo_conversation_fragment(
+            "[Read] /home/x/process.rs\n[Shell] cargo test --workspace\n[Grep] fn foo\n[Task] investigate\n[Task Notification] done\n[Skill] bee-hive",
+        );
+        assert!(html.contains("read <code>process.rs</code>"), "{html}");
+        assert!(html.contains("ran a command"), "{html}");
+        assert!(!html.contains("cargo test --workspace"), "{html}");
+        assert!(html.contains("searched the code"), "{html}");
+        assert!(!html.contains("fn foo"), "{html}");
+        assert!(html.contains("delegated a task"), "{html}");
+        assert!(html.contains("a task finished"), "{html}");
+        assert!(html.contains("loaded a skill"), "{html}");
+        assert!(
+            !html.contains('['),
+            "no raw bracketed technical line must ever reach the page: {html}"
+        );
+    }
+
+    #[test]
+    fn adjacent_reads_collapse_to_a_count_and_adjacent_edits_writes_collapse_together() {
+        let html = paseo_conversation_fragment(
+            "[Read] /a/one.rs\n[Read] /a/two.rs\n[Read] /a/three.rs\n[Edit] /a/one.rs\n[Write] /a/four.rs",
+        );
+        assert!(html.contains("read 3 files"), "{html}");
+        assert!(html.contains("edited 2 files"), "{html}");
+    }
+
+    #[test]
+    fn an_unrecognized_label_renders_the_label_alone_never_its_body() {
+        let html = paseo_conversation_fragment("[Frobnicate] secret payload data");
+        assert!(html.contains("Frobnicate"), "{html}");
+        assert!(
+            !html.contains("secret payload data"),
+            "an unrecognized label's body must never render: {html}"
+        );
+    }
+
+    #[test]
+    fn an_observed_but_unmapped_label_falls_back_to_label_alone() {
+        // AskUserQuestion/EnterWorktree/ExitWorktree are observed on real
+        // transcripts (paseo-control plan.md fact 1) but D2's table gives
+        // them no phrasing — S9's fallback catches them too, not a body.
+        let html = paseo_conversation_fragment("[AskUserQuestion] pick one: a) yes b) no");
+        assert!(html.contains("AskUserQuestion"), "{html}");
+        assert!(!html.contains("pick one"), "{html}");
+    }
+
+    #[test]
+    fn a_non_empty_transcript_matching_no_known_label_renders_the_unrecognized_format_state() {
+        let html = paseo_conversation_fragment("just plain prose\nwith no bracket labels at all");
+        assert!(html.contains("was not recognized"), "{html}");
+        assert!(!html.contains("paseo-line"), "{html}");
+    }
+
+    #[test]
+    fn a_reply_line_beginning_with_a_label_string_is_not_mis_attributed() {
+        // The agent's own reply, immediately following another reply line
+        // with nothing between them, happens to start with the exact
+        // prefixes paseo uses for real entries. Neither must be
+        // reclassified as a real user turn or tool call (paseo-control
+        // plan.md fact 2 / this function's own doc comment).
+        let html = paseo_conversation_fragment(
+            "Let me recap what happened.\n[User] this is quoted text, not a real turn\n[Shell] this is quoted too, not a real command",
+        );
+        assert!(
+            !html.contains("paseo-line--user"),
+            "the coincidental '[User] ' reply line must not render as a user turn: {html}"
+        );
+        assert!(
+            !html.contains("ran a command"),
+            "the coincidental '[Shell] ' reply line must not render as a tool call: {html}"
+        );
+        assert!(html.contains("this is quoted text, not a real turn"), "{html}");
+        assert!(html.contains("this is quoted too, not a real command"), "{html}");
+    }
+
+    #[test]
+    fn a_genuine_label_is_still_recognized_immediately_after_a_reply_with_no_blank_line() {
+        // The verified real transcript (plan.md fact 1) has a reply
+        // immediately followed by a tool-call label with no blank line
+        // between them — the User/Shell-after-reply protection above must
+        // stay narrow and never swallow this.
+        let html = paseo_conversation_fragment(
+            "Some paragraph of the agent's own reply text.\n[Read] /a/process.rs",
+        );
+        assert!(html.contains("read <code>process.rs</code>"), "{html}");
+    }
+
+    #[test]
+    fn agent_output_is_html_escaped() {
+        let html = paseo_conversation_fragment(
+            "[User] <script>alert(1)</script>\n<b>bold reply</b>",
+        );
+        assert!(!html.contains("<script>alert(1)</script>"), "{html}");
+        assert!(!html.contains("<b>bold reply</b>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn cli_error_states_each_render_their_own_named_text() {
+        use crate::paseo_cli::PaseoCliError;
+        let binary = paseo_conversation_error_fragment(PaseoCliError::BinaryNotFound);
+        let daemon = paseo_conversation_error_fragment(PaseoCliError::DaemonUnreachable);
+        let timeout = paseo_conversation_error_fragment(PaseoCliError::TimedOut);
+        let failed = paseo_conversation_error_fragment(PaseoCliError::Failed { exit_code: Some(1) });
+        let bodies = [&binary, &daemon, &timeout, &failed];
+        for (i, a) in bodies.iter().enumerate() {
+            for (j, b) in bodies.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "each CLI failure must render its own distinct state");
+                }
+            }
+        }
+        assert!(binary.contains("not installed"), "{binary}");
+        assert!(daemon.contains("not reachable"), "{daemon}");
+        assert!(timeout.contains("timed out"), "{timeout}");
+    }
+
+    #[test]
+    fn unregistered_page_names_the_per_agent_remedy() {
+        let cwd = std::path::Path::new("/home/user/some-repo");
+        let html = paseo_agent_unregistered_page(cwd);
+        assert!(
+            html.contains("/home/user/some-repo") && html.contains("Register"),
+            "the refusal must name registering this exact folder as the remedy: {html}"
+        );
+    }
+
+    #[test]
+    fn agent_page_carries_the_agent_id_for_its_own_poller() {
+        let agent = waggledance_core::paseo::PaseoAgent {
+            id: "agent-42".to_string(),
+            provider: "claude".to_string(),
+            cwd: std::path::PathBuf::from("/x"),
+            title: "do the secret thing".to_string(),
+            last_status: "running".to_string(),
+            last_activity_at: "2026-08-29T12:00:00Z".to_string(),
+            model: Some("claude-sonnet-5".to_string()),
+        };
+        let html = paseo_agent_page(&agent);
+        assert!(html.contains("data-agent-id=\"agent-42\""), "{html}");
+        assert!(
+            !html.contains("do the secret thing"),
+            "the agent's own title is prompt text and must never render: {html}"
+        );
+        assert!(html.contains("claude-sonnet-5"), "{html}");
     }
 }

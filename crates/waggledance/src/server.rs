@@ -60,6 +60,17 @@ pub struct AppState {
     /// one. An axum handler takes no extra argument, so this field is the
     /// only way a test can hand `index_page` a fixture store.
     pub paseo_store_root: Option<PathBuf>,
+    /// paseo-control pc-2's test seam: the `paseo` program path
+    /// `crate::paseo_cli::PaseoCli` is built against for the `/paseo/...`
+    /// control routes — `None` in production resolves through
+    /// `PaseoCli::default()` (the bare name `paseo`, resolved from `PATH`),
+    /// mirroring `paseo_store_root`'s own shape. Every route test sets this
+    /// to a fixture script path instead: the real `paseo` binary and daemon
+    /// are present and reachable on this machine (paseo-control plan, fact
+    /// 9), so `None` here would let a route test's `/paseo/.../conversation`
+    /// call reach that real daemon exactly like `paseo_store_root: None`
+    /// would leak the developer's real `~/.paseo/agents` store.
+    pub paseo_cli_program: Option<PathBuf>,
     /// terminal-image-attach D3's storage-root test seam: overrides where
     /// `terminal_attach` stores uploaded images, the same shape
     /// `config_data_dir`/`transcript_root` give other terminal routes above.
@@ -278,6 +289,7 @@ pub async fn serve() -> Result<()> {
         herdr: Arc::new(herdr::socket::SocketHerdr::new(herdr_socket_path)),
         transcript_root: None,
         paseo_store_root: None,
+        paseo_cli_program: None,
         attach_root: None,
         terminal_background: Arc::new(crate::TerminalBackground::new()),
         notify_store,
@@ -569,6 +581,19 @@ fn router(state: AppState) -> Router {
         .route(
             "/_terminal/unassigned/:pane_id/keys",
             post(unassigned_terminal_keys),
+        )
+        // paseo-control pc-2: one live paseo agent's own read-only page —
+        // deliberately mounted outside `/p/:id/` (never `/p/:project/paseo/...`),
+        // matching the Unassigned group's own reasoning above: a paseo
+        // agent id shares no namespace with a registered project id, so
+        // this needs no project-scoped prefix, and it can never collide
+        // with `/p/:id/*path`'s own catch-all below since that only matches
+        // paths starting with `/p/`. No route collision with `/p/:id/*path`
+        // or `/p/:id/_code/*path` — the only two catch-alls in this router.
+        .route("/paseo/:agent_id", get(paseo_agent_page))
+        .route(
+            "/paseo/:agent_id/conversation",
+            get(paseo_agent_conversation),
         )
         .route("/p/:id/_code/", get(code_root))
         .route("/p/:id/_code/*path", get(code_dir_or_file))
@@ -3465,6 +3490,159 @@ fn terminal_disabled_json_404() -> Response {
         .into_response()
 }
 
+/// paseo-control D3: builds this state's `PaseoCli`, pointed at
+/// `AppState::paseo_cli_program` when a test has set it (the same test seam
+/// `paseo_store_root` gives `list_live_agents`) or the real `paseo` binary
+/// resolved from `PATH` in production. `PaseoCli` is `crate::paseo_cli`'s
+/// own single door to the binary (pc-1) — this is the only place a
+/// `/paseo/...` route ever constructs one.
+fn paseo_cli(st: &AppState) -> crate::paseo_cli::PaseoCli {
+    match &st.paseo_cli_program {
+        Some(program) => crate::paseo_cli::PaseoCli::new(program.clone()),
+        None => crate::paseo_cli::PaseoCli::default(),
+    }
+}
+
+/// Why `resolve_controllable_paseo_agent` refused `agent_id` — named so
+/// `paseo_agent_page` and `paseo_agent_conversation` can each render it in
+/// their own response shape (HTML page vs JSON) rather than baking one
+/// `Response` shape into the shared guard.
+enum PaseoAgentRefusal {
+    /// S4: no LIVE paseo agent has this id — never reaches the CLI.
+    NotLive,
+    /// S5: a live agent whose `cwd` sits inside no registered project's own
+    /// D5 boundary, and the `unassigned_group_enabled` escape hatch is off.
+    /// Carries the agent's own `cwd` — the per-agent remedy this refusal
+    /// must name (S5) is registering exactly this folder as a project.
+    NotControlled { cwd: PathBuf },
+}
+
+/// S4/S5 guard shared by `paseo_agent_page` and `paseo_agent_conversation`
+/// (paseo-control plan § "Security invariants") — checked on every route
+/// that can reach the `paseo` CLI. Resolves `agent_id` against the LIVE
+/// paseo store only (S4: an id naming no live agent never reaches the CLI),
+/// read through the SAME seam `api_agents` already uses
+/// (`AppState::paseo_store_root` or `default_store_root`, off the reactor
+/// via `spawn_blocking`) — never `default_store_root()` directly, so a
+/// route test never reads the developer's real `~/.paseo` and never blocks
+/// the reactor. A found agent must then sit inside some registered
+/// project's own D5 boundary (`Boundary::validate_existing`, the same join
+/// `push_paseo_rows` uses for the drawer's own badge) UNLESS the existing
+/// `unassigned_group_enabled` switch is on (S5's coarse escape hatch —
+/// never the advertised path; a caller that hits `NotControlled` names the
+/// fine-grained one instead, mirroring `unassigned_paseo_agents`'s own
+/// fail-closed complement over the same agent/project sets). A registry
+/// read failure fails closed to `NotControlled` rather than falling through
+/// to an empty project list, which would make this check pass unconditionally
+/// — the same agent-terminal-11 fail-closed rule `unassigned_terminal_page`
+/// already applies to its own registry read.
+async fn resolve_controllable_paseo_agent(
+    st: &AppState,
+    agent_id: &str,
+) -> Result<waggledance_core::paseo::PaseoAgent, PaseoAgentRefusal> {
+    let root = st
+        .paseo_store_root
+        .clone()
+        .or_else(waggledance_core::paseo::default_store_root);
+    let agents: Vec<waggledance_core::paseo::PaseoAgent> = match root {
+        Some(root) => {
+            tokio::task::spawn_blocking(move || waggledance_core::paseo::list_live_agents(&root))
+                .await
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    let Some(agent) = agents.into_iter().find(|a| a.id == agent_id) else {
+        return Err(PaseoAgentRefusal::NotLive);
+    };
+    if unassigned_group_enabled(st) {
+        return Ok(agent);
+    }
+    let Ok(projects) = st.engine.list_projects() else {
+        return Err(PaseoAgentRefusal::NotControlled {
+            cwd: agent.cwd.clone(),
+        });
+    };
+    for project in &projects {
+        if let Ok(boundary) =
+            waggledance_core::paths_boundary::Boundary::new(vec![project.root_path.clone()])
+        {
+            if boundary.validate_existing(&agent.cwd).is_ok() {
+                return Ok(agent);
+            }
+        }
+    }
+    Err(PaseoAgentRefusal::NotControlled {
+        cwd: agent.cwd.clone(),
+    })
+}
+
+/// `GET /paseo/:agent_id` (paseo-control D1/D2/D4) — the read-only page for
+/// one live paseo agent, reached from the (now-linked, see
+/// `paseo_agent_row`) Agents drawer row. Gated (S7) identically to the rest
+/// of the terminal family: `terminal_family_enabled` off means the ordinary
+/// D12 disabled page and no CLI call, no guard read even attempted. The CLI
+/// itself is never called here — only `paseo_agent_conversation` below
+/// does, on its own poll cadence — so this route's own cost is the S4/S5
+/// guard's store read plus the page shell.
+async fn paseo_agent_page(State(st): State<AppState>, Path(agent_id): Path<String>) -> Response {
+    if !terminal_family_enabled(&st) {
+        return terminal_disabled_page();
+    }
+    match resolve_controllable_paseo_agent(&st, &agent_id).await {
+        Ok(agent) => Html(views::paseo_agent_page(&agent)).into_response(),
+        Err(PaseoAgentRefusal::NotLive) => not_found("paseo agent not found"),
+        Err(PaseoAgentRefusal::NotControlled { cwd }) => (
+            StatusCode::FORBIDDEN,
+            Html(views::paseo_agent_unregistered_page(&cwd)),
+        )
+            .into_response(),
+    }
+}
+
+/// How many lines of `paseo logs` the conversation route asks for — a real
+/// session ran 622 lines (paseo-control plan), so this bounds the read
+/// without pretending the tail is the whole history.
+const PASEO_LOGS_TAIL: u32 = 200;
+
+/// `GET /paseo/:agent_id/conversation` (paseo-control D2/D5) — the
+/// conversation fragment this page's OWN inline poller
+/// (`views::paseo_agent_page`; `assets/app.js` is untouched by this cell's
+/// file list, so the poller lives in the page's own inline `<script>`
+/// instead) fetches at the same 1500ms cadence every other terminal-family
+/// screen uses. Same S4/S5/S7 guard as `paseo_agent_page` above, then the
+/// ONE call into `crate::paseo_cli::PaseoCli::logs` this route makes.
+/// **D5**: every one of the four `PaseoCliError` states, and the parsed
+/// conversation's own empty/unrecognized-format states, render as their own
+/// named text in the returned fragment — never a silent no-op, never a
+/// shape indistinguishable from a real conversation.
+async fn paseo_agent_conversation(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if !terminal_family_enabled(&st) {
+        return terminal_disabled_json_404();
+    }
+    let agent = match resolve_controllable_paseo_agent(&st, &agent_id).await {
+        Ok(agent) => agent,
+        Err(PaseoAgentRefusal::NotLive) => return not_found("paseo agent not found"),
+        Err(PaseoAgentRefusal::NotControlled { cwd }) => {
+            return action_error(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "this agent is outside every project Waggle Dance tracks — register {} as a project to take control of it",
+                    cwd.display()
+                ),
+            );
+        }
+    };
+    let html = match paseo_cli(&st).logs(&agent.id, PASEO_LOGS_TAIL).await {
+        Ok(text) => views::paseo_conversation_fragment(&text),
+        Err(e) => views::paseo_conversation_error_fragment(e),
+    };
+    Json(json!({ "html": html })).into_response()
+}
+
 /// The Telegram credentials to build a live notifier from — `Some((token,
 /// chat_id))` only when both the destination (`cfg.notify_chat_id`, an
 /// ordinary `Config` field) and the credential (its own owner-only file
@@ -5483,15 +5661,18 @@ fn agent_pane_rows(
     rows
 }
 
-/// paseo-support ps-4 (D1): the `/api/agents` row for one live paseo
-/// agent. `url` is deliberately empty — a paseo agent has no herdr pane
-/// and no page to open, so this row must carry no link/open/send-input
-/// affordance at all; `assets/app.js`'s `agentRow` renders a row whose
-/// `url` is empty as a plain (non-anchor) element rather than an
-/// `<a href>`. `title` stays empty rather than the paseo record's own
-/// `title`, which is prompt text — the same rule ps-2's project-row badge
-/// already applies to the same field — and `name` carries provider and
-/// model instead, the vocabulary the drawer falls back to display
+/// paseo-support ps-4 (D1), paseo-control pc-2: the `/api/agents` row for
+/// one live paseo agent. `url` used to be deliberately empty — ps-4 landed
+/// before this agent had any page to open — and now carries pc-2's own
+/// `/paseo/:agent_id` route, so `assets/app.js`'s `agentRow` renders this
+/// row as a real `<a href>` the same way a herdr pane's row already is; the
+/// target page repeats this same S4/S5 authorization check itself before
+/// showing anything, so linking every live agent here (even one this
+/// server cannot yet control) is safe — the page, not this feed, is where
+/// S5's refusal lives. `title` stays empty rather than the paseo record's
+/// own `title`, which is prompt text — the same rule ps-2's project-row
+/// badge already applies to the same field — and `name` carries provider
+/// and model instead, the vocabulary the drawer falls back to display
 /// (`agent.title || agent.name` client-side). `pane_id` is a synthetic,
 /// `paseo:`-prefixed value: no herdr pane backs this row, but the
 /// client's own dedup/keying still wants a stable id, and the prefix can
@@ -5513,7 +5694,7 @@ fn paseo_agent_row(
         mark: views::agent_mark_id(&agent.provider),
         project_id,
         project_name,
-        url: String::new(),
+        url: format!("/paseo/{}", agent.id),
         title: String::new(),
         pane_id: format!("paseo:{}", agent.id),
         name,
@@ -7074,6 +7255,17 @@ mod bee_route_tests {
             // isolated by default; a paseo-route test sets this explicitly
             // to its own fixture store dir instead.
             paseo_store_root: Some(PathBuf::from("/nonexistent/waggledance-test-paseo-store")),
+            // Deliberately NOT `None`, for the same reason as
+            // `paseo_store_root` above: the real `paseo` binary and daemon
+            // are reachable on this machine (paseo-control plan, fact 9), so
+            // `None` would let a `/paseo/.../conversation` route test reach
+            // them. A fixed, guaranteed-nonexistent path keeps every route
+            // test isolated by default; a paseo-control route test that
+            // wants CLI output sets this explicitly to its own fixture
+            // script.
+            paseo_cli_program: Some(PathBuf::from(
+                "/nonexistent/waggledance-test-paseo-cli-binary",
+            )),
             // No route test writes into the developer's real
             // `~/.cache/waggledance/attach` — attach-route tests set this
             // explicitly to a scratch dir (see `attach_fixture` below).
@@ -27681,8 +27873,9 @@ mod bee_route_tests {
     /// resolves inside a tracked project's own D5 boundary
     /// (`Boundary::validate_existing`, the same join ps-2 uses for the
     /// board row's own badge) now appears as a row under that project,
-    /// carrying no `url` (D1: a paseo agent has no pane and no page to
-    /// open) and never the agent's own `title` (prompt text).
+    /// carrying pc-2's own `/paseo/:agent_id` page link (paseo-support D1's
+    /// "no page to open" is superseded by paseo-control D1) and never the
+    /// agent's own `title` (prompt text).
     #[tokio::test]
     async fn api_agents_lists_a_live_paseo_agent_row() {
         let dir = fresh_root("agents-feed-paseo-data");
@@ -27727,8 +27920,8 @@ mod bee_route_tests {
             )
         });
         assert_eq!(
-            row["url"], "",
-            "a paseo row must carry no link, open, or send-input affordance (D1): {body}"
+            row["url"], "/paseo/agent-1",
+            "pc-2 fills paseo_agent_row's own url with its page's path: {body}"
         );
         assert_eq!(
             row["title"], "",
@@ -27800,13 +27993,431 @@ mod bee_route_tests {
         let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert!(
             rows.iter()
-                .any(|r| r["project_id"] == project.id && r["url"] == ""),
-            "the paseo row must still carry no link even when herdr is down: {body}"
+                .any(|r| r["project_id"] == project.id && r["url"] == "/paseo/agent-1"),
+            "the paseo row must still carry its own page link even when herdr is down: {body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
         std::fs::remove_dir_all(&paseo_store).ok();
+    }
+
+    // ── paseo-control pc-2: `GET /paseo/:agent_id` and `/conversation` ──
+    //
+    // Unix-only: `fake_paseo` is a `#!/bin/sh` script, the same constraint
+    // `fake_bee` above and `paseo_cli.rs`'s own fixtures document. The argv
+    // shape and the four `PaseoCliError` states themselves are pc-1's own
+    // job to prove; these tests exercise the S4/S5/S7 guard and D2/D5
+    // rendering ON TOP of that adapter, through the real router.
+
+    /// Writes a live paseo agent record at `<store>/<slug>/<id>.json`,
+    /// mirroring `api_agents_lists_a_live_paseo_agent_row`'s own fixture.
+    fn write_paseo_agent(store: &Path, slug: &str, id: &str, cwd: &Path, provider: &str) {
+        let slug_dir = store.join(slug);
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        std::fs::write(
+            slug_dir.join(format!("{id}.json")),
+            format!(
+                r#"{{
+                    "id": "{id}",
+                    "provider": "{provider}",
+                    "cwd": {cwd},
+                    "title": "do the secret thing",
+                    "lastStatus": "running",
+                    "lastActivityAt": "2026-08-29T12:00:00Z"
+                }}"#,
+                cwd = serde_json::to_string(&cwd.to_string_lossy().into_owned()).unwrap(),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Writes an executable fixture `paseo` binary at `<dir>/paseo` that
+    /// ignores its argv (pc-1's own suite already proves argv shape) and
+    /// just prints `stdout`/`stderr` and exits `code`.
+    #[cfg(unix)]
+    fn fake_paseo(dir: &Path, stdout: &str, stderr: &str, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = dir.join("paseo");
+        let script =
+            format!("#!/bin/sh\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {code}\n");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[tokio::test]
+    async fn paseo_page_switch_off_gives_disabled_shapes_with_no_cli_call() {
+        let dir = fresh_root("paseo-switch-off");
+        // `terminal.enabled` left at its default (false) — no `enable_terminal` call.
+        let st = build_state_with_dir(&dir);
+        let app = router(st);
+
+        let resp = get(app.clone(), "/paseo/agent-1").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_string(resp).await;
+        assert!(body.contains("disabled"), "{body}");
+
+        let resp2 = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp2.status(), StatusCode::NOT_FOUND);
+        let body2 = body_string(resp2).await;
+        let v: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("disabled"), "{body2}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// S4: an id naming no LIVE agent is refused on both routes and never
+    /// reaches the CLI — the fixture `paseo` binary would announce itself
+    /// loudly in its own stdout if it were ever invoked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_routes_refuse_an_unknown_agent_id_and_never_reach_the_cli() {
+        let dir = fresh_root("paseo-unknown-id-data");
+        enable_terminal(&dir);
+        let store = fresh_root("paseo-unknown-id-store");
+        std::fs::create_dir_all(&store).unwrap();
+        let cli_dir = fresh_root("paseo-unknown-id-cli");
+        let bin = fake_paseo(&cli_dir, "CLI-WAS-CALLED", "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        let app = router(st);
+
+        let resp = get(app.clone(), "/paseo/does-not-exist").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp2 = get(app, "/paseo/does-not-exist/conversation").await;
+        assert_eq!(resp2.status(), StatusCode::NOT_FOUND);
+        let body2 = body_string(resp2).await;
+        assert!(
+            !body2.contains("CLI-WAS-CALLED"),
+            "an id naming no live agent must never reach the CLI: {body2}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S5: a live agent whose `cwd` is outside every registered project is
+    /// refused on both routes, and the refusal names the per-agent remedy —
+    /// registering that exact folder — never the coarse unassigned switch.
+    #[tokio::test]
+    async fn paseo_routes_refuse_an_unregistered_agent_and_name_the_remedy() {
+        let dir = fresh_root("paseo-s5-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-s5-scratch");
+        let untracked_root = scratch.join("untracked-project");
+        std::fs::create_dir_all(&untracked_root).unwrap();
+        let store = fresh_root("paseo-s5-store");
+        write_paseo_agent(&store, "slug", "agent-1", &untracked_root, "claude");
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        let app = router(st);
+
+        let resp = get(app.clone(), "/paseo/agent-1").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("Register") && body.contains(&untracked_root.display().to_string()),
+            "the page refusal must name registering this exact folder: {body}"
+        );
+
+        let resp2 = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+        let body2 = body_string(resp2).await;
+        let v: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        let msg = v["error"].as_str().unwrap();
+        assert!(
+            msg.contains("register") && msg.contains(&untracked_root.display().to_string()),
+            "the conversation refusal must name the same remedy: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+    }
+
+    /// S5's own coarse escape hatch: with `unassigned_group_enabled` on, an
+    /// agent outside every project is allowed through instead of refused —
+    /// no new config key (D4 holds), reusing the existing switch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_routes_allow_an_unregistered_agent_when_the_unassigned_switch_is_on() {
+        let dir = fresh_root("paseo-s5-escape-data");
+        enable_terminal(&dir);
+        enable_unassigned_group(&dir);
+        let scratch = fresh_root("paseo-s5-escape-scratch");
+        let untracked_root = scratch.join("untracked-project");
+        std::fs::create_dir_all(&untracked_root).unwrap();
+        let store = fresh_root("paseo-s5-escape-store");
+        write_paseo_agent(&store, "slug", "agent-1", &untracked_root, "claude");
+        let cli_dir = fresh_root("paseo-s5-escape-cli");
+        let bin = fake_paseo(&cli_dir, "[User] hi\nok", "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        let app = router(st);
+
+        let resp = get(app.clone(), "/paseo/agent-1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp2 = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// Happy path, whole-path proof: the page renders the agent's own id
+    /// for its poller, and the conversation route returns the D2-collapsed
+    /// fragment — never the agent's own prompt-text title.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_agent_page_and_conversation_route_render_the_collapsed_conversation() {
+        let dir = fresh_root("paseo-happy-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-happy-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-happy-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-happy-cli");
+        let bin = fake_paseo(
+            &cli_dir,
+            "[User] hello\nSure thing.\n[Read] /a/x.rs\n",
+            "",
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-happy-project");
+        let app = router(st);
+
+        let resp = get(app.clone(), "/paseo/agent-1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("data-agent-id=\"agent-1\""), "{body}");
+        assert!(
+            !body.contains("do the secret thing"),
+            "the agent's own prompt-text title must never render: {body}"
+        );
+
+        let resp2 = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = body_string(resp2).await;
+        let v: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        let html = v["html"].as_str().unwrap();
+        assert!(html.contains("hello"), "{html}");
+        assert!(html.contains("Sure thing."), "{html}");
+        assert!(html.contains("read <code>x.rs</code>"), "{html}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// D5: a short (here, empty) transcript renders the named empty state,
+    /// never an error — `--tail 200` against a brand-new agent is exactly
+    /// this case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_renders_empty_state_for_an_empty_transcript() {
+        let dir = fresh_root("paseo-empty-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-empty-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-empty-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-empty-cli");
+        let bin = fake_paseo(&cli_dir, "", "", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-empty-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["html"].as_str().unwrap().contains("No conversation recorded"),
+            "{body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// D5: `BinaryNotFound` renders its own named state.
+    #[tokio::test]
+    async fn paseo_conversation_route_renders_binary_not_found() {
+        let dir = fresh_root("paseo-cli-binary-not-found-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-cli-binary-not-found-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-cli-binary-not-found-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(PathBuf::from(
+            "/nonexistent/waggledance-paseo-route-test-xyz",
+        ));
+        register(&st, &tracked_root, "paseo-binary-not-found-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["html"].as_str().unwrap().contains("not installed"), "{body}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+    }
+
+    /// D5: `DaemonUnreachable` renders its own named state — the real
+    /// binary can report this with exit `0` (pc-1's own finding), so the
+    /// fixture reproduces that exact shape.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_renders_daemon_unreachable() {
+        let dir = fresh_root("paseo-cli-daemon-down-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-cli-daemon-down-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-cli-daemon-down-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-cli-daemon-down-cli");
+        let bin = fake_paseo(
+            &cli_dir,
+            "",
+            "Error: Cannot connect to daemon at tcp://127.0.0.1:1",
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-daemon-down-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["html"].as_str().unwrap().contains("not reachable"), "{body}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// D5/S6: a non-zero exit renders its own named `Failed` state, and
+    /// never the captured stderr (S6) — `paseo_cli.rs` proves S6 at the
+    /// adapter level; this proves it never leaks through to the page.
+    ///
+    /// (`TimedOut` is not re-proven here with a real
+    /// `PASEO_CLI_TIMEOUT` (10s) wait: pc-1's own suite proves the CLI
+    /// produces that state, `views::tests::cli_error_states_each_render_
+    /// their_own_named_text` proves it renders its own distinct text, and
+    /// this route delegates every `PaseoCliError` variant through the
+    /// identical `Err(e) => views::paseo_conversation_error_fragment(e)`
+    /// branch these three states already exercise.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_renders_failed_exit_never_leaking_stderr() {
+        let dir = fresh_root("paseo-cli-failed-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-cli-failed-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-cli-failed-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-cli-failed-cli");
+        let bin = fake_paseo(&cli_dir, "", "SECRET-STDERR-CANARY", 3);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-failed-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("SECRET-STDERR-CANARY"),
+            "S6: captured stderr must never reach the page: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["html"].as_str().unwrap().contains("could not read"), "{body}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// Seam proof: the write routes this cell deliberately does not add —
+    /// pc-4's send and pc-5's permit answer land in their own later cells,
+    /// on top of the read path this cell proves first.
+    #[tokio::test]
+    async fn paseo_send_and_permit_routes_do_not_exist_yet() {
+        let dir = fresh_root("paseo-seam-proof");
+        enable_terminal(&dir);
+        let st = build_state_with_dir(&dir);
+        let app = router(st);
+
+        let send_req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "text": "hi" }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(send_req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "pc-4 has not landed yet — POST /paseo/:id/send must not exist"
+        );
+
+        let permit_req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "decision": "allow" }).to_string()))
+            .unwrap();
+        let resp2 = app.oneshot(permit_req).await.unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::NOT_FOUND,
+            "pc-5 has not landed yet — POST /paseo/:id/permit must not exist"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── stale-index-refresh-2: the 404 page's Refresh index button ─────────
