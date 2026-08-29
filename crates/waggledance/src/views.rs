@@ -3392,6 +3392,81 @@ fn paseo_composer(name: &str) -> String {
 /// pc-4's file list DOES include `assets/app.js`, so the poller moves there
 /// alongside the new composer wiring — one client-side story for this page,
 /// not two.
+/// pc-5's own answer-wiring script — a global `window.paseoPermitAnswer`
+/// that [`paseo_permit_banner`]'s Allow/Deny buttons call via an `onclick`
+/// attribute (never `addEventListener`, since the buttons live inside
+/// `#paseo-conversation` and get REPLACED wholesale by
+/// `assets/app.js`'s own poll — a once-bound listener on the original nodes
+/// would silently stop firing after the very first poll tick). It reads
+/// `data-req-id`/`data-paseo-permit-action` off the clicked button rather
+/// than any JS-string-interpolated request id, so an id containing a quote
+/// or backslash can never break out of an inline script the way it could if
+/// this page baked it into a JS string literal instead — the same
+/// discipline `esc()`'s HTML-attribute escaping already gives every other
+/// value this module renders.
+///
+/// Lives inline here, not in `assets/app.js`, because this cell's own file
+/// list is `server.rs` + `views.rs` only — the exact constraint pc-4's own
+/// doc comment above (`paseo_agent_page`) already names for its predecessor
+/// pc-2. Defined once in this page's own static shell, so it survives every
+/// `#paseo-conversation` innerHTML replacement untouched.
+const PASEO_PERMIT_SCRIPT: &str = r#"<script>
+(function () {
+  window.paseoPermitAnswer = function (btn) {
+    var main = document.querySelector("main[data-paseo-base]");
+    if (!main) return;
+    var base = main.getAttribute("data-paseo-base");
+    var wrap = btn.closest("[data-paseo-permit]");
+    var buttons = wrap ? wrap.querySelectorAll("[data-paseo-permit-action]") : [btn];
+    var errorEl = wrap ? wrap.querySelector("[data-paseo-permit-error]") : null;
+    var reqId = btn.getAttribute("data-req-id");
+    var action = btn.getAttribute("data-paseo-permit-action");
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+    if (errorEl) {
+      errorEl.hidden = true;
+      errorEl.textContent = "";
+    }
+    fetch(base + "/permit", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: reqId, action: action }),
+    })
+      .then(function (res) {
+        return res
+          .json()
+          .catch(function () {
+            return null;
+          })
+          .then(function (body) {
+            // D5: a failed answer NEVER renders as answered — only a
+            // non-ok response re-enables the buttons and names the
+            // failure. `res.ok` leaves them disabled: the next
+            // conversation poll (<=1500ms) replaces this whole banner
+            // once a fresh `permit_ls` no longer reports it pending,
+            // which is the honest "the page reflects the outcome"
+            // signal rather than a locally guessed one.
+            if (!res.ok) {
+              for (var i = 0; i < buttons.length; i++) buttons[i].disabled = false;
+              if (errorEl) {
+                errorEl.hidden = false;
+                errorEl.textContent =
+                  (body && body.error) || "could not answer this permission request";
+              }
+            }
+          });
+      })
+      .catch(function () {
+        for (var i = 0; i < buttons.length; i++) buttons[i].disabled = false;
+        if (errorEl) {
+          errorEl.hidden = false;
+          errorEl.textContent = "could not answer this permission request";
+        }
+      });
+  };
+})();
+</script>"#;
+
 pub fn paseo_agent_page(agent: &waggledance_core::paseo::PaseoAgent) -> String {
     let heading = match &agent.model {
         Some(model) => format!("{} · {}", agent.provider, model),
@@ -3409,10 +3484,12 @@ pub fn paseo_agent_page(agent: &waggledance_core::paseo::PaseoAgent) -> String {
     <div id="paseo-conversation" class="paseo-conversation" data-agent-id="{agent_id_esc}" aria-live="polite">Loading conversation…</div>
     {composer}
   </div>
-</main>"#,
+</main>
+{permit_script}"#,
         topbar = topbar(&format!("<span class=\"crumb\">{heading_esc}</span>")),
         tab_style = PROJECT_TAB_STYLE,
         composer = paseo_composer(&heading_esc),
+        permit_script = PASEO_PERMIT_SCRIPT,
     );
     layout_with_drawer(&format!("{heading} · paseo"), "", &body, false)
 }
@@ -3469,6 +3546,61 @@ fn paseo_conversation_empty_state() -> String {
 fn paseo_conversation_unrecognized_format_state() -> String {
     r#"<p class="fg-empty">paseo's conversation format was not recognized — no line in this transcript matched a known entry.</p>"#
         .to_string()
+}
+
+/// pc-5's SURFACE requirement: the Allow/Deny control, prepended by
+/// `paseo_agent_conversation` (`server.rs`) above the conversation body
+/// ONLY when a fresh `permit_ls` reports a pending request for THIS agent.
+/// Reuses `.fg-card`/`.term-pane__meta`/`.term-attach__error` — all already
+/// rendered elsewhere in this module — rather than any new class, since
+/// `assets/app.css` sits outside this cell's own file list. Deliberately
+/// plain, unclassed `<button>` elements: `.term-reply__approve` names a
+/// DIFFERENT, bee-session-derived Approve control that `assets/app.js`
+/// binds its own click handling to (the same reason `pc-4`'s composer
+/// carries no `data-pane-id`, above) — reusing that class here would risk
+/// a second, unrelated handler firing on these buttons.
+///
+/// `req_id` is carried ONLY in the HTML-escaped `data-req-id` attribute,
+/// never interpolated into a JS string literal — `PASEO_PERMIT_SCRIPT`
+/// reads it back off the clicked element instead, so a request id
+/// containing a quote or backslash can never break out of the page's own
+/// inline script.
+pub fn paseo_permit_banner(req_id: &str) -> String {
+    let req_id_esc = esc(req_id);
+    format!(
+        r#"<div class="fg-card" data-paseo-permit>
+    <p class="term-pane__meta">This agent is waiting on a permission decision.</p>
+    <p>
+      <button type="button" data-paseo-permit-action="allow" data-req-id="{req_id_esc}" onclick="paseoPermitAnswer(this)">Allow</button>
+      <button type="button" data-paseo-permit-action="deny" data-req-id="{req_id_esc}" onclick="paseoPermitAnswer(this)">Deny</button>
+    </p>
+    <p class="term-attach__error" data-paseo-permit-error role="alert" hidden></p>
+  </div>"#
+    )
+}
+
+/// pc-5: `permit_ls` answered but its payload matched neither the empty
+/// shape nor the one structured (JSON) shape `parse_pending_permissions`
+/// (`server.rs`) trusts. Never rendered as "nothing pending" — the same
+/// fail-closed reasoning `paseo_conversation_unrecognized_format_state`
+/// already applies to the conversation, extended here to a
+/// security-relevant read: a request that IS pending must never get no
+/// control and no visible sign anything is wrong.
+pub fn paseo_permit_unrecognized_format_state() -> String {
+    r#"<p class="fg-empty">paseo's pending-permission list was not recognized — could not determine whether this agent is waiting on a decision.</p>"#
+        .to_string()
+}
+
+/// pc-5/D5: `permit_ls` itself failed (one of the four `PaseoCliError`
+/// states) while the conversation route was deciding whether to show the
+/// Allow/Deny control. S6 holds here exactly as it does on
+/// [`paseo_conversation_error_fragment`]: only the error's own fixed,
+/// static `Display` wording is rendered, never any captured CLI output.
+pub fn paseo_permit_check_error_fragment(err: crate::paseo_cli::PaseoCliError) -> String {
+    format!(
+        r#"<p class="fg-empty">Could not check for a pending permission request: {}</p>"#,
+        esc(&err.to_string())
+    )
 }
 
 /// Splits one `paseo logs` line into `(label, body)` when it starts with a
@@ -20243,5 +20375,51 @@ mod tests {
             "the agent's own title is prompt text and must never render: {html}"
         );
         assert!(html.contains("claude-sonnet-5"), "{html}");
+        assert!(
+            html.contains("paseoPermitAnswer"),
+            "the page must carry its own answer-wiring script: {html}"
+        );
+    }
+
+    #[test]
+    fn permit_banner_carries_the_escaped_request_id_and_both_actions() {
+        let html = paseo_permit_banner("req-9");
+        assert!(html.contains("data-paseo-permit"), "{html}");
+        assert!(
+            html.contains(r#"data-paseo-permit-action="allow""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"data-paseo-permit-action="deny""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"data-req-id="req-9""#), "{html}");
+    }
+
+    /// A request id containing HTML-special characters must never break out
+    /// of the `data-req-id` attribute — the exact discipline
+    /// `PASEO_PERMIT_SCRIPT`'s own doc comment names as the reason this
+    /// value is never interpolated into a JS string literal.
+    #[test]
+    fn permit_banner_escapes_a_hostile_request_id() {
+        let html = paseo_permit_banner(r#""><script>alert(1)</script>"#);
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "a hostile request id must never open a live script tag: {html}"
+        );
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn permit_unrecognized_and_check_error_states_are_named_and_distinct() {
+        use crate::paseo_cli::PaseoCliError;
+        let unrecognized = paseo_permit_unrecognized_format_state();
+        let cli_error = paseo_permit_check_error_fragment(PaseoCliError::DaemonUnreachable);
+        assert_ne!(unrecognized, cli_error);
+        assert!(
+            unrecognized.contains("was not recognized"),
+            "{unrecognized}"
+        );
+        assert!(cli_error.contains("not reachable"), "{cli_error}");
     }
 }

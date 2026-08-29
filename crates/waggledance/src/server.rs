@@ -605,6 +605,12 @@ fn router(state: AppState) -> Router {
             "/paseo/:agent_id/send",
             post(paseo_agent_send).layer(DefaultBodyLimit::max(PASEO_SEND_BODY_LIMIT_BYTES)),
         )
+        // paseo-control pc-5: answers a pending permission request — the one
+        // irreversible action, alone, on top of pc-4's guard helper. No
+        // body-size layer of its own: the payload is one request id and one
+        // "allow"/"deny" string, well inside axum's own default body limit,
+        // with nothing like `PASEO_SEND_MAX_BYTES`'s free-text concern.
+        .route("/paseo/:agent_id/permit", post(paseo_agent_permit))
         .route("/p/:id/_code/", get(code_root))
         .route("/p/:id/_code/*path", get(code_dir_or_file))
         .route("/p/:id/*path", get(project_path))
@@ -3677,11 +3683,30 @@ async fn paseo_agent_conversation(
             );
         }
     };
-    let html = match paseo_cli(&st).logs(&agent.id, PASEO_LOGS_TAIL).await {
+    let convo_html = match paseo_cli(&st).logs(&agent.id, PASEO_LOGS_TAIL).await {
         Ok(text) => views::paseo_conversation_fragment(&text),
         Err(e) => views::paseo_conversation_error_fragment(e),
     };
-    Json(json!({ "html": html })).into_response()
+    // pc-5's SURFACE requirement: the Allow/Deny control appears only when a
+    // FRESH `permit_ls` reports a pending request for THIS agent. Piggybacks
+    // on this same 1500ms poll — `assets/app.js`'s poller (out of this
+    // cell's file list) only ever reads `data.html` and replaces
+    // `#paseo-conversation`'s whole innerHTML with it, so prepending the
+    // banner here is what makes it live-refresh at all without a second
+    // poller or any change to `assets/app.js`.
+    let permit_html = match paseo_cli(&st).permit_ls().await {
+        Ok(text) => match parse_pending_permissions(&text, &agent.id) {
+            PendingPermissionRead::Pending(req_id) => views::paseo_permit_banner(&req_id),
+            PendingPermissionRead::NonePending | PendingPermissionRead::PendingForOtherAgent => {
+                String::new()
+            }
+            PendingPermissionRead::UnrecognizedFormat => {
+                views::paseo_permit_unrecognized_format_state()
+            }
+        },
+        Err(e) => views::paseo_permit_check_error_fragment(e),
+    };
+    Json(json!({ "html": format!("{permit_html}{convo_html}") })).into_response()
 }
 
 /// paseo-control pc-4: the app-level cap on one sent message's byte length —
@@ -3759,6 +3784,197 @@ async fn paseo_agent_send(
         // S6: `send`'s captured stdout is discarded unread here — it is
         // never echoed back to the client, matching the kind-only
         // discipline `PaseoCliError` already holds on the failure side.
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => action_error(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+/// What a FRESH `paseo permit ls` read means for one specific agent —
+/// computed both when the conversation route decides whether to show the
+/// Allow/Deny banner at all (informational: `paseo_agent_conversation`) and,
+/// authoritatively, immediately before `paseo_agent_permit` issues an
+/// answer (pc-5's own stale-`req_id` guard, plan.md pc-5 section).
+///
+/// `permit_ls` is verified (CONTEXT.md, this machine) to print `[]` (this
+/// binary's actual plain-format invocation — `PaseoCli::permit_ls` issues no
+/// `--json` flag — in fact prints nothing at all for the empty case, which
+/// this parser also recognizes) when nothing is pending. Neither this
+/// codebase nor CONTEXT.md carries a VERIFIED populated shape — producing
+/// one needs a live agent to actually hit a permission gate, which this
+/// route's own tests cannot force — so a non-empty, non-`[]` payload is
+/// trusted only as a clean JSON array of objects, each carrying an agent
+/// field (`agentId`/`agent_id`/`agent`, matched against the agent's own id
+/// OR its `paseo ls`-style short-id prefix — `permit allow --help` calls its
+/// own `<agent>` argument "Agent ID (or prefix)") and a request-id field
+/// (`requestId`/`reqId`/`req_id`/`request_id`/`id`). Anything else —
+/// non-JSON text (the shape this binary's real ASCII TABLE format would
+/// actually emit for a populated list, since `permit_ls` passes no format
+/// flag) or a JSON entry missing either field — is `UnrecognizedFormat`,
+/// which NEVER reads as "nothing pending": the caller must render or refuse
+/// on a NAMED failure instead, because silently showing no control when a
+/// request IS pending is exactly the failure mode this feature exists to
+/// prevent (S9's own fail-closed precedent, `paseo_conversation_unrecognized_
+/// format_state`, applied here to a security-relevant read instead of a
+/// display-only one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingPermissionRead {
+    /// No permission request is pending for any agent right now.
+    NonePending,
+    /// A permission is pending for the queried agent, naming its request id.
+    Pending(String),
+    /// The payload parsed cleanly and lists at least one pending request,
+    /// but none of them names the queried agent.
+    PendingForOtherAgent,
+    /// The payload was non-empty and did not match the one structured shape
+    /// this parser trusts.
+    UnrecognizedFormat,
+}
+
+fn paseo_agent_id_matches(candidate: &str, agent_id: &str) -> bool {
+    candidate == agent_id || (candidate.len() >= 6 && agent_id.starts_with(candidate))
+}
+
+fn parse_pending_permissions(raw: &str, agent_id: &str) -> PendingPermissionRead {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return PendingPermissionRead::NonePending;
+    }
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(trimmed) else {
+        return PendingPermissionRead::UnrecognizedFormat;
+    };
+    if entries.is_empty() {
+        return PendingPermissionRead::NonePending;
+    }
+    for entry in &entries {
+        let Some(obj) = entry.as_object() else {
+            return PendingPermissionRead::UnrecognizedFormat;
+        };
+        let entry_agent = ["agentId", "agent_id", "agent"]
+            .iter()
+            .find_map(|k| obj.get(*k))
+            .and_then(|v| v.as_str());
+        let entry_req = ["requestId", "reqId", "req_id", "request_id", "id"]
+            .iter()
+            .find_map(|k| obj.get(*k))
+            .and_then(|v| v.as_str());
+        let (Some(entry_agent), Some(entry_req)) = (entry_agent, entry_req) else {
+            return PendingPermissionRead::UnrecognizedFormat;
+        };
+        if paseo_agent_id_matches(entry_agent, agent_id) {
+            return PendingPermissionRead::Pending(entry_req.to_string());
+        }
+    }
+    PendingPermissionRead::PendingForOtherAgent
+}
+
+/// `POST /paseo/:agent_id/permit` body. **S3**: `Json<PaseoPermitBody>` is
+/// the ONLY extractor this route ever uses, for exactly the reason
+/// `PaseoSendBody` (above) already documents. `action` is a plain string
+/// rather than a bespoke enum so an unrecognized value renders this route's
+/// OWN named "must be allow or deny" refusal instead of axum's bare 422 —
+/// matching D5's never-a-silent-failure rule at the parsing boundary too.
+#[derive(serde::Deserialize)]
+struct PaseoPermitBody {
+    request_id: String,
+    action: String,
+}
+
+/// `POST /paseo/:agent_id/permit` (paseo-control D1/D3/D5, the one
+/// irreversible action pc-5 adds alone on top of pc-4's guard helper) —
+/// answers a pending permission request via `crate::paseo_cli::PaseoCli::
+/// permit_allow`/`permit_deny` (pc-1's own single door to the binary).
+/// Guarded identically to `paseo_agent_send` above (S7, then S4/S5's
+/// `resolve_controllable_paseo_agent`).
+///
+/// **Stale `req_id`** (the bug class only this cell has): `permit_ls` may
+/// have said a request was pending when the page last checked, the agent
+/// may have moved on since, and by the time this answer arrives the id
+/// submitted could name a DIFFERENT request. The submitted id is
+/// revalidated against a FRESH `permit_ls` read immediately before issuing
+/// the answer — a mismatch, or no longer pending at all, is refused by name
+/// (`CONFLICT`) and NO answer is issued. This is distinct from answering an
+/// ALREADY-answered request that the fresh read still (momentarily) shows
+/// as pending — a race the fresh check cannot close — which instead surfaces
+/// as `permit_allow`/`permit_deny`'s own non-zero-exit `PaseoCliError`
+/// below, its own separate named failure, never a second success (D5).
+///
+/// **S6** holds structurally here exactly as it does on `paseo_agent_send`:
+/// this handler makes no `tracing` call at all, so neither the fresh
+/// `permit_ls` output nor the answer CLI's own captured stdout/stderr can
+/// reach a log line through it.
+async fn paseo_agent_permit(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(body): Json<PaseoPermitBody>,
+) -> Response {
+    if !terminal_family_enabled(&st) {
+        return terminal_disabled_json_404();
+    }
+    let agent = match resolve_controllable_paseo_agent(&st, &agent_id).await {
+        Ok(agent) => agent,
+        Err(PaseoAgentRefusal::NotLive) => return not_found("paseo agent not found"),
+        Err(PaseoAgentRefusal::NotControlled { cwd }) => {
+            return action_error(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "this agent is outside every project Waggle Dance tracks — register {} as a project to take control of it",
+                    cwd.display()
+                ),
+            );
+        }
+    };
+    let submitted_req_id = body.request_id.trim();
+    if submitted_req_id.is_empty() {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            "no permission request id was submitted",
+        );
+    }
+    let deny = match body.action.as_str() {
+        "allow" => false,
+        "deny" => true,
+        _ => {
+            return action_error(
+                StatusCode::BAD_REQUEST,
+                "action must be \"allow\" or \"deny\"",
+            );
+        }
+    };
+
+    let fresh = match paseo_cli(&st).permit_ls().await {
+        Ok(text) => text,
+        Err(e) => return action_error(StatusCode::BAD_GATEWAY, e.to_string()),
+    };
+    match parse_pending_permissions(&fresh, &agent.id) {
+        PendingPermissionRead::Pending(fresh_req_id) if fresh_req_id == submitted_req_id => {}
+        PendingPermissionRead::UnrecognizedFormat => {
+            return action_error(
+                StatusCode::BAD_GATEWAY,
+                "could not verify this permission request is still pending",
+            );
+        }
+        PendingPermissionRead::Pending(_)
+        | PendingPermissionRead::PendingForOtherAgent
+        | PendingPermissionRead::NonePending => {
+            return action_error(
+                StatusCode::CONFLICT,
+                "this permission request is no longer pending — it may already have been answered",
+            );
+        }
+    }
+
+    let outcome = if deny {
+        paseo_cli(&st)
+            .permit_deny(&agent.id, submitted_req_id)
+            .await
+    } else {
+        paseo_cli(&st)
+            .permit_allow(&agent.id, submitted_req_id)
+            .await
+    };
+    match outcome {
+        // S6: the answer CLI's own captured stdout is discarded unread here,
+        // exactly like `paseo_agent_send` above.
         Ok(_) => Json(json!({ "ok": true })).into_response(),
         Err(e) => action_error(StatusCode::BAD_GATEWAY, e.to_string()),
     }
@@ -28519,35 +28735,6 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&cli_dir).ok();
     }
 
-    /// Seam proof: the one write route this cell still deliberately does
-    /// not add — pc-5's permit answer lands in its own later cell, on top of
-    /// pc-4's send route this cell adds. (pc-4 landed: `POST
-    /// /paseo/:id/send` now exists — see the `paseo_send_*` tests below —
-    /// which is what makes the old half of this assertion obsolete.)
-    #[tokio::test]
-    async fn paseo_permit_route_does_not_exist_yet() {
-        let dir = fresh_root("paseo-seam-proof");
-        enable_terminal(&dir);
-        let st = build_state_with_dir(&dir);
-        let app = router(st);
-
-        let permit_req = Request::builder()
-            .header(header::HOST, "127.0.0.1")
-            .method("POST")
-            .uri("/paseo/agent-1/permit")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({ "decision": "allow" }).to_string()))
-            .unwrap();
-        let resp2 = app.oneshot(permit_req).await.unwrap();
-        assert_eq!(
-            resp2.status(),
-            StatusCode::NOT_FOUND,
-            "pc-5 has not landed yet — POST /paseo/:id/permit must not exist"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     // ── pc-4: `POST /paseo/:agent_id/send` ──────────────────────────────
 
     /// S7: switch off gives the disabled JSON 404, identically to the read
@@ -28953,6 +29140,906 @@ mod bee_route_tests {
         assert!(
             v["error"].as_str().unwrap().contains("exited with status"),
             "{body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    // ── pc-5: `POST /paseo/:agent_id/permit` ────────────────────────────
+
+    /// Like `fake_paseo_recording`, but branches on the subcommand so a
+    /// single fixture can answer both `permit ls` (its own stdout) and the
+    /// `permit allow`/`permit deny` answer call (its own exit code) — pc-5's
+    /// own routes issue both, in that order, on a single request. The log
+    /// file is overwritten on every invocation (the same idiom
+    /// `fake_paseo_recording` already uses), so its content after a request
+    /// finishes names the LAST subcommand actually reached — which is
+    /// exactly what proves a stale/mismatched request id never reaches the
+    /// answer call at all: the log still reads `permit ls` alone.
+    #[cfg(unix)]
+    fn fake_paseo_permit(dir: &Path, log: &Path, ls_stdout: &str, answer_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = dir.join("paseo");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{log}'\nif [ \"$1\" = permit ] && [ \"$2\" = ls ]; then\n  printf '%s' '{ls_stdout}'\n  exit 0\nfi\nexit {answer_code}\n",
+            log = log.display(),
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// Like `fake_paseo`, but branches on the subcommand so a single
+    /// fixture answers `logs` and `permit ls` with different payloads — the
+    /// conversation route calls both to decide whether to show the pc-5
+    /// banner at all.
+    #[cfg(unix)]
+    fn fake_paseo_dual(dir: &Path, logs_stdout: &str, permit_ls_stdout: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = dir.join("paseo");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = logs ]; then\n  printf '%s' '{logs_stdout}'\n  exit 0\nfi\nif [ \"$1\" = permit ] && [ \"$2\" = ls ]; then\n  printf '%s' '{permit_ls_stdout}'\n  exit 0\nfi\nexit 1\n",
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// The one structured shape `parse_pending_permissions` trusts for a
+    /// populated `permit ls` — see its own doc comment for why: no verified
+    /// real populated shape exists to pin a fixture to instead.
+    fn pending_permission_json(agent_id: &str, req_id: &str) -> String {
+        json!([{ "agentId": agent_id, "requestId": req_id }]).to_string()
+    }
+
+    #[test]
+    fn parse_pending_permissions_recognizes_both_empty_shapes() {
+        assert_eq!(
+            parse_pending_permissions("", "agent-1"),
+            PendingPermissionRead::NonePending
+        );
+        assert_eq!(
+            parse_pending_permissions("   \n", "agent-1"),
+            PendingPermissionRead::NonePending
+        );
+        assert_eq!(
+            parse_pending_permissions("[]", "agent-1"),
+            PendingPermissionRead::NonePending
+        );
+    }
+
+    #[test]
+    fn parse_pending_permissions_finds_the_matching_agent() {
+        let raw = pending_permission_json("agent-1", "req-9");
+        assert_eq!(
+            parse_pending_permissions(&raw, "agent-1"),
+            PendingPermissionRead::Pending("req-9".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_pending_permissions_names_a_different_agent_distinctly() {
+        let raw = pending_permission_json("agent-999", "req-9");
+        assert_eq!(
+            parse_pending_permissions(&raw, "agent-1"),
+            PendingPermissionRead::PendingForOtherAgent
+        );
+    }
+
+    #[test]
+    fn parse_pending_permissions_never_reads_unparseable_content_as_nothing_pending() {
+        assert_eq!(
+            parse_pending_permissions("not json at all", "agent-1"),
+            PendingPermissionRead::UnrecognizedFormat
+        );
+        assert_eq!(
+            parse_pending_permissions(r#"[{"foo":"bar"}]"#, "agent-1"),
+            PendingPermissionRead::UnrecognizedFormat,
+            "an entry missing recognizable fields must fail closed, not read as absent"
+        );
+        assert_eq!(
+            parse_pending_permissions(r#"["not-an-object"]"#, "agent-1"),
+            PendingPermissionRead::UnrecognizedFormat
+        );
+    }
+
+    #[test]
+    fn parse_pending_permissions_matches_a_short_id_prefix() {
+        // `permit allow --help`: "Agent ID (or prefix)" — the same
+        // shortId-vs-full-id convention `paseo ls` uses elsewhere.
+        let raw = pending_permission_json("5d23310", "req-9");
+        assert_eq!(
+            parse_pending_permissions(&raw, "5d233104-8cd3-44b9-ab86-43e5b0f555f0"),
+            PendingPermissionRead::Pending("req-9".to_string())
+        );
+    }
+
+    /// S7: switch off gives the disabled JSON 404, and neither `permit ls`
+    /// nor an answer ever reaches the CLI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_switch_off_gives_disabled_json_404_with_no_cli_call() {
+        let dir = fresh_root("paseo-permit-switch-off");
+        let store = fresh_root("paseo-permit-switch-off-store");
+        let scratch = fresh_root("paseo-permit-switch-off-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-switch-off-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-9"),
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "allow" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("disabled"), "{body}");
+        assert!(
+            !log.exists(),
+            "the switch being off must never reach the CLI"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S4: an id naming no live agent is refused before the CLI is ever
+    /// reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_refuses_an_unknown_agent_id_and_never_reaches_the_cli() {
+        let dir = fresh_root("paseo-permit-unknown-id-data");
+        enable_terminal(&dir);
+        let store = fresh_root("paseo-permit-unknown-id-store");
+        std::fs::create_dir_all(&store).unwrap();
+        let cli_dir = fresh_root("paseo-permit-unknown-id-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-9"),
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/does-not-exist/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "allow" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !log.exists(),
+            "an id naming no live agent must never reach the CLI"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S5: a live agent outside every registered project is refused, names
+    /// the per-agent remedy, and never reaches the CLI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_refuses_an_unregistered_agent_and_names_the_remedy() {
+        let dir = fresh_root("paseo-permit-s5-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-s5-scratch");
+        let untracked_root = scratch.join("untracked-project");
+        std::fs::create_dir_all(&untracked_root).unwrap();
+        let store = fresh_root("paseo-permit-s5-store");
+        write_paseo_agent(&store, "slug", "agent-1", &untracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-s5-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-9"),
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "allow" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let msg = v["error"].as_str().unwrap();
+        assert!(
+            msg.contains("register") && msg.contains(&untracked_root.display().to_string()),
+            "the refusal must name registering this exact folder: {msg}"
+        );
+        assert!(
+            !log.exists(),
+            "an agent outside every registered project must never reach the CLI"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S3, proof one of two: a form-encoded POST is refused before the
+    /// handler body ever runs, so it never reaches the CLI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_refuses_a_form_encoded_body_without_reaching_the_cli() {
+        let dir = fresh_root("paseo-permit-form-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-form-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-permit-form-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-form-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-9"),
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-permit-form-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("request_id=req-9&action=allow"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "a form-encoded POST must be refused: {}",
+            resp.status()
+        );
+        assert!(
+            !log.exists(),
+            "a form-encoded POST must never reach the CLI"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// S3, proof two of two: an `OPTIONS` preflight to this exact route
+    /// gets no successful status and no `access-control-allow-origin`
+    /// header — the test that fails the day a permissive CORS layer
+    /// appears anywhere in the router.
+    #[tokio::test]
+    async fn paseo_permit_options_request_gets_no_cors_preflight() {
+        let dir = fresh_root("paseo-permit-options-data");
+        enable_terminal(&dir);
+        let st = build_state_with_dir(&dir);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("OPTIONS")
+            .uri("/paseo/agent-1/permit")
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "an OPTIONS preflight must never succeed: {}",
+            resp.status()
+        );
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "no access-control-allow-origin header may ever be present: {:?}",
+            resp.headers()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole-path proof: Allow answers the pending request and reaches
+    /// the CLI with `permit allow <agent> <req>` in that exact order (S1/S2
+    /// idiom), never echoing the CLI's own captured stdout (S6).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_allow_answers_the_pending_request_with_the_right_argv() {
+        let dir = fresh_root("paseo-permit-allow-happy-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-allow-happy-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-permit-allow-happy-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-allow-happy-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-9"),
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-permit-allow-happy-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "allow" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{body}");
+
+        let argv = std::fs::read_to_string(&log).expect("the CLI must have been invoked");
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["permit", "allow", "agent-1", "req-9"],
+            "the final invocation must be the answer call, in PaseoCli::permit_allow's own argv order"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// Deny's own whole-path proof, mirroring Allow's above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_deny_answers_the_pending_request_with_the_right_argv() {
+        let dir = fresh_root("paseo-permit-deny-happy-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-deny-happy-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-permit-deny-happy-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-deny-happy-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-9"),
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-permit-deny-happy-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "deny" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{body}");
+
+        let argv = std::fs::read_to_string(&log).expect("the CLI must have been invoked");
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["permit", "deny", "agent-1", "req-9"],
+            "{lines:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// pc-5's own bug class: a fresh `permit_ls` no longer names the
+    /// SUBMITTED request id (the agent moved on to a different pending
+    /// request) — refused by name, and the answer subcommand is never
+    /// issued: the log still reads `permit ls` alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_refuses_a_stale_request_id_that_no_longer_matches_a_fresh_read() {
+        let dir = fresh_root("paseo-permit-stale-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-stale-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-permit-stale-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-stale-cli");
+        let log = cli_dir.join("invocation.log");
+        // Fresh read now names a DIFFERENT request than the one submitted.
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-NEW"),
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-permit-stale-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-STALE", "action": "allow" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "a stale request id must never be answered"
+        );
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("no longer pending"),
+            "{body}"
+        );
+
+        let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["permit", "ls"],
+            "the answer subcommand must never be reached on a stale id: {lines:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// Same refusal, the "nothing pending at all" flavor of the stale case —
+    /// a fresh read reports no permission pending for this agent at all
+    /// (already answered, or never was).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_refuses_when_a_fresh_read_reports_nothing_pending() {
+        let dir = fresh_root("paseo-permit-none-pending-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-none-pending-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-permit-none-pending-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-none-pending-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(&cli_dir, &log, "[]", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-permit-none-pending-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "allow" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("no longer pending"),
+            "{body}"
+        );
+
+        let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
+        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// An unrecognized fresh-read payload is a NAMED failure, never treated
+    /// as "nothing pending" — the parser's own fail-closed rule, proven at
+    /// the route.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_refuses_when_a_fresh_read_is_unrecognized() {
+        let dir = fresh_root("paseo-permit-unrecognized-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-unrecognized-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-permit-unrecognized-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-unrecognized-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(&cli_dir, &log, "not json at all", 0);
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-permit-unrecognized-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "allow" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("could not verify"),
+            "{body}"
+        );
+
+        let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
+        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// D5: answering an ALREADY-answered request — the fresh read still
+    /// (momentarily) shows it pending, but the answer CLI itself exits
+    /// non-zero — renders its own named failure, never a second success,
+    /// and is proven DISTINCT from the stale-id refusal above: this one
+    /// DOES reach the answer subcommand (the log proves it), where the
+    /// stale case never does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_renders_an_already_answered_request_as_a_named_failure_never_a_second_success(
+    ) {
+        let dir = fresh_root("paseo-permit-already-answered-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-already-answered-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-permit-already-answered-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-already-answered-cli");
+        let log = cli_dir.join("invocation.log");
+        // Fresh read still names the SAME request id pending — the answer
+        // call is reached, and only THEN fails.
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-9"),
+            5,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-permit-already-answered-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "allow" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "a failed answer must never render as answered"
+        );
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("exited with status"),
+            "{body}"
+        );
+
+        let argv = std::fs::read_to_string(&log).expect("the answer call must have been reached");
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["permit", "allow", "agent-1", "req-9"],
+            "distinct from the stale case: the answer subcommand IS reached here: {lines:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// D5/input: an empty or unrecognized `action` is refused before the
+    /// CLI is ever reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_permit_refuses_an_unrecognized_action_without_reaching_the_cli() {
+        let dir = fresh_root("paseo-permit-bad-action-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-permit-bad-action-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-permit-bad-action-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-permit-bad-action-cli");
+        let log = cli_dir.join("invocation.log");
+        let bin = fake_paseo_permit(
+            &cli_dir,
+            &log,
+            &pending_permission_json("agent-1", "req-9"),
+            0,
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-permit-bad-action-project");
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri("/paseo/agent-1/permit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "request_id": "req-9", "action": "maybe" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("allow"), "{body}");
+        assert!(
+            !log.exists(),
+            "an unrecognized action must never reach the CLI"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    // ── pc-5: the conversation route's own permit banner (SURFACE) ──────
+
+    /// The Allow/Deny banner appears in the polled conversation fragment
+    /// only when a fresh `permit_ls` reports a pending request for THIS
+    /// agent, carrying its request id for `paseo_permit_banner`'s buttons.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_shows_the_permit_banner_when_pending_for_this_agent() {
+        let dir = fresh_root("paseo-conv-permit-pending-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-conv-permit-pending-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-conv-permit-pending-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-conv-permit-pending-cli");
+        let bin = fake_paseo_dual(
+            &cli_dir,
+            "[User] hi\nok",
+            &pending_permission_json("agent-1", "req-9"),
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-conv-permit-pending-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let html = v["html"].as_str().unwrap();
+        assert!(html.contains("data-paseo-permit"), "{html}");
+        assert!(html.contains("data-req-id=\"req-9\""), "{html}");
+        assert!(
+            html.contains("hi"),
+            "the conversation body must still render: {html}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// No banner when nothing is pending — the common case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_shows_no_permit_banner_when_nothing_pending() {
+        let dir = fresh_root("paseo-conv-permit-none-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-conv-permit-none-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-conv-permit-none-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-conv-permit-none-cli");
+        let bin = fake_paseo_dual(&cli_dir, "[User] hi\nok", "[]");
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-conv-permit-none-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let html = v["html"].as_str().unwrap();
+        assert!(!html.contains("data-paseo-permit"), "{html}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// No banner when a request is pending, but for a DIFFERENT agent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_shows_no_permit_banner_when_pending_for_another_agent() {
+        let dir = fresh_root("paseo-conv-permit-other-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-conv-permit-other-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-conv-permit-other-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-conv-permit-other-cli");
+        let bin = fake_paseo_dual(
+            &cli_dir,
+            "[User] hi\nok",
+            &pending_permission_json("agent-999", "req-9"),
+        );
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-conv-permit-other-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let html = v["html"].as_str().unwrap();
+        assert!(!html.contains("data-paseo-permit"), "{html}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+        std::fs::remove_dir_all(&store).ok();
+        std::fs::remove_dir_all(&cli_dir).ok();
+    }
+
+    /// An unrecognized `permit_ls` payload never renders as "nothing
+    /// pending" — it names the failure instead, distinctly from both the
+    /// banner and the empty case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paseo_conversation_route_names_an_unrecognized_permit_ls_payload() {
+        let dir = fresh_root("paseo-conv-permit-unrecognized-data");
+        enable_terminal(&dir);
+        let scratch = fresh_root("paseo-conv-permit-unrecognized-scratch");
+        let tracked_root = scratch.join("tracked-project");
+        std::fs::create_dir_all(&tracked_root).unwrap();
+        let store = fresh_root("paseo-conv-permit-unrecognized-store");
+        write_paseo_agent(&store, "slug", "agent-1", &tracked_root, "claude");
+        let cli_dir = fresh_root("paseo-conv-permit-unrecognized-cli");
+        let bin = fake_paseo_dual(&cli_dir, "[User] hi\nok", "not json at all");
+
+        let mut st = build_state_with_dir(&dir);
+        st.paseo_store_root = Some(store.clone());
+        st.paseo_cli_program = Some(bin);
+        register(&st, &tracked_root, "paseo-conv-permit-unrecognized-project");
+        let app = router(st);
+
+        let resp = get(app, "/paseo/agent-1/conversation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let html = v["html"].as_str().unwrap();
+        assert!(!html.contains("data-paseo-permit"), "{html}");
+        assert!(
+            html.contains("was not recognized"),
+            "an unrecognized payload must name the failure, never render as silently absent: {html}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
