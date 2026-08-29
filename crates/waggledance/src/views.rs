@@ -141,6 +141,31 @@ fn worktree_branch(id: &str) -> Option<(&str, &str)> {
 pub struct ProjectSuggestion {
     pub path: String,
     pub pane_count: usize,
+    /// paseo-support ps-2 (D3): how many live paseo agents share this same
+    /// untracked `path` — folded into `server.rs::suggested_projects`'s
+    /// existing aggregation rather than a second block, so this is `0` for
+    /// every suggestion that came from a herdr pane alone (unchanged from
+    /// before this feature), and the row's meta text appends ", N paseo
+    /// agent(s)" only when it is non-zero.
+    pub paseo_count: usize,
+}
+
+/// paseo-support ps-2 (D1/D4/D5): one live paseo agent already matched to a
+/// tracked project's own D5 containment boundary — display-only fields
+/// alone (D1). No `id`, no `cwd`, and deliberately no `title` (prompt
+/// text; the page's precedent is agent kind/status, never prompt content,
+/// same rule [`TerminalPaneView`] follows for herdr panes). `model` is
+/// `None` when the paseo record carried no `config.model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaseoAgentBadge {
+    pub provider: String,
+    pub model: Option<String>,
+    /// Raw RFC-3339 string, formatted at render time via
+    /// `bee_fmt_trace_time` — the same relative-age idiom this page
+    /// already uses for a cell's `claimed_at`/`capped_at`. An old
+    /// "running" record simply shows its age; there is no liveness probe
+    /// (CONTEXT's discretion).
+    pub last_activity_at: String,
 }
 
 /// homepage-tabs: which of the home page's two sections `/` renders.
@@ -231,6 +256,16 @@ pub fn home_page(
     // already does — threaded through so `terminals_tab` can offer the
     // same "New shell"/preset buttons the project terminal page offers.
     terminals_presets: &[String],
+    // paseo-support ps-2 (D1/D5): every live paseo agent already mapped to
+    // a tracked project, keyed by project id — `server.rs::index_page`
+    // builds this the same way it builds every other per-project join on
+    // this page (the D5 containment boundary, `Boundary::validate_existing`,
+    // never the raw `is_contained_in_root` predicate). Forwarded verbatim
+    // into [`project_sidebar`], which renders each project's own entry
+    // beside its herdr badges. A project with no live paseo agent is
+    // simply absent from the map, so its row stays byte-identical to
+    // before this feature.
+    paseo_by_project: &std::collections::HashMap<String, Vec<PaseoAgentBadge>>,
 ) -> String {
     // console-theme-kanban (ctk-12), retargeting homepage-tabs edge (b):
     // this line used to force the Projects tab, because that was the only
@@ -279,6 +314,7 @@ pub fn home_page(
                     // still be in the query — the topbar's Orchestrator
                     // button is what is current here.
                     None,
+                    paseo_by_project,
                 ),
                 // D1 (backlog-groom-2): an empty `cross_features_html`
                 // (D9 — no registered project carries a `.bee` board) used
@@ -331,6 +367,7 @@ pub fn home_page(
                     // reader is actually looking at.
                     effective_pane(terminals_panes, terminals_selected_pane)
                         .map(|p| p.view.pane_id.as_str()),
+                    paseo_by_project,
                 ),
                 body = terminals_tab(
                     terminals_panes,
@@ -1094,6 +1131,10 @@ fn project_sidebar(
     // button in the topbar is what is current there — so the rail never
     // carries more than one `aria-current="page"` across the two views.
     terminals_selected_pane: Option<&str>,
+    // paseo-support ps-2: see [`home_page`]'s own parameter of the same
+    // name — forwarded here unchanged, looked up per row by project id
+    // beside [`project_badges`]'s herdr badges.
+    paseo_by_project: &std::collections::HashMap<String, Vec<PaseoAgentBadge>>,
 ) -> String {
     let listing = if projects.is_empty() {
         "<p class=\"fg-empty\">Chưa có project nào trong Waggle Dance. Đăng ký: <code>waggledance register &lt;dir&gt;</code> hoặc gọi MCP <code>waggledance_view_file</code>.</p>".to_string()
@@ -1179,7 +1220,20 @@ fn project_sidebar(
                     id = esc(&bp.id),
                     label = esc(label),
                     meta = proj_row_meta(*bcount, &bp.last_seen_at),
-                    badges = project_badges(&bp.id, bpanes),
+                    // paseo-support ps-2: the paseo badge nav rides
+                    // straight after the herdr one, inside the SAME
+                    // `{badges}` slot — no new markup block, no change to
+                    // the template literal above.
+                    badges = format!(
+                        "{}{}",
+                        project_badges(&bp.id, bpanes),
+                        paseo_badges_nav(
+                            paseo_by_project
+                                .get(&bp.id)
+                                .map(|v| v.as_slice())
+                                .unwrap_or(&[])
+                        ),
+                    ),
                     row_menu = proj_row_menu(&bp.id, &bp.name),
                 ));
             }
@@ -1226,7 +1280,17 @@ fn project_sidebar(
                 folder = RAIL_ICON_FOLDER,
                 row_menu = proj_row_menu(&p.id, &p.name),
                 meta = proj_row_meta(*count, &p.last_seen_at),
-                badges = project_badges(&p.id, panes),
+                // paseo-support ps-2: same fold as the branch row above.
+                badges = format!(
+                    "{}{}",
+                    project_badges(&p.id, panes),
+                    paseo_badges_nav(
+                        paseo_by_project
+                            .get(&p.id)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[])
+                    ),
+                ),
                 branch_list = branch_list,
             ));
         }
@@ -1249,11 +1313,24 @@ fn project_sidebar(
             // construction rather than by two separate `esc()` calls that
             // could drift apart.
             let path = esc(&s.path);
+            // paseo-support ps-2 (D3): appended to the SAME meta span, not
+            // a second one — only when a paseo agent actually shares this
+            // untracked folder, so every existing pane-only suggestion row
+            // stays byte-identical to before this feature.
+            let paseo_suffix = if s.paseo_count == 0 {
+                String::new()
+            } else {
+                format!(
+                    ", {n} paseo agent{plural}",
+                    n = s.paseo_count,
+                    plural = if s.paseo_count == 1 { "" } else { "s" },
+                )
+            };
             rows.push_str(&format!(
                 r#"<li class="proj-row proj-suggestion">
   <div class="proj-row__link proj-suggestion__info">
     <span class="proj-row__name proj-suggestion__path">{path}</span>
-    <span class="proj-row__meta">{count} pane{plural}</span>
+    <span class="proj-row__meta">{count} pane{plural}{paseo_suffix}</span>
   </div>
   <form class="proj-suggestion__register" method="post" action="/api/projects/register">
     <input type="hidden" name="path" value="{path}">
@@ -1263,6 +1340,7 @@ fn project_sidebar(
                 path = path,
                 count = s.pane_count,
                 plural = if s.pane_count == 1 { "" } else { "s" },
+                paseo_suffix = paseo_suffix,
             ));
         }
         format!(
@@ -1627,6 +1705,42 @@ fn register_error_message(code: &str) -> Option<&'static str> {
 /// but shell panes renders no container either, for the same reason.
 fn project_badges(project_id: &str, panes: &[TerminalPaneView]) -> String {
     terminal_badges_nav(project_id, panes, "Terminal panes", "")
+}
+
+/// paseo-support ps-2 (D1/D4): one badge per live paseo agent already
+/// matched to this project's own D5 containment boundary
+/// (`server.rs::index_page`'s `boundary.validate_existing` join, the same
+/// membership test [`project_badges`] uses for herdr panes) — rendered in
+/// the SAME `{badges}` slot as the herdr badges above, not a new markup
+/// block. Display-only (D1): no `href`, no pane route, no send-input or
+/// open affordance — a paseo agent carries no waggledance-owned route to
+/// link to, unlike a herdr pane. The agent's own `title` (prompt text)
+/// never reaches this markup; only `provider`, `model`, and the relative
+/// age of `lastActivityAt` do (via `bee_fmt_trace_time`, the same
+/// relative-age idiom this page already uses elsewhere). An empty
+/// `agents` slice renders nothing, so a project row with no live paseo
+/// agent stays byte-identical to before this feature.
+fn paseo_badges_nav(agents: &[PaseoAgentBadge]) -> String {
+    if agents.is_empty() {
+        return String::new();
+    }
+    let mut out =
+        r#"<nav class="proj-row__badges proj-row__badges--paseo" aria-label="Paseo agents">"#
+            .to_string();
+    for agent in agents {
+        let model = match agent.model.as_deref() {
+            Some(m) if !m.is_empty() => format!(" ({m})", m = esc(m)),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            r#"<span class="proj-row__badge proj-row__badge--paseo">paseo · {provider}{model} · {age}</span>"#,
+            provider = esc(&agent.provider),
+            model = model,
+            age = esc(&bee_fmt_trace_time(&agent.last_activity_at)),
+        ));
+    }
+    out.push_str("</nav>");
+    out
 }
 
 /// The badge markup itself, factored out of [`project_badges`]
@@ -9630,6 +9744,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
         assert!(
             !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
@@ -9659,6 +9774,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
         assert!(
             terminals.contains(
@@ -9681,7 +9797,19 @@ mod tests {
     #[test]
     fn home_page_carries_the_new_task_button_on_both_tabs_over_a_hidden_overlay() {
         for tab in [HomeTab::Kanban, HomeTab::Terminals] {
-            let body = home_page(&[], false, &[], None, "", tab, &[], None, true, &[]);
+            let body = home_page(
+                &[],
+                false,
+                &[],
+                None,
+                "",
+                tab,
+                &[],
+                None,
+                true,
+                &[],
+                &std::collections::HashMap::new(),
+            );
             assert!(
                 body.contains(
                     r#"<button type="button" class="fg-btn fg-btn--ghost topbar__new-task" data-new-task-open>+ New task</button>"#
@@ -9743,6 +9871,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
         let select = body
             .split(r#"<select class="fg-input" name="project" aria-label="Project">"#)
@@ -9860,6 +9989,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
         for hook in [
             "data-new-task-open",
@@ -9907,6 +10037,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
         assert!(
             home_html.contains("data-agent-drawer-homepage"),
@@ -9950,6 +10081,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
         assert!(
             body.contains(
@@ -10090,6 +10222,7 @@ mod tests {
         let suggestions = vec![ProjectSuggestion {
             path: "/tmp/unregistered-folder".into(),
             pane_count: 2,
+            paseo_count: 0,
         }];
         let pinned = vec![menu_pane("w1:p1", Some("proj-1"), "Proj One")];
         let body = home_page(
@@ -10103,6 +10236,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
 
         // The board itself is still here — the rail joined the Kanban tab,
@@ -10220,6 +10354,7 @@ mod tests {
             Some("w1:p2"),
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
 
         let shell_at = body
@@ -10268,7 +10403,15 @@ mod tests {
     /// view's own explanation with it.
     #[test]
     fn rail_with_no_live_panes_still_offers_the_way_to_the_terminals_view() {
-        let rail = project_sidebar(&[], false, &[], None, &[], None);
+        let rail = project_sidebar(
+            &[],
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             rail.contains(
                 r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals"><svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>Agents</a></h2>"#
@@ -10297,7 +10440,15 @@ mod tests {
         let mut pane = menu_pane("w1:p1", Some("proj-1"), "Proj One");
         pane.view.bee_state = Some(BeeActivityState::Blocked);
         pane.view.bee_feature = Some("rail-agents-compact".into());
-        let rail = project_sidebar(&[], false, &[], None, &[pane], None);
+        let rail = project_sidebar(
+            &[],
+            false,
+            &[],
+            None,
+            &[pane],
+            None,
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             rail.contains(
@@ -10328,7 +10479,15 @@ mod tests {
         // width on the first one.
         let mut plain = menu_pane("w1:p2", Some("proj-1"), "w1");
         plain.view.tab = "agent".into();
-        let quiet = project_sidebar(&[], false, &[], None, &[plain], None);
+        let quiet = project_sidebar(
+            &[],
+            false,
+            &[],
+            None,
+            &[plain],
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             quiet.contains(r#"<span class="pinned-row__meta">· agent</span>"#),
             "a workspace that repeats the project name must drop out: {quiet}"
@@ -10358,6 +10517,7 @@ mod tests {
             Some("does-not-exist"),
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
         assert!(
             body.contains(r#"<p class="fg-empty">This terminal is gone.</p>"#),
@@ -10418,7 +10578,15 @@ mod tests {
             (blocked, 1, vec![pane_with_status("blocked")]),
             (quiet, 1, Vec::new()),
         ];
-        let rail = project_sidebar(&projects, false, &[], None, &[], None);
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             rail.starts_with(r#"<nav class="home-sidebar" aria-label="Projects">"#),
@@ -10454,7 +10622,15 @@ mod tests {
             menu_pane("w1:p1", Some("proj-working"), "Proj Working"),
             menu_pane("w1:p2", Some("proj-blocked"), "Proj Blocked"),
         ];
-        let on_terminals = project_sidebar(&projects, false, &[], None, &pinned, Some("w1:p2"));
+        let on_terminals = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &pinned,
+            Some("w1:p2"),
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             on_terminals.matches(r#"aria-current="page""#).count(),
             1,
@@ -10560,7 +10736,15 @@ mod tests {
             (branch, 1, Vec::new()),
             (lone, 0, Vec::new()),
         ];
-        let rail = project_sidebar(&projects, false, &[], None, &[], None);
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+        );
 
         // One group per PROJECT, never per row: the branch is inside its
         // parent's group, so two groups is the whole rail here.
@@ -10728,7 +10912,15 @@ mod tests {
             (idle, 3, vec![shell_pane]),
             (active, 5, vec![pane_with_status("working")]),
         ];
-        let html = project_sidebar(&projects, false, &[], None, &[], None);
+        let html = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             !html.contains("fg-pagehead__title"),
             "the project rail must render no page heading: {html}"
@@ -12038,6 +12230,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
         );
         assert!(
             page_html.contains(r#"<main class="fg-page fg-page--tight">"#),
