@@ -1952,9 +1952,14 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    the edge. */
 @media (max-width: 720px) {
   .term-screen { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: hidden; }
-  .term-keys button, .term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-2) var(--space-3); }
-  .term-reply__actions { justify-content: stretch; }
-  .term-reply__actions button { flex: 1; }
+  /* trc-2: Approve/Stage are `.term-keys` children now, so the grid's own
+     `button` rule already sizes them here — this used to also list
+     `.term-reply__send`/`__stage`/`__approve` and stretch the actions row
+     to full width, back when all three were pill-shaped siblings in that
+     row. Send is the row's only reply-button survivor now, and it is a
+     fixed-size round icon button (below) that must NOT stretch or take
+     this padding. */
+  .term-keys button { padding: var(--space-2) var(--space-3); }
   /* term-keys-grid (D1): the 2×6 grid holds its shape on a handset too —
      six columns, two rows, never collapsing into the old one-row band —
      because the base `.term-keys` rule's own column tracks
@@ -2001,16 +2006,21 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
 }
 /* The controls row sits at the bottom of the card, inside its border — the
    attach icon (attach-capable panes only) pinned to the left via its own
-   `margin-right: auto`, Approve/Stage/Send crowding the right edge. */
+   `margin-right: auto`, Send alone crowding the right edge (trc-2: Approve
+   and Stage moved into the key grid, so this row is `+` and Send only). */
 .term-reply__actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2); }
 .term-attach__btn { margin-right: auto; }
-.term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-1) var(--space-3); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; }
+/* trc-2: Send reads as a round paseo-style send button — a fixed 44px
+   circle filled with the action colour, carrying an up-arrow glyph instead
+   of the word "Send" (the accessible name moves to `aria-label`). */
+.term-reply__send { display: flex; align-items: center; justify-content: center; flex: none; width: 44px; height: 44px; padding: 0; border: var(--border-width-hairline) solid var(--color-action); border-radius: 50%; background: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); font-size: var(--type-body-size); cursor: pointer; }
 /* A4: Approve is withheld unless bee says this agent is at a permission
-   prompt. It stays in place, same size, so the row never reflows as a state
-   changes — only its weight drops, and its `title` says why. */
+   prompt. It stays in place, same size, so the grid never reflows as a
+   state changes — only its weight drops, and its `title` says why. Its
+   base shape now comes from `.term-keys button` below (trc-2: Approve
+   lives in the key grid), so only the disabled dimming stays specific to
+   it here. */
 .term-reply__approve:disabled { opacity: .5; cursor: not-allowed; }
-/* Send is the primary of the pair — Stage beside it stays the quiet one. */
-.term-reply__send { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); }
 /* tkg-1 (D1): the two key groups merge into one 2×6 grid, so the wrapper
    holds just that single grid now — no more "wrap only when too narrow to
    hold both groups" balancing act the two-group layout used to need. */
@@ -2732,10 +2742,14 @@ fn pane_controls(
     // would take away a working control on the evidence of nothing.
     let approve_btn = match bee_state {
         Some(state) if !matches!(state, BeeActivityState::Blocked) => format!(
-            r#"<button type="button" class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is {word}">Approve</button>"#,
+            r#"<button type="button" class="term-reply__approve" data-pane-id="{pane_id}" disabled title="Approve answers a permission prompt; this agent is {word}">Approve</button>"#,
+            pane_id = esc(pane_id),
             word = esc(state.word()),
         ),
-        _ => r#"<button type="button" class="term-reply__approve">Approve</button>"#.to_string(),
+        _ => format!(
+            r#"<button type="button" class="term-reply__approve" data-pane-id="{pane_id}">Approve</button>"#,
+            pane_id = esc(pane_id),
+        ),
     };
     // paseo-composer (D1, term-reply-composer): the whole composer — the
     // writing surface AND every control — reads as one bordered rounded
@@ -2746,11 +2760,14 @@ fn pane_controls(
     // (`.term-attach[data-pane-id]` stays the box those four live in), so
     // the card boundary and the attach boundary are the same element there.
     // `.term-reply__field` draws the identical card for panes with no
-    // attach control. Either way the bottom row keeps the
-    // `.term-reply__actions` class — attach's `+` leads it, left-aligned,
-    // Approve/Stage/Send trail it, right-aligned — so every existing CSS
-    // rule and `assets/app.js` selector for those buttons keeps working
-    // unchanged; only the nesting moved.
+    // attach control. trc-2: the bottom row keeps the `.term-reply__actions`
+    // class but now only the `+` attach (left) and Send (right) — Approve
+    // and Stage moved into the key grid below, so a one-tap reply reads
+    // beside the other soft keys instead of at the bottom of the card. Send
+    // renders as a round icon button (an up-arrow glyph, `aria-label="Send"`
+    // carrying the accessible name text used to give) rather than the word
+    // "Send", but keeps the `.term-reply__send` class so the submit wiring
+    // in `assets/app.js` is untouched.
     let field = if attach {
         format!(
             r#"
@@ -2761,15 +2778,12 @@ fn pane_controls(
       <p class="term-attach__error" data-pane-id="{pane_id}" role="alert" hidden></p>
       <div class="term-reply__actions">
         <button type="button" class="term-attach__btn" data-pane-id="{pane_id}" title="Attach images" aria-label="Attach images to send to {name}">+</button>
-        {approve_btn}
-        <button type="button" class="term-reply__stage">Stage</button>
-        <button type="submit" class="term-reply__send">Send</button>
+        <button type="submit" class="term-reply__send" aria-label="Send">↑</button>
       </div>
     </div>"#,
             pane_id = esc(pane_id),
             name = esc(name),
             base_attr = base_attr,
-            approve_btn = approve_btn,
         )
     } else {
         format!(
@@ -2777,23 +2791,31 @@ fn pane_controls(
     <div class="term-reply__field">
       <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
       <div class="term-reply__actions">
-        {approve_btn}
-        <button type="button" class="term-reply__stage">Stage</button>
-        <button type="submit" class="term-reply__send">Send</button>
+        <button type="submit" class="term-reply__send" aria-label="Send">↑</button>
       </div>
     </div>"#,
             name = esc(name),
-            approve_btn = approve_btn,
         )
     };
+    // trc-2: row 1 of the key grid is Esc, Tab, Approve, ↑, Stage, Ctrl+C —
+    // Approve and Stage take the slots Ctrl and Shift used to hold, which
+    // are removed outright (Alt is the only latching modifier left,
+    // `data-mod="alt"`; `assets/app.js`'s `wireTermKeysGrid` already reads
+    // `button[data-mod]` generically, so dropping two of the three needs no
+    // JS change). Approve/Stage keep their `.term-reply__approve`/
+    // `.term-reply__stage` classes and A4's disabled/title gating — they
+    // just render here, inside `.term-keys`, instead of inside the
+    // `.term-reply` form; `assets/app.js`'s handlers find them via the
+    // shared `.term-pane` card ancestor now that they are no longer form
+    // descendants.
     format!(
         r#"<div class="term-controls">
     <div class="term-keys" data-pane-id="{pane_id}"{base_attr} aria-label="Send a key to {name}">
       <button type="button" data-key="escape">Esc</button>
       <button type="button" data-key="tab">Tab</button>
-      <button type="button" data-mod="ctrl" aria-pressed="false">Ctrl</button>
+      {approve_btn}
       <button type="button" data-key="up">↑</button>
-      <button type="button" data-mod="shift" aria-pressed="false">Shift</button>
+      <button type="button" class="term-reply__stage" data-pane-id="{pane_id}">Stage</button>
       <button type="button" data-key="ctrl+c">Ctrl+C</button>
       <button type="button" data-mod="alt" aria-pressed="false">Alt</button>
       <button type="button" class="term-keys__paste" aria-label="Paste into the reply to {name}">Paste</button>
@@ -2810,6 +2832,7 @@ fn pane_controls(
         field = field,
         base_attr = base_attr,
         state_attr = state_attr,
+        approve_btn = approve_btn,
     )
 }
 
@@ -11704,14 +11727,17 @@ mod tests {
         }
     }
 
-    /// D1 (terminal-approve-button): Approve leads the row — Approve,
-    /// Stage, Send — so a one-tap send never sits shoulder to shoulder with
-    /// Send, and Stage/Send keep their existing relative order.
+    /// D1 (terminal-approve-button), amended by trc-2: Approve leads Stage
+    /// in the key grid's row 1 — a one-tap send never sits shoulder to
+    /// shoulder with Send — and both render before Send, which now trails
+    /// alone in the composer's actions row.
     #[test]
     fn pane_controls_renders_approve_before_stage_and_send() {
         let html = pane_controls("pane-1", "Agent One", false, None, None);
         assert!(
-            html.contains(r#"<button type="button" class="term-reply__approve">Approve</button>"#),
+            html.contains(
+                r#"<button type="button" class="term-reply__approve" data-pane-id="pane-1">Approve</button>"#
+            ),
             "the Approve button must render: {html}"
         );
         let approve_at = html
@@ -11725,7 +11751,7 @@ mod tests {
             .expect("Send button must render");
         assert!(
             approve_at < stage_at && stage_at < send_at,
-            "the row must read Approve, Stage, Send: {html}"
+            "the key grid must read Approve then Stage, before Send trails in the composer: {html}"
         );
         assert!(
             !html.contains("data-agent-state"),
@@ -11748,8 +11774,9 @@ mod tests {
             Some(&BeeActivityState::Blocked),
         );
         assert!(
-            blocked
-                .contains(r#"<button type="button" class="term-reply__approve">Approve</button>"#),
+            blocked.contains(
+                r#"<button type="button" class="term-reply__approve" data-pane-id="pane-1">Approve</button>"#
+            ),
             "a blocked pane keeps the plain, enabled Approve button: {blocked}"
         );
         assert!(
@@ -11766,7 +11793,7 @@ mod tests {
         );
         assert!(
             waiting.contains(
-                r#"<button type="button" class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is needs an answer">Approve</button>"#
+                r#"<button type="button" class="term-reply__approve" data-pane-id="pane-1" disabled title="Approve answers a permission prompt; this agent is needs an answer">Approve</button>"#
             ),
             "a pane waiting on a typed answer must render Approve disabled, with the reason: {waiting}"
         );
@@ -11775,8 +11802,8 @@ mod tests {
             "the reply form must carry that pane's state word too: {waiting}"
         );
         for enabled in [
-            r#"<button type="button" class="term-reply__stage">Stage</button>"#,
-            r#"<button type="submit" class="term-reply__send">Send</button>"#,
+            r#"<button type="button" class="term-reply__stage" data-pane-id="pane-1">Stage</button>"#,
+            r#"<button type="submit" class="term-reply__send" aria-label="Send">↑</button>"#,
         ] {
             assert!(
                 waiting.contains(enabled),
@@ -11793,7 +11820,7 @@ mod tests {
         );
         assert!(
             working.contains(
-                r#"class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is working">Approve</button>"#
+                r#"class="term-reply__approve" data-pane-id="pane-1" disabled title="Approve answers a permission prompt; this agent is working">Approve</button>"#
             ),
             "a working pane must render Approve disabled too: {working}"
         );
@@ -11824,22 +11851,29 @@ mod tests {
         );
     }
 
-    /// D1: the new button sizes exactly like its siblings — no new colours,
-    /// no new tokens — so it joins both the shared reply-button rule and the
-    /// mobile sizing tweak alongside term-reply__send/term-reply__stage.
+    /// trc-2: Approve and Stage now render inside `.term-keys`, so they take
+    /// their box shape from the grid's own `.term-keys button` rule — no
+    /// dedicated reply-button rule lists them any more, on the base
+    /// stylesheet or the mobile tweak. Send stays outside the grid, in the
+    /// composer's own actions row, with its own distinct round-button rule
+    /// (a fixed-size circle must never join a shared padding/stretch rule).
     #[test]
-    fn term_reply_approve_shares_the_stage_send_css_rule() {
+    fn term_reply_approve_and_stage_share_the_key_grid_css_rule() {
         let project = sample_project();
         let html = terminal_page(&project, &[], None, &[]);
         assert!(
-            html.contains(".term-reply__send, .term-reply__stage, .term-reply__approve {"),
-            "the shared reply-button rule must include term-reply__approve: {html}"
+            !html.contains(".term-reply__send, .term-reply__stage, .term-reply__approve {"),
+            "Approve/Stage/Send must no longer share one box-shape rule: {html}"
         );
         assert!(
-            html.contains(
+            !html.contains(
                 ".term-keys button, .term-reply__send, .term-reply__stage, .term-reply__approve {"
             ),
-            "the mobile sizing tweak must include term-reply__approve: {html}"
+            "the mobile sizing tweak must no longer list the reply buttons by name: {html}"
+        );
+        assert!(
+            html.contains(".term-keys button { padding: var(--space-2) var(--space-3); }"),
+            "the mobile tweak must still size every key-grid button, Approve/Stage included since they render inside it now: {html}"
         );
     }
 
@@ -11872,16 +11906,21 @@ mod tests {
         );
     }
 
-    /// D2/D4: `assets/app.js` wires the Approve button the same way it
-    /// wires Stage — posting through the existing `postJson`/`inputUrl`
-    /// helpers, never a new fetch — so the project page and the homepage
-    /// Terminals tab both get a working button for free.
+    /// D2/D4, amended by trc-2: `assets/app.js` wires the Approve button the
+    /// same way it wires Stage — posting through the existing
+    /// `postJson`/`inputUrl` helpers, never a new fetch — so the project
+    /// page and the homepage Terminals tab both get a working button for
+    /// free. Approve now renders in the key grid rather than inside the
+    /// `.term-reply` form, so it is read off the shared `.term-pane` card
+    /// ancestor instead of the form itself.
     #[test]
     fn app_js_wires_the_approve_button() {
         let script = include_str!("../assets/app.js");
         assert!(
-            script.contains(r#"var approveBtn = form.querySelector(".term-reply__approve");"#),
-            "app.js must read the Approve button: {script}"
+            script.contains(
+                r#"var approveBtn = card && card.querySelector(".term-reply__approve");"#
+            ),
+            "app.js must read the Approve button from the pane's card: {script}"
         );
         assert!(
             script
@@ -11907,8 +11946,10 @@ mod tests {
         });
         let section = &script[start..];
         assert!(
-            section.contains(r#"var approveBtn = form.querySelector(".term-reply__approve");"#),
-            "the Unassigned page's own wiring in app.js must read the Approve button: {section}"
+            section.contains(
+                r#"var approveBtn = card && card.querySelector(".term-reply__approve");"#
+            ),
+            "the Unassigned page's own wiring in app.js must read the Approve button from the pane's card: {section}"
         );
         assert!(
             section.contains(r#"postJson(inputUrl(paneId), { text: "Approve", submit: true })"#),
