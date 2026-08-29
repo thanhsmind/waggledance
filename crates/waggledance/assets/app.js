@@ -3426,12 +3426,21 @@
     }
 
     function agentRow(agent) {
-      var item = document.createElement("a");
+      // paseo-support ps-4 (D1): a paseo agent has no herdr pane and no
+      // page to open — its feed row carries an empty `url`, and this row
+      // must then carry no link/open/send-input affordance at all. A
+      // regular herdr row always carries a non-empty `url`
+      // (`AgentPaneRow::url`, server.rs), so this is exactly the paseo-row
+      // discriminator, never a guess.
+      var hasLink = !!agent.url;
+      var item = document.createElement(hasLink ? "a" : "div");
       item.className = "fg-menu__item agent-drawer__item";
-      // home-terminal-parity-2: the homepage instance links to its own tab
-      // rather than the agent's own project page — `agent.url` still wins
-      // outright on the project page (`homepage: false`, unchanged).
-      item.href = homepage ? "/?tab=terminals&pane=" + encodeURIComponent(agent.pane_id) : agent.url;
+      if (hasLink) {
+        // home-terminal-parity-2: the homepage instance links to its own tab
+        // rather than the agent's own project page — `agent.url` still wins
+        // outright on the project page (`homepage: false`, unchanged).
+        item.href = homepage ? "/?tab=terminals&pane=" + encodeURIComponent(agent.pane_id) : agent.url;
+      }
 
       // Line one: the status pill, then what the agent is doing — its
       // terminal title (`AgentPaneRow.title`), falling back to the pane
