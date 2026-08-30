@@ -12,9 +12,10 @@ use waggledance_core::bee::{
 use waggledance_core::code_source::DirListing;
 use waggledance_core::config::Config;
 use waggledance_core::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
-use waggledance_core::engine::ChangesView;
+use waggledance_core::engine::{ChangesContent, ChangesView};
 use waggledance_core::git_diff::{
-    ChangeBody, ChangeStatus, DiffLine, FileChange, GitDiffError, LineKind, WorkingTreeDiff,
+    ActiveBase, ChangeBody, ChangeStatus, CommitEntry, DiffLine, FileChange, GitDiffError,
+    LineKind, WorkingTreeDiff,
 };
 use waggledance_core::render::{HighlightedSource, RenderService};
 use waggledance_core::short_link::{path_hash, short_code};
@@ -3272,6 +3273,42 @@ fn agent_switch_drawer(homepage: bool) -> String {
     )
 }
 
+/// changes-diff-screen D8: the terminal page's own FILES | DIFF panel —
+/// two toggle buttons above the screen and the container the panel opens
+/// into. Open, the panel takes the TOP HALF of the content area and the
+/// terminal compresses into the bottom half; closed (the default this
+/// renders) the page is byte-for-byte the terminal page it has always been
+/// apart from the two buttons themselves — no panel, no frame, no request.
+///
+/// D9 lives entirely in the two `data-embed-src` attributes: the panel is a
+/// same-origin iframe onto the Code and Changes pages this project already
+/// serves, in their `embed=1` chrome (topbar off, in-page sidebars intact —
+/// [`PageChrome::Embed`]). There is no fragment endpoint and no second
+/// render path, and `assets/app.js` never assembles a project id into a URL:
+/// the two addresses are built HERE, escaped here, and the script only ever
+/// copies the attribute it is handed onto the frame.
+///
+/// The `<iframe>` ships with no `src` at all — that is the laziness, in
+/// markup rather than in script: a terminal page nobody opens the panel on
+/// fetches neither page. `assets/app.js` sets it the first time a tab is
+/// opened and leaves it set, so reopening a tab shows a frame already
+/// loaded.
+fn terminal_embed_panel(project_id: &str) -> String {
+    let pid = esc(project_id);
+    format!(
+        r#"<div class="term-embed" data-project-id="{pid}">
+  <div class="term-embed__tabs" role="group" aria-label="Show this project's files or diff above the terminal">
+    <button type="button" class="term-embed__tab" data-embed-tab="files" data-embed-src="/p/{pid}/_code/?embed=1" aria-pressed="false">FILES</button>
+    <button type="button" class="term-embed__tab" data-embed-tab="diff" data-embed-src="/p/{pid}/_changes?embed=1" aria-pressed="false">DIFF</button>
+  </div>
+  <div class="term-embed__panel" hidden>
+    <iframe class="term-embed__frame" title="Project files and diff"></iframe>
+  </div>
+</div>"#,
+        pid = pid,
+    )
+}
+
 /// `GET /p/:id/_terminal` and `/p/:id/_terminal/pane/:pane_id` up state
 /// (D2/D4/D6): one pane's own page, chosen by `selected` from the pane strip
 /// (D4) rendered above it. `selected` is `None` only when `panes` is empty
@@ -3313,6 +3350,7 @@ pub fn terminal_page(
 {tab_style}
 <main class="fg-page fg-page--tight" data-project-id="{pid}">
   {bar}
+  {embed}
   <div class="term-panes">{rows}</div>
 </main>"#,
         topbar = topbar_full(
@@ -3327,6 +3365,7 @@ pub fn terminal_page(
         tab_style = PROJECT_TAB_STYLE,
         pid = esc(&project.id),
         bar = bar,
+        embed = terminal_embed_panel(&project.id),
         rows = rows,
     );
     layout_with_drawer(&format!("{} · terminal", project.name), "", &body, false)
@@ -5070,7 +5109,11 @@ fn bee_live_strip_section(snapshot: &BeeSnapshot) -> String {
                     None => String::new(),
                 };
                 (
-                    format!(" data-work-status=\"{}\"{}", esc(&work.status), acceptance_attr),
+                    format!(
+                        " data-work-status=\"{}\"{}",
+                        esc(&work.status),
+                        acceptance_attr
+                    ),
                     format!(
                         r#"<span class="bee-strip__work">“{}”</span>"#,
                         esc(&work.title)
@@ -9437,7 +9480,14 @@ pub fn file_page(
 ) -> String {
     let tree = file_tree(project, files, &file.rel_path);
     let right = right_panel(project, page, backlinks);
-    let breadcrumb = breadcrumb(project, "", &file.rel_path, true, copy_md_button());
+    let breadcrumb = breadcrumb(
+        project,
+        "",
+        &file.rel_path,
+        true,
+        copy_md_button(),
+        PageChrome::Full,
+    );
     // Raw markdown source for copy-as-markdown: the client maps a DOM selection
     // (via data-sourcepos line ranges) back to these source lines. Escape `<`
     // so a source containing "</script>" can't break out of the tag.
@@ -9574,12 +9624,24 @@ fn right_panel(project: &Project, page: &RenderedPage, backlinks: &[(String, Str
 /// copy-as-markdown button, or a code file's type/size) — `""` for pages
 /// with nothing to put there. `narrow`, true for Docs only, caps the bar's
 /// width to match `.fg-reading` (the markdown column below it); Code's bar
-/// stays full-width, matching its own full-width main pane.
-fn breadcrumb(project: &Project, base: &str, rel_path: &str, narrow: bool, right: &str) -> String {
+/// stays full-width, matching its own full-width main pane. `chrome` is D9:
+/// the one crumb that IS a link carries `?embed=1` when the page is
+/// embedded, so clicking the project root inside a frame stays inside it.
+/// Docs always passes `PageChrome::Full` — `/p/:id/` has no embed mode to
+/// carry into.
+fn breadcrumb(
+    project: &Project,
+    base: &str,
+    rel_path: &str,
+    narrow: bool,
+    right: &str,
+    chrome: PageChrome,
+) -> String {
     let mut crumbs = format!(
-        "<a href=\"/p/{pid}/{base}\">{name}</a>",
+        "<a href=\"/p/{pid}/{base}{q}\">{name}</a>",
         pid = esc(&project.id),
         base = base,
+        q = chrome.link_query(),
         name = esc(&project.name)
     );
     for seg in rel_path.split('/').filter(|s| !s.is_empty()) {
@@ -9602,6 +9664,54 @@ enum Section {
     Code,
     /// The Changes screen — the working-tree diff (D2).
     Changes,
+}
+
+/// D9: how much of the outer chrome a Code or Changes page renders.
+///
+/// `Embed` is what `?embed=1` asks for: the SAME page, minus the topbar —
+/// so a same-origin iframe (the terminal screen's FILES | DIFF panel, D8)
+/// shows the file list, the base picker and the reviewed marks without a
+/// second application bar stacked inside the frame. Everything inside the
+/// `.layout` is untouched; only the bar above it, and the sticky offsets
+/// that were measured against it, differ.
+///
+/// It is not a second render path (D9): the same functions render both,
+/// and any value other than `embed=1` — absent, empty, `0`, anything —
+/// lands on `Full`, which is byte-for-byte the page as it was before this
+/// existed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PageChrome {
+    Full,
+    Embed,
+}
+
+impl PageChrome {
+    fn is_embed(self) -> bool {
+        self == PageChrome::Embed
+    }
+
+    /// The query an in-page link must carry to stay inside the frame it was
+    /// clicked in. Only ever appended to a URL this module builds with no
+    /// query of its own, so `?` is always the right separator.
+    fn link_query(self) -> &'static str {
+        if self.is_embed() {
+            "?embed=1"
+        } else {
+            ""
+        }
+    }
+
+    /// The `.layout` element's class list. `layout--embed` is what app.css
+    /// hangs the dropped topbar offset on — with no 53px bar above them,
+    /// the sticky sidebar, the code pane and a file section's sticky header
+    /// stick to the frame's own top edge instead.
+    fn layout_class(self) -> &'static str {
+        if self.is_embed() {
+            "layout layout--embed"
+        } else {
+            "layout"
+        }
+    }
 }
 
 /// Docs|Code toggle for the top bar. The only change `file_page` makes to
@@ -9631,6 +9741,24 @@ fn section_switch(project: &Project, active: Section) -> String {
     )
 }
 
+/// The top bar a Code or Changes page renders — or, under D9's `embed=1`,
+/// the nothing it renders instead.
+///
+/// The whole of the outer chrome these two sections carry lives on that one
+/// bar: the section switch, the mobile drawer's hamburger, the menu, the
+/// agent and theme toggles. Dropping the bar therefore drops all of it in
+/// one place, and every element the page is actually FOR — the sidebar, the
+/// base picker, the reviewed marks — is below it and untouched. The
+/// `.layout` class beside this ([`PageChrome::layout_class`]) is what tells
+/// app.css that the 53px every sticky offset below assumes is no longer
+/// there.
+fn section_topbar(project: &Project, section: Section, chrome: PageChrome) -> String {
+    if chrome.is_embed() {
+        return String::new();
+    }
+    topbar_full(sidebar_toggle(), &section_switch(project, section), "", "")
+}
+
 /// What the main pane of a Code-section file page shows: highlighted source,
 /// or a binary notice (never a garbled render of raw bytes).
 pub enum CodeBody<'a> {
@@ -9654,9 +9782,10 @@ pub fn code_page(
     rel_path: &str,
     body: CodeBody,
     sidebar: &DirListing,
+    chrome: PageChrome,
 ) -> String {
     let active = base_name(rel_path);
-    let tree = code_tree(project, sidebar, Some(active));
+    let tree = code_tree(project, sidebar, Some(active), chrome);
 
     let (main, meta) = match body {
         CodeBody::Binary { size } => (
@@ -9702,11 +9831,11 @@ pub fn code_page(
             (main, meta)
         }
     };
-    let breadcrumb = breadcrumb(project, "_code/", rel_path, false, &meta);
+    let breadcrumb = breadcrumb(project, "_code/", rel_path, false, &meta, chrome);
 
     let body_html = format!(
         r#"{topbar}
-<div class="layout">
+<div class="{layout_cls}">
   <aside id="sidebar" class="sidebar">{tree}</aside>
   <div class="sidebar-backdrop"></div>
   <main class="content content--code">
@@ -9714,12 +9843,8 @@ pub fn code_page(
     <div class="codeview">{main}</div>
   </main>
 </div>"#,
-        topbar = topbar_full(
-            sidebar_toggle(),
-            &section_switch(project, Section::Code),
-            "",
-            "",
-        ),
+        topbar = section_topbar(project, Section::Code, chrome),
+        layout_cls = chrome.layout_class(),
         tree = tree,
         breadcrumb = breadcrumb,
         main = main,
@@ -9730,17 +9855,18 @@ pub fn code_page(
 /// A directory in the Code section: the same listing rendered both in the
 /// sidebar (compact nav) and the main pane (with sizes) — the two panes
 /// serve different roles, same as a file-explorer's tree-plus-detail split.
-pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
-    let tree = code_tree(project, listing, None);
-    let breadcrumb = breadcrumb(project, "_code/", &listing.rel_path, false, "");
+pub fn code_dir_page(project: &Project, listing: &DirListing, chrome: PageChrome) -> String {
+    let tree = code_tree(project, listing, None, chrome);
+    let breadcrumb = breadcrumb(project, "_code/", &listing.rel_path, false, "", chrome);
 
     let mut rows = String::new();
     if !listing.rel_path.is_empty() {
         let parent = parent_dir(&listing.rel_path);
         rows.push_str(&format!(
-            "<a class=\"codelist__row codelist__row--dir\" href=\"/p/{pid}/_code/{parent}\">.. </a>",
+            "<a class=\"codelist__row codelist__row--dir\" href=\"/p/{pid}/_code/{parent}{q}\">.. </a>",
             pid = esc(&project.id),
             parent = esc(parent),
+            q = chrome.link_query(),
         ));
     }
     for entry in &listing.entries {
@@ -9761,10 +9887,11 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
             format_size(entry.size)
         };
         rows.push_str(&format!(
-            "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}\"><span class=\"codelist__name\">{label}</span><span class=\"codelist__size\">{size}</span></a>",
+            "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}{q}\"><span class=\"codelist__name\">{label}</span><span class=\"codelist__size\">{size}</span></a>",
             cls = cls,
             pid = esc(&project.id),
             rel = esc(&rel),
+            q = chrome.link_query(),
             label = esc(&label),
             size = size,
         ));
@@ -9777,7 +9904,7 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
     };
     let body_html = format!(
         r#"{topbar}
-<div class="layout">
+<div class="{layout_cls}">
   <aside id="sidebar" class="sidebar">{tree}</aside>
   <div class="sidebar-backdrop"></div>
   <main class="content content--code">
@@ -9785,12 +9912,8 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
     <div class="codelist">{rows}</div>
   </main>
 </div>"#,
-        topbar = topbar_full(
-            sidebar_toggle(),
-            &section_switch(project, Section::Code),
-            "",
-            "",
-        ),
+        topbar = section_topbar(project, Section::Code, chrome),
+        layout_cls = chrome.layout_class(),
         tree = tree,
         breadcrumb = breadcrumb,
         rows = rows,
@@ -9824,40 +9947,158 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
 /// Git being unavailable, the project not being a repository, and a call
 /// that had to be killed all render an explained empty state here (D3) —
 /// the entry point stays, only its content changes.
-pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderService) -> String {
-    let (tree, main) = match view {
-        ChangesView::Unavailable(reason) => (
+///
+/// `chrome` is D9: `PageChrome::Embed` renders this exact page without the
+/// topbar, for a same-origin iframe. Nothing inside the `.layout` changes —
+/// the changed-file sidebar, the base picker and the reviewed marks are all
+/// still here — and the picker carries the flag onward so a base change
+/// inside a frame stays inside it.
+pub fn changes_page(
+    project: &Project,
+    view: &ChangesView,
+    render: &RenderService,
+    chrome: PageChrome,
+) -> String {
+    let scope = base_label(&view.base);
+    let picker = base_picker(project, view, chrome);
+    let (tree, main) = match &view.content {
+        ChangesContent::Unavailable(reason) => (
             changes_nav_empty("No file list — see the note beside it."),
             changes_unavailable(reason),
         ),
-        ChangesView::Diff(diff) if diff.files.is_empty() => (
+        ChangesContent::Diff(diff) if diff.files.is_empty() => (
             changes_nav_empty("No changed files."),
-            changes_body(project, diff, render),
+            changes_body(project, diff, &picker, render),
         ),
-        ChangesView::Diff(diff) => (changes_nav(diff), changes_body(project, diff, render)),
+        ChangesContent::Diff(diff) => (
+            changes_nav(diff),
+            changes_body(project, diff, &picker, render),
+        ),
     };
     let body_html = format!(
         r#"{topbar}
-<div class="layout">
+<div class="{layout_cls}">
   <aside id="sidebar" class="sidebar">{tree}</aside>
   <div class="sidebar-backdrop"></div>
   <main class="content content--changes">
-    <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">working tree</span></div></nav>
-    <div class="changes" data-project-id="{pid}">{main}</div>
+    <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">{scope}</span></div></nav>
+    <div class="changes" data-project-id="{pid}" data-base="{base}">{main}</div>
   </main>
 </div>"#,
-        topbar = topbar_full(
-            sidebar_toggle(),
-            &section_switch(project, Section::Changes),
-            "",
-            "",
-        ),
+        topbar = section_topbar(project, Section::Changes, chrome),
+        layout_cls = chrome.layout_class(),
         tree = tree,
         pid = esc(&project.id),
         name = esc(&project.name),
+        scope = esc(&scope),
+        base = esc(active_sha(&view.base)),
         main = main,
     );
     layout_with_drawer("Changes", "", &body_html, false)
+}
+
+/// What the screen says it is comparing (D6). The working tree keeps the
+/// words it has always had, so a page without `?commit` reads exactly as it
+/// did; a commit names itself by git's own abbreviation and its subject.
+///
+/// The subject is whatever a commit author typed — it is escaped by every
+/// caller here, like every other string this module renders.
+fn base_label(base: &ActiveBase) -> String {
+    match base {
+        ActiveBase::WorkingTree => "working tree".to_string(),
+        ActiveBase::Commit(commit) if commit.subject.is_empty() => {
+            format!("commit {}", commit.short)
+        }
+        ActiveBase::Commit(commit) => format!("{} — {}", commit.short, commit.subject),
+    }
+}
+
+/// The base a reviewed mark and the picker are keyed by: the empty string
+/// for the working tree, the full sha for a commit. Not a label — a value.
+fn active_sha(base: &ActiveBase) -> &str {
+    match base {
+        ActiveBase::WorkingTree => "",
+        ActiveBase::Commit(commit) => commit.sha.as_str(),
+    }
+}
+
+/// D6's base picker: the working tree and the repository's recent commits,
+/// as one `<select>` sitting where the scope label used to sit.
+///
+/// Every option value is either empty or a sha this server itself read out
+/// of git — never anything a reader typed, and never a label. The reader's
+/// choice becomes `?commit=<sha>`, which D7 checks again before git sees
+/// it; nothing here is trusted twice over.
+///
+/// The `<form>` around it is the no-scripting path: submitting posts the
+/// same `commit` field to the same screen, and an empty value falls back to
+/// the working tree exactly like any other unusable one. With scripting,
+/// `app.js` hides the button and navigates on `change`, so the plain URL
+/// (not `?commit=`) is what a working-tree choice leaves in the address bar.
+///
+/// The working-tree option is capitalised on purpose: "working tree" in
+/// lower case is the page's own claim about what it is showing (the
+/// breadcrumb, the header's empty state), and a picker that always offers
+/// the choice must not be mistaken for the page making that claim.
+fn base_picker(project: &Project, view: &ChangesView, chrome: PageChrome) -> String {
+    let active = active_sha(&view.base);
+    let mut options = format!(
+        "<option value=\"\"{sel}>Working tree</option>",
+        sel = if active.is_empty() { " selected" } else { "" },
+    );
+    // A commit older than the listed window would otherwise vanish from its
+    // own picker; it leads the list instead, so what the page shows is
+    // always something the picker shows too.
+    if let ActiveBase::Commit(commit) = &view.base {
+        if !view.commits.iter().any(|e| e.sha == commit.sha) {
+            options.push_str(&commit_option(commit, true));
+        }
+    }
+    for commit in &view.commits {
+        options.push_str(&commit_option(commit, commit.sha == active));
+    }
+    // D9: a picked base must not navigate the frame out of embed mode. A GET
+    // form drops any query already in its `action`, so the flag rides as a
+    // field of the form itself; `data-embed` is the same answer for the
+    // scripted path, which builds its own URL in `app.js`.
+    let (embed_field, embed_attr) = if chrome.is_embed() {
+        (
+            "<input type=\"hidden\" name=\"embed\" value=\"1\">",
+            " data-embed=\"1\"",
+        )
+    } else {
+        ("", "")
+    };
+    format!(
+        "<form class=\"changes__base\" method=\"get\" action=\"/p/{pid}/_changes\">\
+         <label class=\"changes__base-label\" for=\"changes-base\">Comparing</label>\
+         <select class=\"changes__base-select\" id=\"changes-base\" name=\"commit\" \
+         data-base-url=\"/p/{pid}/_changes\"{embed_attr}>{options}</select>\
+         {embed_field}\
+         <button class=\"changes__base-go\" type=\"submit\">Show</button>\
+         </form>",
+        pid = esc(&project.id),
+        embed_attr = embed_attr,
+        options = options,
+        embed_field = embed_field,
+    )
+}
+
+/// One commit as the picker lists it. The subject is whatever its author
+/// typed — untrusted text, escaped here like everything else this module
+/// renders, and never part of a URL.
+fn commit_option(commit: &CommitEntry, selected: bool) -> String {
+    let label = if commit.subject.is_empty() {
+        format!("{} · {}", commit.short, commit.date)
+    } else {
+        format!("{} — {} · {}", commit.short, commit.subject, commit.date)
+    };
+    format!(
+        "<option value=\"{sha}\"{sel}>{label}</option>",
+        sha = esc(&commit.sha),
+        sel = if selected { " selected" } else { "" },
+        label = esc(&label),
+    )
 }
 
 /// D3's empty state, in the user's terms: what the screen would show, why it
@@ -9981,13 +10222,21 @@ fn chg_stat(file: &FileChange) -> String {
     )
 }
 
-fn changes_body(project: &Project, diff: &WorkingTreeDiff, render: &RenderService) -> String {
+fn changes_body(
+    project: &Project,
+    diff: &WorkingTreeDiff,
+    picker: &str,
+    render: &RenderService,
+) -> String {
     let mut out = String::new();
+    // The scope label the screen shipped with is now something you can
+    // change (D6): the picker renders here, already carrying the active
+    // base as its selected option, and the breadcrumb keeps the words.
     let mut head = format!(
-        "<span class=\"changes__count\">{n} {word} changed</span>\
-         <span class=\"changes__scope\">working tree</span>",
+        "<span class=\"changes__count\">{n} {word} changed</span>{picker}",
         n = diff.files.len(),
         word = plural_files(diff.files.len()),
+        picker = picker,
     );
     if !diff.files.is_empty() {
         // D4's N/M counter. It ships `hidden` and `app.js` unhides it, the
@@ -10016,7 +10265,12 @@ fn changes_body(project: &Project, diff: &WorkingTreeDiff, render: &RenderServic
         out.push_str("<p class=\"changes__note\">Only the first files are shown with their contents; the rest are listed without.</p>");
     }
     if diff.files.is_empty() {
-        out.push_str("<p class=\"changes__empty\">Nothing has changed in the working tree.</p>");
+        out.push_str(match diff.base {
+            ActiveBase::WorkingTree => {
+                "<p class=\"changes__empty\">Nothing has changed in the working tree.</p>"
+            }
+            ActiveBase::Commit(_) => "<p class=\"changes__empty\">This commit changed nothing.</p>",
+        });
         return out;
     }
     for (i, file) in diff.files.iter().enumerate() {
@@ -10296,7 +10550,12 @@ fn changes_row(
 /// script in `app.js` wires the folder bar's click-to-toggle behavior once
 /// at load (this HTML needs no JS to render correctly, only to become
 /// interactive).
-fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>) -> String {
+fn code_tree(
+    project: &Project,
+    listing: &DirListing,
+    active_file: Option<&str>,
+    chrome: PageChrome,
+) -> String {
     let mut out = String::from(
         "<div class=\"fg-sidebar-search\">\
          <input class=\"fg-input\" placeholder=\"Search…\" autocomplete=\"off\" disabled></div>\
@@ -10304,8 +10563,9 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
     );
 
     let mut crumbs = format!(
-        "<a class=\"chap-seg\" href=\"/p/{pid}/_code/\">{name}</a>",
+        "<a class=\"chap-seg\" href=\"/p/{pid}/_code/{q}\">{name}</a>",
         pid = esc(&project.id),
+        q = chrome.link_query(),
         name = esc(&project.name),
     );
     let mut acc = String::new();
@@ -10315,9 +10575,10 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
         }
         acc.push_str(seg);
         crumbs.push_str(&format!(
-            "<span class=\"chap-sep\">›</span><a class=\"chap-seg\" href=\"/p/{pid}/_code/{acc}\">{seg}</a>",
+            "<span class=\"chap-sep\">›</span><a class=\"chap-seg\" href=\"/p/{pid}/_code/{acc}{q}\">{seg}</a>",
             pid = esc(&project.id),
             acc = esc(&acc),
+            q = chrome.link_query(),
             seg = esc(seg),
         ));
     }
@@ -10331,9 +10592,10 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
         if entry.is_dir {
             dir_count += 1;
             dirs.push_str(&format!(
-                "<a class=\"chap-subfolder\" href=\"/p/{pid}/_code/{rel}\">{name}</a>",
+                "<a class=\"chap-subfolder\" href=\"/p/{pid}/_code/{rel}{q}\">{name}</a>",
                 pid = esc(&project.id),
                 rel = esc(&rel),
+                q = chrome.link_query(),
                 name = esc(&entry.name),
             ));
         } else {
@@ -10343,10 +10605,11 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
                 "chap-file"
             };
             files.push_str(&format!(
-                "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}\">{name}</a>",
+                "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}{q}\">{name}</a>",
                 cls = cls,
                 pid = esc(&project.id),
                 rel = esc(&rel),
+                q = chrome.link_query(),
                 name = esc(&entry.name),
             ));
         }
@@ -12425,7 +12688,10 @@ mod tests {
             "a subject inside the budget is rendered whole"
         );
         assert_eq!(
-            bee_rail_wait_clip("Chon muc do tich hop Jarvis vao Super+Space tren Omarchy", 48),
+            bee_rail_wait_clip(
+                "Chon muc do tich hop Jarvis vao Super+Space tren Omarchy",
+                48
+            ),
             "Chon muc do tich hop Jarvis vao Super+Space…",
             "the live subject clips at its last space inside the budget"
         );
@@ -13236,6 +13502,126 @@ mod tests {
         );
     }
 
+    /// changes-diff-screen D8/D9: the terminal page offers FILES and DIFF,
+    /// and offers them CLOSED. Both buttons carry the exact `embed=1`
+    /// addresses the script is allowed to load — built here, never assembled
+    /// from a project id in `assets/app.js` — the panel ships hidden, and the
+    /// frame ships with no `src` at all, so a terminal page nobody touches
+    /// fetches neither page.
+    #[test]
+    fn terminal_page_offers_files_and_diff_tabs_closed_with_no_frame_loaded() {
+        let project = sample_project();
+        let html = terminal_page(&project, &[], None, &[]);
+        assert!(
+            html.contains(
+                r#"<button type="button" class="term-embed__tab" data-embed-tab="files" data-embed-src="/p/proj-1/_code/?embed=1" aria-pressed="false">FILES</button>"#
+            ),
+            "FILES must carry the Code page's own embed URL: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<button type="button" class="term-embed__tab" data-embed-tab="diff" data-embed-src="/p/proj-1/_changes?embed=1" aria-pressed="false">DIFF</button>"#
+            ),
+            "DIFF must carry the Changes page's own embed URL: {html}"
+        );
+        assert!(
+            html.contains(r#"<div class="term-embed__panel" hidden>"#),
+            "the panel must exist and ship hidden: {html}"
+        );
+        let frame_start = html
+            .find("<iframe class=\"term-embed__frame\"")
+            .expect("no panel frame");
+        let frame_end = html[frame_start..]
+            .find('>')
+            .map(|i| frame_start + i)
+            .expect("unclosed iframe tag");
+        assert!(
+            !html[frame_start..frame_end].contains("src="),
+            "an untouched terminal page must load no frame: {html}"
+        );
+    }
+
+    /// The panel is the TOP half: it renders above the terminal, inside the
+    /// same content column, so opening it compresses the screen downward
+    /// rather than covering it.
+    #[test]
+    fn the_terminal_panel_renders_above_the_terminal() {
+        let project = sample_project();
+        let html = terminal_page(&project, &[], None, &[]);
+        let panel = html
+            .find(r#"<div class="term-embed" data-project-id="proj-1">"#)
+            .expect("no panel");
+        let panes = html
+            .find("<div class=\"term-panes\">")
+            .expect("no terminal pane list");
+        assert!(
+            panel < panes,
+            "the panel must render above the terminal: {html}"
+        );
+    }
+
+    /// D8's JS half. Three things are pinned because three things could go
+    /// quietly wrong: the frame's URL is only ever the button's own
+    /// server-rendered attribute (never a string built here from a project
+    /// id, and never a value read out of storage); the open tab is remembered
+    /// per project in `sessionStorage` under this feature's own key; and
+    /// every storage touch is wrapped, so a disabled or quota-blocked store
+    /// degrades to closed instead of taking the terminal page down.
+    #[test]
+    fn app_js_opens_the_terminal_panel_from_the_servers_own_urls() {
+        let script = include_str!("../assets/app.js");
+        assert!(
+            script.contains(r#"var src = btn.getAttribute("data-embed-src") || "";"#)
+                && script.contains(
+                    r#"if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);"#
+                ),
+            "the frame's src must be copied from the button's own attribute: {script}"
+        );
+        assert!(
+            script.contains(
+                r#"var KEY = "waggledance-term-panel:" + root.getAttribute("data-project-id");"#
+            ),
+            "the open tab must be remembered per project under the D8 key: {script}"
+        );
+        assert!(
+            script.contains(
+                r#"try { stored = sessionStorage.getItem(KEY); } catch (e) { stored = null; }"#
+            ),
+            "a throwing sessionStorage must read as closed: {script}"
+        );
+        assert!(
+            script.contains(r#"if (main) main.classList.toggle("term-split", !!openTab);"#),
+            "the split class must be driven by the open tab: {script}"
+        );
+    }
+
+    /// D8's CSS half: half and half, and only while a tab is open. The rule
+    /// hangs off `main.fg-page.term-split`, so with the panel closed nothing
+    /// in it applies and the terminal page keeps the page-scrolled,
+    /// full-height screen it has always had.
+    #[test]
+    fn the_terminal_panel_splits_the_content_area_in_half_only_while_open() {
+        let css = include_str!("../assets/app.css");
+        assert!(
+            css.contains(
+                "main.fg-page.term-split { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }"
+            ),
+            "the split must give the content area one fixed frame: {css}"
+        );
+        assert!(
+            css.contains("main.fg-page.term-split .term-embed { flex: 1 1 50%; min-height: 0; }"),
+            "the panel must take half the frame: {css}"
+        );
+        assert!(
+            css.contains("main.fg-page.term-split .term-panes { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top:"),
+            "the terminal must take the other half and scroll inside it: {css}"
+        );
+        assert!(
+            !css.contains(".term-embed__panel { display:"),
+            "the panel must take no display rule, or `hidden` would stop hiding it: {css}"
+        );
+    }
+
     /// homepage-terminal-full D7: the transcript page's own pane links keep
     /// their `_transcript` shape, unchanged by the same signature change.
     #[test]
@@ -13371,19 +13757,19 @@ mod tests {
     fn every_page_offers_the_guide_from_the_shared_top_bar_menu() {
         let project = sample_project();
         let pages = [
-            ("settings", settings_page(
-                &Config::default(),
-                false,
-                false,
-                NotifyCredentialView::NotConfigured,
-                &[],
-            )),
+            (
+                "settings",
+                settings_page(
+                    &Config::default(),
+                    false,
+                    false,
+                    NotifyCredentialView::NotConfigured,
+                    &[],
+                ),
+            ),
             ("terminal", terminal_page(&project, &[], None, &[])),
             ("guide index", guide_index_page()),
-            (
-                "guide chapter",
-                guide_chapter_page(&guide::CHAPTERS[0]),
-            ),
+            ("guide chapter", guide_chapter_page(&guide::CHAPTERS[0])),
         ];
         for (what, html) in pages {
             let menu_start = html
@@ -15964,7 +16350,10 @@ mod tests {
         let html = bee_live_strip_section(&waggledance_core::bee::read_snapshot(&root));
 
         assert!(!html.contains("<img"), "the tag must not survive: {html}");
-        assert!(!html.contains("<script"), "nor the one in the acceptance: {html}");
+        assert!(
+            !html.contains("<script"),
+            "nor the one in the acceptance: {html}"
+        );
         assert!(html.contains("&lt;img"), "it must arrive escaped: {html}");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -16004,7 +16393,12 @@ mod tests {
             .split('}')
             .next()
             .unwrap();
-        for needed in ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap", "min-width: 0"] {
+        for needed in [
+            "overflow: hidden",
+            "text-overflow: ellipsis",
+            "white-space: nowrap",
+            "min-width: 0",
+        ] {
             assert!(rule.contains(needed), "the work span must {needed}: {rule}");
         }
     }
@@ -18334,12 +18728,10 @@ mod tests {
         );
 
         let card_slot = (1..=10)
-            .find(|n| {
-                html.contains(&format!(
-                    "bee-hub__shell--p{n}\" data-hub-key=\""
-                ))
-            })
-            .unwrap_or_else(|| panic!("proj-a's own In Progress card must carry a colour modifier: {html}"));
+            .find(|n| html.contains(&format!("bee-hub__shell--p{n}\" data-hub-key=\"")))
+            .unwrap_or_else(|| {
+                panic!("proj-a's own In Progress card must carry a colour modifier: {html}")
+            });
         let row_slot = (1..=10)
             .find(|n| html.contains(&format!("bee-hub__row-project--p{n}\">Project A</span>")))
             .unwrap_or_else(|| {
@@ -22585,9 +22977,8 @@ mod tests {
 
     #[test]
     fn agent_output_is_html_escaped() {
-        let html = paseo_conversation_fragment(
-            "[User] <script>alert(1)</script>\n<b>bold reply</b>",
-        );
+        let html =
+            paseo_conversation_fragment("[User] <script>alert(1)</script>\n<b>bold reply</b>");
         assert!(!html.contains("<script>alert(1)</script>"), "{html}");
         assert!(!html.contains("<b>bold reply</b>"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
@@ -22599,7 +22990,8 @@ mod tests {
         let binary = paseo_conversation_error_fragment(PaseoCliError::BinaryNotFound);
         let daemon = paseo_conversation_error_fragment(PaseoCliError::DaemonUnreachable);
         let timeout = paseo_conversation_error_fragment(PaseoCliError::TimedOut);
-        let failed = paseo_conversation_error_fragment(PaseoCliError::Failed { exit_code: Some(1) });
+        let failed =
+            paseo_conversation_error_fragment(PaseoCliError::Failed { exit_code: Some(1) });
         let bodies = [&binary, &daemon, &timeout, &failed];
         for (i, a) in bodies.iter().enumerate() {
             for (j, b) in bodies.iter().enumerate() {
@@ -23135,6 +23527,7 @@ mod tests {
             hidden: 2,
             stdout_truncated: false,
             sections_capped: false,
+            base: ActiveBase::WorkingTree,
         }
     }
 
@@ -23156,11 +23549,34 @@ mod tests {
         out
     }
 
+    /// A page built from one diff and nothing else: the base the view
+    /// reports mirrors the diff's own, exactly as `Engine::changes` builds
+    /// it, so these fixtures cannot drift from the real pairing.
+    fn changes_view(diff: WorkingTreeDiff) -> ChangesView {
+        ChangesView {
+            base: diff.base.clone(),
+            content: ChangesContent::Diff(diff),
+            commits: Vec::new(),
+        }
+    }
+
     fn changes_html(diff: WorkingTreeDiff) -> String {
         changes_page(
             &sample_project(),
-            &ChangesView::Diff(diff),
+            &changes_view(diff),
             &RenderService::new(),
+            PageChrome::Full,
+        )
+    }
+
+    /// The same page under D9's `embed=1`, so an embed test differs from its
+    /// full-chrome twin by exactly one argument.
+    fn changes_html_embedded(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &changes_view(diff),
+            &RenderService::new(),
+            PageChrome::Embed,
         )
     }
 
@@ -23272,6 +23688,155 @@ mod tests {
         );
     }
 
+    /// cds-6 / D6: a commit as the picker lists it.
+    fn sample_commit(sha: &str, subject: &str) -> CommitEntry {
+        CommitEntry {
+            sha: sha.into(),
+            short: sha[..7].into(),
+            date: "2026-08-30".into(),
+            subject: subject.into(),
+        }
+    }
+
+    /// The page as the route builds it: a diff, the picker's commit list,
+    /// and the base the diff itself reports.
+    fn changes_html_with_commits(diff: WorkingTreeDiff, commits: Vec<CommitEntry>) -> String {
+        changes_page(
+            &sample_project(),
+            &ChangesView {
+                base: diff.base.clone(),
+                content: ChangesContent::Diff(diff),
+                commits,
+            },
+            &RenderService::new(),
+            PageChrome::Full,
+        )
+    }
+
+    /// D6: the header offers the working tree and the recent commits, and
+    /// exactly one of them — the one the page is showing — is selected.
+    #[test]
+    fn the_base_picker_lists_the_working_tree_and_the_recent_commits() {
+        let older = sample_commit(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "an older commit",
+        );
+        let newest = sample_commit(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "the newest commit",
+        );
+        let commits = vec![newest.clone(), older.clone()];
+
+        let html = changes_html_with_commits(changes_fixture(), commits.clone());
+        assert!(
+            html.contains("<option value=\"\" selected>Working tree</option>"),
+            "the default page has the working tree picked: {html}"
+        );
+        assert!(
+            html.contains(&format!("<option value=\"{}\">", newest.sha))
+                && html.contains("the newest commit")
+                && html.contains("an older commit"),
+            "both commits are offered, neither picked: {html}"
+        );
+        assert_eq!(
+            html.matches(" selected>").count(),
+            1,
+            "exactly one option is selected: {html}"
+        );
+
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(older.clone());
+        let html = changes_html_with_commits(diff, commits);
+        assert!(
+            html.contains(&format!(
+                "<option value=\"{}\" selected>{} — an older commit · 2026-08-30</option>",
+                older.sha, older.short
+            )),
+            "the commit being shown is the picked one: {html}"
+        );
+        assert!(
+            html.contains("<option value=\"\">Working tree</option>"),
+            "and the way back to the working tree is still offered: {html}"
+        );
+        assert_eq!(
+            html.matches(" selected>").count(),
+            1,
+            "exactly one option is selected: {html}"
+        );
+    }
+
+    /// A commit older than the listed window is still what the page shows,
+    /// so the picker shows it too rather than presenting a list none of
+    /// whose entries is the current one.
+    #[test]
+    fn a_base_outside_the_listed_window_still_appears_picked() {
+        let listed = sample_commit("cccccccccccccccccccccccccccccccccccccccc", "listed");
+        let ancient = sample_commit("dddddddddddddddddddddddddddddddddddddddd", "ancient");
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(ancient.clone());
+
+        let html = changes_html_with_commits(diff, vec![listed]);
+        assert!(
+            html.contains(&format!("<option value=\"{}\" selected>", ancient.sha)),
+            "the shown commit leads the list: {html}"
+        );
+        assert_eq!(html.matches(" selected>").count(), 1, "{html}");
+    }
+
+    /// A commit subject is whatever its author typed. It reaches the picker
+    /// as text and nothing else — the value beside it is the sha alone, so
+    /// no part of a subject ever reaches a URL either.
+    #[test]
+    fn a_commit_subject_with_markup_in_it_is_escaped_in_the_picker() {
+        let nasty = sample_commit(
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "fix <script>alert(1)</script> & \"quotes\"",
+        );
+
+        let html = changes_html_with_commits(changes_fixture(), vec![nasty]);
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "the subject never renders as markup: {html}"
+        );
+        assert!(
+            html.contains("fix &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;"),
+            "it renders as the text it is: {html}"
+        );
+    }
+
+    /// D4 under D6: the reviewed layer is the same layer in commit mode —
+    /// same per-section attributes, same counter — and the base it is keyed
+    /// by rides the screen root, empty for the working tree so marks made
+    /// before the picker existed keep the key they were written under.
+    #[test]
+    fn commit_mode_keeps_the_reviewed_markup_and_names_its_base() {
+        let commit = sample_commit("ffffffffffffffffffffffffffffffffffffffff", "a commit");
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains("data-base=\"\""),
+            "the working tree is the empty base: {html}"
+        );
+
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(commit.clone());
+        let html = changes_html_with_commits(diff, vec![commit.clone()]);
+        assert!(
+            html.contains(&format!("data-base=\"{}\"", commit.sha)),
+            "a commit view is keyed by its own sha: {html}"
+        );
+        for needle in [
+            "class=\"changes__reviewed\"",
+            "changeset__review",
+            "data-path=",
+            "data-key=",
+        ] {
+            assert!(
+                html.contains(needle),
+                "the reviewed layer is unchanged in commit mode, missing {needle}: {html}"
+            );
+        }
+    }
+
     /// Every `data-key` on the page, in section order — the content keys a
     /// reviewed mark is stored against.
     fn data_keys(html: &str) -> Vec<String> {
@@ -23293,11 +23858,16 @@ mod tests {
         let html = changes_html(changes_fixture());
 
         assert!(
-            html.contains("<div class=\"changes\" data-project-id=\"proj-1\">"),
-            "marks are scoped per project, so the id is on the screen root: {html}"
+            // cds-6 extended this: a mark is scoped per project AND per
+            // base (D6), so the root names both. The empty base is the
+            // working tree, which keeps the key it always had.
+            html.contains("<div class=\"changes\" data-project-id=\"proj-1\" data-base=\"\">"),
+            "marks are scoped per project and base, so both are on the screen root: {html}"
         );
         assert!(
-            html.contains("<section class=\"changeset\" id=\"f0\" data-path=\"src/app/main.rs\" data-key=\""),
+            html.contains(
+                "<section class=\"changeset\" id=\"f0\" data-path=\"src/app/main.rs\" data-key=\""
+            ),
             "each section names its file and its content key: {html}"
         );
         assert_eq!(
@@ -23397,10 +23967,15 @@ mod tests {
     fn the_unavailable_state_is_a_page_not_a_stack_trace() {
         let html = changes_page(
             &sample_project(),
-            &ChangesView::Unavailable(GitDiffError::GitUnavailable(
-                "/secret/path/git: No such file".into(),
-            )),
+            &ChangesView {
+                content: ChangesContent::Unavailable(GitDiffError::GitUnavailable(
+                    "/secret/path/git: No such file".into(),
+                )),
+                commits: Vec::new(),
+                base: ActiveBase::WorkingTree,
+            },
             &RenderService::new(),
+            PageChrome::Full,
         );
         assert!(
             html.contains("git command line"),
@@ -23439,6 +24014,152 @@ mod tests {
             assert!(
                 nav.contains(&format!("href=\"{current_href}\" aria-current=\"page\"")),
                 "the active section is the marked one: {nav}"
+            );
+        }
+    }
+
+    /// A directory a Code page can be rendered from: one subfolder and one
+    /// file, so both kinds of sidebar link are on the page at once.
+    fn code_listing() -> DirListing {
+        DirListing {
+            rel_path: "src".into(),
+            entries: vec![
+                waggledance_core::code_source::DirEntry {
+                    name: "app".into(),
+                    is_dir: true,
+                    size: 0,
+                },
+                waggledance_core::code_source::DirEntry {
+                    name: "main.rs".into(),
+                    is_dir: false,
+                    size: 42,
+                },
+            ],
+        }
+    }
+
+    /// D9: `embed=1` takes the topbar off the Changes screen and nothing
+    /// else. What the screen is FOR — the changed-file sidebar, the base
+    /// picker, the reviewed marks — is still every bit of it there, and the
+    /// layout says it is embedded so app.css can drop the 53px offset its
+    /// sticky elements were measured against.
+    #[test]
+    fn an_embedded_changes_page_drops_the_topbar_and_keeps_the_screen() {
+        let html = changes_html_embedded(changes_fixture());
+
+        assert!(
+            !html.contains("<header class=\"topbar\">"),
+            "no topbar inside the frame: {html}"
+        );
+        assert!(
+            !html.contains("section-switch"),
+            "and none of the chrome that lived on it: {html}"
+        );
+        assert!(
+            !html.contains("id=\"sidebar-toggle\""),
+            "including the drawer toggle: {html}"
+        );
+
+        assert!(
+            html.contains("class=\"layout layout--embed\""),
+            "the layout marks itself embedded: {html}"
+        );
+        assert!(
+            html.contains("changes-nav"),
+            "the changed-file sidebar stays: {html}"
+        );
+        assert!(
+            html.contains("changes__base-select"),
+            "the base picker stays: {html}"
+        );
+        assert!(
+            html.contains("changeset__review"),
+            "the reviewed marks stay: {html}"
+        );
+    }
+
+    /// D9: navigating inside the frame must stay inside it. The picker is the
+    /// one control on this screen that navigates, and it has two paths — the
+    /// plain GET form (which drops any query already in its `action`, so the
+    /// flag rides as a field) and `app.js` (which reads `data-embed`).
+    #[test]
+    fn an_embedded_changes_page_carries_embed_through_its_base_picker() {
+        let html = changes_html_embedded(changes_fixture());
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"embed\" value=\"1\">"),
+            "the scripting-off form submits the flag: {html}"
+        );
+        assert!(
+            html.contains("data-embed=\"1\""),
+            "and the scripted path is told about it: {html}"
+        );
+    }
+
+    /// D9 on the Code section: same page, no bar, and every link the tree
+    /// offers keeps the reader in the frame — the crumbs up, the subfolders
+    /// down, and the files themselves.
+    #[test]
+    fn an_embedded_code_page_carries_embed_through_its_sidebar_links() {
+        for html in [
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Embed),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Embed,
+            ),
+        ] {
+            assert!(
+                !html.contains("<header class=\"topbar\">"),
+                "no topbar inside the frame: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout layout--embed\""),
+                "the layout marks itself embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/?embed=1\""),
+                "the root crumb stays embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/src/app?embed=1\""),
+                "a subfolder link stays embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/src/main.rs?embed=1\""),
+                "a file link stays embedded: {html}"
+            );
+        }
+    }
+
+    /// The other half of D9: without the flag these pages are the pages they
+    /// have always been — the bar is there, no link carries a query it never
+    /// carried, and nothing claims to be embedded.
+    #[test]
+    fn without_the_embed_flag_the_pages_keep_their_chrome() {
+        for html in [
+            changes_html(changes_fixture()),
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Full),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Full,
+            ),
+        ] {
+            assert!(
+                html.contains("<header class=\"topbar\">"),
+                "the topbar is where it was: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout\""),
+                "and the layout carries no embed modifier: {html}"
+            );
+            assert!(
+                !html.contains("embed=1"),
+                "no link and no field mentions embedding: {html}"
             );
         }
     }

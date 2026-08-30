@@ -10,7 +10,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, Form, Path, Query, State,
     },
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
+use waggledance_core::git_diff::DiffBase;
 use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::render::{theme_css, RenderService};
 use waggledance_core::Engine;
@@ -659,11 +660,11 @@ fn router(state: AppState) -> Router {
 /// on HTTP/1.1, so its absence is never a legitimate local client, only a
 /// crafted request trying to dodge the check.
 ///
-/// paseo-control S8: also carries the `Sec-Fetch-Site` assertion
-/// (`sec_fetch_site_is_allowed`), refused with this same status and body so
+/// paseo-control S8: also carries the Fetch-Metadata assertion
+/// (`sec_fetch_is_allowed`), refused with this same status and body so
 /// callers see one consistent behaviour rather than two dialects. `Host`
 /// alone stops DNS rebinding, not a cross-site request aimed at this
-/// daemon's own configured hostname (fact 6 / D10) -- the `Sec-Fetch-Site`
+/// daemon's own configured hostname (fact 6 / D10) -- the `Sec-Fetch-*`
 /// check closes that gap for every route the router serves, in one place.
 async fn require_loopback_host(
     State(state): State<AppState>,
@@ -671,7 +672,7 @@ async fn require_loopback_host(
     next: Next,
 ) -> Response {
     if !host_is_allowed(req.headers(), &state.engine.config.server.hostname)
-        || !sec_fetch_site_is_allowed(req.headers())
+        || !sec_fetch_is_allowed(req.method(), req.headers())
     {
         return (
             StatusCode::MISDIRECTED_REQUEST,
@@ -720,26 +721,76 @@ fn strip_host_port(host: &str) -> &str {
     }
 }
 
-/// paseo-control S8: the `Sec-Fetch-Site` allowlist, split out from
+/// paseo-control S8: the Fetch-Metadata allowlist, split out from
 /// `require_loopback_host` the same way `host_is_allowed` is, so a unit test
-/// can drive it directly against a bare `HeaderMap`. An ABSENT header is
-/// ALLOWED -- deliberately, not an oversight: every browser capable of
-/// mounting a cross-site attack against this router always sends
-/// `Sec-Fetch-Site` on fetches and navigations, while a non-browser client
-/// (curl, the `paseo` CLI, this crate's own tests) never sends it at all.
-/// Refusing an absent header would break every non-browser caller for zero
-/// security gain against the one actor the header exists to constrain. When
-/// the header IS present, only `same-origin` and `none` (a typed-URL or
-/// bookmark navigation, not a cross-site fetch) are allowed --
-/// `same-site` is refused too: a sibling subdomain sharing this
-/// deployment's parent domain is not this origin. Do not "tighten" the
-/// absent case into a refusal; that would lock out every non-browser client
-/// this daemon serves.
-fn sec_fetch_site_is_allowed(headers: &HeaderMap) -> bool {
+/// can drive it directly against a bare method and `HeaderMap`. An ABSENT
+/// `Sec-Fetch-Site` header is ALLOWED -- deliberately, not an oversight:
+/// every browser capable of mounting a cross-site attack against this
+/// router always sends `Sec-Fetch-Site` on fetches and navigations, while a
+/// non-browser client (curl, the `paseo` CLI, this crate's own tests) never
+/// sends it at all. Refusing an absent header would break every non-browser
+/// caller for zero security gain against the one actor the header exists to
+/// constrain. When the header IS present, `same-origin` and `none` (a
+/// typed-URL or bookmark navigation, not a cross-site fetch) are allowed
+/// outright.
+///
+/// changes-diff-screen cds-4: a `cross-site` or `same-site` value is allowed
+/// ONLY as a top-level navigation -- a GET or HEAD carrying
+/// `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`. This is the
+/// standard Fetch-Metadata resource-isolation shape, and it is what makes
+/// the daemon reachable behind an identity proxy at all: Cloudflare Access
+/// bounces the operator through its own login origin and redirects back to
+/// the configured hostname, and that return trip is by definition a
+/// cross-site top-level navigation. Refusing it 421'd the site immediately
+/// after every successful login.
+///
+/// Allowing it is safe because CSRF lives on state-changing requests, and
+/// every mutating route this router serves is a POST (`/api/config`,
+/// `/api/projects/...`, `/paseo/:agent_id/send`, `/paseo/:agent_id/permit`)
+/// -- a cross-site POST is still refused here, whatever its
+/// `Sec-Fetch-Mode`. The `Dest: document` half keeps the allowance to real
+/// navigations: a cross-site `iframe`/`frame`/`image`/`script` load, or a
+/// `cors`/`no-cors` fetch, never satisfies it, so cross-origin embedding
+/// and cross-origin reads stay refused exactly as before.
+///
+/// Do not "tighten" the absent case into a refusal; that would lock out
+/// every non-browser client this daemon serves.
+fn sec_fetch_is_allowed(method: &Method, headers: &HeaderMap) -> bool {
     let Some(value) = headers.get("sec-fetch-site") else {
         return true;
     };
-    matches!(value.to_str(), Ok("same-origin") | Ok("none"))
+    match value.to_str() {
+        Ok("same-origin") | Ok("none") => true,
+        // `cross-site` and `same-site` -- and any value a future browser
+        // spells that this build does not know -- get exactly one door: the
+        // top-level navigation.
+        Ok(_) => is_top_level_navigation(method, headers),
+        // A non-UTF-8 `Sec-Fetch-Site` is not something any browser sends;
+        // refuse it rather than guess, same as before this allowance.
+        Err(_) => false,
+    }
+}
+
+/// The top-level-navigation half of `sec_fetch_is_allowed`: true only for a
+/// safe method (GET/HEAD -- never a mutating one) whose `Sec-Fetch-Mode` is
+/// exactly `navigate` and whose `Sec-Fetch-Dest` is exactly `document`.
+/// Both headers must be PRESENT: a request that omits them is not a browser
+/// navigation, and this door is only ever opened for one.
+fn is_top_level_navigation(method: &Method, headers: &HeaderMap) -> bool {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    header_equals(headers, "sec-fetch-mode", "navigate")
+        && header_equals(headers, "sec-fetch-dest", "document")
+}
+
+/// `headers[name] == expected`, with an absent or non-UTF-8 value reading
+/// as "no" rather than as a match.
+fn header_equals(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected)
 }
 
 /// D1/D6: the bound on `index_page`'s one herdr snapshot. `SocketHerdr::call`
@@ -7393,28 +7444,88 @@ async fn jump_search(
     Json(hits).into_response()
 }
 
-/// The Changes screen: the project's working tree against HEAD (D2). Every
-/// git call happens inside `Engine::changes`, on a blocking thread -- the
-/// calls have a 10 s budget of their own, and a request holding a runtime
-/// worker that long would starve every other page.
+/// The base the Changes screen was asked for (D6). `?commit=<sha>` is the
+/// only value; anything else about the query string is ignored.
+///
+/// D7 is NOT enforced here on purpose: this layer does no validation, so
+/// there is exactly one gate to audit and it sits next to the git calls it
+/// protects (`git_diff::diff`). What this layer owes is that the value
+/// reaches that gate unchanged and never comes back out — an unresolvable
+/// commit renders the working tree, and the response carries no trace of
+/// what was sent.
+#[derive(serde::Deserialize)]
+struct ChangesQuery {
+    #[serde(default)]
+    commit: Option<String>,
+    /// D9's view flag, carried on the same query as `commit`. Read only by
+    /// [`page_chrome`], never by anything that touches the repository.
+    #[serde(default)]
+    embed: Option<String>,
+}
+
+/// The `embed` flag alone, for the two Code routes — the same field
+/// `ChangesQuery` carries, with nothing else on it.
+#[derive(serde::Deserialize)]
+struct CodeQuery {
+    #[serde(default)]
+    embed: Option<String>,
+}
+
+/// D9: how much chrome a Code or Changes page renders, decided from the
+/// `embed` query value and nothing else.
+///
+/// `embed=1` — and only that — asks for the chrome-less rendering. Absent,
+/// empty, `0`, `true`, or anything a reader made up all fall through to the
+/// full page, so an unrecognised value can never produce a stranger page
+/// than the one that route has always served. The value never reaches a
+/// filesystem path, a git argument, or the response body: it selects between
+/// two constants in `views` and stops there.
+fn page_chrome(embed: Option<&str>) -> views::PageChrome {
+    match embed.map(str::trim) {
+        Some("1") => views::PageChrome::Embed,
+        _ => views::PageChrome::Full,
+    }
+}
+
+/// The Changes screen: the project's working tree against HEAD (D2), or one
+/// commit against its parent when `?commit=<sha>` names one (D6). Every git
+/// call happens inside `Engine::changes`, on a blocking thread -- the calls
+/// have a 10 s budget of their own, and a request holding a runtime worker
+/// that long would starve every other page.
 ///
 /// git missing, the project not being a repository, and a killed call are
 /// all a 200 carrying the explained empty state (D3), never a 500 and never
-/// a hidden entry point. Only an unknown project id is a 404.
+/// a hidden entry point. So is a `?commit` value that names no commit: it
+/// falls back to the working-tree view (D7). Only an unknown project id is
+/// a 404.
 ///
 /// Highlighting both sides of every section is as CPU-bound as the git calls
 /// are I/O-bound, so the whole page — read, highlight, format — is built on
 /// the same blocking thread and only the finished HTML crosses back.
-async fn changes_screen(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn changes_screen(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ChangesQuery>,
+) -> Response {
     let Ok(Some(project)) = st.engine.get_project(&id) else {
         return not_found("project not found");
     };
+    let base = match query
+        .commit
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(sha) => DiffBase::Commit(sha.to_string()),
+        None => DiffBase::WorkingTree,
+    };
+    let chrome = page_chrome(query.embed.as_deref());
     let engine = st.engine.clone();
     let project_id = id.clone();
     let page = tokio::task::spawn_blocking(move || {
         engine
-            .changes(&project_id)
-            .map(|view| views::changes_page(&project, &view, changes_highlighter()))
+            .changes(&project_id, &base)
+            .map(|view| views::changes_page(&project, &view, changes_highlighter(), chrome))
     })
     .await;
     match page {
@@ -7436,15 +7547,20 @@ fn changes_highlighter() -> &'static RenderService {
     HIGHLIGHTER.get_or_init(RenderService::new)
 }
 
-async fn code_root(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    code_response(&st, &id, "").await
+async fn code_root(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CodeQuery>,
+) -> Response {
+    code_response(&st, &id, "", page_chrome(query.embed.as_deref())).await
 }
 
 async fn code_dir_or_file(
     State(st): State<AppState>,
     Path((id, path)): Path<(String, String)>,
+    Query(query): Query<CodeQuery>,
 ) -> Response {
-    code_response(&st, &id, &path).await
+    code_response(&st, &id, &path, page_chrome(query.embed.as_deref())).await
 }
 
 /// Shared body for both Code-section routes. Every filesystem access goes
@@ -7452,13 +7568,13 @@ async fn code_dir_or_file(
 /// this section — this function never computes a path itself. A denied path
 /// and a missing path return the identical 404 body: a distinguishing
 /// message would itself disclose that a denied file exists.
-async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
+async fn code_response(st: &AppState, id: &str, path: &str, chrome: views::PageChrome) -> Response {
     let Ok(Some(project)) = st.engine.get_project(id) else {
         return not_found("file not found");
     };
     match st.engine.code_path(id, path) {
         Ok(waggledance_core::engine::CodeView::Dir(listing)) => {
-            Html(views::code_dir_page(&project, &listing)).into_response()
+            Html(views::code_dir_page(&project, &listing, chrome)).into_response()
         }
         Ok(waggledance_core::engine::CodeView::File {
             highlighted,
@@ -7475,6 +7591,7 @@ async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
                     size,
                 },
                 &sidebar,
+                chrome,
             ))
             .into_response()
         }
@@ -7485,6 +7602,7 @@ async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
                 path,
                 views::CodeBody::Binary { size },
                 &sidebar,
+                chrome,
             ))
             .into_response()
         }
@@ -29086,7 +29204,10 @@ mod bee_route_tests {
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            v["html"].as_str().unwrap().contains("No conversation recorded"),
+            v["html"]
+                .as_str()
+                .unwrap()
+                .contains("No conversation recorded"),
             "{body}"
         );
 
@@ -29119,7 +29240,10 @@ mod bee_route_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["html"].as_str().unwrap().contains("not installed"), "{body}");
+        assert!(
+            v["html"].as_str().unwrap().contains("not installed"),
+            "{body}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -29157,7 +29281,10 @@ mod bee_route_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["html"].as_str().unwrap().contains("not reachable"), "{body}");
+        assert!(
+            v["html"].as_str().unwrap().contains("not reachable"),
+            "{body}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -29203,7 +29330,10 @@ mod bee_route_tests {
             "S6: captured stderr must never reach the page: {body}"
         );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["html"].as_str().unwrap().contains("could not read"), "{body}");
+        assert!(
+            v["html"].as_str().unwrap().contains("could not read"),
+            "{body}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -29247,7 +29377,10 @@ mod bee_route_tests {
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["error"].as_str().unwrap().contains("disabled"), "{body}");
-        assert!(!log.exists(), "the switch being off must never reach the CLI");
+        assert!(
+            !log.exists(),
+            "the switch being off must never reach the CLI"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&store).ok();
@@ -29386,7 +29519,14 @@ mod bee_route_tests {
         let lines: Vec<&str> = argv.lines().collect();
         assert_eq!(
             lines,
-            vec!["send", "agent-1", "--prompt", "hello there", "--no-wait", "--json"],
+            vec![
+                "send",
+                "agent-1",
+                "--prompt",
+                "hello there",
+                "--no-wait",
+                "--json"
+            ],
             "argv must match PaseoCli::send's own shape (S1/S2)"
         );
 
@@ -29477,7 +29617,10 @@ mod bee_route_tests {
             v["error"].as_str().unwrap().contains("32768-byte limit"),
             "the app's own named refusal must name the byte limit, never axum's bare 413: {body}"
         );
-        assert!(!log.exists(), "an oversized message must never reach the CLI");
+        assert!(
+            !log.exists(),
+            "an oversized message must never reach the CLI"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -29552,10 +29695,7 @@ mod bee_route_tests {
             .method("OPTIONS")
             .uri("/paseo/agent-1/send")
             .header(header::ORIGIN, "https://evil.example")
-            .header(
-                header::ACCESS_CONTROL_REQUEST_METHOD,
-                "POST",
-            )
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -30215,7 +30355,10 @@ mod bee_route_tests {
         );
 
         let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
-        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls", "--json"]);
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["permit", "ls", "--json"]
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -30265,7 +30408,10 @@ mod bee_route_tests {
         );
 
         let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
-        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls", "--json"]);
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["permit", "ls", "--json"]
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -30648,7 +30794,10 @@ mod bee_route_tests {
         let html = v["html"].as_str().unwrap();
         assert!(!html.contains("data-paseo-permit"), "{html}");
         assert!(!html.contains("was not recognized"), "{html}");
-        assert!(html.contains("hi"), "the conversation body must still render: {html}");
+        assert!(
+            html.contains("hi"),
+            "the conversation body must still render: {html}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -30897,38 +31046,109 @@ mod bee_route_tests {
     /// S8 must-have: an ABSENT `Sec-Fetch-Site` header is allowed, so every
     /// non-browser client (curl, the `paseo` CLI) keeps working unchanged.
     #[test]
-    fn sec_fetch_site_is_allowed_when_the_header_is_absent() {
+    fn sec_fetch_is_allowed_when_the_site_header_is_absent() {
         let headers = HeaderMap::new();
         assert!(
-            sec_fetch_site_is_allowed(&headers),
+            sec_fetch_is_allowed(&Method::GET, &headers),
             "an absent Sec-Fetch-Site header must be allowed"
         );
     }
 
     /// S8 must-have: `same-origin` and `none` are allowed.
     #[test]
-    fn sec_fetch_site_is_allowed_for_same_origin_and_none() {
+    fn sec_fetch_is_allowed_for_same_origin_and_none() {
         for value in ["same-origin", "none"] {
             let mut headers = HeaderMap::new();
             headers.insert("sec-fetch-site", value.parse().unwrap());
             assert!(
-                sec_fetch_site_is_allowed(&headers),
+                sec_fetch_is_allowed(&Method::GET, &headers),
                 "Sec-Fetch-Site {value:?} must be allowed"
             );
         }
     }
 
-    /// S8 must-have: `cross-site` is refused, and `same-site` is refused
-    /// too -- a sibling subdomain under this deployment's shared parent
-    /// domain is not this origin.
+    /// S8 must-have: `cross-site` and `same-site` are refused when the
+    /// request is not a navigation -- here, with no `Sec-Fetch-Mode` or
+    /// `Sec-Fetch-Dest` at all, which is every cross-origin fetch this
+    /// guard exists to stop.
     #[test]
-    fn sec_fetch_site_is_refused_for_cross_site_and_same_site() {
+    fn sec_fetch_is_refused_for_cross_site_and_same_site_non_navigations() {
         for value in ["cross-site", "same-site"] {
             let mut headers = HeaderMap::new();
             headers.insert("sec-fetch-site", value.parse().unwrap());
             assert!(
-                !sec_fetch_site_is_allowed(&headers),
-                "Sec-Fetch-Site {value:?} must be refused"
+                !sec_fetch_is_allowed(&Method::GET, &headers),
+                "Sec-Fetch-Site {value:?} must be refused without a navigation"
+            );
+        }
+    }
+
+    /// cds-4 must-have: a cross-site TOP-LEVEL NAVIGATION is allowed -- the
+    /// shape an identity proxy's post-login redirect back to the configured
+    /// hostname arrives in. `same-site` navigations ride the same door.
+    #[test]
+    fn cross_site_top_level_navigation_is_allowed() {
+        for site in ["cross-site", "same-site"] {
+            for method in [Method::GET, Method::HEAD] {
+                let mut headers = HeaderMap::new();
+                headers.insert("sec-fetch-site", site.parse().unwrap());
+                headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+                headers.insert("sec-fetch-dest", "document".parse().unwrap());
+                assert!(
+                    sec_fetch_is_allowed(&method, &headers),
+                    "a {method} navigation from {site:?} must be allowed"
+                );
+            }
+        }
+    }
+
+    /// cds-4 must-have: the navigation door is safe-method only -- a
+    /// cross-site POST is refused even when it claims to be a navigation,
+    /// which is what keeps the CSRF half of this guard intact.
+    #[test]
+    fn cross_site_mutating_navigation_is_refused() {
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+            headers.insert("sec-fetch-dest", "document".parse().unwrap());
+            assert!(
+                !sec_fetch_is_allowed(&method, &headers),
+                "a cross-site {method} must be refused"
+            );
+        }
+    }
+
+    /// cds-4 must-have: a cross-site GET that is not a navigation --
+    /// `cors`, `no-cors`, or no `Sec-Fetch-Mode` at all -- stays refused.
+    #[test]
+    fn cross_site_non_navigate_mode_is_refused() {
+        for mode in ["cors", "no-cors", "same-origin", "websocket"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            headers.insert("sec-fetch-mode", mode.parse().unwrap());
+            headers.insert("sec-fetch-dest", "document".parse().unwrap());
+            assert!(
+                !sec_fetch_is_allowed(&Method::GET, &headers),
+                "a cross-site GET with Sec-Fetch-Mode {mode:?} must be refused"
+            );
+        }
+    }
+
+    /// cds-4 must-have: a cross-site navigate whose destination is not a
+    /// document -- an iframe, a script, an image -- stays refused, so
+    /// cross-origin embedding of this daemon is no more possible than it
+    /// was before the navigation allowance existed.
+    #[test]
+    fn cross_site_navigate_to_a_non_document_dest_is_refused() {
+        for dest in ["iframe", "frame", "image", "script", "empty"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+            headers.insert("sec-fetch-dest", dest.parse().unwrap());
+            assert!(
+                !sec_fetch_is_allowed(&Method::GET, &headers),
+                "a cross-site navigation to Sec-Fetch-Dest {dest:?} must be refused"
             );
         }
     }
@@ -31056,8 +31276,9 @@ mod bee_route_tests {
         }
     }
 
-    /// S8: `cross-site` and `same-site` are refused with the same 421 shape
-    /// the Host guard uses -- one consistent behaviour, not two dialects.
+    /// S8: `cross-site` and `same-site` fetches -- no `Sec-Fetch-Mode`, so
+    /// not navigations -- are refused with the same 421 shape the Host
+    /// guard uses: one consistent behaviour, not two dialects.
     #[tokio::test]
     async fn cross_site_and_same_site_sec_fetch_site_are_refused_with_421() {
         for value in ["cross-site", "same-site"] {
@@ -31073,6 +31294,86 @@ mod bee_route_tests {
                 resp.status(),
                 StatusCode::MISDIRECTED_REQUEST,
                 "Sec-Fetch-Site {value:?} must be refused with 421"
+            );
+        }
+    }
+
+    /// cds-4 must-have 1, through the whole router: the request an identity
+    /// proxy's post-login redirect actually makes -- the operator's
+    /// configured hostname in `Host`, a cross-site top-level navigation in
+    /// the Fetch-Metadata headers -- reaches an ordinary GET route instead
+    /// of 421ing the operator out of their own site.
+    #[tokio::test]
+    async fn cross_site_top_level_navigation_reaches_a_plain_get_route() {
+        let app = router(build_state_with_hostname("waggle.gogl.be"));
+        let req = Request::builder()
+            .header(header::HOST, "waggle.gogl.be")
+            .header("sec-fetch-site", "cross-site")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a cross-site top-level navigation must reach /health"
+        );
+    }
+
+    /// cds-4 must-have 2, on the state-changing route the original CSRF
+    /// finding named: a cross-site POST is still refused with 421 even
+    /// while claiming navigate/document -- and, per
+    /// `docs/history/learnings/20260805-toothless-security-assertions.md`,
+    /// the config on disk is untouched, not merely the response code.
+    #[tokio::test]
+    async fn cross_site_post_is_refused_with_421_and_leaves_config_unchanged() {
+        let dir = fresh_root("cds4-cross-site-api-config");
+        let st = build_state_with_dir(&dir);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7700")
+            .header("sec-fetch-site", "cross-site")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .method("POST")
+            .uri("/api/config")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("port=58314"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+
+        assert!(
+            !dir.join("config.toml").exists(),
+            "a cross-site POST must never reach update_config's write at all"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// cds-4 must-have 3, through the whole router: a cross-site GET that
+    /// is not a navigation -- a `cors` fetch, and a navigate aimed at an
+    /// `iframe` -- is still refused with 421.
+    #[tokio::test]
+    async fn cross_site_non_navigation_gets_are_refused_with_421() {
+        for (mode, dest) in [("cors", "empty"), ("navigate", "iframe")] {
+            let app = router(build_state());
+            let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7700")
+                .header("sec-fetch-site", "cross-site")
+                .header("sec-fetch-mode", mode)
+                .header("sec-fetch-dest", dest)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "a cross-site GET (mode {mode:?}, dest {dest:?}) must be refused with 421"
             );
         }
     }
@@ -34784,6 +35085,118 @@ needs_you:
         );
     }
 
+    /// A fixture git call whose stdout is the answer: the commit-mode route
+    /// tests have to learn the sha they are about to put in a URL.
+    fn git_fixture_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/nonexistent/waggledance-git-global")
+            .env("GIT_CONFIG_SYSTEM", "/nonexistent/waggledance-git-system")
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// cds-5 / D6: `?commit=<sha>` end to end. The parsers have their own
+    /// unit tests; what only the route can prove is that the query value
+    /// reaches the git layer and that the page comes back showing THAT
+    /// commit — the working tree is dirtied first so the two are
+    /// distinguishable in the response body.
+    #[tokio::test]
+    async fn changes_route_in_commit_mode_shows_that_commit_not_the_working_tree() {
+        let dir = fresh_root("changes-commit");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "first"]);
+        write(&dir, "mod.txt", "alpha\nCOMMITTED\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "the second commit"]);
+        let sha = git_fixture_out(&dir, &["rev-parse", "HEAD"]);
+        // Noise the commit view must not pick up: an edit and an untracked
+        // file, both real on disk and both absent from the commit.
+        write(&dir, "mod.txt", "alpha\nDIRTYWORKTREE\n");
+        write(&dir, "loosefile.txt", "untracked\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-commit");
+        let resp = get(
+            router(st),
+            &format!("/p/{}/_changes?commit={sha}", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        assert!(
+            body.contains("COMMITTED"),
+            "the commit's own new side renders: {body}"
+        );
+        assert!(
+            !body.contains("DIRTYWORKTREE"),
+            "a commit base never shows what the working tree holds now: {body}"
+        );
+        assert!(
+            !body.contains("loosefile.txt"),
+            "no untracked call runs in commit mode: {body}"
+        );
+        assert!(
+            body.contains("the second commit") && body.contains(&sha[..7]),
+            "the header names the commit being read: {body}"
+        );
+        assert!(
+            !body.contains("working tree"),
+            "and no longer claims to be the working tree: {body}"
+        );
+    }
+
+    /// D7 through the route: a `?commit` value that is not a commit renders
+    /// the working tree, with a 200 and with no trace of what was sent —
+    /// the daemon is unauthenticated on the LAN, so a reflected value is a
+    /// finding on its own.
+    #[tokio::test]
+    async fn changes_route_with_an_unusable_commit_falls_back_without_echoing_it() {
+        let dir = fresh_root("changes-badcommit");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return;
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nWORKTREEONLY\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-badcommit");
+        let app = router(st);
+        for raw in [
+            "zzz",
+            "--upload-pack=x",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            let resp = get(
+                app.clone(),
+                &format!("/p/{}/_changes?commit={raw}", project.id),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "D7: never a 500 for {raw}");
+            let body = body_string(resp).await;
+            assert!(
+                body.contains("working tree") && body.contains("WORKTREEONLY"),
+                "the fallback is the real working-tree view: {body}"
+            );
+            assert!(
+                !body.contains(raw),
+                "the refused value is never echoed back: {raw}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn changes_route_resolves_above_the_project_path_catch_all() {
         let dir = fresh_root("changes-catchall");
@@ -34795,6 +35208,114 @@ needs_you:
         assert!(
             body.contains("class=\"changes\""),
             "the Changes screen answered, not the document catch-all: {body}"
+        );
+    }
+
+    /// cds-7 / D9: `?embed=1` on the Changes route serves the same screen
+    /// with no topbar, so a same-origin iframe carries one application bar
+    /// rather than two. The whole point is that only the bar goes: the
+    /// changed-file sidebar, the base picker and the reviewed marks are all
+    /// still on the page, and a real repository is what proves it — the
+    /// picker only renders where there is a diff to pick a base for.
+    #[tokio::test]
+    async fn changes_route_with_embed_drops_the_topbar_and_keeps_the_screen() {
+        let dir = fresh_root("changes-embed");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the view unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-embed");
+        let app = router(st);
+
+        let plain =
+            body_string(get(app.clone(), &format!("/p/{}/_changes", project.id)).await).await;
+        assert!(
+            plain.contains("<header class=\"topbar\">"),
+            "the ordinary page still has its bar: {plain}"
+        );
+
+        let resp = get(app.clone(), &format!("/p/{}/_changes?embed=1", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("<header class=\"topbar\">") && !body.contains("section-switch"),
+            "embed=1 serves the screen with no outer chrome: {body}"
+        );
+        assert!(
+            body.contains("class=\"layout layout--embed\""),
+            "and says so, so app.css can drop the topbar offset: {body}"
+        );
+        assert!(
+            body.contains("changes-nav") && body.contains("mod.txt"),
+            "the changed-file sidebar is still the point of the screen: {body}"
+        );
+        assert!(
+            body.contains("changes__base-select") && body.contains("data-embed=\"1\""),
+            "the base picker stays and keeps the reader in the frame: {body}"
+        );
+        assert!(
+            body.contains("changeset__review"),
+            "the reviewed marks stay: {body}"
+        );
+
+        // Anything that is not `embed=1` is the page as it always was.
+        for raw in ["0", "true", "", "yes"] {
+            let body = body_string(
+                get(
+                    app.clone(),
+                    &format!("/p/{}/_changes?embed={raw}", project.id),
+                )
+                .await,
+            )
+            .await;
+            assert!(
+                body.contains("<header class=\"topbar\">"),
+                "an unrecognised embed value renders normal chrome ({raw}): {body}"
+            );
+        }
+    }
+
+    /// cds-7 / D9 on the Code section: the tree is the whole reason to embed
+    /// this page, so its links have to keep the reader inside the frame they
+    /// were clicked in.
+    #[tokio::test]
+    async fn code_routes_with_embed_drop_the_topbar_and_keep_the_tree_embedded() {
+        let dir = fresh_root("code-embed");
+        write(&dir, "src/main.rs", "fn main() {}\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "code-embed");
+        let app = router(st);
+
+        for path in ["_code/", "_code/src", "_code/src/main.rs"] {
+            let resp = get(app.clone(), &format!("/p/{}/{path}?embed=1", project.id)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = body_string(resp).await;
+            assert!(
+                !body.contains("<header class=\"topbar\">") && !body.contains("section-switch"),
+                "embed=1 drops the chrome on {path}: {body}"
+            );
+            assert!(
+                body.contains("class=\"layout layout--embed\""),
+                "and marks the layout embedded on {path}: {body}"
+            );
+            assert!(
+                body.contains(&format!("href=\"/p/{}/_code/?embed=1\"", project.id)),
+                "the tree's root crumb carries embed on {path}: {body}"
+            );
+        }
+
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_code/src", project.id)).await).await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && !body.contains("embed=1"),
+            "without the param the Code page is untouched: {body}"
         );
     }
 }

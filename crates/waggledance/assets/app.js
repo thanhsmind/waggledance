@@ -1659,9 +1659,55 @@
         visible.sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
         setActive("#" + visible[0].target.id);
       },
-      { rootMargin: "-53px 0px -70% 0px", threshold: 0 }
+      // The top inset is the topbar's own rendered height, so a section
+      // counts as "current" from the moment it clears the bar. Under D9's
+      // `embed=1` there IS no bar (`.layout--embed`), and keeping the inset
+      // would hand the highlight to the next section 53px early.
+      {
+        rootMargin:
+          (document.querySelector(".layout--embed") ? "0px" : "-53px") +
+          " 0px -70% 0px",
+        threshold: 0,
+      }
     );
     sections.forEach(function (s) { observer.observe(s); });
+  })();
+
+  // Changes-screen base picker (changes-diff-screen, D6): the header's
+  // `<select>` lists the working tree and the repository's recent commits,
+  // and choosing one is a NAVIGATION, not a form post — so the address bar
+  // keeps holding the shareable thing it already held: `?commit=<sha>` for a
+  // commit, the plain screen URL for the working tree.
+  //
+  // Values come from the server's own commit list and are shas or the empty
+  // string, never anything a reader typed. The hex test below is belt and
+  // braces on that; the server checks the same value again (D7) before git
+  // ever sees it.
+  //
+  // The surrounding `<form>` is what works with scripting off, so the submit
+  // button only earns its place there — here it is hidden, because the
+  // change handler has already done the navigating.
+  //
+  // D9: on an embedded page (`data-embed="1"`, the same flag the form's own
+  // hidden field carries for the scripting-off path) the navigation keeps
+  // `embed=1` on it — picking a base inside an iframe must not replace the
+  // frame with a full-chrome page.
+  (function () {
+    var sel = document.querySelector(".changes__base-select[data-base-url]");
+    if (!sel) return;
+    var url = sel.getAttribute("data-base-url");
+    if (!url) return;
+    var embed = sel.getAttribute("data-embed") === "1";
+    var go = sel.form && sel.form.querySelector(".changes__base-go");
+    if (go) go.hidden = true;
+    sel.addEventListener("change", function () {
+      var v = sel.value || "";
+      if (v && !/^[0-9a-f]{4,40}$/.test(v)) return;
+      var q = [];
+      if (v) q.push("commit=" + encodeURIComponent(v));
+      if (embed) q.push("embed=1");
+      window.location.href = q.length ? url + "?" + q.join("&") : url;
+    });
   })();
 
   // Changes-screen reviewed marks (changes-diff-screen, D4): which files the
@@ -1686,7 +1732,16 @@
     var sections = Array.prototype.slice.call(root.querySelectorAll(".changeset[data-key]"));
     if (!sections.length) return;
 
-    var KEY = "waggledance-reviewed:" + root.getAttribute("data-project-id");
+    // D6: a mark says "I have read this file IN THIS COMPARISON", so the key
+    // carries the base. The working tree keeps the key it has always had —
+    // marks made before the picker existed are still the same reader's marks
+    // on the same screen — and each commit view gets a key of its own, so
+    // reading a commit never ticks off the work you have not looked at yet.
+    var base = root.getAttribute("data-base") || "";
+    var KEY =
+      "waggledance-reviewed:" +
+      root.getAttribute("data-project-id") +
+      (base ? ":" + base : "");
     var counter = root.querySelector(".changes__reviewed");
     var nav = document.querySelector(".changes-nav");
     var total = sections.length;
@@ -1800,6 +1855,107 @@
     // Write once on load so the marks dropped just above (edited files, files
     // no longer in the diff) leave storage instead of growing there forever.
     save();
+  })();
+
+
+  // Terminal FILES | DIFF panel (changes-diff-screen, D8/D9): the terminal
+  // page can put this project's own file tree or its working-tree diff in the
+  // TOP HALF of the screen area, the terminal compressing into the bottom
+  // half — watching an agent work and reading what it just wrote is one
+  // glance, not two tabs. Clicking the tab that is already open closes the
+  // panel and the terminal returns to full height.
+  //
+  // D9's two addresses are the SERVER's (`views.rs::terminal_embed_panel`):
+  // each button carries its own `data-embed-src`, already escaped, and this
+  // module only ever copies that attribute onto the frame. No project id is
+  // assembled here, and no URL that is not one of those two attributes can
+  // ever reach the iframe — including on the restore path below, where the
+  // stored value only ever NAMES a tab this page already rendered.
+  //
+  // The frame is lazy in the markup itself (no `src` ships), and once loaded
+  // it stays loaded: closing hides the panel rather than tearing the frame
+  // down, so reopening the same tab shows a page that is already there.
+  (function () {
+    var root = document.querySelector(".term-embed[data-project-id]");
+    if (!root) return;
+    var tabs = Array.prototype.slice.call(
+      root.querySelectorAll(".term-embed__tab[data-embed-tab]")
+    );
+    var panel = root.querySelector(".term-embed__panel");
+    var frame = root.querySelector(".term-embed__frame");
+    if (!tabs.length || !panel || !frame) return;
+    // The split is a property of the whole content area, not of the panel:
+    // `<main>` is what has to stop scrolling the page and start dividing a
+    // fixed height between the two halves.
+    var main = document.querySelector("main.fg-page[data-project-id]");
+    var KEY = "waggledance-term-panel:" + root.getAttribute("data-project-id");
+    var openTab = "";
+
+    function paint() {
+      tabs.forEach(function (btn) {
+        var on = btn.getAttribute("data-embed-tab") === openTab;
+        btn.setAttribute("aria-pressed", on ? "true" : "false");
+        btn.classList.toggle("term-embed__tab--on", on);
+      });
+      panel.hidden = !openTab;
+      root.classList.toggle("term-embed--open", !!openTab);
+      if (main) main.classList.toggle("term-split", !!openTab);
+      // The terminal keeps its full WIDTH either way — the panel is above it,
+      // never beside it — but the bottom half becomes its own scroll
+      // container, and that scrollbar can take a few pixels off the screen's
+      // available width. The screen poller already refits on `resize` and
+      // already skips a pane whose available width did not actually move, so
+      // this reuses that path instead of reaching into the poller: nothing
+      // about polling, input or scrollback changes here.
+      try { window.dispatchEvent(new Event("resize")); } catch (e) {}
+    }
+
+    function tabButton(name) {
+      var found = null;
+      tabs.forEach(function (btn) {
+        if (btn.getAttribute("data-embed-tab") === name) found = btn;
+      });
+      return found;
+    }
+
+    function show(name) {
+      var btn = tabButton(name);
+      if (!btn) return;
+      var src = btn.getAttribute("data-embed-src") || "";
+      if (!src) return;
+      openTab = name;
+      if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);
+      paint();
+    }
+
+    function close() {
+      openTab = "";
+      paint();
+    }
+
+    // Storage is a hostile input like everywhere else (the rail and tab-bar
+    // collapses above take the same shape): a disabled or quota-blocked
+    // `sessionStorage` throws on read or write, and every failure degrades to
+    // the default this page already renders — closed.
+    function persist() {
+      try {
+        if (openTab) sessionStorage.setItem(KEY, openTab);
+        else sessionStorage.removeItem(KEY);
+      } catch (e) {}
+    }
+
+    tabs.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var name = btn.getAttribute("data-embed-tab") || "";
+        if (name && name === openTab) close();
+        else show(name);
+        persist();
+      });
+    });
+
+    var stored = null;
+    try { stored = sessionStorage.getItem(KEY); } catch (e) { stored = null; }
+    if (stored) show(stored);
   })();
 
 
