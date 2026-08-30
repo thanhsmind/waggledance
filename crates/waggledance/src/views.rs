@@ -3265,6 +3265,42 @@ fn agent_switch_drawer(homepage: bool) -> String {
     )
 }
 
+/// changes-diff-screen D8: the terminal page's own FILES | DIFF panel —
+/// two toggle buttons above the screen and the container the panel opens
+/// into. Open, the panel takes the TOP HALF of the content area and the
+/// terminal compresses into the bottom half; closed (the default this
+/// renders) the page is byte-for-byte the terminal page it has always been
+/// apart from the two buttons themselves — no panel, no frame, no request.
+///
+/// D9 lives entirely in the two `data-embed-src` attributes: the panel is a
+/// same-origin iframe onto the Code and Changes pages this project already
+/// serves, in their `embed=1` chrome (topbar off, in-page sidebars intact —
+/// [`PageChrome::Embed`]). There is no fragment endpoint and no second
+/// render path, and `assets/app.js` never assembles a project id into a URL:
+/// the two addresses are built HERE, escaped here, and the script only ever
+/// copies the attribute it is handed onto the frame.
+///
+/// The `<iframe>` ships with no `src` at all — that is the laziness, in
+/// markup rather than in script: a terminal page nobody opens the panel on
+/// fetches neither page. `assets/app.js` sets it the first time a tab is
+/// opened and leaves it set, so reopening a tab shows a frame already
+/// loaded.
+fn terminal_embed_panel(project_id: &str) -> String {
+    let pid = esc(project_id);
+    format!(
+        r#"<div class="term-embed" data-project-id="{pid}">
+  <div class="term-embed__tabs" role="group" aria-label="Show this project's files or diff above the terminal">
+    <button type="button" class="term-embed__tab" data-embed-tab="files" data-embed-src="/p/{pid}/_code/?embed=1" aria-pressed="false">FILES</button>
+    <button type="button" class="term-embed__tab" data-embed-tab="diff" data-embed-src="/p/{pid}/_changes?embed=1" aria-pressed="false">DIFF</button>
+  </div>
+  <div class="term-embed__panel" hidden>
+    <iframe class="term-embed__frame" title="Project files and diff"></iframe>
+  </div>
+</div>"#,
+        pid = pid,
+    )
+}
+
 /// `GET /p/:id/_terminal` and `/p/:id/_terminal/pane/:pane_id` up state
 /// (D2/D4/D6): one pane's own page, chosen by `selected` from the pane strip
 /// (D4) rendered above it. `selected` is `None` only when `panes` is empty
@@ -3306,6 +3342,7 @@ pub fn terminal_page(
 {tab_style}
 <main class="fg-page fg-page--tight" data-project-id="{pid}">
   {bar}
+  {embed}
   <div class="term-panes">{rows}</div>
 </main>"#,
         topbar = topbar_full(
@@ -3320,6 +3357,7 @@ pub fn terminal_page(
         tab_style = PROJECT_TAB_STYLE,
         pid = esc(&project.id),
         bar = bar,
+        embed = terminal_embed_panel(&project.id),
         rows = rows,
     );
     layout_with_drawer(&format!("{} · terminal", project.name), "", &body, false)
@@ -13094,6 +13132,126 @@ mod tests {
         assert!(
             html.contains(r#"href="/p/proj-1/_terminal/pane/w1:p1""#),
             "the pane's link must reproduce today's `/p/{{id}}/_terminal/pane/{{pane_id}}` shape: {html}"
+        );
+    }
+
+    /// changes-diff-screen D8/D9: the terminal page offers FILES and DIFF,
+    /// and offers them CLOSED. Both buttons carry the exact `embed=1`
+    /// addresses the script is allowed to load — built here, never assembled
+    /// from a project id in `assets/app.js` — the panel ships hidden, and the
+    /// frame ships with no `src` at all, so a terminal page nobody touches
+    /// fetches neither page.
+    #[test]
+    fn terminal_page_offers_files_and_diff_tabs_closed_with_no_frame_loaded() {
+        let project = sample_project();
+        let html = terminal_page(&project, &[], None, &[]);
+        assert!(
+            html.contains(
+                r#"<button type="button" class="term-embed__tab" data-embed-tab="files" data-embed-src="/p/proj-1/_code/?embed=1" aria-pressed="false">FILES</button>"#
+            ),
+            "FILES must carry the Code page's own embed URL: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<button type="button" class="term-embed__tab" data-embed-tab="diff" data-embed-src="/p/proj-1/_changes?embed=1" aria-pressed="false">DIFF</button>"#
+            ),
+            "DIFF must carry the Changes page's own embed URL: {html}"
+        );
+        assert!(
+            html.contains(r#"<div class="term-embed__panel" hidden>"#),
+            "the panel must exist and ship hidden: {html}"
+        );
+        let frame_start = html
+            .find("<iframe class=\"term-embed__frame\"")
+            .expect("no panel frame");
+        let frame_end = html[frame_start..]
+            .find('>')
+            .map(|i| frame_start + i)
+            .expect("unclosed iframe tag");
+        assert!(
+            !html[frame_start..frame_end].contains("src="),
+            "an untouched terminal page must load no frame: {html}"
+        );
+    }
+
+    /// The panel is the TOP half: it renders above the terminal, inside the
+    /// same content column, so opening it compresses the screen downward
+    /// rather than covering it.
+    #[test]
+    fn the_terminal_panel_renders_above_the_terminal() {
+        let project = sample_project();
+        let html = terminal_page(&project, &[], None, &[]);
+        let panel = html
+            .find(r#"<div class="term-embed" data-project-id="proj-1">"#)
+            .expect("no panel");
+        let panes = html
+            .find("<div class=\"term-panes\">")
+            .expect("no terminal pane list");
+        assert!(
+            panel < panes,
+            "the panel must render above the terminal: {html}"
+        );
+    }
+
+    /// D8's JS half. Three things are pinned because three things could go
+    /// quietly wrong: the frame's URL is only ever the button's own
+    /// server-rendered attribute (never a string built here from a project
+    /// id, and never a value read out of storage); the open tab is remembered
+    /// per project in `sessionStorage` under this feature's own key; and
+    /// every storage touch is wrapped, so a disabled or quota-blocked store
+    /// degrades to closed instead of taking the terminal page down.
+    #[test]
+    fn app_js_opens_the_terminal_panel_from_the_servers_own_urls() {
+        let script = include_str!("../assets/app.js");
+        assert!(
+            script.contains(r#"var src = btn.getAttribute("data-embed-src") || "";"#)
+                && script.contains(
+                    r#"if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);"#
+                ),
+            "the frame's src must be copied from the button's own attribute: {script}"
+        );
+        assert!(
+            script.contains(
+                r#"var KEY = "waggledance-term-panel:" + root.getAttribute("data-project-id");"#
+            ),
+            "the open tab must be remembered per project under the D8 key: {script}"
+        );
+        assert!(
+            script.contains(
+                r#"try { stored = sessionStorage.getItem(KEY); } catch (e) { stored = null; }"#
+            ),
+            "a throwing sessionStorage must read as closed: {script}"
+        );
+        assert!(
+            script.contains(r#"if (main) main.classList.toggle("term-split", !!openTab);"#),
+            "the split class must be driven by the open tab: {script}"
+        );
+    }
+
+    /// D8's CSS half: half and half, and only while a tab is open. The rule
+    /// hangs off `main.fg-page.term-split`, so with the panel closed nothing
+    /// in it applies and the terminal page keeps the page-scrolled,
+    /// full-height screen it has always had.
+    #[test]
+    fn the_terminal_panel_splits_the_content_area_in_half_only_while_open() {
+        let css = include_str!("../assets/app.css");
+        assert!(
+            css.contains(
+                "main.fg-page.term-split { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }"
+            ),
+            "the split must give the content area one fixed frame: {css}"
+        );
+        assert!(
+            css.contains("main.fg-page.term-split .term-embed { flex: 1 1 50%; min-height: 0; }"),
+            "the panel must take half the frame: {css}"
+        );
+        assert!(
+            css.contains("main.fg-page.term-split .term-panes { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top:"),
+            "the terminal must take the other half and scroll inside it: {css}"
+        );
+        assert!(
+            !css.contains(".term-embed__panel { display:"),
+            "the panel must take no display rule, or `hidden` would stop hiding it: {css}"
         );
     }
 

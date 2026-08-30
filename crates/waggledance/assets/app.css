@@ -3659,6 +3659,36 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
 }
 
 /* ============================================================
+   TERMINAL FILES | DIFF PANEL (changes-diff-screen, D8)
+   Two toggle buttons above the terminal and the panel they open: an
+   `embed=1` iframe onto this project's Code or Changes page. Closed is the
+   default and costs nothing — the panel carries the `hidden` attribute, no
+   rule here sets `display` on it, and the page below it is laid out exactly
+   as it was before this feature existed.
+   ============================================================ */
+.term-embed { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; max-width: 100%; }
+.term-embed__tabs { display: flex; gap: var(--space-1); min-width: 0; }
+.term-embed__tab { padding: var(--space-1) var(--space-3); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); letter-spacing: .04em; cursor: pointer; }
+.term-embed__tab:hover { border-color: var(--color-border-strong); color: var(--color-text); }
+.term-embed__tab--on { border-color: var(--color-action); color: var(--color-text); font-weight: var(--weight-semibold); }
+.term-embed__panel { min-height: 0; min-width: 0; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); overflow: hidden; }
+.term-embed__frame { display: block; width: 100%; height: 100%; border: 0; }
+/* The split itself, applied by `assets/app.js` to `<main>` while a tab is
+   open: the page stops scrolling as one column and becomes a fixed frame
+   divided in half — panel on top, terminal below. 53px is the topbar's own
+   pinned height (see `.topbar` above), the one thing between the viewport
+   top and this element. The terminal half scrolls inside itself, which is
+   what lets `.term-screen` keep the `height: auto` full-frame rendering the
+   page has always given it; its WIDTH is untouched, so the screen poller's
+   font fit reads exactly what it read before. */
+main.fg-page.term-split { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }
+main.fg-page.term-split .term-embed { flex: 1 1 50%; min-height: 0; }
+main.fg-page.term-split .term-embed__panel { flex: 1 1 auto; }
+/* The slim rule between the two halves — one hairline, so the boundary reads
+   as a boundary without spending a band on it. */
+main.fg-page.term-split .term-panes { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top: var(--border-width-hairline) solid var(--color-border); padding-top: var(--space-2); }
+
+/* ============================================================
    EMBED MODE (changes-diff-screen, D9)
    `?embed=1` renders the Code and Changes pages without the topbar, for a
    same-origin iframe (the terminal screen's FILES | DIFF panel). The markup

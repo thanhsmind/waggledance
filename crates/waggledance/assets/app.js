@@ -1858,6 +1858,107 @@
   })();
 
 
+  // Terminal FILES | DIFF panel (changes-diff-screen, D8/D9): the terminal
+  // page can put this project's own file tree or its working-tree diff in the
+  // TOP HALF of the screen area, the terminal compressing into the bottom
+  // half — watching an agent work and reading what it just wrote is one
+  // glance, not two tabs. Clicking the tab that is already open closes the
+  // panel and the terminal returns to full height.
+  //
+  // D9's two addresses are the SERVER's (`views.rs::terminal_embed_panel`):
+  // each button carries its own `data-embed-src`, already escaped, and this
+  // module only ever copies that attribute onto the frame. No project id is
+  // assembled here, and no URL that is not one of those two attributes can
+  // ever reach the iframe — including on the restore path below, where the
+  // stored value only ever NAMES a tab this page already rendered.
+  //
+  // The frame is lazy in the markup itself (no `src` ships), and once loaded
+  // it stays loaded: closing hides the panel rather than tearing the frame
+  // down, so reopening the same tab shows a page that is already there.
+  (function () {
+    var root = document.querySelector(".term-embed[data-project-id]");
+    if (!root) return;
+    var tabs = Array.prototype.slice.call(
+      root.querySelectorAll(".term-embed__tab[data-embed-tab]")
+    );
+    var panel = root.querySelector(".term-embed__panel");
+    var frame = root.querySelector(".term-embed__frame");
+    if (!tabs.length || !panel || !frame) return;
+    // The split is a property of the whole content area, not of the panel:
+    // `<main>` is what has to stop scrolling the page and start dividing a
+    // fixed height between the two halves.
+    var main = document.querySelector("main.fg-page[data-project-id]");
+    var KEY = "waggledance-term-panel:" + root.getAttribute("data-project-id");
+    var openTab = "";
+
+    function paint() {
+      tabs.forEach(function (btn) {
+        var on = btn.getAttribute("data-embed-tab") === openTab;
+        btn.setAttribute("aria-pressed", on ? "true" : "false");
+        btn.classList.toggle("term-embed__tab--on", on);
+      });
+      panel.hidden = !openTab;
+      root.classList.toggle("term-embed--open", !!openTab);
+      if (main) main.classList.toggle("term-split", !!openTab);
+      // The terminal keeps its full WIDTH either way — the panel is above it,
+      // never beside it — but the bottom half becomes its own scroll
+      // container, and that scrollbar can take a few pixels off the screen's
+      // available width. The screen poller already refits on `resize` and
+      // already skips a pane whose available width did not actually move, so
+      // this reuses that path instead of reaching into the poller: nothing
+      // about polling, input or scrollback changes here.
+      try { window.dispatchEvent(new Event("resize")); } catch (e) {}
+    }
+
+    function tabButton(name) {
+      var found = null;
+      tabs.forEach(function (btn) {
+        if (btn.getAttribute("data-embed-tab") === name) found = btn;
+      });
+      return found;
+    }
+
+    function show(name) {
+      var btn = tabButton(name);
+      if (!btn) return;
+      var src = btn.getAttribute("data-embed-src") || "";
+      if (!src) return;
+      openTab = name;
+      if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);
+      paint();
+    }
+
+    function close() {
+      openTab = "";
+      paint();
+    }
+
+    // Storage is a hostile input like everywhere else (the rail and tab-bar
+    // collapses above take the same shape): a disabled or quota-blocked
+    // `sessionStorage` throws on read or write, and every failure degrades to
+    // the default this page already renders — closed.
+    function persist() {
+      try {
+        if (openTab) sessionStorage.setItem(KEY, openTab);
+        else sessionStorage.removeItem(KEY);
+      } catch (e) {}
+    }
+
+    tabs.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var name = btn.getAttribute("data-embed-tab") || "";
+        if (name && name === openTab) close();
+        else show(name);
+        persist();
+      });
+    });
+
+    var stored = null;
+    try { stored = sessionStorage.getItem(KEY); } catch (e) { stored = null; }
+    if (stored) show(stored);
+  })();
+
+
   // Live reload, targeted (PRD FR-19): the watcher broadcasts
   // {"changed":["<project_id>/<rel_path>", ...]}. A file page reloads only
   // when its own document is in the list; project-scoped pages (home,
