@@ -1633,6 +1633,59 @@ fn proj_row_meta(count: usize, last_seen_at: &str) -> String {
     )
 }
 
+/// (board-visibility bv-6) The bare words the rail's wait pill says when it
+/// has nothing better -- the "derived" side of the quality comparison in
+/// [`proj_row_bee`], exactly as the card's derived sentence is the derived
+/// side of its own.
+const RAIL_WAIT_LABEL: &str = "Waiting on you";
+
+/// (board-visibility bv-6) How much of a recorded subject the rail pill
+/// spends on screen. The rail is a 259px column (`app.css`, ctk-13) and this
+/// row must stay ONE line, so a subject that is free text of any length gets
+/// a hard character budget here rather than being handed to the layout to
+/// cope with. The full text is never lost -- it rides the pill's `title`,
+/// and the nested `.proj-row__badge-title` (the same clip-and-ellipsis span
+/// a pane's own free-text title already wears) adds the browser's ellipsis
+/// on top for a column narrower than even this budget.
+const RAIL_WAIT_SUBJECT_CHARS: usize = 48;
+
+/// (board-visibility bv-6) Clip a recorded subject to the rail's budget on a
+/// word boundary, ending in an ellipsis so a reader can see it was cut.
+///
+/// Cuts at the last space inside the budget when that space still leaves at
+/// least two thirds of the budget standing; a subject whose first word runs
+/// longer than that is cut mid-word instead, because dropping it whole would
+/// say less than a truncated version of it. Trailing punctuation goes before
+/// the ellipsis, so the pill never reads `"foo,…"`.
+///
+/// Character counts, never byte counts: this store's own live subject is
+/// Vietnamese (`"Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"`
+/// is the one mark that reaches this pill today, and its neighbours carry
+/// diacritics), and a byte slice landing inside a multi-byte char panics.
+fn bee_rail_wait_clip(subject: &str, max_chars: usize) -> String {
+    let subject = subject.trim();
+    if subject.chars().count() <= max_chars {
+        return subject.to_string();
+    }
+    let cut = subject
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(subject.len());
+    let head = &subject[..cut];
+    let kept = match head
+        .rfind(char::is_whitespace)
+        .filter(|i| head[..*i].chars().count() * 3 >= max_chars * 2)
+    {
+        Some(i) => &head[..i],
+        None => head,
+    };
+    let kept = kept
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-' | '—'));
+    let kept = if kept.is_empty() { head } else { kept };
+    format!("{kept}…")
+}
+
 /// board-visibility bv-4: one rail row's own bee line -- what this project
 /// is working on, and whether it is waiting on the reader.
 ///
@@ -1656,6 +1709,18 @@ fn proj_row_meta(count: usize, last_seen_at: &str) -> String {
 /// STRING: no container, no placeholder, no "idle" word. An idle row must
 /// stay exactly the row it was before this feature, so the rail's ink is
 /// spent only where something is happening.
+///
+/// (bv-6) The wait pill also NAMES what is owed, when the project recorded
+/// something worth naming. The judgment is [`bee_hub_subject_beats_derived`]
+/// -- bv-3's rule, CALLED here and not copied here -- with the pill's own
+/// generic label as the derived side: a subject that is blank, one bare word
+/// (`"AskUserQuestion"`, which four lanes of this store record), or an echo
+/// of "waiting on you" keeps the plain pill, and a sentence a human actually
+/// wrote wins it. This is the surface that widening lives on because it is
+/// the surface that renders: measured against all three registered projects
+/// (`docs/history/board-visibility/proof.md`), the card's waiting sentence
+/// appeared zero times and this pill appeared once, so a subject placed
+/// anywhere else on this page says nothing to anybody today.
 ///
 /// Markup reuses the row's existing badge vocabulary (`.proj-row__badges`
 /// plus `.proj-row__badge`, the same classes the herdr and paseo badges
@@ -1700,9 +1765,29 @@ fn proj_row_bee(rollup: Option<&BeeProjectRollup>) -> String {
         ));
     }
     if state.waiting_on_live {
-        pills.push_str(
-            r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#,
-        );
+        // (bv-6) The recorded subject is offered THE SAME pill -- never a
+        // second pill, never a second line -- and wins it only by beating the
+        // bare label, which is `bee_hub_subject_beats_derived`'s judgment
+        // rather than a second copy of it. `waiting_on_live` already stands
+        // in front of this, so a `turn-end` mark never lends its words to a
+        // wait (D4); and since a live mark always carries a well-formed
+        // `waiting_on`, the `None` arm below is the REFUSED-subject arm, not
+        // the absent-mark one.
+        let subject = state
+            .waiting_on
+            .as_ref()
+            .map(|w| w.subject.trim())
+            .filter(|s| bee_hub_subject_beats_derived(s, RAIL_WAIT_LABEL));
+        match subject {
+            Some(subject) => pills.push_str(&format!(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="{full}">{RAIL_WAIT_LABEL}<span class="proj-row__badge-title">— {shown}</span></span>"#,
+                full = esc(&format!("{RAIL_WAIT_LABEL} — {subject}")),
+                shown = esc(&bee_rail_wait_clip(subject, RAIL_WAIT_SUBJECT_CHARS)),
+            )),
+            None => pills.push_str(&format!(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait">{RAIL_WAIT_LABEL}</span>"#
+            )),
+        }
     }
     format!(r#"<div class="proj-row__badges proj-row__badges--bee">{pills}</div>"#)
 }
@@ -11249,11 +11334,14 @@ mod tests {
             ),
             "the busy row must name its active feature and that feature's phase: {rail}"
         );
+        // (bv-6) The busy fixture's subject is a real sentence, so it wins
+        // the pill -- the pill still leads with its own word, and the wait
+        // is still one pill on one row.
         assert!(
             rail.contains(
-                r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Shape + execution approval">Waiting on you<span class="proj-row__badge-title">— Shape + execution approval</span></span>"#
             ),
-            "a live gate wait must read as a need on the project's own row: {rail}"
+            "a live gate wait must read as a need on the project's own row, and name it: {rail}"
         );
         assert_eq!(
             rail.matches("proj-row__badges--bee").count(),
@@ -11266,8 +11354,12 @@ mod tests {
             "the idle project's phase belongs to no active feature, so nothing of it renders: \
              {rail}"
         );
+        // Counted by the pill's own class, not by its words: since bv-6 the
+        // label appears twice inside ONE pill (its hover title repeats it
+        // ahead of the subject), so counting the phrase would count markup
+        // rather than rows.
         assert_eq!(
-            rail.matches("Waiting on you").count(),
+            rail.matches("proj-row__badge--bee-wait").count(),
             1,
             "the turn-end mark is the idle mark, not a demand -- exactly one row waits: {rail}"
         );
@@ -11312,7 +11404,7 @@ mod tests {
             page.contains(
                 r#"<span class="proj-row__badge proj-row__badge--bee">board-visibility · executing</span>"#
             ) && page.contains(
-                r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Shape + execution approval">Waiting on you<span class="proj-row__badge-title">— Shape + execution approval</span></span>"#
             ),
             "the board page's own rail must carry both facts: {page}"
         );
@@ -11320,6 +11412,169 @@ mod tests {
         for r in [&busy_root, &idle_root] {
             let _ = std::fs::remove_dir_all(r);
         }
+    }
+
+    /// board-visibility bv-6: the rail's wait pill says WHAT the project is
+    /// waiting for, and only when the recorded subject beats the bare label
+    /// it would otherwise print. The three refusals are
+    /// [`bee_hub_subject_beats_derived`]'s, called here rather than
+    /// re-implemented, so a bare tool name and an echo of the label both keep
+    /// the plain pill -- and a project that is not waiting still renders no
+    /// pill at all.
+    #[test]
+    fn a_rail_wait_pill_names_the_subject_only_when_it_beats_the_bare_label() {
+        let root_for = |slug: &str| {
+            std::env::temp_dir().join(format!(
+                "waggledance-views-rail-wait-{slug}-{}",
+                std::process::id()
+            ))
+        };
+        // `named` carries the one subject that reaches this pill on the live
+        // store today (jarvis's, verbatim from `proof.md`) -- 56 characters,
+        // so it also exercises the clip.
+        let named_root = root_for("named");
+        let tool_root = root_for("tool");
+        let echo_root = root_for("echo");
+        let quiet_root = root_for("quiet");
+        let roots = [&named_root, &tool_root, &echo_root, &quiet_root];
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        let write = |root: &std::path::Path, body: &str| {
+            let p = root.join(".bee/state.json");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            &named_root,
+            r#"{"waiting_on": {"kind": "question",
+               "subject": "Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"}}"#,
+        );
+        write(
+            &tool_root,
+            r#"{"waiting_on": {"kind": "gate", "subject": "AskUserQuestion"}}"#,
+        );
+        write(
+            &echo_root,
+            r#"{"waiting_on": {"kind": "gate", "subject": "Waiting on you"}}"#,
+        );
+        write(
+            &quiet_root,
+            r#"{"waiting_on": {"kind": "turn-end", "subject": "Nothing is owed"}}"#,
+        );
+
+        let mut projects = Vec::new();
+        for (id, root) in [
+            ("named", &named_root),
+            ("tool", &tool_root),
+            ("echo", &echo_root),
+            ("quiet", &quiet_root),
+        ] {
+            let mut p = sample_project();
+            p.id = id.into();
+            p.name = id.into();
+            p.root_path = root.clone();
+            projects.push((p, 0, Vec::new()));
+        }
+        let owned: Vec<std::path::PathBuf> = vec![
+            named_root.clone(),
+            tool_root.clone(),
+            echo_root.clone(),
+            quiet_root.clone(),
+        ];
+        let rollups = waggledance_core::bee::read_rollup(&owned);
+        let bee_by_project: std::collections::HashMap<String, &BeeProjectRollup> = projects
+            .iter()
+            .map(|(p, _, _)| p.id.clone())
+            .zip(rollups.iter())
+            .collect();
+
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &bee_by_project,
+        );
+
+        // A sentence a human wrote wins the pill: the label still leads it,
+        // the clipped text follows in the row's own free-text span, and the
+        // whole subject survives in the hover title.
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Chon muc do tich hop Jarvis vao Super+Space tren Omarchy">Waiting on you<span class="proj-row__badge-title">— Chon muc do tich hop Jarvis vao Super+Space…</span></span>"#
+            ),
+            "the recorded subject must name the wait on the rail, clipped for display with the \
+             whole of it kept in the title: {rail}"
+        );
+        // The two refused shapes keep the pill exactly as bv-4 wrote it --
+        // same markup, no title, nothing added.
+        assert_eq!(
+            rail.matches(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#
+            )
+            .count(),
+            2,
+            "a bare tool name and an echo of the label must both keep the plain pill: {rail}"
+        );
+        assert!(
+            !rail.contains("AskUserQuestion"),
+            "a one-word subject names a mechanism, never a decision, so it must not render: \
+             {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badge--bee-wait").count(),
+            3,
+            "the turn-end project is not waiting, so it renders no pill at all -- and no \
+             project ever renders two: {rail}"
+        );
+        assert!(
+            !rail.contains("Nothing is owed"),
+            "a turn-end mark's words must never reach the rail: {rail}"
+        );
+        // One line, still: the wait is one pill inside the row's own badge
+        // block, never a list and never a second block.
+        assert_eq!(
+            rail.matches("proj-row__badges--bee").count(),
+            3,
+            "each waiting row carries exactly one bee block and the quiet row none: {rail}"
+        );
+
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// board-visibility bv-6: the rail is a 259px column and its row stays
+    /// one line, so a free-text subject is clipped in Rust rather than left
+    /// to the layout -- on a word boundary where there is one, by characters
+    /// and never by bytes.
+    #[test]
+    fn a_long_wait_subject_is_clipped_on_a_word_boundary_never_mid_char() {
+        assert_eq!(
+            bee_rail_wait_clip("Shape + execution approval", 48),
+            "Shape + execution approval",
+            "a subject inside the budget is rendered whole"
+        );
+        assert_eq!(
+            bee_rail_wait_clip("Chon muc do tich hop Jarvis vao Super+Space tren Omarchy", 48),
+            "Chon muc do tich hop Jarvis vao Super+Space…",
+            "the live subject clips at its last space inside the budget"
+        );
+        assert_eq!(
+            bee_rail_wait_clip("Quyết định, mức độ tích hợp Jarvis vào Super+Space", 14),
+            "Quyết định…",
+            "diacritics count as characters, not bytes, and trailing punctuation goes before \
+             the ellipsis"
+        );
+        assert_eq!(
+            bee_rail_wait_clip("supercalifragilisticexpialidocious ok", 20),
+            "supercalifragilistic…",
+            "a first word longer than the budget is cut mid-word rather than dropped whole"
+        );
     }
 
     /// rail-agents-compact: a live agent's row is at most two lines. Line
