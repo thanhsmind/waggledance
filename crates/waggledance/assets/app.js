@@ -1958,6 +1958,196 @@
     if (stored) show(stored);
   })();
 
+  // Homepage terminals tab: Files | Diff sidebar + the panel above the
+  // terminal (home-terminal-panel, D1/D2/D3). The shape the project page's
+  // panel above already has, split in two: the SIDEBAR carries the two nav
+  // frames (a file tree, a changed-file list), and the PANEL above the
+  // terminal carries whatever a row in one of them opens.
+  //
+  // What makes it one feature rather than two is the thing this module does
+  // NOT do: it never routes a click from the sidebar to the panel. The panel
+  // frame is named (`views.rs::PANEL_FRAME_NAME`) and the nav pages inside
+  // the sidebar carry `<base target>` with that same name, so the browser
+  // does the routing itself — with this script disabled, a file row still
+  // loads the panel, it just arrives in a panel nobody opened. That is why
+  // the split opens on the frame's own `load` event: it follows navigations
+  // this module never saw.
+  //
+  // Every URL here is the SERVER's (`views.rs::home_term_sidebar`): each tab
+  // button carries its own `data-nav-src`, the sidebar carries the panel's
+  // `data-panel-src`, and this module only ever copies one of those
+  // attributes onto a frame. No project id is assembled here, on the restore
+  // path included — a stored value only ever NAMES a tab this page rendered.
+  (function () {
+    var root = document.querySelector(".home-term");
+    if (!root) return;
+    var side = root.querySelector(".home-term__side");
+    var panel = root.querySelector(".home-term__panel");
+    var panelFrame = root.querySelector(".home-term__frame");
+    var tabs = Array.prototype.slice.call(
+      root.querySelectorAll(".home-term__tab[data-nav-tab]")
+    );
+    var navs = Array.prototype.slice.call(
+      root.querySelectorAll(".home-term__nav[data-nav-for]")
+    );
+    // A pane outside every registered project renders the sidebar's
+    // explanation and no frames at all — nothing to wire, and nothing about
+    // the terminal below changes.
+    if (!side || !panel || !panelFrame || !tabs.length || !navs.length) return;
+    // The split is a property of the whole content area, exactly as it is on
+    // the project page: `<main>` is what stops scrolling as one column and
+    // starts dividing a fixed height between the panel and the terminal.
+    // This tab's `<main>` carries no `data-project-id` (homepage-terminal-full
+    // D5), so it is matched by position instead.
+    var main = root.closest ? root.closest("main.fg-page") : null;
+    var KEY =
+      "waggledance-home-panel:" + (root.getAttribute("data-panel-project") || "");
+    var openTab = "";
+    var split = false;
+
+    function paintTabs() {
+      tabs.forEach(function (btn) {
+        var on = btn.getAttribute("data-nav-tab") === openTab;
+        btn.setAttribute("aria-pressed", on ? "true" : "false");
+        btn.classList.toggle("home-term__tab--on", on);
+      });
+      navs.forEach(function (frame) {
+        frame.hidden = frame.getAttribute("data-nav-for") !== openTab;
+      });
+      side.classList.toggle("home-term__side--open", !!openTab);
+    }
+
+    function paintSplit() {
+      panel.hidden = !split;
+      root.classList.toggle("home-term--split", split);
+      if (main) main.classList.toggle("term-split", split);
+      // The terminal keeps its full WIDTH either way — the panel is above
+      // it, never beside it — but the bottom half becomes its own scroll
+      // container, and that scrollbar can take a few pixels off the screen's
+      // available width. The screen poller already refits on `resize` and
+      // already skips a pane whose available width did not move, so this
+      // reuses that path instead of reaching into the poller: nothing about
+      // polling, input or scrollback changes here.
+      try { window.dispatchEvent(new Event("resize")); } catch (e) {}
+    }
+
+    function navFrame(name) {
+      var found = null;
+      navs.forEach(function (frame) {
+        if (frame.getAttribute("data-nav-for") === name) found = frame;
+      });
+      return found;
+    }
+
+    function tabButton(name) {
+      var found = null;
+      tabs.forEach(function (btn) {
+        if (btn.getAttribute("data-nav-tab") === name) found = btn;
+      });
+      return found;
+    }
+
+    // Opening a nav tab is a SIDEBAR move only: it never touches the panel,
+    // which is what keeps the restore path below from reopening a split the
+    // reader closed. `src` is set once and left — a tab reopened shows a
+    // frame already loaded.
+    function showTab(name) {
+      var btn = tabButton(name);
+      var frame = navFrame(name);
+      if (!btn || !frame) return;
+      var src = btn.getAttribute("data-nav-src") || "";
+      if (!src) return;
+      openTab = name;
+      if (!frame.getAttribute("src")) frame.setAttribute("src", src);
+      paintTabs();
+    }
+
+    function closeTab() {
+      openTab = "";
+      paintTabs();
+    }
+
+    function openPanel() {
+      if (split) return;
+      split = true;
+      paintSplit();
+    }
+
+    // D1: choosing Diff shows the changed-file list in the sidebar AND the
+    // diff itself above the terminal, in one move — reading a diff is the
+    // one case where the list alone is never the answer.
+    function fillPanelWithDiff() {
+      var src = side.getAttribute("data-panel-src") || "";
+      if (!src) return;
+      if (panelFrame.getAttribute("src") !== src) {
+        panelFrame.setAttribute("src", src);
+      }
+      openPanel();
+    }
+
+    // Storage is a hostile input like everywhere else (the project page's
+    // panel and the rail collapses take the same shape): a disabled or
+    // quota-blocked `sessionStorage` throws on read or write, and every
+    // failure degrades to what this page already rendered — no tab open.
+    function persist() {
+      try {
+        if (openTab) sessionStorage.setItem(KEY, openTab);
+        else sessionStorage.removeItem(KEY);
+      } catch (e) {}
+    }
+
+    tabs.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var name = btn.getAttribute("data-nav-tab") || "";
+        if (!name) return;
+        if (name === openTab) {
+          closeTab();
+        } else {
+          showTab(name);
+          if (name === "diff") fillPanelWithDiff();
+        }
+        persist();
+      });
+    });
+
+    var closer = root.querySelector("[data-panel-close]");
+    if (closer) {
+      closer.addEventListener("click", function () {
+        // The frame keeps its `src`: closing gives the terminal its full
+        // height back, it does not throw away a page already fetched.
+        split = false;
+        paintSplit();
+      });
+    }
+
+    // The panel opens itself the first time it actually holds something —
+    // which is how a file clicked in the FILES nav splits the view without
+    // this module knowing that click happened (the `<base target>` above).
+    // A frame with no `src` may fire one `load` for its initial
+    // `about:blank`; that is not a page, so it is filtered out here rather
+    // than by guessing at timing.
+    panelFrame.addEventListener("load", function () {
+      var here = "";
+      try {
+        here =
+          (panelFrame.contentWindow && panelFrame.contentWindow.location.href) ||
+          "";
+      } catch (e) {
+        here = panelFrame.getAttribute("src") || "";
+      }
+      if (!here || here === "about:blank") return;
+      openPanel();
+    });
+
+    var storedTab = null;
+    try { storedTab = sessionStorage.getItem(KEY); } catch (e) { storedTab = null; }
+    // Restores the SIDEBAR tab only. The split is never restored: it is the
+    // terminal's own height, and taking half of it back on every reload
+    // (the homepage reloads itself on any watched change) is not a thing a
+    // reader asked for once and meant forever.
+    if (storedTab) showTab(storedTab);
+  })();
+
 
   // Live reload, targeted (PRD FR-19): the watcher broadcasts
   // {"changed":["<project_id>/<rel_path>", ...]}. A file page reloads only
