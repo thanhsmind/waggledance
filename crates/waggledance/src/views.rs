@@ -10288,7 +10288,9 @@ pub fn changes_page(
     }
     let main = match &view.content {
         ChangesContent::Unavailable(reason) => changes_unavailable(reason),
-        ChangesContent::Diff(diff) => changes_body(project, diff, &picker, render),
+        ChangesContent::Diff(diff) => {
+            changes_body(project, diff, &picker, render, chrome.link_query())
+        }
     };
     // UAT: in panel mode the changed-file list is already on screen — it is
     // the sidebar this frame was opened FROM — so the page renders without
@@ -10626,6 +10628,7 @@ fn changes_body(
     diff: &WorkingTreeDiff,
     picker: &str,
     render: &RenderService,
+    open_q: &str,
 ) -> String {
     let mut out = String::new();
     // The scope label the screen shipped with is now something you can
@@ -10673,7 +10676,7 @@ fn changes_body(
         return out;
     }
     for (i, file) in diff.files.iter().enumerate() {
-        out.push_str(&changes_section(project, i, file, render));
+        out.push_str(&changes_section(project, i, file, render, open_q));
     }
     out
 }
@@ -10683,6 +10686,7 @@ fn changes_section(
     index: usize,
     file: &FileChange,
     render: &RenderService,
+    open_q: &str,
 ) -> String {
     let name = match &file.old_path {
         Some(old) => format!("{} → {}", old, file.path),
@@ -10702,7 +10706,7 @@ fn changes_section(
             let banner = if *truncated {
                 format!(
                     "<p class=\"changes__note\">Truncated — too large to show whole. {link}</p>",
-                    link = code_view_link(project, &file.path),
+                    link = code_view_link(project, &file.path, open_q),
                 )
             } else {
                 String::new()
@@ -10726,7 +10730,7 @@ fn changes_section(
         ChangeBody::Omitted(why) => format!(
             "<p class=\"changeset__flat\">{why} {link}</p>",
             why = esc(why),
-            link = code_view_link(project, &file.path),
+            link = code_view_link(project, &file.path, open_q),
         ),
     };
     format!(
@@ -10792,12 +10796,15 @@ fn changeset_key(file: &FileChange) -> String {
 }
 
 /// The same file over in the Code section — the way out of every section
-/// this screen deliberately does not render whole.
-fn code_view_link(project: &Project, rel_path: &str) -> String {
+/// this screen deliberately does not render whole. Carries the page's own
+/// chrome query so a framed page (embed/panel) never walks its frame back
+/// to full chrome.
+fn code_view_link(project: &Project, rel_path: &str, open_q: &str) -> String {
     format!(
-        "<a class=\"changeset__open\" href=\"/p/{pid}/_code/{path}\">Open in Code view</a>",
+        "<a class=\"changeset__open\" href=\"/p/{pid}/_code/{path}{q}\">Open in Code view</a>",
         pid = esc(&project.id),
         path = esc(rel_path),
+        q = open_q,
     )
 }
 
@@ -24976,6 +24983,32 @@ mod tests {
             &RenderService::new(),
             PageChrome::Panel,
         )
+    }
+
+    /// A framed page must never hand its frame a way back to full chrome:
+    /// the changeset "Open in Code view" link carries the page's own chrome
+    /// query — nothing on a full page, `?embed=1` under embed, and
+    /// `?embed=1&panel=1` inside the homepage panel.
+    #[test]
+    fn the_open_in_code_view_link_carries_the_pages_own_chrome() {
+        let project = sample_project();
+        assert_eq!(
+            code_view_link(&project, "src/main.rs", PageChrome::Full.link_query()),
+            format!(
+                "<a class=\"changeset__open\" href=\"/p/{}/_code/src/main.rs\">Open in Code view</a>",
+                project.id
+            ),
+        );
+        assert!(
+            code_view_link(&project, "src/main.rs", PageChrome::Embed.link_query())
+                .contains("/_code/src/main.rs?embed=1\""),
+            "embed keeps the frame embedded"
+        );
+        assert!(
+            code_view_link(&project, "src/main.rs", PageChrome::Panel.link_query())
+                .contains("/_code/src/main.rs?embed=1&amp;panel=1\""),
+            "panel keeps the frame sidebar-less"
+        );
     }
 
     /// UAT, the whole of it: inside the homepage panel the page keeps every
