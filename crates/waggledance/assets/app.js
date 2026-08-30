@@ -1664,6 +1664,34 @@
     sections.forEach(function (s) { observer.observe(s); });
   })();
 
+  // Changes-screen base picker (changes-diff-screen, D6): the header's
+  // `<select>` lists the working tree and the repository's recent commits,
+  // and choosing one is a NAVIGATION, not a form post — so the address bar
+  // keeps holding the shareable thing it already held: `?commit=<sha>` for a
+  // commit, the plain screen URL for the working tree.
+  //
+  // Values come from the server's own commit list and are shas or the empty
+  // string, never anything a reader typed. The hex test below is belt and
+  // braces on that; the server checks the same value again (D7) before git
+  // ever sees it.
+  //
+  // The surrounding `<form>` is what works with scripting off, so the submit
+  // button only earns its place there — here it is hidden, because the
+  // change handler has already done the navigating.
+  (function () {
+    var sel = document.querySelector(".changes__base-select[data-base-url]");
+    if (!sel) return;
+    var url = sel.getAttribute("data-base-url");
+    if (!url) return;
+    var go = sel.form && sel.form.querySelector(".changes__base-go");
+    if (go) go.hidden = true;
+    sel.addEventListener("change", function () {
+      var v = sel.value || "";
+      if (v && !/^[0-9a-f]{4,40}$/.test(v)) return;
+      window.location.href = v ? url + "?commit=" + encodeURIComponent(v) : url;
+    });
+  })();
+
   // Changes-screen reviewed marks (changes-diff-screen, D4): which files the
   // reader has already been through is the READER's business, so it lives in
   // this browser and nowhere else — `localStorage["waggledance-reviewed:<project-id>"]`,
@@ -1686,7 +1714,16 @@
     var sections = Array.prototype.slice.call(root.querySelectorAll(".changeset[data-key]"));
     if (!sections.length) return;
 
-    var KEY = "waggledance-reviewed:" + root.getAttribute("data-project-id");
+    // D6: a mark says "I have read this file IN THIS COMPARISON", so the key
+    // carries the base. The working tree keeps the key it has always had —
+    // marks made before the picker existed are still the same reader's marks
+    // on the same screen — and each commit view gets a key of its own, so
+    // reading a commit never ticks off the work you have not looked at yet.
+    var base = root.getAttribute("data-base") || "";
+    var KEY =
+      "waggledance-reviewed:" +
+      root.getAttribute("data-project-id") +
+      (base ? ":" + base : "");
     var counter = root.querySelector(".changes__reviewed");
     var nav = document.querySelector(".changes-nav");
     var total = sections.length;

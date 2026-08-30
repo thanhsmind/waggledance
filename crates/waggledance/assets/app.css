@@ -3327,13 +3327,51 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   font-weight: var(--type-heading-sm-weight);
   color: var(--color-text);
 }
-.changes__scope {
+/* D6's base picker, sitting where the scope label used to sit: the same
+   quiet pill, now something you can change. The `<select>` keeps the
+   platform's own control — its arrow, its keyboard handling, its sheet on
+   mobile — and borrows nothing but this site's tokens. */
+.changes__base {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.changes__base-label {
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.changes__base-select,
+.changes__base-go {
+  max-width: 100%;
   padding: var(--space-0) var(--space-2);
+  border: var(--border-width-hairline) solid var(--color-border);
   border-radius: var(--radius-pill);
   background: var(--color-surface-sunken);
   font-family: var(--type-caption-font);
   font-size: var(--type-caption-size);
-  color: var(--color-text-muted);
+  color: var(--color-text);
+}
+.changes__base-select {
+  /* A long subject must not push the counter off the line. */
+  max-width: 26rem;
+  text-overflow: ellipsis;
+}
+.changes__base-go {
+  cursor: pointer;
+}
+.changes__base-go[hidden] {
+  display: none;
+}
+.changes__base-select:hover,
+.changes__base-go:hover {
+  border-color: var(--color-border-strong);
+}
+.changes__base-select:focus-visible,
+.changes__base-go:focus-visible {
+  outline: var(--border-width-strong) solid var(--focus-color);
+  outline-offset: 2px;
 }
 /* D4's N/M counter: the same pill as the scope chip beside it, so the two
    read as one line of header state. It ships `hidden` and app.js unhides

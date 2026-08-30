@@ -14,8 +14,8 @@ use waggledance_core::config::Config;
 use waggledance_core::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
 use waggledance_core::engine::{ChangesContent, ChangesView};
 use waggledance_core::git_diff::{
-    ActiveBase, ChangeBody, ChangeStatus, DiffLine, FileChange, GitDiffError, LineKind,
-    WorkingTreeDiff,
+    ActiveBase, ChangeBody, ChangeStatus, CommitEntry, DiffLine, FileChange, GitDiffError,
+    LineKind, WorkingTreeDiff,
 };
 use waggledance_core::render::{HighlightedSource, RenderService};
 use waggledance_core::short_link::{path_hash, short_code};
@@ -9747,6 +9747,7 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
 /// the entry point stays, only its content changes.
 pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderService) -> String {
     let scope = base_label(&view.base);
+    let picker = base_picker(project, view);
     let (tree, main) = match &view.content {
         ChangesContent::Unavailable(reason) => (
             changes_nav_empty("No file list — see the note beside it."),
@@ -9754,11 +9755,11 @@ pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderServic
         ),
         ChangesContent::Diff(diff) if diff.files.is_empty() => (
             changes_nav_empty("No changed files."),
-            changes_body(project, diff, &scope, render),
+            changes_body(project, diff, &picker, render),
         ),
         ChangesContent::Diff(diff) => (
             changes_nav(diff),
-            changes_body(project, diff, &scope, render),
+            changes_body(project, diff, &picker, render),
         ),
     };
     let body_html = format!(
@@ -9768,7 +9769,7 @@ pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderServic
   <div class="sidebar-backdrop"></div>
   <main class="content content--changes">
     <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">{scope}</span></div></nav>
-    <div class="changes" data-project-id="{pid}">{main}</div>
+    <div class="changes" data-project-id="{pid}" data-base="{base}">{main}</div>
   </main>
 </div>"#,
         topbar = topbar_full(
@@ -9781,6 +9782,7 @@ pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderServic
         pid = esc(&project.id),
         name = esc(&project.name),
         scope = esc(&scope),
+        base = esc(active_sha(&view.base)),
         main = main,
     );
     layout_with_drawer("Changes", "", &body_html, false)
@@ -9800,6 +9802,79 @@ fn base_label(base: &ActiveBase) -> String {
         }
         ActiveBase::Commit(commit) => format!("{} — {}", commit.short, commit.subject),
     }
+}
+
+/// The base a reviewed mark and the picker are keyed by: the empty string
+/// for the working tree, the full sha for a commit. Not a label — a value.
+fn active_sha(base: &ActiveBase) -> &str {
+    match base {
+        ActiveBase::WorkingTree => "",
+        ActiveBase::Commit(commit) => commit.sha.as_str(),
+    }
+}
+
+/// D6's base picker: the working tree and the repository's recent commits,
+/// as one `<select>` sitting where the scope label used to sit.
+///
+/// Every option value is either empty or a sha this server itself read out
+/// of git — never anything a reader typed, and never a label. The reader's
+/// choice becomes `?commit=<sha>`, which D7 checks again before git sees
+/// it; nothing here is trusted twice over.
+///
+/// The `<form>` around it is the no-scripting path: submitting posts the
+/// same `commit` field to the same screen, and an empty value falls back to
+/// the working tree exactly like any other unusable one. With scripting,
+/// `app.js` hides the button and navigates on `change`, so the plain URL
+/// (not `?commit=`) is what a working-tree choice leaves in the address bar.
+///
+/// The working-tree option is capitalised on purpose: "working tree" in
+/// lower case is the page's own claim about what it is showing (the
+/// breadcrumb, the header's empty state), and a picker that always offers
+/// the choice must not be mistaken for the page making that claim.
+fn base_picker(project: &Project, view: &ChangesView) -> String {
+    let active = active_sha(&view.base);
+    let mut options = format!(
+        "<option value=\"\"{sel}>Working tree</option>",
+        sel = if active.is_empty() { " selected" } else { "" },
+    );
+    // A commit older than the listed window would otherwise vanish from its
+    // own picker; it leads the list instead, so what the page shows is
+    // always something the picker shows too.
+    if let ActiveBase::Commit(commit) = &view.base {
+        if !view.commits.iter().any(|e| e.sha == commit.sha) {
+            options.push_str(&commit_option(commit, true));
+        }
+    }
+    for commit in &view.commits {
+        options.push_str(&commit_option(commit, commit.sha == active));
+    }
+    format!(
+        "<form class=\"changes__base\" method=\"get\" action=\"/p/{pid}/_changes\">\
+         <label class=\"changes__base-label\" for=\"changes-base\">Comparing</label>\
+         <select class=\"changes__base-select\" id=\"changes-base\" name=\"commit\" \
+         data-base-url=\"/p/{pid}/_changes\">{options}</select>\
+         <button class=\"changes__base-go\" type=\"submit\">Show</button>\
+         </form>",
+        pid = esc(&project.id),
+        options = options,
+    )
+}
+
+/// One commit as the picker lists it. The subject is whatever its author
+/// typed — untrusted text, escaped here like everything else this module
+/// renders, and never part of a URL.
+fn commit_option(commit: &CommitEntry, selected: bool) -> String {
+    let label = if commit.subject.is_empty() {
+        format!("{} · {}", commit.short, commit.date)
+    } else {
+        format!("{} — {} · {}", commit.short, commit.subject, commit.date)
+    };
+    format!(
+        "<option value=\"{sha}\"{sel}>{label}</option>",
+        sha = esc(&commit.sha),
+        sel = if selected { " selected" } else { "" },
+        label = esc(&label),
+    )
 }
 
 /// D3's empty state, in the user's terms: what the screen would show, why it
@@ -9926,16 +10001,18 @@ fn chg_stat(file: &FileChange) -> String {
 fn changes_body(
     project: &Project,
     diff: &WorkingTreeDiff,
-    scope: &str,
+    picker: &str,
     render: &RenderService,
 ) -> String {
     let mut out = String::new();
+    // The scope label the screen shipped with is now something you can
+    // change (D6): the picker renders here, already carrying the active
+    // base as its selected option, and the breadcrumb keeps the words.
     let mut head = format!(
-        "<span class=\"changes__count\">{n} {word} changed</span>\
-         <span class=\"changes__scope\">{scope}</span>",
+        "<span class=\"changes__count\">{n} {word} changed</span>{picker}",
         n = diff.files.len(),
         word = plural_files(diff.files.len()),
-        scope = esc(scope),
+        picker = picker,
     );
     if !diff.files.is_empty() {
         // D4's N/M counter. It ships `hidden` and `app.js` unhides it, the
@@ -22377,6 +22454,154 @@ mod tests {
         );
     }
 
+    /// cds-6 / D6: a commit as the picker lists it.
+    fn sample_commit(sha: &str, subject: &str) -> CommitEntry {
+        CommitEntry {
+            sha: sha.into(),
+            short: sha[..7].into(),
+            date: "2026-08-30".into(),
+            subject: subject.into(),
+        }
+    }
+
+    /// The page as the route builds it: a diff, the picker's commit list,
+    /// and the base the diff itself reports.
+    fn changes_html_with_commits(diff: WorkingTreeDiff, commits: Vec<CommitEntry>) -> String {
+        changes_page(
+            &sample_project(),
+            &ChangesView {
+                base: diff.base.clone(),
+                content: ChangesContent::Diff(diff),
+                commits,
+            },
+            &RenderService::new(),
+        )
+    }
+
+    /// D6: the header offers the working tree and the recent commits, and
+    /// exactly one of them — the one the page is showing — is selected.
+    #[test]
+    fn the_base_picker_lists_the_working_tree_and_the_recent_commits() {
+        let older = sample_commit(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "an older commit",
+        );
+        let newest = sample_commit(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "the newest commit",
+        );
+        let commits = vec![newest.clone(), older.clone()];
+
+        let html = changes_html_with_commits(changes_fixture(), commits.clone());
+        assert!(
+            html.contains("<option value=\"\" selected>Working tree</option>"),
+            "the default page has the working tree picked: {html}"
+        );
+        assert!(
+            html.contains(&format!("<option value=\"{}\">", newest.sha))
+                && html.contains("the newest commit")
+                && html.contains("an older commit"),
+            "both commits are offered, neither picked: {html}"
+        );
+        assert_eq!(
+            html.matches(" selected>").count(),
+            1,
+            "exactly one option is selected: {html}"
+        );
+
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(older.clone());
+        let html = changes_html_with_commits(diff, commits);
+        assert!(
+            html.contains(&format!(
+                "<option value=\"{}\" selected>{} — an older commit · 2026-08-30</option>",
+                older.sha, older.short
+            )),
+            "the commit being shown is the picked one: {html}"
+        );
+        assert!(
+            html.contains("<option value=\"\">Working tree</option>"),
+            "and the way back to the working tree is still offered: {html}"
+        );
+        assert_eq!(
+            html.matches(" selected>").count(),
+            1,
+            "exactly one option is selected: {html}"
+        );
+    }
+
+    /// A commit older than the listed window is still what the page shows,
+    /// so the picker shows it too rather than presenting a list none of
+    /// whose entries is the current one.
+    #[test]
+    fn a_base_outside_the_listed_window_still_appears_picked() {
+        let listed = sample_commit("cccccccccccccccccccccccccccccccccccccccc", "listed");
+        let ancient = sample_commit("dddddddddddddddddddddddddddddddddddddddd", "ancient");
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(ancient.clone());
+
+        let html = changes_html_with_commits(diff, vec![listed]);
+        assert!(
+            html.contains(&format!("<option value=\"{}\" selected>", ancient.sha)),
+            "the shown commit leads the list: {html}"
+        );
+        assert_eq!(html.matches(" selected>").count(), 1, "{html}");
+    }
+
+    /// A commit subject is whatever its author typed. It reaches the picker
+    /// as text and nothing else — the value beside it is the sha alone, so
+    /// no part of a subject ever reaches a URL either.
+    #[test]
+    fn a_commit_subject_with_markup_in_it_is_escaped_in_the_picker() {
+        let nasty = sample_commit(
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "fix <script>alert(1)</script> & \"quotes\"",
+        );
+
+        let html = changes_html_with_commits(changes_fixture(), vec![nasty]);
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "the subject never renders as markup: {html}"
+        );
+        assert!(
+            html.contains("fix &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;"),
+            "it renders as the text it is: {html}"
+        );
+    }
+
+    /// D4 under D6: the reviewed layer is the same layer in commit mode —
+    /// same per-section attributes, same counter — and the base it is keyed
+    /// by rides the screen root, empty for the working tree so marks made
+    /// before the picker existed keep the key they were written under.
+    #[test]
+    fn commit_mode_keeps_the_reviewed_markup_and_names_its_base() {
+        let commit = sample_commit("ffffffffffffffffffffffffffffffffffffffff", "a commit");
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains("data-base=\"\""),
+            "the working tree is the empty base: {html}"
+        );
+
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(commit.clone());
+        let html = changes_html_with_commits(diff, vec![commit.clone()]);
+        assert!(
+            html.contains(&format!("data-base=\"{}\"", commit.sha)),
+            "a commit view is keyed by its own sha: {html}"
+        );
+        for needle in [
+            "class=\"changes__reviewed\"",
+            "changeset__review",
+            "data-path=",
+            "data-key=",
+        ] {
+            assert!(
+                html.contains(needle),
+                "the reviewed layer is unchanged in commit mode, missing {needle}: {html}"
+            );
+        }
+    }
+
     /// Every `data-key` on the page, in section order — the content keys a
     /// reviewed mark is stored against.
     fn data_keys(html: &str) -> Vec<String> {
@@ -22398,8 +22623,11 @@ mod tests {
         let html = changes_html(changes_fixture());
 
         assert!(
-            html.contains("<div class=\"changes\" data-project-id=\"proj-1\">"),
-            "marks are scoped per project, so the id is on the screen root: {html}"
+            // cds-6 extended this: a mark is scoped per project AND per
+            // base (D6), so the root names both. The empty base is the
+            // working tree, which keeps the key it always had.
+            html.contains("<div class=\"changes\" data-project-id=\"proj-1\" data-base=\"\">"),
+            "marks are scoped per project and base, so both are on the screen root: {html}"
         );
         assert!(
             html.contains(
