@@ -5230,6 +5230,42 @@ fn bee_phase_is_terminal(phase: Option<&str>) -> bool {
     matches!(phase, Some("idle") | Some("compounding-complete"))
 }
 
+/// (board-visibility bv-3) Does `state.json`'s recorded `waiting_on.subject`
+/// tell the reader more than the sentence the card derives on its own?
+///
+/// The whole point of the widening this answers is that the card's derived
+/// wording is already good — *"Shape gate awaiting your decision"* — so a
+/// recorded subject only ever replaces it by being BETTER. The reader
+/// (`BeeState::waiting_on`) deliberately passes no judgment on the string;
+/// this is where the judgment lives, at the one surface that knows what it
+/// would be giving up.
+///
+/// Three refusals, each measured against what this repo's own store
+/// actually records:
+///
+/// - **Blank.** Nothing to say. (The reader already turns a blank field into
+///   `None`, so this is belt-and-braces, not the live path.)
+/// - **A single word.** Four lanes in this store record the literal subject
+///   `"AskUserQuestion"` — the name of the tool that asked — and a bare
+///   `"shape"` is no better. One token names a mechanism or a gate key; it
+///   never names a decision, and the derived sentence already says the gate.
+/// - **An echo.** A subject the derived sentence already contains
+///   (case-insensitively) adds nothing by definition, so the wording that
+///   was written for the card wins on punctuation and capitalisation.
+///
+/// Everything else wins — including a subject this function has never seen
+/// the shape of. That default is the same one `waiting_on_is_live` takes for
+/// unknown kinds: a real sentence a human wrote is the thing the board is
+/// short of, so the doubt goes to rendering it, and the refusals grow only
+/// on evidence, one measured shape at a time.
+fn bee_hub_subject_beats_derived(subject: &str, derived: &str) -> bool {
+    let subject = subject.trim();
+    if subject.is_empty() || subject.split_whitespace().count() < 2 {
+        return false;
+    }
+    !derived.to_lowercase().contains(&subject.to_lowercase())
+}
+
 fn bee_classify_features(
     snapshot: &BeeSnapshot,
     archived_features: &std::collections::HashSet<String>,
@@ -5393,13 +5429,38 @@ fn bee_classify_features(
             // gate stop or a paused handoff no longer moves the feature to
             // a separate column, it only adds the `Waiting on you — ` line
             // to this same card.
+            //
+            // (board-visibility bv-3) `state.json`'s recorded
+            // `waiting_on.subject` is offered THAT SAME sentence — never a
+            // second line, never a second surface — and wins it only when
+            // it beats the derived wording
+            // ([`bee_hub_subject_beats_derived`]). Two gates stand before
+            // that comparison, both deliberate: `is_active`, because
+            // `state.json` names one feature at a time and a sibling card's
+            // wait is not this card's; and `waiting_on_live`, so a
+            // `turn-end` mark — D4's "nothing owed" — never lends its words
+            // to a sentence about a real stop.
+            let live_wait = if is_active {
+                snapshot
+                    .state
+                    .as_ref()
+                    .filter(|s| s.waiting_on_live)
+                    .and_then(|s| s.waiting_on.as_ref())
+            } else {
+                None
+            };
             let reason = if !working_now && (gate_stop.is_some() || waiting_via_handoff) {
-                Some(match gate_stop {
-                    Some((_, label)) => {
-                        format!("Waiting on you — {label} gate awaiting your decision")
-                    }
-                    None => "Waiting on you — Work is parked, waiting on your decision".to_string(),
-                })
+                let derived = match gate_stop {
+                    Some((_, label)) => format!("{label} gate awaiting your decision"),
+                    None => "Work is parked, waiting on your decision".to_string(),
+                };
+                let recorded = live_wait
+                    .map(|w| w.subject.as_str())
+                    .filter(|s| bee_hub_subject_beats_derived(s, &derived));
+                Some(format!(
+                    "Waiting on you — {}",
+                    recorded.unwrap_or(derived.as_str())
+                ))
             } else {
                 None
             };
@@ -13962,6 +14023,291 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (board-visibility bv-3) The half the widening exists for: when the
+    /// project recorded what it is actually waiting for — a sentence a
+    /// human wrote, not a tool name — that sentence takes the card's
+    /// waiting line, in place of the derived wording and never beside it.
+    /// The board's answer to "what does this project need from me?" is the
+    /// subject itself; `Shape gate awaiting your decision` was only ever
+    /// the best guess available without one.
+    #[test]
+    fn hub_renders_the_recorded_waiting_subject_when_it_beats_the_derived_sentence() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-hub-subject-informative-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            ".bee/state.json",
+            r#"{"feature": "subject-feat", "phase": "executing", "waiting_on": {"kind": "gate", "subject": "Agent logo marks — shape + execution approval"}}"#,
+        );
+        write(
+            ".bee/lanes/subject-feat.json",
+            r#"{
+                "feature": "subject-feat",
+                "phase": "executing",
+                "mode": "standard",
+                "next_action": "keep going",
+                "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+            }"#,
+        );
+
+        let snapshot = waggledance_core::bee::read_snapshot(&root);
+        let mut project = sample_project();
+        project.root_path = root.clone();
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
+        );
+
+        assert!(
+            html.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Agent logo marks — shape + execution approval</p>"#
+            ),
+            "a real recorded subject must become the card's waiting sentence: {html}"
+        );
+        assert!(
+            !html.contains("Shape gate awaiting your decision"),
+            "the recorded subject replaces the derived sentence, it never joins it: {html}"
+        );
+        assert_eq!(
+            html.matches("bee-hub__reason").count(),
+            1,
+            "one waiting line, not a second surface beside it: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (board-visibility bv-3) The recorded `waiting_on.subject` replaces
+    /// the card's own derived sentence ONLY when it says more to a human
+    /// than that sentence already does. A bare one-word subject never
+    /// does: four lanes in this repo's own store record the literal
+    /// subject `"AskUserQuestion"` — the name of the tool that asked,
+    /// which says nothing about what is being asked — and rendering it
+    /// would replace a good sentence with a worse one. Written before the
+    /// widening in [`bee_classify_features`] that renders a good subject,
+    /// because the fallback is the half of that rule the board can be hurt
+    /// by.
+    #[test]
+    fn hub_keeps_the_derived_waiting_sentence_when_the_recorded_subject_is_a_bare_tool_name() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-hub-subject-tool-name-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            ".bee/state.json",
+            r#"{"feature": "subject-feat", "phase": "executing", "waiting_on": {"kind": "gate", "subject": "AskUserQuestion"}}"#,
+        );
+        write(
+            ".bee/lanes/subject-feat.json",
+            r#"{
+                "feature": "subject-feat",
+                "phase": "executing",
+                "mode": "standard",
+                "next_action": "keep going",
+                "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+            }"#,
+        );
+
+        let snapshot = waggledance_core::bee::read_snapshot(&root);
+        let mut project = sample_project();
+        project.root_path = root.clone();
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
+        );
+
+        assert!(
+            html.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#
+            ),
+            "a bare tool name must leave the card's own derived sentence standing: {html}"
+        );
+        assert!(
+            !html.contains("AskUserQuestion"),
+            "the name of the tool that asked must never reach the card: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (board-visibility bv-3) The other two ways a recorded subject earns
+    /// nothing: it is blank, or it only echoes the sentence the card
+    /// derives anyway. The echo case is spelled in a different case from
+    /// the derived wording precisely so the assertion can tell the two
+    /// apart — if the subject won, the card would say `shape gate`
+    /// lowercase.
+    #[test]
+    fn hub_keeps_the_derived_waiting_sentence_for_a_blank_or_echoing_recorded_subject() {
+        let render = |suffix: &str, waiting_on: &str| -> String {
+            let root = std::env::temp_dir().join(format!(
+                "waggledance-views-hub-subject-{suffix}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |rel: &str, body: &str| {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            };
+            write(
+                ".bee/state.json",
+                &format!(
+                    r#"{{"feature": "subject-feat", "phase": "executing", "waiting_on": {waiting_on}}}"#
+                ),
+            );
+            write(
+                ".bee/lanes/subject-feat.json",
+                r#"{
+                    "feature": "subject-feat",
+                    "phase": "executing",
+                    "mode": "standard",
+                    "next_action": "keep going",
+                    "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+                }"#,
+            );
+            let snapshot = waggledance_core::bee::read_snapshot(&root);
+            let mut project = sample_project();
+            project.root_path = root.clone();
+            let html = bee_feature_hub_section(
+                &project,
+                &snapshot,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &BeeHubLiveRuns::new(),
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            html
+        };
+
+        let derived = r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#;
+
+        let blank = render("blank", r#"{"kind": "gate", "subject": "   "}"#);
+        assert!(
+            blank.contains(derived),
+            "a blank subject must leave the derived sentence standing: {blank}"
+        );
+
+        let echo = render(
+            "echo",
+            r#"{"kind": "gate", "subject": "shape gate awaiting your decision"}"#,
+        );
+        assert!(
+            echo.contains(derived),
+            "a subject that only echoes the derived sentence must leave it standing: {echo}"
+        );
+        assert!(
+            !echo.contains("Waiting on you — shape gate"),
+            "the echoing subject must not be rendered in place of the sentence it echoes: {echo}"
+        );
+    }
+
+    /// (board-visibility bv-3, D4 seen from the view) A `turn-end` mark is
+    /// AGENTS.md's "control back with the human and nothing owed" — the
+    /// idle mark, not a demand — so bv-1 already made it read not-live.
+    /// From the board that has to be visible twice over: a project whose
+    /// ONLY wait is `turn-end` gets no waiting line at all, and a project
+    /// that really is gate-stopped never borrows a `turn-end` subject for
+    /// the sentence it does draw. The subject used here is a live lane's
+    /// own, and it means "nothing is waiting on you" — the exact string
+    /// that must never be rendered as a demand.
+    #[test]
+    fn hub_draws_no_waiting_line_for_a_turn_end_mark_and_never_borrows_its_subject() {
+        let render = |suffix: &str, gates: &str| -> String {
+            let root = std::env::temp_dir().join(format!(
+                "waggledance-views-hub-turn-end-{suffix}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |rel: &str, body: &str| {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            };
+            write(
+                ".bee/state.json",
+                r#"{"feature": "quiet-feat", "phase": "executing", "waiting_on": {"kind": "turn-end", "subject": "Không còn gì chờ bạn"}}"#,
+            );
+            write(
+                ".bee/lanes/quiet-feat.json",
+                &format!(
+                    r#"{{
+                        "feature": "quiet-feat",
+                        "phase": "executing",
+                        "mode": "standard",
+                        "next_action": "keep going",
+                        "approved_gates": {gates}
+                    }}"#
+                ),
+            );
+            let snapshot = waggledance_core::bee::read_snapshot(&root);
+            let mut project = sample_project();
+            project.root_path = root.clone();
+            let html = bee_feature_hub_section(
+                &project,
+                &snapshot,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &BeeHubLiveRuns::new(),
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            html
+        };
+
+        // Every gate that can be a stop is approved, so nothing else is
+        // pulling a waiting line onto this card: the `turn-end` mark is
+        // the only wait this project records.
+        let only_turn_end = render(
+            "alone",
+            r#"{"context": true, "shape": true, "execution": true, "review": false}"#,
+        );
+        assert!(
+            only_turn_end.contains(r#"href="/p/proj-1/_bee/feature/quiet-feat""#),
+            "the feature is still active work, so its card must render: {only_turn_end}"
+        );
+        assert!(
+            !only_turn_end.contains("bee-hub__reason"),
+            "a finished turn is nothing owed: the card must carry no waiting line: {only_turn_end}"
+        );
+        assert!(
+            !only_turn_end.contains("Không còn gì chờ bạn"),
+            "a not-live mark's subject must not reach the card at all: {only_turn_end}"
+        );
+
+        let gate_stopped = render(
+            "with-gate",
+            r#"{"context": true, "shape": false, "execution": false, "review": false}"#,
+        );
+        assert!(
+            gate_stopped.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#
+            ),
+            "a real gate stop still draws its own sentence: {gate_stopped}"
+        );
+        assert!(
+            !gate_stopped.contains("Không còn gì chờ bạn"),
+            "a not-live subject must never be borrowed for the sentence a real stop draws: {gate_stopped}"
+        );
     }
 
     /// (waiting-means-stopped-1) A pause handoff naming the active feature,
