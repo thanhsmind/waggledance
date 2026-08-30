@@ -542,6 +542,12 @@ fn attach_workspace_id(error: HerdrError, workspace_id: &str) -> HerdrError {
     }
 }
 
+/// How long herdr may wait for a freshly started agent to become
+/// interactive-ready before `agent.start` gives up. 30 s is herdr's own CLI
+/// default; `herdr api schema --json` accepts `> 3000` and `<= 300000`, so any
+/// change must stay inside that band or the call is rejected at the door.
+const AGENT_START_READY_TIMEOUT_MS: u64 = 30_000;
+
 /// Build the `agent.start` params -- `name`, `argv`, `workspace_id`,
 /// `focus: false`, plus `cwd` only when the caller supplied one. Deliberately
 /// no `tab_id`/`split`: sending both a tab and a workspace opens
@@ -558,6 +564,16 @@ fn attach_workspace_id(error: HerdrError, workspace_id: &str) -> HerdrError {
 /// kind and the remaining tokens into the agent's own argv"), which is why
 /// every `herding.agents` entry leads with `claude` / `pi` / `agy`.
 ///
+/// `timeout_ms` is the readiness wait and is NOT optional in practice: herdr
+/// only reports `agent.start` done once the agent is *interactive-ready*, and
+/// it only waits that long when asked. Omitting the key made `agent.start`
+/// return the moment the process launched (~0.2 s), so the `agent.prompt` that
+/// follows found no registered agent and died with `agent_not_ready` — twice
+/// out of two live dispatches, while the same argv started through herdr's own
+/// CLI took 3.74 s to report `interactive_ready`. We send
+/// [`AGENT_START_READY_TIMEOUT_MS`] to match that CLI's own default. The
+/// daemon owns the waiting; waggledance never polls for readiness itself.
+///
 /// The caller guarantees a non-empty `argv`; `agent_start_named` refuses an
 /// empty one before reaching here.
 fn agent_start_params(name: &str, pane_id: &str, argv: &[String]) -> Value {
@@ -566,6 +582,7 @@ fn agent_start_params(name: &str, pane_id: &str, argv: &[String]) -> Value {
         "kind": argv[0],
         "pane_id": pane_id,
         "args": &argv[1..],
+        "timeout_ms": AGENT_START_READY_TIMEOUT_MS,
     })
 }
 
@@ -954,7 +971,28 @@ mod tests {
                 "kind": "pi",
                 "pane_id": "w1:p1",
                 "args": ["-a", "--model", "x"],
+                "timeout_ms": 30_000,
             })
+        );
+    }
+
+    #[test]
+    fn agentstart_params_ask_for_the_readiness_wait() {
+        // The wire shape IS the fix: with `timeout_ms` omitted, agent.start
+        // returned as soon as the process launched and the agent.prompt that
+        // follows died with `agent_not_ready`. The key must be present, and
+        // its value must sit inside the band herdr's schema accepts
+        // (`> 3000`, `<= 300000`) or the call is rejected at the door.
+        let argv = vec!["claude".to_string()];
+        let params = agent_start_params("ready-please", "w1:p1", &argv);
+        let timeout = params
+            .get("timeout_ms")
+            .expect("timeout_ms must be sent, not omitted -- omitting it is the agent_not_ready bug")
+            .as_u64()
+            .expect("timeout_ms must be a number");
+        assert!(
+            timeout > 3_000 && timeout <= 300_000,
+            "timeout_ms {timeout} is outside herdr's accepted band (>3000, <=300000)"
         );
     }
 
