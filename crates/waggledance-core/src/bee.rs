@@ -91,7 +91,11 @@
 //! read comes back as [`BeeMailboxEntry::Unreadable`] rather than vanishing —
 //! bee's own rule, and the reasoning lives in that module's doc comment. The
 //! letter files are opened for reading only, like every other path here (D4);
-//! read/unread is flipped by calling bee, never by writing the file.
+//! read/unread is flipped by calling bee, never by writing the file. The same
+//! directory also holds bee's period digests, told apart by their frontmatter
+//! `type: "digest"` and never by their file name: they come back as
+//! [`BeeMailboxEntry::Digest`] beside the letters and are counted as none of
+//! them (mailbox-inbox D1).
 //!
 //! Every path-shaped value that crosses into a public field is rendered
 //! relative to the project root (or reduced to a bare filename when it
@@ -108,8 +112,8 @@ use std::path::{Path, PathBuf};
 mod mailbox;
 
 pub use mailbox::{
-    mailbox_dir, BeeLetter, BeeLetterDeparture, BeeLetterItem, BeeLetterNeedsYou, BeeLetterStatus,
-    BeeMailboxEntry,
+    mailbox_dir, BeeDigest, BeeLetter, BeeLetterDeparture, BeeLetterItem, BeeLetterNeedsYou,
+    BeeLetterStatus, BeeMailboxEntry,
 };
 
 /// One live cell, trimmed to what the cockpit board needs. Any path-shaped

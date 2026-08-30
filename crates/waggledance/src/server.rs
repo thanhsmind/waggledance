@@ -1652,6 +1652,21 @@ fn inbox_row(
             unread: entry.is_unread(),
             unreadable: None,
         },
+        // A digest rides the SAME list as the letters (mailbox-inbox D1) and is
+        // never one: `unread` is false because a digest holds no read state at
+        // all, and its `project` line is the checkout's — a fold spans every
+        // project of its period, so no single one can be named off the file.
+        // The row this builds is deliberately plain; the badge and the fold's
+        // own summary are mi-2's, on this same shape.
+        waggledance_core::bee::BeeMailboxEntry::Digest(digest) => views::InboxRow {
+            href: Some(format!("/inbox/{}/{}", project.id, digest.id)),
+            subject: digest.subject.clone(),
+            project: project.name.clone(),
+            filed_at: digest.filed_at.clone(),
+            file: digest.id.clone(),
+            unread: false,
+            unreadable: None,
+        },
         waggledance_core::bee::BeeMailboxEntry::Unreadable { file, reason } => views::InboxRow {
             href: None,
             subject: String::new(),
