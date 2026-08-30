@@ -330,9 +330,16 @@ content itself.
   above the terminal via a `<base target>`). Selecting Diff also fills that
   panel with the embedded Changes page at once; a close control restores the
   full-height terminal. A pane belonging to no registered project shows an
-  explained empty state and loads no frames. The open sidebar tab is
-  remembered per project for the browser tab; every frame URL is emitted by
-  the server.
+  explained empty state and loads no frames (a pane in an unregistered
+  worktree counts as project-less — the Suggestion row's one-press register
+  is the way to its diffs). The open sidebar tab is remembered per project
+  for the browser tab; every frame URL is emitted by the server. Pages
+  loaded INTO the panel carry `panel=1`: they drop their own in-page
+  sidebar (the homepage sidebar already navigates) while keeping the page
+  header, and every in-panel link — the base picker and the "Open in Code
+  view" link included — threads the flag so the frame never walks back to
+  full chrome. The project terminal page's own split panel keeps the plain
+  embedded pages, sidebar included, as its only navigation.
 
 ## Actors & Access
 
