@@ -571,6 +571,30 @@ impl RunStatus {
             RunStatus::Timeout => "timeout",
         }
     }
+
+    /// Whether this status ends the run. `Working` is the one open
+    /// status — its own doc says the run "stays open for a later
+    /// `await_run` call" — and the store agrees: the per-feature run lock
+    /// holds exactly the `working` rows and calls every other status
+    /// terminal.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, RunStatus::Working)
+    }
+
+    /// The terminal status a stored `Run::status` string names, or `None`
+    /// when the row is still open.
+    ///
+    /// Derived from [`RunStatus::as_str`] so the two spellings cannot
+    /// drift, and deliberately a whitelist: `working` reads as open by
+    /// name, and so does any other string — a `pending` row, or a status a
+    /// future build wrote that this one does not know. An unrecognized
+    /// value costs one poll of a live pane, never a wrong answer from the
+    /// ledger.
+    pub fn terminal_from_stored(status: &str) -> Option<RunStatus> {
+        [RunStatus::Done, RunStatus::Blocked, RunStatus::Timeout]
+            .into_iter()
+            .find(|s| s.as_str() == status)
+    }
 }
 
 /// `await_run`'s result: the terminal-for-this-call status plus the
@@ -629,6 +653,17 @@ async fn await_run_with_poll_interval(
     poll_interval: Duration,
     notify_store: Option<&NotifyStore>,
 ) -> Result<AwaitOutcome, OrchestrateError> {
+    // A run the ledger already records as finished is answered from the
+    // ledger (P2-4). Once a finished run's pane can be closed, re-reading
+    // it would turn a repeat await into a propagated pane error, and even
+    // an open pane has moved on since -- so the status and the transcript
+    // `finish` stored are the honest answer. Nothing on this path touches
+    // herdr at all: no snapshot, no `read_pane`.
+    if let Some(status) = RunStatus::terminal_from_stored(&run.status) {
+        let delta = engine.run_final_transcript(&run.id)?.unwrap_or_default();
+        return Ok(AwaitOutcome { status, delta });
+    }
+
     let deadline = tokio::time::Instant::now() + clamp_timeout(timeout);
     // A marker string minted for THIS run but already sitting in ITS OWN
     // baseline can only mean the joined string reached the pane some other
@@ -707,6 +742,16 @@ async fn finish(
     delta: String,
     notify_store: Option<&NotifyStore>,
 ) -> Result<AwaitOutcome, OrchestrateError> {
+    // Transcript first, status second: a row that reads terminal then
+    // always carries the transcript it was capped with, which is exactly
+    // what the short-circuit above hands a second await. A failed write
+    // leaves the run open and re-awaitable rather than finished with
+    // nothing to show. A still-`Working` run has no final delta to store
+    // -- its screen is not final -- so the column staying NULL is what
+    // makes "has a transcript" mean "is over".
+    if status.is_terminal() {
+        engine.set_run_final_transcript(&run.id, &delta)?;
+    }
     engine.update_run_status(&run.id, status.as_str(), &now_rfc3339(), None, None)?;
     if let Some(store) = notify_store {
         if notify::is_run_notifiable(status) {
@@ -1268,6 +1313,91 @@ mod tests {
             store.undelivered().unwrap().is_empty(),
             "Working never notifies (D1)"
         );
+        assert_eq!(
+            engine.run_final_transcript(&run.id).unwrap(),
+            None,
+            "a run that stays open has no FINAL transcript -- the column filling in \
+             is what marks the run over"
+        );
+    }
+
+    /// Every status that ends a run leaves its transcript on the row, so the
+    /// answer outlives the pane it was read from.
+    #[tokio::test]
+    async fn finish_stores_the_final_transcript_on_a_terminal_status() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4"; // seeded Idle -- a legal send target.
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        let run = build_run("run-transcript", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+
+        send_task(&herdr, pane, &run.task, &marker).await.unwrap();
+        herdr
+            .send_input(pane, &marker.joined(), false)
+            .await
+            .unwrap();
+
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert_eq!(
+            engine.run_final_transcript(&run.id).unwrap().as_deref(),
+            Some(outcome.delta.as_str()),
+            "the delta the caller was handed is the delta the store keeps"
+        );
+    }
+
+    /// P2-4: a second await on a run the ledger already records as finished
+    /// answers from the store. `set_available(false)` makes EVERY herdr call
+    /// -- `snapshot` and `read_pane` alike -- return an error, so an `Ok`
+    /// here can only mean zero pane reads were attempted. That is what keeps
+    /// a re-await honest once the run's pane has been closed.
+    #[tokio::test]
+    async fn await_run_answers_a_finished_run_from_the_store_without_reading_the_pane() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let mut run = build_run("run-reawait", "w2:p4", "baseline", "HERDR_DONE_x");
+        run.status = "done".into();
+        engine.insert_run(&run, None).unwrap();
+        engine
+            .set_run_final_transcript(&run.id, "all the work\nHERDR_DONE_x")
+            .unwrap();
+
+        herdr.set_available(false);
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .expect("a finished run must answer without touching herdr at all");
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert_eq!(outcome.delta, "all the work\nHERDR_DONE_x");
+    }
+
+    /// The short-circuit reads the three terminal spellings and nothing
+    /// else: `working` is open by name, and so is any status this build does
+    /// not know -- an unrecognized value costs a poll, never a wrong answer.
+    #[test]
+    fn only_the_terminal_statuses_answer_from_the_store() {
+        assert_eq!(
+            RunStatus::terminal_from_stored("done"),
+            Some(RunStatus::Done)
+        );
+        assert_eq!(
+            RunStatus::terminal_from_stored("blocked"),
+            Some(RunStatus::Blocked)
+        );
+        assert_eq!(
+            RunStatus::terminal_from_stored("timeout"),
+            Some(RunStatus::Timeout)
+        );
+        assert_eq!(RunStatus::terminal_from_stored("working"), None);
+        assert_eq!(RunStatus::terminal_from_stored("pending"), None);
+        assert_eq!(RunStatus::terminal_from_stored("Done"), None);
+        assert!(!RunStatus::Working.is_terminal());
+        for status in [RunStatus::Done, RunStatus::Blocked, RunStatus::Timeout] {
+            assert!(status.is_terminal(), "{status:?} ends the run");
+        }
     }
 
     #[tokio::test]
