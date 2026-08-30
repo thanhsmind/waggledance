@@ -14,6 +14,7 @@ pub mod domain;
 pub mod engine;
 pub mod error;
 pub mod fuzzy;
+pub mod git_diff;
 pub mod indexer;
 pub mod link_resolver;
 pub mod notify_store;

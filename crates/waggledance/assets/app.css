@@ -3272,3 +3272,350 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   .guide-steps { flex-direction: column; }
   .guide-step--next { text-align: left; margin-left: 0; }
 }
+
+/* ============================================================
+   Changes screen (the working-tree diff, D2)
+
+   Layout, sidebar and mobile drawer are the Code section's own:
+   `.layout` + `#sidebar` + `.chapter`/`.chap-sec`/`.chap-file`
+   render the changed-file list, so nothing here re-implements
+   navigation — this block adds the diff palette, the status
+   badges and the two-pane table.
+
+   The panes sit on `--signature-dark-bg` for the same reason
+   `.codeview` does: /highlight.css is built for one dark syntect
+   theme regardless of the page scheme, so a light page painting
+   those token colors on a light pane would be unreadable. That
+   makes the diff palette below a mix INTO that pane colour rather
+   than into `--color-bg` — one derivation that is legible under
+   both page schemes, and that follows a theme which re-points
+   either the pane or the status colours.
+   ============================================================ */
+/* One bar at a time in the 53px slot under the topbar: the breadcrumb here
+   is a plain header row, and the slot belongs to whichever file section the
+   reader is currently inside. */
+.content--changes > .breadcrumb {
+  position: static;
+}
+.changes {
+  --diff-add-row: color-mix(in srgb, var(--color-success) 15%, var(--signature-dark-bg));
+  --diff-add-gutter: color-mix(in srgb, var(--color-success) 32%, var(--signature-dark-bg));
+  --diff-del-row: color-mix(in srgb, var(--color-danger) 15%, var(--signature-dark-bg));
+  --diff-del-gutter: color-mix(in srgb, var(--color-danger) 32%, var(--signature-dark-bg));
+  /* The side a row has no line on: dimmer than the pane, so a missing
+     counterpart reads as absence rather than as unchanged content. */
+  --diff-none-row: color-mix(in srgb, var(--signature-dark-text) 5%, var(--signature-dark-bg));
+  --diff-rule: color-mix(in srgb, var(--signature-dark-text) 14%, var(--signature-dark-bg));
+  --diff-gutter-text: color-mix(in srgb, var(--signature-dark-text) 55%, var(--signature-dark-bg));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4) 0 var(--space-8);
+}
+
+/* ── Header: what is being compared, and what is not shown ─────── */
+.changes__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: 0 var(--space-4);
+}
+.changes__count {
+  font-family: var(--type-heading-sm-font);
+  font-size: var(--type-heading-sm-size);
+  font-weight: var(--type-heading-sm-weight);
+  color: var(--color-text);
+}
+.changes__scope {
+  padding: var(--space-0) var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+/* D4's N/M counter: the same pill as the scope chip beside it, so the two
+   read as one line of header state. It ships `hidden` and app.js unhides
+   it — this file only has to make sure the `display` below does not outrank
+   the UA sheet's `[hidden] { display: none }` (the trap `.proj-row[hidden]`
+   documents). At N == M it takes the site's own success accent plus the
+   checkmark app.js puts in the text: a quiet "that's all of them", not a
+   banner. */
+.changes__reviewed {
+  display: inline-block;
+  padding: var(--space-0) var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-family: var(--num-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.changes__reviewed[hidden] {
+  display: none;
+}
+.changes__reviewed--done {
+  background: var(--color-success-tint);
+  color: var(--color-success);
+}
+/* D5: an aggregate count, never a name. */
+.changes__hidden,
+.changes__note,
+.changes__empty {
+  font-family: var(--type-body-sm-font);
+  font-size: var(--type-body-sm-size);
+  color: var(--color-text-muted);
+}
+.changes__note,
+.changes__empty {
+  margin: 0 var(--space-4);
+}
+.changes__note {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-warning-tint);
+  color: var(--color-text);
+}
+
+/* ── Sidebar rows: the Code section's `.chap-file` with a status badge
+   and the file's own +n −m appended. ──────────────────────────── */
+.chg-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.chg-row__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The sidebar's mirror of the section checkbox (D4). It holds its column
+   whether or not it is showing, so ticking a file never shifts the row's
+   name under the pointer. */
+.chg-row__check {
+  flex: none;
+  visibility: hidden;
+  color: var(--color-success);
+  font-size: var(--type-tag-size);
+}
+.chg-row--reviewed .chg-row__check {
+  visibility: visible;
+}
+.chg-row--reviewed .chg-row__name {
+  color: var(--color-text-muted);
+}
+.changes-nav__empty {
+  margin: 0;
+  padding: 0 var(--space-2);
+  font-family: var(--type-body-sm-font);
+  font-size: var(--type-body-sm-size);
+  color: var(--color-text-muted);
+}
+
+/* ── Status badge: one letter, colour by status. ───────────────── */
+.chg-badge {
+  flex: none;
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-xs);
+  font-family: var(--font-mono);
+  font-size: var(--type-tag-size);
+  line-height: 18px;
+  font-weight: var(--weight-semibold);
+  text-align: center;
+}
+.chg-badge--m {
+  background: var(--color-warning-tint);
+  color: var(--color-warning);
+}
+.chg-badge--a {
+  background: var(--color-success-tint);
+  color: var(--color-success);
+}
+.chg-badge--d {
+  background: var(--color-danger-tint);
+  color: var(--color-danger);
+}
+.chg-badge--r {
+  background: var(--color-info-tint);
+  color: var(--color-info);
+}
+.chg-stat {
+  flex: none;
+  display: inline-flex;
+  gap: var(--space-1);
+  font-family: var(--num-font);
+  font-size: var(--type-tag-size);
+}
+.chg-stat__add {
+  color: var(--color-success);
+}
+.chg-stat__del {
+  color: var(--color-danger);
+}
+
+/* ── One file's section: a sticky header over its own diff pane. The
+   header stops under the topbar (53px, the same structural offset the
+   sidebar and breadcrumb use) so the path stays readable while a long
+   file scrolls past. ──────────────────────────────────────────── */
+.changeset {
+  border-top: var(--border-width-hairline) solid var(--color-border);
+}
+.changeset__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  position: sticky;
+  top: 53px;
+  z-index: var(--z-nav);
+  background: var(--color-surface);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  font-family: var(--type-body-sm-font);
+  font-size: var(--type-body-sm-size);
+  font-weight: var(--weight-regular);
+}
+.changeset__path {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  color: var(--color-text);
+  word-break: break-all;
+}
+/* The reviewed checkbox, at the far end of the sticky header where the
+   reader's eye lands after the path and the counts. Scripting-only, so it
+   ships `hidden`; the `display` here would otherwise outrank the UA sheet's
+   `[hidden]` rule and show a box that remembers nothing. */
+.changeset__review {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.changeset__review[hidden] {
+  display: none;
+}
+.changeset__review-box {
+  margin: 0;
+  accent-color: var(--color-success);
+}
+/* Reviewed: the section steps back rather than disappearing — the header
+   stays fully legible so the file is still findable by name. */
+.changeset--reviewed .changeset__path {
+  color: var(--color-text-muted);
+}
+.changeset--reviewed .changeset__review {
+  color: var(--color-success);
+}
+.changeset--reviewed .changeset__body {
+  opacity: 0.55;
+}
+/* Folded away. Clicking the header brings it back (app.js), which is why the
+   header itself is never hidden with it. */
+.changeset--collapsed .changeset__body {
+  display: none;
+}
+.changeset--collapsed .changeset__head {
+  cursor: pointer;
+}
+.changeset__note {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-size: var(--type-tag-size);
+  color: var(--color-text-muted);
+}
+.changeset__flat {
+  margin: 0;
+  padding: var(--space-4);
+  background: var(--signature-dark-bg);
+  color: var(--signature-dark-text);
+  font-family: var(--type-body-sm-font);
+  font-size: var(--type-body-sm-size);
+}
+.changeset__open {
+  color: var(--color-link);
+}
+.changeset__scroll {
+  overflow-x: auto;
+  background: var(--signature-dark-bg);
+  color: var(--signature-dark-text);
+}
+.changeset__table {
+  width: 100%;
+  min-width: 560px;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--fs-prose-code);
+  line-height: var(--lh-prose-code);
+}
+
+/* ── Diff rows: gutter, pane, gutter, pane. The tint says which side a
+   line belongs to; the gutter carries a stronger shade of the same
+   colour so the two read as one row even at a glance. ─────────── */
+.diffrow__num {
+  box-sizing: border-box;
+  width: 3.5em;
+  padding: 0 var(--space-2);
+  text-align: right;
+  vertical-align: top;
+  user-select: none;
+  color: var(--diff-gutter-text);
+  border-right: var(--border-width-hairline) solid var(--diff-rule);
+}
+.diffrow__num--new {
+  border-left: var(--border-width-hairline) solid var(--diff-rule);
+}
+.diffrow__side {
+  box-sizing: border-box;
+  width: calc(50% - 3.5em);
+  padding: 0 var(--space-3);
+  vertical-align: top;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.diffrow__side code {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+}
+.diffrow--del .diffrow__side--old,
+.diffrow--chg .diffrow__side--old {
+  background: var(--diff-del-row);
+}
+.diffrow--del .diffrow__num--old,
+.diffrow--chg .diffrow__num--old {
+  background: var(--diff-del-gutter);
+}
+.diffrow--add .diffrow__side--new,
+.diffrow--chg .diffrow__side--new {
+  background: var(--diff-add-row);
+}
+.diffrow--add .diffrow__num--new,
+.diffrow--chg .diffrow__num--new {
+  background: var(--diff-add-gutter);
+}
+.diffrow__side--none {
+  background: var(--diff-none-row);
+}
+
+@media (max-width: 700px) {
+  .changes__head,
+  .changeset__head {
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+}
