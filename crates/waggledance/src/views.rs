@@ -10480,10 +10480,18 @@ pub fn inbox_page(rows: &[InboxRow]) -> String {
     layout_with_drawer("Hộp thư", "", &body, false)
 }
 
-/// One row. A readable letter is an anchor to its own body; an unreadable
-/// entry is a plain block naming the file and the reason — louder than an
-/// ordinary row on purpose, and never a link, because there is no parsed
-/// letter on the other side of one.
+/// One row: a link to the letter's own body, and the control that flips its
+/// read state ([`inbox_mark_form`]). An unreadable entry is a plain block
+/// naming the file and the reason — louder than an ordinary row on purpose,
+/// never a link, and with no flip control either, because there is no parsed
+/// letter on the other side of one and nothing whose status bee could move.
+///
+/// bi-3: the card is a `<div>` whose TITLE is the anchor, where bi-2 made the
+/// whole card one anchor. A form is interactive content and a browser may not
+/// nest it inside a link at all, so keeping the outer anchor would have meant
+/// keeping the flip control off the list — and the list is exactly where a
+/// human decides a letter is dealt with. The link itself is unchanged in
+/// target; only how much of the card is clickable.
 fn inbox_row_html(row: &InboxRow) -> String {
     if let Some(reason) = &row.unreadable {
         return format!(
@@ -10498,15 +10506,17 @@ fn inbox_row_html(row: &InboxRow) -> String {
         );
     }
     format!(
-        r#"<a class="fg-card" href="{href}">
-  <div class="fg-card__head"><div class="fg-card__title">{subject}</div>{mark}</div>
+        r#"<div class="fg-card">
+  <div class="fg-card__head"><a class="fg-card__title" href="{href}">{subject}</a>{mark}</div>
   <div class="fg-card__sub">{project} · {filed_at}</div>
-</a>"#,
+  {flip}
+</div>"#,
         href = esc(row.href.as_deref().unwrap_or("/inbox")),
         subject = esc(&row.subject),
         mark = unread_mark(row.unread),
         project = esc(&row.project),
         filed_at = esc(&row.filed_at),
+        flip = inbox_mark_form(row, "/inbox"),
     )
 }
 
@@ -10520,12 +10530,65 @@ fn unread_mark(unread: bool) -> &'static str {
     }
 }
 
+/// bi-3: the one control that flips a letter between read and unread.
+///
+/// It is a plain HTML `<form>` posting to `server.rs::inbox_mark_handler`, and
+/// that handler runs `bee mailbox mark` in the letter's own project. Nothing
+/// in this file, and nothing behind that route, opens the letter — human-mailbox
+/// D6 puts the field inside the letter and bee's own command is the only thing
+/// allowed to move it. So the state shown here is never flipped optimistically:
+/// the page that renders after the post is re-read from disk, which means what
+/// the chip says is what bee wrote, and a refused mark leaves the row exactly
+/// as it was.
+///
+/// A form, not `fetch` (the same reasoning `error_page_with_refresh`'s refresh
+/// button already took): the post works with the page's own scripts idle, and
+/// the button carries no state of its own that could disagree with the letter.
+///
+/// One button, whose direction is the letter's current state — an unread letter
+/// offers "read", a read one offers "unread" — because those are the only two
+/// values in bee's closed status set and offering both at once would render one
+/// button that is always a no-op.
+///
+/// `back` is where the reader should land afterwards: the list for a row, the
+/// letter's own page for the letter view. It is a same-site path built here,
+/// never user input, and `server.rs::safe_redirect_path` re-checks it anyway
+/// because the route is unauthenticated like every other route in this server.
+///
+/// An unreadable entry (`href: None`) gets no form: bee refuses a mark naming
+/// no filed letter, and a button whose only outcome is a refusal is not a
+/// control, it is a trap.
+fn inbox_mark_form(row: &InboxRow, back: &str) -> String {
+    let Some(href) = row.href.as_deref() else {
+        return String::new();
+    };
+    let (status, label) = if row.unread {
+        ("read", "Đánh dấu đã đọc")
+    } else {
+        ("unread", "Đánh dấu chưa đọc")
+    };
+    format!(
+        r#"<form class="fg-card__foot" method="post" action="{action}">
+  <input type="hidden" name="status" value="{status}">
+  <input type="hidden" name="back" value="{back}">
+  <button type="submit" class="fg-btn fg-btn--secondary">{label}</button>
+</form>"#,
+        action = esc(&format!("{href}/mark")),
+        status = status,
+        back = esc(back),
+        label = label,
+    )
+}
+
 /// One letter, opened. The header is the typed frontmatter bi-1 parsed; the
 /// prose below it is the letter's own body, rendered through the sanitizing
 /// pipeline — see [`SanitizedLetterBody`] for why it can be nothing else.
 ///
-/// bi-3 owns the control that flips this letter's read state, so there is none
-/// here yet and this page opens no file for writing.
+/// bi-3: the header also carries the flip control ([`inbox_mark_form`]), beside
+/// the chip that states the letter's current state — the reader who just
+/// finished the letter is the one most likely to mark it read. The control is a
+/// form posting to a bee command; this page still opens no file, for reading or
+/// for writing, beyond the body it was handed.
 pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
     // A letter whose run recorded nothing has an empty prose body (bee emits
     // the frontmatter and stops). Saying so beats an unexplained blank.
@@ -10540,7 +10603,7 @@ pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
   <header class="fg-pagehead">
     <div class="fg-pagehead__eyebrow">{project} · {filed_at}</div>
     <h1 class="fg-pagehead__title">{subject}</h1>
-    <div class="fg-pagehead__aside">{mark}</div>
+    <div class="fg-pagehead__aside">{mark}{flip}</div>
   </header>
   <article class="fg-prose">{prose}</article>
   <p class="fg-card__sub">{file}</p>
@@ -10553,6 +10616,9 @@ pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
         filed_at = esc(&row.filed_at),
         subject = esc(&row.subject),
         mark = unread_mark(row.unread),
+        // Back to this letter's own page: a reader who marks it here stays
+        // here, and sees the chip beside the button carry bee's answer.
+        flip = inbox_mark_form(row, row.href.as_deref().unwrap_or("/inbox")),
         prose = prose,
         file = esc(&row.file),
     );
@@ -22291,6 +22357,79 @@ mod tests {
         assert!(
             !html.contains(r#"<a class="fg-card" href="/inbox/"#),
             "an unreadable entry has no letter to open, so it is no link: {html}"
+        );
+        // bi-3: nor anything to flip. bee refuses a mark naming no filed
+        // letter, and a button whose only outcome is a refusal is a trap.
+        assert!(
+            !html.contains("/mark"),
+            "an unreadable entry offers no read/unread control: {html}"
+        );
+    }
+
+    /// bi-3: the flip control, on the row and on the letter's own page. It is
+    /// a form posting to the route that calls `bee mailbox mark` — never a
+    /// link, never a script — and it offers exactly the one direction the
+    /// letter is not already in, because `read|unread` is bee's whole set.
+    #[test]
+    fn the_flip_control_offers_the_one_direction_the_letter_is_not_in() {
+        let unread = inbox_page(&[letter_row(
+            "Đêm qua",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            true,
+        )]);
+        assert!(
+            unread.contains(r#"method="post" action="/inbox/p/2026-08-30T09:00:00Z-run.md/mark""#),
+            "the control posts to that letter's own mark route: {unread}"
+        );
+        assert!(
+            unread.contains(r#"name="status" value="read""#)
+                && unread.contains("Đánh dấu đã đọc")
+                && !unread.contains(r#"name="status" value="unread""#),
+            "an unread letter is offered the flip to read, and only that: {unread}"
+        );
+        assert!(
+            unread.contains(r#"name="back" value="/inbox""#),
+            "and lands the reader back on the list they clicked from: {unread}"
+        );
+
+        let read = inbox_page(&[letter_row(
+            "Đã xem",
+            "waggledance",
+            "2026-08-29T09:00:00Z",
+            false,
+        )]);
+        assert!(
+            read.contains(r#"name="status" value="unread""#)
+                && read.contains("Đánh dấu chưa đọc"),
+            "a read letter is offered the way back: {read}"
+        );
+    }
+
+    /// The letter's own page carries the same control, beside the chip that
+    /// states where the letter stands — and comes back to this letter, not to
+    /// the list, so the reader sees bee's answer on the page they are on.
+    #[test]
+    fn an_opened_letter_carries_the_flip_control_back_to_itself() {
+        let row = letter_row("Đêm qua", "waggledance", "2026-08-30T09:00:00Z", true);
+        let index: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let page = waggledance_core::render::RenderService::new().render(
+            "một việc\n",
+            &std::env::temp_dir().join("waggledance-bi3-letter.md"),
+            "p",
+            std::path::Path::new("/nonexistent"),
+            &index,
+        );
+        let html = inbox_letter_page(&row, &SanitizedLetterBody::from_rendered(&page));
+        assert!(
+            html.contains(r#"action="/inbox/p/2026-08-30T09:00:00Z-run.md/mark""#)
+                && html.contains(r#"name="status" value="read""#),
+            "the opened letter offers the same one flip: {html}"
+        );
+        assert!(
+            html.contains(r#"name="back" value="/inbox/p/2026-08-30T09:00:00Z-run.md""#),
+            "and returns to this letter rather than to the list: {html}"
         );
     }
 

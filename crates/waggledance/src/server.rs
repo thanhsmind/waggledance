@@ -471,6 +471,13 @@ fn router(state: AppState) -> Router {
         // reader already listed, never by joining the URL onto a path.
         .route("/inbox", get(inbox_page_handler))
         .route("/inbox/:project/:letter", get(inbox_letter_handler))
+        // board-visibility bi-3: the inbox's ONE write path, and it writes
+        // nothing itself — human-mailbox D6 keeps read/unread inside the
+        // letter file and makes `bee mailbox mark` the only thing allowed to
+        // move it, so this route relays into the project's own bee exactly
+        // the way `bee_action`'s gate half does. Mounted with `post` alone
+        // (toa-1): a GET here is axum's ordinary 405, never a flip.
+        .route("/inbox/:project/:letter/mark", post(inbox_mark_handler))
         .route("/api/config", get(api_config).post(update_config))
         // toa-1 (D5/D11): the method-mismatch-oracle this family used to
         // close with an extra method-checking extractor existed only to
@@ -1704,6 +1711,152 @@ fn not_found_letter() -> Response {
         .into_response()
 }
 
+/// The flip control's form body ([`views::inbox_mark_form`]).
+#[derive(serde::Deserialize)]
+struct InboxMarkForm {
+    /// `read` or `unread` — human-mailbox's closed status set, checked here
+    /// rather than trusted, so an invented third value never reaches bee's
+    /// argv.
+    status: String,
+    /// Where to land after the mark. Same-site only, through the same
+    /// [`safe_redirect_path`] guard the refresh form's field goes through.
+    #[serde(default)]
+    back: Option<String>,
+}
+
+/// Every way a mark can fail, in the one shape its caller can read: this
+/// route's caller is a browser submitting a plain form (no `fetch`, no JSON
+/// reader), so a refusal is an HTML page carrying the reason — never a silent
+/// redirect back to a list that would then look like the mark had worked.
+fn mark_error(status: StatusCode, msg: &str) -> Response {
+    (status, Html(views::error_page(status.as_u16(), msg))).into_response()
+}
+
+/// `POST /inbox/:project/:letter/mark` — flip one letter between read and
+/// unread, BY CALLING BEE.
+///
+/// human-mailbox D6 is the whole shape of this handler: *"Read/unread is a
+/// field bee owns inside the letter file. The waggledance inbox flips it by
+/// calling a bee command, never by writing the file."* So there is no write
+/// here, and none anywhere else in waggledance: the letter is opened for
+/// reading exactly once, by [`inbox_letter_handler`], and for nothing else.
+/// The command is `bee mailbox mark --id <file name> --status read|unread
+/// --json`, run in the project's own root through the project's own
+/// `.bee/bin/bee` — [`bee_action_gate`]'s spawn verbatim, for its reasons: a
+/// PATH `bee` would move a letter in a repository that never vendored one,
+/// and the cwd is what decides *whose* mailbox this is.
+///
+/// `--id` takes the letter's FILE NAME, which human-mailbox D11 makes its only
+/// id and which [`waggledance_core::bee::BeeLetter::id`] already carries. The
+/// `:letter` segment is never handed to bee as it arrived: it is matched
+/// against the names the mailbox reader listed for that project and bee is
+/// given the matched entry's own name, so this route cannot name a file the
+/// reader never saw.
+///
+/// Four refusals, each an HTML page rather than a redirect, because a redirect
+/// to the list would read as success:
+/// - an unknown project, an unknown file name, or a file that could not be
+///   parsed as a letter → the same 404 the letter view answers
+///   ([`not_found_letter`]); an unreadable entry has no status field to move
+///   and bee would refuse it too;
+/// - a status outside `read|unread` → 400, without spawning anything;
+/// - a project with no vendored bee → 409, the same answer
+///   [`create_project_pbi`] gives for the same missing writer;
+/// - bee itself refusing → 502 carrying bee's own stderr tail, because bee is
+///   the only party that knows why it said no ("no letter … remedy: list that
+///   directory and pass a name it holds" is a real one).
+///
+/// Success is bee's own JSON, parsed — `{letter, path, status, previous_status,
+/// changed}`. `changed: false` is SUCCESS, not a warning: `mailbox mark` is
+/// idempotent and bee's own rule is that a retry must never be punished, so
+/// marking a letter to the status it already has lands exactly where a real
+/// flip lands. What is checked is `status`: it must equal what was asked for.
+/// A zero exit whose JSON is missing, unparseable, or reports some other
+/// status is a 502 too — we cannot say a letter is read on the strength of
+/// output we could not read, and quietly redirecting would be exactly the
+/// optimistic flip D6 forbids.
+///
+/// Nothing is cached past the write: the redirect's own GET re-reads the
+/// rollup, and `compute_bee_fingerprint` walks `.bee/` — the mailbox included
+/// — so the letter bee just rewrote invalidates its project's cache entry by
+/// itself, and the chip the reader lands on is what is on disk.
+async fn inbox_mark_handler(
+    State(st): State<AppState>,
+    Path((project_id, letter_id)): Path<(String, String)>,
+    Form(form): Form<InboxMarkForm>,
+) -> Response {
+    let rollups = inbox_rollups(&st).await;
+    let Some((project, rollup)) = rollups.iter().find(|(p, _)| p.id == project_id) else {
+        return not_found_letter();
+    };
+    let Some(letter) = rollup
+        .snapshot
+        .mailbox
+        .iter()
+        .find(|entry| entry.file() == letter_id)
+        .and_then(|entry| entry.letter())
+    else {
+        return not_found_letter();
+    };
+    let status = match form.status.as_str() {
+        "read" => "read",
+        "unread" => "unread",
+        _ => {
+            return mark_error(
+                StatusCode::BAD_REQUEST,
+                "Một lá thư chỉ có thể là đã đọc hoặc chưa đọc.",
+            )
+        }
+    };
+    let Some(bee) = project_bee_binary(&project.root_path) else {
+        return mark_error(
+            StatusCode::CONFLICT,
+            "Dự án này không có bee riêng, nên không có ai được phép đổi trạng thái lá thư.",
+        );
+    };
+
+    let out = tokio::process::Command::new(&bee)
+        .arg("mailbox")
+        .arg("mark")
+        .arg("--id")
+        .arg(&letter.id)
+        .arg("--status")
+        .arg(status)
+        .arg("--json")
+        .current_dir(&project.root_path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => {
+            return mark_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("Không chạy được bee của dự án này: {e}"),
+            )
+        }
+    };
+    if !out.status.success() {
+        return mark_error(StatusCode::BAD_GATEWAY, &stderr_tail(&out.stderr));
+    }
+    let confirmed = first_json_object(&String::from_utf8_lossy(&out.stdout))
+        .and_then(|v| v.get("status")?.as_str().map(str::to_string))
+        .is_some_and(|reported| reported == status);
+    if !confirmed {
+        return mark_error(
+            StatusCode::BAD_GATEWAY,
+            "bee chạy xong nhưng không xác nhận trạng thái mới, nên lá thư vẫn giữ nguyên như cũ.",
+        );
+    }
+
+    let fallback = "/inbox".to_string();
+    let target = match form.back.as_deref() {
+        Some(raw) => safe_redirect_path(raw, &fallback),
+        None => fallback,
+    };
+    Redirect::to(&target).into_response()
+}
+
 async fn settings_page_handler(
     State(st): State<AppState>,
     Query(flag): Query<SavedFlag>,
@@ -1849,31 +2002,15 @@ fn stderr_tail(stderr: &[u8]) -> String {
 /// printed. The CLI prints its JSON object and then a trailing
 /// `[bee] backlog pbi add 1ms` timing line on the same stream, so the
 /// whole stdout is not itself parseable JSON — the first balanced `{...}`
-/// block is. The scan below is the fallback for the one case that framing
-/// cannot survive: an unbalanced brace inside the echoed title.
+/// block is ([`first_json_object`]). [`scan_json_id`] below is the fallback
+/// for the one case that framing cannot survive: an unbalanced brace inside
+/// the echoed title.
 fn parse_pbi_id(stdout: &str) -> Option<String> {
-    if let Some(start) = stdout.find('{') {
-        let mut depth = 0usize;
-        for (i, ch) in stdout[start..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let block = &stdout[start..start + i + ch.len_utf8()];
-                        if let Some(id) = serde_json::from_str::<serde_json::Value>(block)
-                            .ok()
-                            .and_then(|v| v.get("id")?.as_str().map(str::to_string))
-                            .filter(|id| !id.is_empty())
-                        {
-                            return Some(id);
-                        }
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
+    if let Some(id) = first_json_object(stdout)
+        .and_then(|v| v.get("id")?.as_str().map(str::to_string))
+        .filter(|id| !id.is_empty())
+    {
+        return Some(id);
     }
     scan_json_id(stdout)
 }
@@ -33893,6 +34030,398 @@ mod bee_route_tests {
                 resp.status(),
                 StatusCode::NOT_FOUND,
                 "{uri} names no letter, so it must say so rather than render one"
+            );
+        }
+    }
+
+    // -- board-visibility bi-3: read and unread, flipped BY BEE -----------
+    //
+    // human-mailbox D6 is absolute: the field lives inside the letter and
+    // `bee mailbox mark` is the only thing allowed to move it. So the
+    // contract under test is an argv and a working directory, not a file
+    // waggledance wrote — these put a real executable at `<root>/.bee/bin/bee`
+    // (`fake_bee`, the board-new-task idiom) and read back what it was handed.
+    // `a_mark_leaves_the_letter_file_byte_identical` is the other half: with a
+    // bee that changes nothing, the file on disk must be untouched, which is
+    // what "waggledance never opens a letter for writing" means on disk rather
+    // than in a comment.
+
+    /// bee's own success shape for this verb — `{letter, path, status,
+    /// previous_status, changed}` under the trailing timing line the CLI
+    /// prints on the same stream.
+    #[cfg(unix)]
+    fn mark_json(name: &str, status: &str, previous: &str, changed: bool) -> String {
+        format!(
+            "{{\"letter\":\"{name}\",\"path\":\".bee/human-mailbox/{name}\",\"status\":\"{status}\",\"previous_status\":\"{previous}\",\"changed\":{changed}}}\n[bee] mailbox mark 1ms\n"
+        )
+    }
+
+    #[cfg(unix)]
+    fn mark_req(project_id: &str, letter: &str, form: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri(format!("/inbox/{project_id}/{letter}/mark"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(form.to_string()))
+            .unwrap()
+    }
+
+    /// The letter's bytes on disk, and when they were last modified.
+    #[cfg(unix)]
+    fn letter_on_disk(root: &Path, name: &str) -> (Vec<u8>, std::time::SystemTime) {
+        let p = root.join(".bee/human-mailbox").join(name);
+        let meta = std::fs::metadata(&p).unwrap();
+        (std::fs::read(&p).unwrap(), meta.modified().unwrap())
+    }
+
+    /// The whole path, end to end: a row's flip control posts, and what comes
+    /// out the other side is `bee mailbox mark --id <the letter's own file
+    /// name> --status read --json`, run in that project's own root — the cwd
+    /// being what decides whose mailbox is touched at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marking_a_letter_read_calls_bee_with_that_letters_own_file_name() {
+        let root = fresh_root("inbox-mark-read");
+        let log = fresh_root("inbox-mark-read-log").join("argv");
+        let name = "2026-08-30T09-00-00Z-night.md";
+        letter_file(
+            &root,
+            name,
+            "Đêm qua",
+            "zeta",
+            "2026-08-30T09:00:00Z",
+            "unread",
+            "ok\n",
+        );
+        fake_bee(&root, &log, &mark_json(name, "read", "unread", true), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Zeta");
+        let app = router(st);
+
+        // The control the list actually renders, with the action it carries.
+        let list = body_string(get(app.clone(), "/inbox").await).await;
+        assert!(
+            list.contains(&format!(
+                r#"action="/inbox/{}/{name}/mark""#,
+                project.id
+            )) && list.contains(r#"name="status" value="read""#),
+            "an unread row must offer the flip to read: {list}"
+        );
+
+        let resp = app
+            .oneshot(mark_req(&project.id, name, "status=read&back=%2Finbox"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "a mark that bee accepted lands the reader back where they were"
+        );
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/inbox");
+        let (cwd, argv) = recorded(&log);
+        assert_eq!(
+            std::fs::canonicalize(&cwd).unwrap(),
+            std::fs::canonicalize(&project.root_path).unwrap(),
+            "bee must run in the project's own root, or it marks another project's letter"
+        );
+        assert_eq!(
+            argv,
+            vec!["mailbox", "mark", "--id", name, "--status", "read", "--json"],
+            "--id is the letter's file name, which is its only id (human-mailbox D11)"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A read letter offers the way back, and the same route carries it —
+    /// `--status unread`, the other member of bee's closed set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marking_a_read_letter_unread_calls_bee_with_the_other_status() {
+        let root = fresh_root("inbox-mark-unread");
+        let log = fresh_root("inbox-mark-unread-log").join("argv");
+        let name = "2026-08-30T10-00-00Z-again.md";
+        letter_file(
+            &root,
+            name,
+            "Đã xem rồi",
+            "eta",
+            "2026-08-30T10:00:00Z",
+            "read",
+            "ok\n",
+        );
+        fake_bee(&root, &log, &mark_json(name, "unread", "read", true), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Eta");
+        let app = router(st);
+
+        let list = body_string(get(app.clone(), "/inbox").await).await;
+        assert!(
+            list.contains(r#"name="status" value="unread""#),
+            "a read row must offer the flip back to unread: {list}"
+        );
+
+        let resp = app
+            .oneshot(mark_req(&project.id, name, "status=unread&back=%2Finbox"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let (_, argv) = recorded(&log);
+        assert_eq!(
+            argv,
+            vec!["mailbox", "mark", "--id", name, "--status", "unread", "--json"]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `mailbox mark` is idempotent and bee's own source says a retry must
+    /// never be punished: marking a letter to the status it already has
+    /// answers `changed: false` and that is a SUCCESS. Two clicks on the same
+    /// button — a double submit, a refresh — must land exactly where one did.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn re_marking_a_letter_to_the_status_it_already_has_is_success() {
+        let root = fresh_root("inbox-mark-idempotent");
+        let log = fresh_root("inbox-mark-idempotent-log").join("argv");
+        let name = "2026-08-30T11-00-00Z-twice.md";
+        letter_file(
+            &root,
+            name,
+            "Hai lần",
+            "theta",
+            "2026-08-30T11:00:00Z",
+            "read",
+            "ok\n",
+        );
+        // changed:false, previous_status == status — bee's own answer to a
+        // no-op mark, exit 0.
+        fake_bee(&root, &log, &mark_json(name, "read", "read", false), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Theta");
+        let app = router(st);
+
+        let resp = app
+            .oneshot(mark_req(&project.id, name, "status=read&back=%2Finbox"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "changed:false is bee saying the letter is already where you asked for it, \
+             not a failure to report"
+        );
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/inbox");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A refusal reaches the human in bee's own words — bee is the only party
+    /// that knows why it said no — and the letter's state is untouched: the
+    /// list still says "chưa đọc" afterwards, because nothing here ever flips
+    /// a row on the strength of a click.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_mark_surfaces_bees_reason_and_leaves_the_row_unread() {
+        let root = fresh_root("inbox-mark-refused");
+        let log = fresh_root("inbox-mark-refused-log").join("argv");
+        let name = "2026-08-30T12-00-00Z-refuse.md";
+        letter_file(
+            &root,
+            name,
+            "Chưa đụng tới",
+            "iota",
+            "2026-08-30T12:00:00Z",
+            "unread",
+            "ok\n",
+        );
+        // bee's real refusal text, from a live probe against this very verb.
+        fake_bee(
+            &root,
+            &log,
+            "",
+            "bee mailbox mark: no letter in .bee/human-mailbox — remedy: list that directory and pass a name it holds",
+            1,
+        );
+        let st = build_state();
+        let project = register(&st, &root, "Iota");
+        let app = router(st);
+
+        let resp = app
+            .clone()
+            .oneshot(mark_req(&project.id, name, "status=read&back=%2Finbox"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "a refused mark must not answer like one that worked"
+        );
+        let page = body_string(resp).await;
+        assert!(
+            page.contains("remedy: list that directory and pass a name it holds"),
+            "bee's own reason must reach the reader, never a generic failure: {page}"
+        );
+
+        let list = body_string(get(app, "/inbox").await).await;
+        assert!(
+            list.contains("Chưa đọc") && list.contains("1 chưa đọc"),
+            "the row must be exactly as it was — a refused mark flips nothing: {list}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D6 on disk: with a bee that reports success and changes nothing, the
+    /// letter file must be byte-identical and its mtime untouched afterwards.
+    /// If any code path in this server opened a letter to write the status
+    /// itself, this is the assertion that would fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mark_leaves_the_letter_file_byte_identical() {
+        let root = fresh_root("inbox-mark-no-write");
+        let log = fresh_root("inbox-mark-no-write-log").join("argv");
+        let name = "2026-08-30T13-00-00Z-intact.md";
+        letter_file(
+            &root,
+            name,
+            "Nguyên vẹn",
+            "kappa",
+            "2026-08-30T13:00:00Z",
+            "unread",
+            "ok\n",
+        );
+        fake_bee(&root, &log, &mark_json(name, "read", "unread", true), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Kappa");
+        let before = letter_on_disk(&root, name);
+
+        let resp = router(st)
+            .oneshot(mark_req(&project.id, name, "status=read&back=%2Finbox"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let after = letter_on_disk(&root, name);
+        assert_eq!(
+            before.0, after.0,
+            "waggledance must never write a letter's bytes — bee owns that field"
+        );
+        assert_eq!(
+            before.1, after.1,
+            "and must not so much as touch the file's mtime"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two ways a mark can be wrong before bee is ever worth running: a status
+    /// outside bee's closed set, and a letter name the reader never listed. In
+    /// both, no process is spawned at all — the log file the fake bee would
+    /// have written does not exist.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mark_that_bee_would_refuse_never_reaches_bee() {
+        let root = fresh_root("inbox-mark-guarded");
+        let log = fresh_root("inbox-mark-guarded-log").join("argv");
+        let name = "2026-08-30T14-00-00Z-guard.md";
+        letter_file(
+            &root,
+            name,
+            "Có thật",
+            "lambda",
+            "2026-08-30T14:00:00Z",
+            "unread",
+            "ok\n",
+        );
+        fake_bee(&root, &log, &mark_json(name, "read", "unread", true), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Lambda");
+        let app = router(st);
+
+        let bad_status = app
+            .clone()
+            .oneshot(mark_req(&project.id, name, "status=archived"))
+            .await
+            .unwrap();
+        assert_eq!(
+            bad_status.status(),
+            StatusCode::BAD_REQUEST,
+            "read|unread is a closed set, checked here rather than in bee's argv"
+        );
+
+        let unknown = app
+            .oneshot(mark_req(&project.id, "nothing-like-this.md", "status=read"))
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.status(),
+            StatusCode::NOT_FOUND,
+            "the :letter segment is matched against the names the reader listed"
+        );
+
+        assert!(
+            !log.exists(),
+            "neither refusal may spawn the project's bee at all"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D6 as a property of the source rather than of one traced path: the only
+    /// way anything here names a letter's location on disk is
+    /// `waggledance_core::bee`'s mailbox-directory helper, and its single use
+    /// in this server is a read. The view layer never names one at all.
+    ///
+    /// The needle is assembled rather than written out, so this test's own
+    /// source does not match itself.
+    #[test]
+    fn the_only_place_a_letter_path_is_built_is_a_read() {
+        let needle = format!("mailbox_{}(", "dir");
+        let write_apis = [
+            "fs::write",
+            "File::create",
+            "OpenOptions",
+            "write_all",
+            "create_new",
+            "remove_file",
+        ];
+        let read_source = |name: &str| {
+            std::fs::read_to_string(format!("{}/src/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        };
+
+        let views = read_source("views.rs");
+        assert_eq!(
+            views.matches(&needle).count(),
+            0,
+            "the view layer builds no path to a letter — it renders what it is handed"
+        );
+
+        let server = read_source("server.rs");
+        assert_eq!(
+            server.matches(&needle).count(),
+            1,
+            "exactly one place in this server resolves a letter's path: the one that reads it"
+        );
+        let lines: Vec<&str> = server.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains(&needle))
+            .expect("the one occurrence was just counted");
+        let window = lines[at..(at + 8).min(lines.len())].join("\n");
+        assert!(
+            window.contains("read_to_string"),
+            "that one occurrence must feed a read: {window}"
+        );
+        for api in write_apis {
+            assert!(
+                !window.contains(api),
+                "no letter path may reach {api} — human-mailbox D6 gives that field to bee: {window}"
             );
         }
     }
