@@ -17,6 +17,7 @@ use waggledance_core::git_diff::{
     ChangeBody, ChangeStatus, DiffLine, FileChange, GitDiffError, LineKind, WorkingTreeDiff,
 };
 use waggledance_core::render::{HighlightedSource, RenderService};
+use waggledance_core::short_link::{path_hash, short_code};
 
 pub fn layout(title: &str, head_extra: &str, body: &str) -> String {
     let title = esc(title);
@@ -9730,6 +9731,12 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
 /// block comment, a raw string) stays correct, and the per-line fragments
 /// it returns drop straight into the table cells.
 ///
+/// Reviewed marks are the reader's own, not the server's (D4): this page
+/// only lays the ground for them — `data-project-id` on the screen root,
+/// `data-path` and a content [`changeset_key`] on every section, a checkbox
+/// in each sticky header and a tick on each sidebar row. Which of them are
+/// ticked lives in the browser's `localStorage` and is never sent anywhere.
+///
 /// Git being unavailable, the project not being a repository, and a call
 /// that had to be killed all render an explained empty state here (D3) —
 /// the entry point stays, only its content changes.
@@ -9752,7 +9759,7 @@ pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderServic
   <div class="sidebar-backdrop"></div>
   <main class="content content--changes">
     <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">working tree</span></div></nav>
-    <div class="changes">{main}</div>
+    <div class="changes" data-project-id="{pid}">{main}</div>
   </main>
 </div>"#,
         topbar = topbar_full(
@@ -9832,9 +9839,15 @@ fn changes_nav(diff: &WorkingTreeDiff) -> String {
                 Some(old) => format!("{} → {}", old, file.path),
                 None => file.path.clone(),
             };
+            // The tick mirrors the section header's checkbox and is never read
+            // back: `app.js` paints it from that one checkbox, which is the
+            // single source of truth for a file's reviewed mark (D4). It ships
+            // in the markup and hides in CSS, so a page with scripting off
+            // shows no tick rather than a control that never moves.
             out.push_str(&format!(
                 "<a class=\"chap-file chg-row\" href=\"#f{i}\" title=\"{title}\">\
-                 {badge}<span class=\"chg-row__name\">{name}</span>{stat}</a>",
+                 {badge}<span class=\"chg-row__name\">{name}</span>{stat}\
+                 <span class=\"chg-row__check\" aria-hidden=\"true\">\u{2713}</span></a>",
                 i = i,
                 title = esc(&label),
                 badge = chg_badge(file),
@@ -9892,6 +9905,16 @@ fn changes_body(project: &Project, diff: &WorkingTreeDiff, render: &RenderServic
         n = diff.files.len(),
         word = plural_files(diff.files.len()),
     );
+    if !diff.files.is_empty() {
+        // D4's N/M counter. It ships `hidden` and `app.js` unhides it, the
+        // same way every other scripting-only control on this site does: with
+        // scripting off there is no storage to read and no checkbox to count,
+        // and a counter frozen at zero would be a number that lies.
+        head.push_str(&format!(
+            "<span class=\"changes__reviewed\" hidden>0/{n} reviewed</span>",
+            n = diff.files.len(),
+        ));
+    }
     if diff.hidden > 0 {
         // D5: the count, never the names — naming them would disclose
         // exactly what the project's exclude rules exist to hide.
@@ -9970,17 +9993,65 @@ fn changes_section(
         ),
     };
     format!(
-        "<section class=\"changeset\" id=\"f{index}\">\
+        "<section class=\"changeset\" id=\"f{index}\" data-path=\"{path}\" data-key=\"{key}\">\
          <h2 class=\"changeset__head\">{badge}\
-         <span class=\"changeset__path\">{name}</span>{note}{stat}</h2>\
+         <span class=\"changeset__path\">{name}</span>{note}{stat}\
+         <label class=\"changeset__review\" hidden>\
+         <input type=\"checkbox\" class=\"changeset__review-box\">\
+         <span class=\"changeset__review-text\">Reviewed</span></label></h2>\
          <div class=\"changeset__body\">{body}</div></section>",
         index = index,
+        path = esc(&file.path),
+        key = changeset_key(file),
         badge = chg_badge(file),
         name = esc(&name),
         note = note,
         stat = chg_stat(file),
         body = body,
     )
+}
+
+/// The content key a reviewed mark is stored against (D4).
+///
+/// A mark is a statement about what the reader SAW, never about a file name,
+/// so it hangs on the section's content: status, the counts, and both
+/// reconstructed sides. Edit a marked file and this key moves, the mark
+/// stored in the reader's browser stops matching, and `app.js` drops it on
+/// the next load — a tick can never end up hiding a change nobody has read.
+///
+/// FNV-1a through [`path_hash`], which is the one hash in this repo written
+/// to stay byte-identical across Rust releases; `DefaultHasher` explicitly
+/// does not promise that, and a value living in someone's `localStorage`
+/// between browser sessions is exactly where that promise matters.
+///
+/// Named limit: a binary file's bytes are not in the diff at all
+/// ([`ChangeBody::Binary`] carries no content), so re-editing one leaves its
+/// key unmoved and its mark standing. There is nothing to hash short of
+/// reading the file, and the section shows no content to re-review.
+fn changeset_key(file: &FileChange) -> String {
+    // \u{1} separates the fields so no concatenation of two of them can be
+    // read as a different pair (a path ending in a digit beside a count).
+    let body = match &file.body {
+        ChangeBody::Text {
+            old_text,
+            new_text,
+            truncated,
+            ..
+        } => format!("text\u{1}{truncated}\u{1}{old_text}\u{1}{new_text}"),
+        ChangeBody::Binary => "binary".to_string(),
+        ChangeBody::Submodule => "submodule".to_string(),
+        ChangeBody::NoContentChange => "unchanged".to_string(),
+        ChangeBody::Omitted(why) => format!("omitted\u{1}{why}"),
+    };
+    let material = format!(
+        "{status}\u{1}{old}\u{1}{added}\u{1}{removed}\u{1}{body}",
+        status = file.status.letter(),
+        old = file.old_path.as_deref().unwrap_or(""),
+        added = file.added,
+        removed = file.removed,
+        body = body,
+    );
+    short_code(&path_hash(&file.path, &material))
 }
 
 /// The same file over in the Code section — the way out of every section
@@ -22202,8 +22273,8 @@ mod tests {
             "the row reuses the Code sidebar's own row class and links to its section: {html}"
         );
         assert!(
-            html.contains("<section class=\"changeset\" id=\"f0\">")
-                && html.contains("<section class=\"changeset\" id=\"f1\">"),
+            html.contains("<section class=\"changeset\" id=\"f0\"")
+                && html.contains("<section class=\"changeset\" id=\"f1\""),
             "every anchor a row points at exists: {html}"
         );
         assert!(
@@ -22246,6 +22317,103 @@ mod tests {
             html.contains("2 files hidden by this project's exclude rules"),
             "the aggregate hidden count is shown: {html}"
         );
+    }
+
+    /// Every `data-key` on the page, in section order — the content keys a
+    /// reviewed mark is stored against.
+    fn data_keys(html: &str) -> Vec<String> {
+        html.match_indices("data-key=\"")
+            .map(|(i, m)| {
+                let rest = &html[i + m.len()..];
+                rest[..rest.find('"').expect("attribute is closed")].to_string()
+            })
+            .collect()
+    }
+
+    /// cds-3 / D4: the ground the client-side reviewed layer stands on. The
+    /// marks themselves live in the reader's browser, so what the SERVER
+    /// owes is the addressing — the project the marks are scoped to, a path
+    /// and a content key per section, a checkbox to tick and a tick on the
+    /// sidebar row that mirrors it, and the counter's own element.
+    #[test]
+    fn the_page_carries_everything_a_reviewed_mark_hangs_on() {
+        let html = changes_html(changes_fixture());
+
+        assert!(
+            html.contains("<div class=\"changes\" data-project-id=\"proj-1\">"),
+            "marks are scoped per project, so the id is on the screen root: {html}"
+        );
+        assert!(
+            html.contains("<section class=\"changeset\" id=\"f0\" data-path=\"src/app/main.rs\" data-key=\""),
+            "each section names its file and its content key: {html}"
+        );
+        assert_eq!(
+            data_keys(&html).len(),
+            2,
+            "one key per changed file: {html}"
+        );
+        assert!(
+            html.contains("<label class=\"changeset__review\" hidden>")
+                && html.contains("<input type=\"checkbox\" class=\"changeset__review-box\">"),
+            "the checkbox is in the sticky header, shipped hidden for no-script: {html}"
+        );
+        assert_eq!(
+            html.matches("class=\"chg-row__check\"").count(),
+            2,
+            "every sidebar row carries the mirrored tick: {html}"
+        );
+        assert!(
+            html.contains("<span class=\"changes__reviewed\" hidden>0/2 reviewed</span>"),
+            "the N/M counter ships with the file total and stays hidden until app.js counts: {html}"
+        );
+    }
+
+    /// The rule that keeps a tick honest: the key is derived from the
+    /// section's CONTENT, so editing a marked file moves it and the mark
+    /// stored under the old key stops matching (app.js drops it on load).
+    /// Re-rendering the same diff must move nothing, or every mark would
+    /// evaporate on the next reload.
+    #[test]
+    fn editing_a_file_moves_its_content_key_and_leaves_the_others_alone() {
+        let before = data_keys(&changes_html(changes_fixture()));
+        let again = data_keys(&changes_html(changes_fixture()));
+        assert_eq!(
+            before, again,
+            "the same diff renders the same keys, or no mark would ever survive a reload"
+        );
+
+        let mut edited = changes_fixture();
+        if let ChangeBody::Text { new_text, .. } = &mut edited.files[0].body {
+            *new_text = new_text.replace("let new = 2;", "let new = 42;");
+        }
+        let after = data_keys(&changes_html(edited));
+        assert_ne!(
+            before[0], after[0],
+            "an edit to the file's new side moves its key: {before:?} vs {after:?}"
+        );
+        assert_eq!(
+            before[1], after[1],
+            "and moves no other file's: {before:?} vs {after:?}"
+        );
+
+        // A rename with byte-identical content is still a different thing to
+        // have reviewed, so the status is part of the key too.
+        let mut renamed = changes_fixture();
+        renamed.files[0].status = ChangeStatus::Renamed;
+        assert_ne!(before[0], data_keys(&changes_html(renamed))[0]);
+    }
+
+    /// Nothing changed: no sections, so no counter — "0/0 reviewed" beside
+    /// "nothing has changed" would be a number about nothing.
+    #[test]
+    fn an_empty_diff_offers_no_reviewed_counter() {
+        let html = changes_html(WorkingTreeDiff::default());
+        assert!(
+            html.contains("Nothing has changed in the working tree."),
+            "{html}"
+        );
+        assert!(!html.contains("changes__reviewed"), "{html}");
+        assert!(!html.contains("changeset__review"), "{html}");
     }
 
     /// A binary file says so instead of rendering bytes; a truncated one

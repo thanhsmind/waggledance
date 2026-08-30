@@ -3335,6 +3335,29 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   font-size: var(--type-caption-size);
   color: var(--color-text-muted);
 }
+/* D4's N/M counter: the same pill as the scope chip beside it, so the two
+   read as one line of header state. It ships `hidden` and app.js unhides
+   it — this file only has to make sure the `display` below does not outrank
+   the UA sheet's `[hidden] { display: none }` (the trap `.proj-row[hidden]`
+   documents). At N == M it takes the site's own success accent plus the
+   checkmark app.js puts in the text: a quiet "that's all of them", not a
+   banner. */
+.changes__reviewed {
+  display: inline-block;
+  padding: var(--space-0) var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-family: var(--num-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.changes__reviewed[hidden] {
+  display: none;
+}
+.changes__reviewed--done {
+  background: var(--color-success-tint);
+  color: var(--color-success);
+}
 /* D5: an aggregate count, never a name. */
 .changes__hidden,
 .changes__note,
@@ -3367,6 +3390,21 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* The sidebar's mirror of the section checkbox (D4). It holds its column
+   whether or not it is showing, so ticking a file never shifts the row's
+   name under the pointer. */
+.chg-row__check {
+  flex: none;
+  visibility: hidden;
+  color: var(--color-success);
+  font-size: var(--type-tag-size);
+}
+.chg-row--reviewed .chg-row__check {
+  visibility: visible;
+}
+.chg-row--reviewed .chg-row__name {
+  color: var(--color-text-muted);
 }
 .changes-nav__empty {
   margin: 0;
@@ -3448,6 +3486,47 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   font-family: var(--font-mono);
   color: var(--color-text);
   word-break: break-all;
+}
+/* The reviewed checkbox, at the far end of the sticky header where the
+   reader's eye lands after the path and the counts. Scripting-only, so it
+   ships `hidden`; the `display` here would otherwise outrank the UA sheet's
+   `[hidden]` rule and show a box that remembers nothing. */
+.changeset__review {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.changeset__review[hidden] {
+  display: none;
+}
+.changeset__review-box {
+  margin: 0;
+  accent-color: var(--color-success);
+}
+/* Reviewed: the section steps back rather than disappearing — the header
+   stays fully legible so the file is still findable by name. */
+.changeset--reviewed .changeset__path {
+  color: var(--color-text-muted);
+}
+.changeset--reviewed .changeset__review {
+  color: var(--color-success);
+}
+.changeset--reviewed .changeset__body {
+  opacity: 0.55;
+}
+/* Folded away. Clicking the header brings it back (app.js), which is why the
+   header itself is never hidden with it. */
+.changeset--collapsed .changeset__body {
+  display: none;
+}
+.changeset--collapsed .changeset__head {
+  cursor: pointer;
 }
 .changeset__note {
   padding: 0 var(--space-2);

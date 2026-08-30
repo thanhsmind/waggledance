@@ -1664,6 +1664,144 @@
     sections.forEach(function (s) { observer.observe(s); });
   })();
 
+  // Changes-screen reviewed marks (changes-diff-screen, D4): which files the
+  // reader has already been through is the READER's business, so it lives in
+  // this browser and nowhere else — `localStorage["waggledance-reviewed:<project-id>"]`,
+  // no server state, no cookie, no request. Closing the tab is the only thing
+  // that has ever known about it.
+  //
+  // The stored value is a map of file path -> the section's `data-key`, the
+  // short content hash `views.rs` emits for exactly this purpose: a mark is a
+  // statement about CONTENT, not about a name. Edit a file after marking it
+  // and its key moves, the stored mark no longer matches, and it is dropped
+  // on load — "reviewed" can never end up hiding a change nobody has read.
+  //
+  // ONE source of truth: the checkbox in each sticky section header. The
+  // sidebar tick, the section's dimmed/collapsed state and the N/M counter
+  // are all painted FROM those checkboxes and never read back, so there is no
+  // second copy of the answer to keep in step.
+  (function () {
+    var root = document.querySelector(".changes[data-project-id]");
+    if (!root) return;
+    var sections = Array.prototype.slice.call(root.querySelectorAll(".changeset[data-key]"));
+    if (!sections.length) return;
+
+    var KEY = "waggledance-reviewed:" + root.getAttribute("data-project-id");
+    var counter = root.querySelector(".changes__reviewed");
+    var nav = document.querySelector(".changes-nav");
+    var total = sections.length;
+
+    // Storage is a hostile input like any other (same idiom as the rail and
+    // tab-bar collapses above): a disabled or quota-blocked `localStorage`
+    // throws on read, and anything that is not a flat object of strings reads
+    // as "nothing marked" rather than taking the screen down with it.
+    function load() {
+      var raw = null;
+      try { raw = localStorage.getItem(KEY); } catch (e) { return {}; }
+      if (!raw) return {};
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (e) { return {}; }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      var out = {};
+      Object.keys(parsed).forEach(function (k) {
+        if (typeof parsed[k] === "string") out[k] = parsed[k];
+      });
+      return out;
+    }
+
+    // Written from the checkboxes, so it carries only files this page still
+    // lists with the key it renders today. That is the pruning: a file that
+    // has since been committed, or whose content moved under a mark, simply
+    // is not in what gets written back.
+    function save() {
+      var next = {};
+      var marked = 0;
+      state.forEach(function (s) {
+        if (s.box && s.box.checked && s.path && s.key) {
+          next[s.path] = s.key;
+          marked += 1;
+        }
+      });
+      try {
+        if (!marked) localStorage.removeItem(KEY);
+        else localStorage.setItem(KEY, JSON.stringify(next));
+      } catch (e) {}
+    }
+
+    var state = sections.map(function (section) {
+      var label = section.querySelector(".changeset__review");
+      return {
+        section: section,
+        head: section.querySelector(".changeset__head"),
+        path: section.getAttribute("data-path") || "",
+        key: section.getAttribute("data-key") || "",
+        label: label,
+        box: label && label.querySelector(".changeset__review-box"),
+        row: nav && nav.querySelector("a[href='#" + section.id + "']"),
+      };
+    });
+
+    function paintCounter() {
+      if (!counter) return;
+      var n = 0;
+      state.forEach(function (s) { if (s.box && s.box.checked) n += 1; });
+      var done = n === total;
+      // The complete state is a checkmark and the accent the rest of the site
+      // already uses for "green" — CSS carries the colour, this only says so.
+      counter.textContent = (done ? "✓ " : "") + n + "/" + total + " reviewed";
+      counter.classList.toggle("changes__reviewed--done", done);
+    }
+
+    function paintOne(s) {
+      var on = !!(s.box && s.box.checked);
+      s.section.classList.toggle("changeset--reviewed", on);
+      if (s.row) s.row.classList.toggle("chg-row--reviewed", on);
+      if (s.label) {
+        var what = s.path || "this file";
+        s.label.title = on ? "Mark " + what + " unreviewed" : "Mark " + what + " reviewed";
+      }
+    }
+
+    var marks = load();
+    state.forEach(function (s) {
+      if (!s.box) return;
+      // The key check is the whole "an edit clears the mark" rule: a stored
+      // key that is not the one this page just rendered is a mark on content
+      // the reader has not seen, and it does not come back.
+      s.box.checked = !!(s.path && s.key && marks[s.path] === s.key);
+      // A marked file folds away — reviewing is subtractive, and the point of
+      // marking one is to stop looking at it.
+      s.section.classList.toggle("changeset--collapsed", s.box.checked);
+      paintOne(s);
+      if (s.label) s.label.hidden = false;
+
+      s.box.addEventListener("change", function () {
+        s.section.classList.toggle("changeset--collapsed", s.box.checked);
+        paintOne(s);
+        paintCounter();
+        save();
+      });
+
+      // Clicking the sticky header brings a folded section back. One way on
+      // purpose: a stray click on a header must never hide content the reader
+      // was reading. The mark itself is untouched — folding is a view of the
+      // review, not the review. Clicks inside the label belong to the
+      // checkbox and are left alone.
+      if (s.head) {
+        s.head.addEventListener("click", function (e) {
+          if (s.label && s.label.contains(e.target)) return;
+          s.section.classList.remove("changeset--collapsed");
+        });
+      }
+    });
+
+    paintCounter();
+    if (counter) counter.hidden = false;
+    // Write once on load so the marks dropped just above (edited files, files
+    // no longer in the diff) leave storage instead of growing there forever.
+    save();
+  })();
+
 
   // Live reload, targeted (PRD FR-19): the watcher broadcasts
   // {"changed":["<project_id>/<rel_path>", ...]}. A file page reloads only

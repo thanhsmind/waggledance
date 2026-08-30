@@ -33639,8 +33639,18 @@ mod bee_route_tests {
         // back highlighted rather than as plain text.
         assert!(
             body.contains("class=\"chap-file chg-row\" href=\"#f0\"")
-                && body.contains("<section class=\"changeset\" id=\"f0\">"),
+                && body.contains("<section class=\"changeset\" id=\"f0\""),
             "a sidebar row links to a section that exists: {body}"
+        );
+        // cds-3: the reviewed layer, through the same real route. The marks
+        // themselves never leave the browser (D4), so what the response owes
+        // is the addressing they hang on.
+        assert!(
+            body.contains(&format!("data-project-id=\"{}\"", project.id))
+                && body.contains("data-path=\"mod.txt\" data-key=\"")
+                && body.contains("class=\"changeset__review-box\"")
+                && body.contains("reviewed</span>"),
+            "the page carries the project scope, a per-file content key, the checkbox and the counter: {body}"
         );
         assert!(
             body.contains("diffrow__side--old") && body.contains("diffrow__side--new"),
