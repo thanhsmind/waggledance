@@ -321,6 +321,18 @@ content itself.
   embedded Code or Changes frame for the same project, the bottom half the
   live terminal. Default closed (the page is unchanged until a tab is
   clicked); the open tab is remembered per project for the browser tab.
+- **Homepage terminals sidebar:** the home page's terminals tab
+  (`/?tab=terminals&pane=<id>`) carries a right sidebar with Files and Diff
+  tabs scoped to the selected pane's project — Files a compact file tree,
+  Diff the changed-files list with badges and per-file counts (both are
+  nav-only frames: `?embed=1&nav=1` renders just the list, folder links
+  navigate the sidebar itself, file links load into a named panel frame
+  above the terminal via a `<base target>`). Selecting Diff also fills that
+  panel with the embedded Changes page at once; a close control restores the
+  full-height terminal. A pane belonging to no registered project shows an
+  explained empty state and loads no frames. The open sidebar tab is
+  remembered per project for the browser tab; every frame URL is emitted by
+  the server.
 
 ## Actors & Access
 

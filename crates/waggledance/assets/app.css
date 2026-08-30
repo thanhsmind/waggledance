@@ -3689,6 +3689,68 @@ main.fg-page.term-split .term-embed__panel { flex: 1 1 auto; }
 main.fg-page.term-split .term-panes { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top: var(--border-width-hairline) solid var(--color-border); padding-top: var(--space-2); }
 
 /* ============================================================
+   HOMEPAGE TERMINALS TAB — FILES | DIFF SIDEBAR + PANEL
+   (home-terminal-panel, D1/D2)
+   The same two halves the block above gives a project's terminal page, laid
+   out for a tab that has a rail on its left already: the sidebar is a third
+   column on the right (tabs over one lazy nav frame), and the panel those
+   frames open into sits above the terminal, splitting the area in half
+   exactly as `.term-embed` does — the split class on `<main>` is literally
+   the same one, so there is one definition of what "split" means.
+   Closed costs nothing: `.home-term__panel` and the nav frames carry the
+   `hidden` attribute and NO rule here sets `display` on them unconditionally
+   (`:not([hidden])` is what turns the panel into a column), so a tab nobody
+   opens is the tab it has always been, plus the sidebar.
+   ============================================================ */
+.home-term { display: flex; align-items: stretch; gap: var(--space-3); min-width: 0; }
+.home-term__col { display: flex; flex-direction: column; gap: var(--space-2); flex: 1 1 auto; min-width: 0; min-height: 0; }
+/* Judged against the nav pages it holds: the Code tree's own sidebar is
+   240px wide and the changed-file list's rows carry a badge and ± counts
+   beside the name, so 280px is the width where a middling path stops
+   wrapping — and it is taken from a `<main>` that already stretches to fill
+   whatever the 320px rail leaves. */
+.home-term__side { display: flex; flex-direction: column; gap: var(--space-2); flex: 0 0 280px; min-width: 0; min-height: 0; }
+.home-term__tabs { display: flex; gap: var(--space-1); min-width: 0; }
+/* The project page's `.term-embed__tab`, halved across the sidebar's width
+   so the pair reads as one control rather than two loose buttons. */
+.home-term__tab { flex: 1 1 0; padding: var(--space-1) var(--space-3); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); letter-spacing: .04em; cursor: pointer; }
+.home-term__tab:hover { border-color: var(--color-border-strong); color: var(--color-text); }
+.home-term__tab--on { border-color: var(--color-action); color: var(--color-text); font-weight: var(--weight-semibold); }
+/* The hint is what the sidebar says before either tab is opened; once one
+   is, the frame below says it better. */
+.home-term__side--open .home-term__hint { display: none; }
+.home-term__navs { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; }
+.home-term__nav { flex: 1 1 auto; width: 100%; min-height: 360px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); }
+.home-term__panel { min-height: 0; min-width: 0; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); overflow: hidden; }
+.home-term__panel:not([hidden]) { display: flex; flex-direction: column; }
+.home-term__panel-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: var(--space-1) var(--space-2); border-bottom: var(--border-width-hairline) solid var(--color-border); }
+.home-term__panel-name { font-size: var(--type-tag-size); letter-spacing: .04em; color: var(--color-text-muted); }
+.home-term__close { padding: var(--space-1) var(--space-2); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); cursor: pointer; }
+.home-term__close:hover { border-color: var(--color-border-strong); color: var(--color-text); }
+.home-term__frame { display: block; flex: 1 1 auto; width: 100%; min-height: 0; border: 0; }
+/* The split, applied by `assets/app.js` to `<main>` — the same class and the
+   same height rule the project page's panel uses (above); only the children
+   it divides are this tab's. */
+main.fg-page.term-split .home-term { height: 100%; min-height: 0; }
+main.fg-page.term-split .home-term__panel { flex: 1 1 50%; }
+main.fg-page.term-split .home-term__screen { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top: var(--border-width-hairline) solid var(--color-border); padding-top: var(--space-2); }
+/* Narrow: the sidebar goes UNDER the terminal rather than squeezing it —
+   the same answer the rail already gives at this width (it becomes a
+   drawer), for the same reason. A fixed-height split has nothing to divide
+   on a handset either, so the page goes back to scrolling as one column
+   with the panel taking a readable slice of the viewport. 700px is the one
+   breakpoint this layout uses. */
+@media (max-width: 700px) {
+  .home-term { flex-direction: column; }
+  .home-term__side { flex: none; width: auto; }
+  .home-term__nav { min-height: 60vh; }
+  .home-shell > main.fg-page.term-split { height: auto; overflow: visible; }
+  .home-shell > main.fg-page.term-split .home-term { height: auto; }
+  .home-shell > main.fg-page.term-split .home-term__panel { flex: none; height: 60vh; }
+  .home-shell > main.fg-page.term-split .home-term__screen { flex: none; overflow: visible; }
+}
+
+/* ============================================================
    EMBED MODE (changes-diff-screen, D9)
    `?embed=1` renders the Code and Changes pages without the topbar, for a
    same-origin iframe (the terminal screen's FILES | DIFF panel). The markup
@@ -3725,4 +3787,60 @@ html:has(.layout--embed) {
   .layout--embed.sidebar-open .sidebar-backdrop {
     inset: 0;
   }
+}
+
+/* ============================================================
+   NAV-ONLY MODE (home-terminal-panel, D2)
+   `?embed=1&nav=1` serves a Code or Changes page as its NAVIGATION alone —
+   the tree, or the changed-file list — for the two narrow iframes in the
+   homepage terminals tab's right sidebar. The rows themselves are the
+   sidebar rows the full pages already ship (`.chapter`, `.chap-file`,
+   `.chg-row`), unchanged and unduplicated; what this block does is put them
+   in a document that is nothing but them, at roughly a third of the width
+   `.sidebar` was drawn for. Placed after the embed rules for the same
+   reason those were placed last: source order decides between rules of
+   equal specificity.
+   ============================================================ */
+.nav-only {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: var(--space-3) var(--space-2);
+  background: var(--color-surface);
+}
+/* No topbar above this document, so an anchored jump has nothing to clear —
+   the reserve `html` keeps for the 53px bar would just be a gap here. */
+html:has(.nav-only) {
+  scroll-padding-top: var(--space-3);
+}
+/* The Diff nav's header strip: the base picker, ruled off from the list it
+   governs so a long file list scrolling past it stays legible. */
+.nav-only__head {
+  margin-bottom: var(--space-2);
+  padding-bottom: var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+}
+/* The picker at sidebar width: the label sits above its control rather than
+   beside it, and the select gives up the 26rem it holds on the full screen —
+   at this width that cap is wider than the frame. */
+.nav-only .changes__base {
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.nav-only .changes__base-select {
+  flex: 1 1 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.nav-only .changes__base-go {
+  flex: none;
+}
+/* The Files nav's own search box is inert on these pages (the Code tree
+   ships it disabled); it keeps its place but not the full sidebar's gap. */
+.nav-only .fg-sidebar-search {
+  margin-bottom: var(--space-2);
+}
+/* A file's `+n −m` must not push its name out of the row: the name is the
+   part that ellipses, the counts hold their width. */
+.nav-only .chg-stat {
+  flex: none;
 }
