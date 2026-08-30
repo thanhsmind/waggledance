@@ -1026,6 +1026,14 @@ mod tests {
                 }
             }
         }
+        async fn agent_wait(
+            &self,
+            pane_id: &str,
+            until: &[AgentStatus],
+            timeout_ms: u64,
+        ) -> herdr::Result<AgentStatus> {
+            self.inner.agent_wait(pane_id, until, timeout_ms).await
+        }
         async fn send_text(&self, pane_id: &str, bytes: &str) -> herdr::Result<()> {
             self.inner.send_text(pane_id, bytes).await
         }

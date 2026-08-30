@@ -542,10 +542,22 @@ fn attach_workspace_id(error: HerdrError, workspace_id: &str) -> HerdrError {
     }
 }
 
-/// How long herdr may wait for a freshly started agent to become
-/// interactive-ready before `agent.start` gives up. 30 s is herdr's own CLI
-/// default; `herdr api schema --json` accepts `> 3000` and `<= 300000`, so any
-/// change must stay inside that band or the call is rejected at the door.
+/// The `timeout_ms` sent with `agent.start` — herdr's own **startup**
+/// timeout, and nothing more.
+///
+/// It buys no readiness whatsoever (dispatch-submit-and-reclaim **D4**,
+/// probed at the wire 2026-08-30): replaying these exact params WITH
+/// `timeout_ms: 30000` returns in 0.00 s carrying `launch_pending: true` and
+/// `agent_status: unknown`. The 30 s wait-for-interactive-ready that
+/// `herdr agent start --help` advertises is the herdr CLI's own, performed
+/// client-side after the call — the socket method never performs it.
+/// Readiness comes from the separate `agent.wait` hop
+/// ([`super::Herdr::agent_wait`], called by `start_declared_agent`); this
+/// value only bounds how long herdr will keep trying to launch.
+///
+/// 30 s matches herdr's own CLI default; `herdr api schema --json` accepts
+/// `> 3000` and `<= 300000`, so any change must stay inside that band or the
+/// call is rejected at the door.
 const AGENT_START_READY_TIMEOUT_MS: u64 = 30_000;
 
 /// Build the `agent.start` params -- `name`, `argv`, `workspace_id`,
@@ -564,15 +576,15 @@ const AGENT_START_READY_TIMEOUT_MS: u64 = 30_000;
 /// kind and the remaining tokens into the agent's own argv"), which is why
 /// every `herding.agents` entry leads with `claude` / `pi` / `agy`.
 ///
-/// `timeout_ms` is the readiness wait and is NOT optional in practice: herdr
-/// only reports `agent.start` done once the agent is *interactive-ready*, and
-/// it only waits that long when asked. Omitting the key made `agent.start`
-/// return the moment the process launched (~0.2 s), so the `agent.prompt` that
-/// follows found no registered agent and died with `agent_not_ready` — twice
-/// out of two live dispatches, while the same argv started through herdr's own
-/// CLI took 3.74 s to report `interactive_ready`. We send
-/// [`AGENT_START_READY_TIMEOUT_MS`] to match that CLI's own default. The
-/// daemon owns the waiting; waggledance never polls for readiness itself.
+/// `timeout_ms` is herdr's **startup** timeout — how long it keeps trying to
+/// launch — and it is deliberately NOT a readiness wait, whatever the CLI's
+/// help text suggests (dispatch-submit-and-reclaim **D4**: with this key
+/// present, `agent.start` still returns in 0.00 s carrying
+/// `launch_pending: true` and `agent_status: unknown`). It is kept because
+/// herdr documents and accepts it, sized at
+/// [`AGENT_START_READY_TIMEOUT_MS`] to match that CLI's own default.
+/// Readiness is bought one hop later, by `agent.wait`
+/// ([`super::Herdr::agent_wait`]); nothing in these params provides it.
 ///
 /// The caller guarantees a non-empty `argv`; `agent_start_named` refuses an
 /// empty one before reaching here.
@@ -600,6 +612,21 @@ fn agent_prompt_params(pane_id: &str, text: &str, until: &[AgentStatus], timeout
             "until": until,
             "timeout_ms": timeout_ms,
         },
+    })
+}
+
+/// Build the `agent.wait` params -- `target`, `until`, `timeout_ms`, flat
+/// (`AgentWaitParams { target, until, timeout_ms }`, confirmed via
+/// `herdr api schema --json` and a live probe). Note the shape difference
+/// from `agent.prompt`: there is no nested `wait` object here, the three keys
+/// sit at the top level. `target` is the pane id, the same wire slot herdr's
+/// `<TARGET>` CLI argument fills. Pure, same testable seam as
+/// `agent_start_params`/`agent_prompt_params`.
+fn agent_wait_params(pane_id: &str, until: &[AgentStatus], timeout_ms: u64) -> Value {
+    json!({
+        "target": pane_id,
+        "until": until,
+        "timeout_ms": timeout_ms,
     })
 }
 
@@ -729,6 +756,28 @@ impl Herdr for SocketHerdr {
             .clone();
         serde_json::from_value(status)
             .map_err(|e| HerdrError::Malformed(format!("agent_prompted.agent.agent_status: {e}")))
+    }
+
+    async fn agent_wait(
+        &self,
+        pane_id: &str,
+        until: &[AgentStatus],
+        timeout_ms: u64,
+    ) -> Result<AgentStatus> {
+        let result = self
+            .call("agent.wait", agent_wait_params(pane_id, until, timeout_ms))
+            .await?;
+        // result: { "type":"agent_info", "agent": AgentInfo } -- the status
+        // the agent actually reached. A target carrying no registered agent
+        // refuses `agent_not_found` before any waiting happens, which arrives
+        // here as a generic `Remote` and is a genuine spawn failure.
+        let status = result
+            .get("agent")
+            .and_then(|agent| agent.get("agent_status"))
+            .ok_or_else(|| HerdrError::Malformed("agent_info.agent.agent_status missing".into()))?
+            .clone();
+        serde_json::from_value(status)
+            .map_err(|e| HerdrError::Malformed(format!("agent_info.agent.agent_status: {e}")))
     }
 
     async fn send_keys(&self, pane_id: &str, keys: &[String]) -> Result<()> {
@@ -977,22 +1026,48 @@ mod tests {
     }
 
     #[test]
-    fn agentstart_params_ask_for_the_readiness_wait() {
-        // The wire shape IS the fix: with `timeout_ms` omitted, agent.start
-        // returned as soon as the process launched and the agent.prompt that
-        // follows died with `agent_not_ready`. The key must be present, and
-        // its value must sit inside the band herdr's schema accepts
-        // (`> 3000`, `<= 300000`) or the call is rejected at the door.
+    fn agentstart_params_carry_herdrs_startup_timeout_and_buy_no_readiness() {
+        // This pins the BAND, not a guarantee. `timeout_ms` is herdr's
+        // startup timeout: D4 replayed these exact params at the wire WITH
+        // the key present and `agent.start` still returned in 0.00s carrying
+        // `launch_pending: true` / `agent_status: unknown`. So the only thing
+        // this test may claim is that the value we send is one herdr accepts
+        // -- inside the schema's `> 3000`, `<= 300000` band, or the call is
+        // rejected at the door. Readiness is proved by
+        // `agentwait_params_are_the_readiness_hop` below and delivered by
+        // `Herdr::agent_wait`, never here.
         let argv = vec!["claude".to_string()];
         let params = agent_start_params("ready-please", "w1:p1", &argv);
         let timeout = params
             .get("timeout_ms")
-            .expect("timeout_ms must be sent, not omitted -- omitting it is the agent_not_ready bug")
+            .expect("timeout_ms is herdr's documented startup timeout and must still be sent")
             .as_u64()
             .expect("timeout_ms must be a number");
         assert!(
             timeout > 3_000 && timeout <= 300_000,
             "timeout_ms {timeout} is outside herdr's accepted band (>3000, <=300000)"
+        );
+    }
+
+    #[test]
+    fn agentwait_params_are_the_readiness_hop() {
+        // The exact bytes `agent.wait` puts on the wire -- the hop that
+        // actually buys readiness (D4). Flat keys, deliberately: unlike
+        // `agent.prompt` there is no nested `wait` object, and nesting them
+        // would be silently accepted as an empty wait. `until` serializes as
+        // herdr's own snake_case status names.
+        let params = agent_wait_params(
+            "w1:pM",
+            &[AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done],
+            30_000,
+        );
+        assert_eq!(
+            params,
+            json!({
+                "target": "w1:pM",
+                "until": ["idle", "working", "done"],
+                "timeout_ms": 30_000,
+            })
         );
     }
 

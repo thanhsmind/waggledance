@@ -673,6 +673,39 @@ impl Herdr for FakeHerdr {
         }
     }
 
+    /// The readiness hop, with the same no-clock honesty as `agent_prompt`:
+    /// `FakeHerdr` cannot simulate the daemon spending 3.41s watching an
+    /// agent come up, so it answers from the status the agent already
+    /// carries. `agent_start_named` registers a new agent as `Idle`, which
+    /// is inside every caller's `until`, so a spawn through this fake sails
+    /// through exactly as a real ready agent would. A pane with no
+    /// registered agent refuses `NoSuchPane` -- the fake's spelling of
+    /// herdr's own `agent_not_found` -- and a status outside `until` is the
+    /// budget running out, since with no clock there is nothing else a
+    /// non-matching state could become.
+    async fn agent_wait(
+        &self,
+        pane_id: &str,
+        until: &[AgentStatus],
+        _timeout_ms: u64,
+    ) -> Result<AgentStatus> {
+        self.ensure_up()?;
+        let snap = self.inner.snapshot.lock().await;
+        let agent = snap
+            .agents
+            .iter()
+            .find(|a| a.pane_id == pane_id)
+            .ok_or_else(|| HerdrError::NoSuchPane(pane_id.to_string()))?;
+        if until.is_empty() || until.contains(&agent.status) {
+            Ok(agent.status)
+        } else {
+            Err(HerdrError::Timeout(format!(
+                "agent on {pane_id} did not reach {until:?} (observed {:?})",
+                agent.status
+            )))
+        }
+    }
+
     async fn close_pane(&self, pane_id: &str) -> Result<()> {
         self.ensure_up()?;
         // Logged before the refusal check and before the pane is looked up:
