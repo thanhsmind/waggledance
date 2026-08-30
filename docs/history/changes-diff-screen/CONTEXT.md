@@ -87,18 +87,20 @@ These are fixed. Planning must implement them exactly — cited, never reinterpr
 
 ### Deferred To Planning
 
-- [ ] git2 vs shell-out — measure build-cost impact and pick (Agent's Discretion).
-- [ ] Large-diff limits — what caps a 10k-line diff or a 500-file working tree;
-      reuse the 2 MiB/read_source discipline.
-- [ ] Rename detection (R status) — show as R or as D+A pair; whichever the chosen
-      git access makes cheap.
+<!-- bee:not-a-deferral: all three were answered by planning on 2026-08-30 — resolutions recorded in plan.md (Approach) and decision ad275999; kept as the historical question list, nothing left to act on -->
+- [x] git2 vs shell-out — resolved: shell-out, 3 read-only calls (plan.md Approach).
+- [x] Large-diff limits — resolved: 2 MiB/side, 100 sections, 48 MiB stdout (plan.md).
+- [x] Rename detection — resolved: R with `old → new` label via `-M` (plan.md).
+<!-- /bee:not-a-deferral -->
 
 ## Deferred Ideas
 
+<!-- bee:not-a-deferral: out-of-scope register mirrored in plan.md "Out of scope"; these become work only through a new user ask or backlog item, no promise to act rides here -->
 - Base/commit picker (diff vs arbitrary ref) — v2; D2 locks working-tree-only.
 - Nested files-explorer tree + Docs/Code unification (layers 1–3) — explicitly
   out, per D1.
 - Live refresh of the diff via the watcher — watcher is md-only today; separate ask.
+<!-- /bee:not-a-deferral -->
 
 ## Handoff Note
 
