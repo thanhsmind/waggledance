@@ -266,6 +266,12 @@ pub fn home_page(
     // simply absent from the map, so its row stays byte-identical to
     // before this feature.
     paseo_by_project: &std::collections::HashMap<String, Vec<PaseoAgentBadge>>,
+    // board-visibility bv-4: the per-project bee roll-up `server.rs::index_page`
+    // already read for the Kanban section, keyed by project id and forwarded
+    // verbatim into [`project_sidebar`] — plumbing only, never a second read.
+    // A project with no `.bee/` (or with the roll-up read skipped entirely) is
+    // simply absent from the map and its row stays exactly as it was.
+    bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
 ) -> String {
     // console-theme-kanban (ctk-12), retargeting homepage-tabs edge (b):
     // this line used to force the Projects tab, because that was the only
@@ -315,6 +321,7 @@ pub fn home_page(
                     // button is what is current here.
                     None,
                     paseo_by_project,
+                    bee_by_project,
                 ),
                 // D1 (backlog-groom-2): an empty `cross_features_html`
                 // (D9 — no registered project carries a `.bee` board) used
@@ -368,6 +375,7 @@ pub fn home_page(
                     effective_pane(terminals_panes, terminals_selected_pane)
                         .map(|p| p.view.pane_id.as_str()),
                     paseo_by_project,
+                    bee_by_project,
                 ),
                 body = terminals_tab(
                     terminals_panes,
@@ -1115,6 +1123,11 @@ fn bee_hub_kind_naming_columnar(agent: Option<&BeeCardAgent>) -> String {
 ///
 /// Returns the `<nav>` element alone; the shell around it, the topbar and
 /// `layout` wrapping stay the caller's own job.
+// Same reason [`home_page`] carries this allow: every parameter is an
+// independent render input assembled by `server.rs::index_page`, and each
+// one is documented where it stands — bundling them into a struct would
+// move those doc comments away from the thing they describe.
+#[allow(clippy::too_many_arguments)]
 fn project_sidebar(
     projects: &[(Project, usize, Vec<TerminalPaneView>)],
     unassigned_visible: bool,
@@ -1135,6 +1148,13 @@ fn project_sidebar(
     // name — forwarded here unchanged, looked up per row by project id
     // beside [`project_badges`]'s herdr badges.
     paseo_by_project: &std::collections::HashMap<String, Vec<PaseoAgentBadge>>,
+    // board-visibility bv-4: see [`home_page`]'s own parameter of the same
+    // name — looked up per row by project id, exactly as `paseo_by_project`
+    // is, and rendered by [`proj_row_bee`] into the same `{badges}` slot.
+    // This rail is the page's per-project surface, so "what is this project
+    // doing, and does it want me" belongs on the row rather than in the
+    // feature-column section beside it.
+    bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
 ) -> String {
     let listing = if projects.is_empty() {
         "<p class=\"fg-empty\">Chưa có project nào trong Waggle Dance. Đăng ký: <code>waggledance register &lt;dir&gt;</code> hoặc gọi MCP <code>waggledance_view_file</code>.</p>".to_string()
@@ -1225,7 +1245,12 @@ fn project_sidebar(
                     // `{badges}` slot — no new markup block, no change to
                     // the template literal above.
                     badges = format!(
-                        "{}{}",
+                        "{}{}{}",
+                        // board-visibility bv-4: a worktree branch is its own
+                        // registered project with its own `.bee/`, so it reads
+                        // its own row's line here rather than borrowing its
+                        // parent's.
+                        proj_row_bee(bee_by_project.get(&bp.id).copied()),
                         project_badges(&bp.id, bpanes),
                         paseo_badges_nav(
                             paseo_by_project
@@ -1282,7 +1307,12 @@ fn project_sidebar(
                 meta = proj_row_meta(*count, &p.last_seen_at),
                 // paseo-support ps-2: same fold as the branch row above.
                 badges = format!(
-                    "{}{}",
+                    "{}{}{}",
+                    // board-visibility bv-4: the bee line leads the row's
+                    // badge block — what the project is DOING is what the
+                    // reader came to this rail for; the agents running there
+                    // annotate it.
+                    proj_row_bee(bee_by_project.get(&p.id).copied()),
                     project_badges(&p.id, panes),
                     paseo_badges_nav(
                         paseo_by_project
@@ -1601,6 +1631,80 @@ fn proj_row_meta(count: usize, last_seen_at: &str) -> String {
         seen = esc(last_seen_at),
         seen_short = esc(&short_instant(last_seen_at)),
     )
+}
+
+/// board-visibility bv-4: one rail row's own bee line -- what this project
+/// is working on, and whether it is waiting on the reader.
+///
+/// Two facts, and deliberately only two. D3 refuses a section unless the
+/// owner can ACT on it from this page AND its number can go DOWN: a feature
+/// finishes and a gate gets answered, and the row is already a link into
+/// the project where both happen. Knowledge-debt fails that test in the
+/// second half -- it only ever climbs, and nothing on this page lowers it --
+/// so it is absent here on purpose, as are `config.gate_bypass` and
+/// `running_workers`, which are recorded deletions from this board
+/// (board-trim D1, board-declutter) and not this function's to reverse.
+///
+/// The wait is `BeeState.waiting_on_live`, which board-visibility D4 taught
+/// to exclude the `turn-end` idle mark, so a project reads "Waiting on you"
+/// here only when something is actually owed. The phase comes from
+/// `phase_board` -- the same lanes-∪-active-feature union
+/// [`bee_live_strip_section`] reads -- falling back to `state.phase` for an
+/// active feature whose lane record carries none.
+///
+/// A project with no active feature and no live wait renders the EMPTY
+/// STRING: no container, no placeholder, no "idle" word. An idle row must
+/// stay exactly the row it was before this feature, so the rail's ink is
+/// spent only where something is happening.
+///
+/// Markup reuses the row's existing badge vocabulary (`.proj-row__badges`
+/// plus `.proj-row__badge`, the same classes the herdr and paseo badges
+/// wear) rather than minting a rail stylesheet of its own -- the block is
+/// one flex line under the name, and the modifier classes are style hooks
+/// that need no rule to render correctly. The wait says its own word, so it
+/// never depends on colour to be read.
+fn proj_row_bee(rollup: Option<&BeeProjectRollup>) -> String {
+    let Some(rollup) = rollup else {
+        return String::new();
+    };
+    let Some(state) = rollup.snapshot.state.as_ref() else {
+        return String::new();
+    };
+    let work = state
+        .feature
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|feature| {
+            let phase = rollup
+                .snapshot
+                .phase_board
+                .iter()
+                .find(|f| f.feature == feature)
+                .and_then(|f| f.phase.as_deref())
+                .or(state.phase.as_deref())
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            match phase {
+                Some(phase) => format!("{} · {}", esc(feature), esc(phase)),
+                None => esc(feature),
+            }
+        });
+    if work.is_none() && !state.waiting_on_live {
+        return String::new();
+    }
+    let mut pills = String::new();
+    if let Some(work) = work {
+        pills.push_str(&format!(
+            r#"<span class="proj-row__badge proj-row__badge--bee">{work}</span>"#,
+        ));
+    }
+    if state.waiting_on_live {
+        pills.push_str(
+            r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#,
+        );
+    }
+    format!(r#"<div class="proj-row__badges proj-row__badges--bee">{pills}</div>"#)
 }
 
 /// A rail row's actions menu -- a native `<details>`, so it opens and
@@ -10359,6 +10463,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
@@ -10388,6 +10493,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -10422,6 +10528,7 @@ mod tests {
                 None,
                 true,
                 &[],
+                &std::collections::HashMap::new(),
                 &std::collections::HashMap::new(),
             );
             assert!(
@@ -10485,6 +10592,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let select = body
@@ -10604,6 +10712,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         for hook in [
             "data-new-task-open",
@@ -10652,6 +10761,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             home_html.contains("data-agent-drawer-homepage"),
@@ -10695,6 +10805,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -10851,6 +10962,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         // The board itself is still here — the rail joined the Kanban tab,
@@ -10969,6 +11081,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         let shell_at = body
@@ -11025,6 +11138,7 @@ mod tests {
             &[],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             rail.contains(
@@ -11040,6 +11154,172 @@ mod tests {
             !rail.contains(r#"<ul class="pinned-list">"#),
             "an empty Agents group must render no list at all: {rail}"
         );
+    }
+
+    /// board-visibility bv-4: the rail is this page's per-project surface,
+    /// so a row says what its own project is working on and whether that
+    /// project wants the reader -- and a project with neither says nothing
+    /// at all rather than rendering an empty shell. The facts D3 refuses
+    /// (knowledge-debt) and the two recorded deletions (`gate_bypass`,
+    /// `running_workers`) are present in these fixtures on purpose: the
+    /// rail must stay silent about all three.
+    #[test]
+    fn a_project_row_names_its_live_feature_and_its_own_wait() {
+        let busy_root = std::env::temp_dir().join(format!(
+            "waggledance-views-rail-bee-busy-{}",
+            std::process::id()
+        ));
+        let idle_root = std::env::temp_dir().join(format!(
+            "waggledance-views-rail-bee-idle-{}",
+            std::process::id()
+        ));
+        for r in [&busy_root, &idle_root] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        let write = |root: &std::path::Path, rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+
+        // The busy project: an active feature on a phase, a live `gate`
+        // wait, and -- deliberately -- a knowledge-debt stub, a recorded
+        // `gate_bypass` and a named worker for the rail to stay quiet about.
+        write(
+            &busy_root,
+            ".bee/state.json",
+            r#"{
+                "feature": "board-visibility",
+                "phase": "executing",
+                "workers": [{"name": "rail-ghost-worker", "cell": "bv-4"}],
+                "waiting_on": {"kind": "gate", "subject": "Shape + execution approval"}
+            }"#,
+        );
+        write(&busy_root, ".bee/config.json", r#"{"gate_bypass": "full"}"#);
+        write(
+            &busy_root,
+            ".bee/capture-queue.jsonl",
+            "{\"kind\": \"stub\", \"id\": \"cap-1\"}\n",
+        );
+
+        // The idle project: no active feature, and the one mark AGENTS.md
+        // gives every ordinary turn end -- "control back with the human and
+        // nothing owed" (D4). Neither fact is a demand, so neither renders.
+        write(
+            &idle_root,
+            ".bee/state.json",
+            r#"{
+                "phase": "exploring",
+                "waiting_on": {"kind": "turn-end", "subject": "Không còn gì chờ bạn"}
+            }"#,
+        );
+
+        let mut busy = sample_project();
+        busy.id = "busy".into();
+        busy.name = "Busy".into();
+        busy.root_path = busy_root.clone();
+        let mut idle = sample_project();
+        idle.id = "idle".into();
+        idle.name = "Idle".into();
+        idle.root_path = idle_root.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(&[busy_root.clone(), idle_root.clone()]);
+        let bee_by_project: std::collections::HashMap<String, &BeeProjectRollup> = vec![
+            ("busy".to_string(), &rollups[0]),
+            ("idle".to_string(), &rollups[1]),
+        ]
+        .into_iter()
+        .collect();
+        let projects = vec![(busy, 3, Vec::new()), (idle, 0, Vec::new())];
+
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &bee_by_project,
+        );
+
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee">board-visibility · executing</span>"#
+            ),
+            "the busy row must name its active feature and that feature's phase: {rail}"
+        );
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#
+            ),
+            "a live gate wait must read as a need on the project's own row: {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badges--bee").count(),
+            1,
+            "only the busy project has anything to say, so the idle row must render no bee \
+             block at all -- not an empty one: {rail}"
+        );
+        assert!(
+            !rail.contains("exploring"),
+            "the idle project's phase belongs to no active feature, so nothing of it renders: \
+             {rail}"
+        );
+        assert_eq!(
+            rail.matches("Waiting on you").count(),
+            1,
+            "the turn-end mark is the idle mark, not a demand -- exactly one row waits: {rail}"
+        );
+        // D3's refusal and the two recorded deletions, seen from the rail.
+        for absent in [
+            "knowledge-debt",
+            "gate_bypass",
+            "gate bypass",
+            "rail-ghost-worker",
+        ] {
+            assert!(
+                !rail.contains(absent),
+                "the rail must never carry {absent}: {rail}"
+            );
+        }
+        // One line per project: the bee block is a single flex row, never a
+        // list of its own.
+        assert!(
+            !rail.contains(r#"<ul class="proj-row__badges"#)
+                && !rail.contains("proj-row__bee-list"),
+            "the bee line must stay one row, never a nested list: {rail}"
+        );
+
+        // The whole path, not the helper alone: the same map threaded
+        // through `home_page` -- which is all `server.rs::index_page` does
+        // with it -- reaches the rendered board's own rail.
+        let page = home_page(
+            &projects,
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Kanban,
+            &[],
+            None,
+            true,
+            &[],
+            &std::collections::HashMap::new(),
+            &bee_by_project,
+        );
+        assert!(
+            page.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee">board-visibility · executing</span>"#
+            ) && page.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#
+            ),
+            "the board page's own rail must carry both facts: {page}"
+        );
+
+        for r in [&busy_root, &idle_root] {
+            let _ = std::fs::remove_dir_all(r);
+        }
     }
 
     /// rail-agents-compact: a live agent's row is at most two lines. Line
@@ -11061,6 +11341,7 @@ mod tests {
             None,
             &[pane],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
 
@@ -11101,6 +11382,7 @@ mod tests {
             &[plain],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             quiet.contains(r#"<span class="pinned-row__meta">· agent</span>"#),
@@ -11131,6 +11413,7 @@ mod tests {
             Some("does-not-exist"),
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -11200,6 +11483,7 @@ mod tests {
             &[],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -11243,6 +11527,7 @@ mod tests {
             None,
             &pinned,
             Some("w1:p2"),
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert_eq!(
@@ -11357,6 +11642,7 @@ mod tests {
             None,
             &[],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
 
@@ -11533,6 +11819,7 @@ mod tests {
             None,
             &[],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -12844,6 +13131,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
