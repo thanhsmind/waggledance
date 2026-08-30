@@ -57,6 +57,7 @@ pub fn run(as_json: bool, dry_run: bool, fix: bool) -> Result<()> {
     checks.push(check_mcp_antigravity(dry_run, fix));
     checks.push(check_agent_instruction(dry_run, fix));
     checks.push(check_skill(dry_run, fix));
+    checks.push(check_supervisor_skill(dry_run, fix));
 
     if as_json {
         let arr: Vec<Value> = checks
@@ -651,12 +652,27 @@ fn check_agent_instruction(dry_run: bool, fix: bool) -> Check {
 /// block.
 const SKILL_TEMPLATE: &str = include_str!("../../../docs/waggledance-skill-template.md");
 
+/// The cockpit-supervisor skill — relays a spec from the human into a target
+/// project's own backlog via the existing dispatch door. Same install
+/// mechanics as `SKILL_TEMPLATE`: a whole-file content match owned entirely
+/// by waggledance, installed to its own skill directory.
+const SUPERVISOR_SKILL_TEMPLATE: &str =
+    include_str!("../../../docs/waggledance-supervisor-skill-template.md");
+
 /// `~/.claude/skills/waggledance/SKILL.md` — the global (not per-project)
 /// skill file.
 fn skill_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude/skills/waggledance/SKILL.md")
+}
+
+/// `~/.claude/skills/waggledance-supervisor/SKILL.md` — the global
+/// cockpit-supervisor skill file, installed beside the viewer skill.
+fn supervisor_skill_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude/skills/waggledance-supervisor/SKILL.md")
 }
 
 /// The pre-rename skill directory sitting beside `path`'s own skill
@@ -672,26 +688,71 @@ fn check_skill(dry_run: bool, fix: bool) -> Check {
     if !claude_present() {
         return skipped("Claude skill", "Claude Code");
     }
-    check_skill_at(&skill_path(), dry_run, fix)
+    check_skill_at(
+        &skill_path(),
+        SKILL_TEMPLATE,
+        "skill",
+        "global /waggledance skill",
+        true,
+        dry_run,
+        fix,
+    )
 }
 
-/// Install/verify the global waggledance skill at `path`, and remove the
-/// stale `.../skills/mdview/` directory a pre-rename install left behind —
-/// otherwise it keeps telling agents to run a deleted binary and call a tool
-/// that no longer exists. Split from `check_skill` so the write/idempotency
+fn check_supervisor_skill(dry_run: bool, fix: bool) -> Check {
+    // Same install surface as the viewer skill — only relevant to Claude Code.
+    if !claude_present() {
+        return skipped("supervisor skill", "Claude Code");
+    }
+    check_skill_at(
+        &supervisor_skill_path(),
+        SUPERVISOR_SKILL_TEMPLATE,
+        "supervisor skill",
+        "global waggledance-supervisor skill",
+        false,
+        dry_run,
+        fix,
+    )
+}
+
+/// Install/verify a global waggledance skill at `path` against `template`,
+/// reporting under `check_name` (must be distinct per skill — it is the
+/// `--json` output's key, so two checks sharing a name would collide into
+/// one row). `label` is the human phrase used in the detail sentences.
+///
+/// When `sweep_old` is set, also remove the stale `.../skills/mdview/`
+/// directory a pre-rename install left behind — otherwise it keeps telling
+/// agents to run a deleted binary and call a tool that no longer exists.
+/// Only the viewer skill's directory ever had a pre-rename life, so every
+/// other skill passes `sweep_old: false` — left unconditional, a skill with
+/// nothing to sweep would still report `Manual` over a viewer-only leftover.
+///
+/// Split from `check_skill`/`check_supervisor_skill` so the write/idempotency
 /// logic is testable without touching the real HOME.
-fn check_skill_at(path: &std::path::Path, dry_run: bool, fix: bool) -> Check {
-    let old_dir = old_skill_dir_for(path);
+fn check_skill_at(
+    path: &std::path::Path,
+    template: &str,
+    check_name: &str,
+    label: &str,
+    sweep_old: bool,
+    dry_run: bool,
+    fix: bool,
+) -> Check {
+    let old_dir = if sweep_old {
+        old_skill_dir_for(path)
+    } else {
+        None
+    };
     let old_present = old_dir.as_deref().is_some_and(|d| d.exists());
 
     let in_sync = std::fs::read_to_string(path)
-        .map(|t| t == SKILL_TEMPLATE)
+        .map(|t| t == template)
         .unwrap_or(false);
     if in_sync && !old_present {
         return Check {
-            name: "skill".into(),
+            name: check_name.into(),
             status: Status::Ok,
-            detail: "global /waggledance skill is installed and current".into(),
+            detail: format!("{label} is installed and current"),
         };
     }
     if dry_run || !fix {
@@ -702,12 +763,12 @@ fn check_skill_at(path: &std::path::Path, dry_run: bool, fix: bool) -> Check {
             )
         } else {
             format!(
-                "global /waggledance skill missing or outdated at {} — run `waggledance doctor --fix`",
+                "{label} missing or outdated at {} — run `waggledance doctor --fix`",
                 path.display()
             )
         };
         return Check {
-            name: "skill".into(),
+            name: check_name.into(),
             status: Status::Manual,
             detail,
         };
@@ -716,7 +777,7 @@ fn check_skill_at(path: &std::path::Path, dry_run: bool, fix: bool) -> Check {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        config::write_atomic(path, SKILL_TEMPLATE.as_bytes()).map_err(anyhow::Error::from)?;
+        config::write_atomic(path, template.as_bytes()).map_err(anyhow::Error::from)?;
         if let Some(dir) = &old_dir {
             if dir.exists() {
                 std::fs::remove_dir_all(dir)?;
@@ -726,12 +787,12 @@ fn check_skill_at(path: &std::path::Path, dry_run: bool, fix: bool) -> Check {
     };
     match write() {
         Ok(()) => Check {
-            name: "skill".into(),
+            name: check_name.into(),
             status: Status::Fixed,
-            detail: format!("installed global /waggledance skill at {}", path.display()),
+            detail: format!("installed {label} at {}", path.display()),
         },
         Err(e) => Check {
-            name: "skill".into(),
+            name: check_name.into(),
             status: Status::Manual,
             detail: format!("write failed: {e}"),
         },
@@ -806,19 +867,46 @@ mod agent_instruction_tests {
         let path = base.join("skills/waggledance/SKILL.md");
         // Missing → Manual on a dry run (no write).
         assert!(matches!(
-            check_skill_at(&path, true, false).status,
+            check_skill_at(
+                &path,
+                SKILL_TEMPLATE,
+                "skill",
+                "global /waggledance skill",
+                true,
+                true,
+                false
+            )
+            .status,
             Status::Manual
         ));
         assert!(!path.exists());
         // --fix installs the file with the template content verbatim.
         assert!(matches!(
-            check_skill_at(&path, false, true).status,
+            check_skill_at(
+                &path,
+                SKILL_TEMPLATE,
+                "skill",
+                "global /waggledance skill",
+                true,
+                false,
+                true
+            )
+            .status,
             Status::Fixed
         ));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_TEMPLATE);
         // Re-running is a no-op: the file is already in sync.
         assert!(matches!(
-            check_skill_at(&path, false, true).status,
+            check_skill_at(
+                &path,
+                SKILL_TEMPLATE,
+                "skill",
+                "global /waggledance skill",
+                true,
+                false,
+                true
+            )
+            .status,
             Status::Ok
         ));
         std::fs::remove_dir_all(&base).ok();
@@ -838,20 +926,156 @@ mod agent_instruction_tests {
         // The stale directory alone makes a dry run report Manual, even
         // before the new skill file exists.
         assert!(matches!(
-            check_skill_at(&path, true, false).status,
+            check_skill_at(
+                &path,
+                SKILL_TEMPLATE,
+                "skill",
+                "global /waggledance skill",
+                true,
+                true,
+                false
+            )
+            .status,
             Status::Manual
         ));
         assert!(matches!(
-            check_skill_at(&path, false, true).status,
+            check_skill_at(
+                &path,
+                SKILL_TEMPLATE,
+                "skill",
+                "global /waggledance skill",
+                true,
+                false,
+                true
+            )
+            .status,
             Status::Fixed
         ));
         assert!(!old_dir.exists(), "stale skill directory should be removed");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_TEMPLATE);
         // Idempotent: nothing left to sweep, so a re-run reports OK.
         assert!(matches!(
-            check_skill_at(&path, false, true).status,
+            check_skill_at(
+                &path,
+                SKILL_TEMPLATE,
+                "skill",
+                "global /waggledance skill",
+                true,
+                false,
+                true
+            )
+            .status,
             Status::Ok
         ));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn supervisor_skill_template_is_a_valid_skill_file() {
+        assert!(SUPERVISOR_SKILL_TEMPLATE.starts_with("---"));
+        assert!(SUPERVISOR_SKILL_TEMPLATE.contains("name: waggledance-supervisor"));
+        // The spec-drop provenance line format — what lets a target repo
+        // recognize where a drop came from and de-duplicate a re-send.
+        assert!(SUPERVISOR_SKILL_TEMPLATE.contains("spec-drop <corr-id> from waggledance@<sha>"));
+        // The no-merge rule — merging to the target repo's main is human-only.
+        assert!(SUPERVISOR_SKILL_TEMPLATE.contains("Never merge, and never ask for a merge"));
+        // The duplicate-id line — a duplicate `--id` means the drop already
+        // landed, not that anything failed.
+        assert!(SUPERVISOR_SKILL_TEMPLATE
+            .contains("duplicate `--id` **refuses** rather than overwriting"));
+        // A caller names a preset label only — never raw argv, an env var, or
+        // a pane path. The only fenced code block in the whole file is the
+        // one-line spec-drop provenance format above — no example anywhere
+        // shows a literal command invocation.
+        assert!(SUPERVISOR_SKILL_TEMPLATE.contains("never raw argv"));
+        assert_eq!(SUPERVISOR_SKILL_TEMPLATE.matches("```").count(), 2);
+    }
+
+    #[test]
+    fn supervisor_skill_installs_then_reports_in_sync_idempotently() {
+        let base = tmp_path("supervisor-skill");
+        let path = base.join("skills/waggledance-supervisor/SKILL.md");
+        // Missing → Manual on a dry run (no write).
+        assert!(matches!(
+            check_skill_at(
+                &path,
+                SUPERVISOR_SKILL_TEMPLATE,
+                "supervisor skill",
+                "global waggledance-supervisor skill",
+                false,
+                true,
+                false
+            )
+            .status,
+            Status::Manual
+        ));
+        assert!(!path.exists());
+        // --fix installs the file with the template content verbatim.
+        assert!(matches!(
+            check_skill_at(
+                &path,
+                SUPERVISOR_SKILL_TEMPLATE,
+                "supervisor skill",
+                "global waggledance-supervisor skill",
+                false,
+                false,
+                true
+            )
+            .status,
+            Status::Fixed
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SUPERVISOR_SKILL_TEMPLATE
+        );
+        // Re-running is a no-op: the file is already in sync.
+        assert!(matches!(
+            check_skill_at(
+                &path,
+                SUPERVISOR_SKILL_TEMPLATE,
+                "supervisor skill",
+                "global waggledance-supervisor skill",
+                false,
+                false,
+                true
+            )
+            .status,
+            Status::Ok
+        ));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The stale `mdview` sweep is viewer-only (`sweep_old: false` here) —
+    /// a leftover pre-rename viewer directory must not make the supervisor
+    /// check report Manual once the supervisor skill itself is installed
+    /// and current.
+    #[test]
+    fn supervisor_skill_check_ignores_stale_viewer_directory() {
+        let base = tmp_path("supervisor-skill-stale");
+        let old_dir = base.join("skills/mdview");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("SKILL.md"), "old content, old binary").unwrap();
+        let path = base.join("skills/waggledance-supervisor/SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, SUPERVISOR_SKILL_TEMPLATE).unwrap();
+
+        // The supervisor skill is already installed and current, and the
+        // stale mdview directory belongs to the viewer skill, not this one —
+        // so this check reports Ok despite `old_dir` existing.
+        assert!(matches!(
+            check_skill_at(
+                &path,
+                SUPERVISOR_SKILL_TEMPLATE,
+                "supervisor skill",
+                "global waggledance-supervisor skill",
+                false,
+                false,
+                true
+            )
+            .status,
+            Status::Ok
+        ));
+        assert!(old_dir.exists(), "sweep is viewer-only — must not touch it");
         std::fs::remove_dir_all(&base).ok();
     }
 

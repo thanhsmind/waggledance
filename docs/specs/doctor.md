@@ -43,6 +43,7 @@ machine, so nothing was written for it — waggledance never registers blindly.
 | 6 | MCP · Antigravity | If Antigravity is present, waggledance is registered in `~/.gemini/config/mcp_config.json` (`mcpServers`, JSON — shared by the IDE/CLI/2.0) | Yes, with `--fix`; SKIP when Antigravity isn't detected |
 | 7 | Agent instruction | AGENTS.md and CLAUDE.md, in the current directory, carry waggledance's current instruction block (marker-delimited). AGENTS.md is the shared instruction file every agent tool (Claude Code, Codex, Antigravity CLI) reads | Yes, with `--fix` |
 | 8 | Skill | The global Claude Code skill `~/.claude/skills/waggledance/SKILL.md` (the `/waggledance <path>` command) is installed and matches the shipped template | Yes, with `--fix`; SKIP when Claude Code isn't detected |
+| 9 | Supervisor skill | The global Claude Code skill `~/.claude/skills/waggledance-supervisor/SKILL.md` (the cockpit-supervisor seat — relays a spec into a target project's own backlog) is installed and matches the shipped template | Yes, with `--fix`; SKIP when Claude Code isn't detected |
 
 **Detection** (a tool counts as installed when either signal is present):
 Claude Code — `~/.claude.json`, a `~/.claude/` directory, or `claude` on PATH.
@@ -55,8 +56,9 @@ Codex — a `~/.codex/` directory or `codex` on PATH. Antigravity — a
 
 - **Triggers:** the CLI command, with or without `--json`.
 - **What happens:** the checks run in order (PATH, Config, Daemon, MCP · Claude
-  Code, MCP · Codex, MCP · Antigravity, Agent instruction, Skill) and each
-  reports OK / FIXED / MANUAL / WARN / SKIP with a one-line detail.
+  Code, MCP · Codex, MCP · Antigravity, Agent instruction, Skill, Supervisor
+  skill) and each reports OK / FIXED / MANUAL / WARN / SKIP with a one-line
+  detail.
 - **Side effects:** the Config check writes a default configuration file the
   moment one is missing, **whenever `--dry-run` is not given** — see Rule R2;
   this is the one check whose write is not conditional on `--fix`.
@@ -93,7 +95,15 @@ Codex — a `~/.codex/` directory or `codex` on PATH. Antigravity — a
     created/overwritten with the current template. Unlike the Agent-instruction
     block, waggledance owns this file entirely, so the check is a whole-file content
     match and the fix is a full rewrite — it is global (per-user), not tied to
-    the current directory.
+    the current directory. This same check also removes a stale
+    `~/.claude/skills/mdview/` directory a pre-rename install left behind.
+  - Supervisor skill, if the global `~/.claude/skills/waggledance-supervisor/SKILL.md`
+    is missing or does not match the shipped template: same install mechanics as
+    the Skill check above — a whole-file content match, a full rewrite on
+    `--fix`, global rather than tied to the current directory — but installed
+    to its own directory and reported under its own check name, so `--json`
+    never emits two rows for the same key. It does not sweep the stale
+    `mdview/` directory; that leftover belongs to the viewer skill alone.
 - **Side effects:** the MCP-registration fix saves an untouched copy of
   `.claude.json` before changing it (see Rule R1). The Agent-instruction fix
   writes no `.bak`: the marker block bounds exactly what it edits, so
