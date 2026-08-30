@@ -486,6 +486,57 @@ needs_you: []
 Nothing to report.
 ";
 
+    /// The bytes of a letter bee ACTUALLY composed, copied verbatim off
+    /// `<worktree>/target/bi5-scratch/.bee/human-mailbox/20260830T114615Z-bi5-scratch-run.md`
+    /// (`sha256 f48f7c17d453cb9ae2c18978c1d48a20dee909d0d96f22c7b3a1eb744ac15e00`).
+    /// That file was produced by real verbs in a scratch store — `bee cells
+    /// finish` for the cap, `bee cells block` for the blocker carrying a
+    /// `needs_you`, then `bee work set --status done` firing the composer —
+    /// and its `status` is `read` because bi-5's proof flipped it through
+    /// `bee mailbox mark`. Kept here as a literal rather than read off disk
+    /// because `target/` is scratch: the shape is what must not regress, and
+    /// the shape has to survive a clean checkout.
+    ///
+    /// Recorded in `docs/history/board-visibility/proof-slice-2.md`, leg (a).
+    const REAL_BEE_LETTER: &str = r#"---
+subject: "Add the scratch reader file"
+run: "bi5-scratch-run"
+project: "bi5-scratch"
+filed_at: "2026-08-30T11:46:15.336Z"
+status: "read"
+items:
+  - what: "Add the scratch reader file"
+    files:
+      - "reader.txt"
+    commit: null
+    proof: "true — green — scratch fixture, one file"
+    departure: null
+  - what: "the store path is not settled — the scratch reader needs a decision on where it reads from"
+    files: []
+    commit: null
+    proof: null
+    departure: null
+needs_you:
+  - id: "sx-2"
+    what: "the store path is not settled — the scratch reader needs a decision on where it reads from"
+    blocks: "Point the scratch reader at the store"
+    kind: "question"
+    needs_human_decision: true
+---
+
+## Done
+
+- Add the scratch reader file
+
+## Broken or unfinished
+
+- the store path is not settled — the scratch reader needs a decision on where it reads from
+
+## Needs your call
+
+- [sx-2] the store path is not settled — the scratch reader needs a decision on where it reads from — blocks: Point the scratch reader at the store
+"#;
+
     fn parse(text: &str) -> Result<BeeLetter, String> {
         parse_letter("2026-08-30T04-12-07Z-nightly.md", text)
     }
@@ -563,6 +614,46 @@ Nothing to report.
         assert_eq!(asks[0].blocks, "bi-5");
         assert_eq!(asks[0].kind.as_deref(), Some("decision"));
         assert_eq!(asks[1].kind, None);
+    }
+
+    /// The proof cell's own finding: fixtures are written by the people who
+    /// wrote the parser, so they agree with it by construction. This one is
+    /// not — it is the emitter's output, byte for byte. It pins the two
+    /// shapes the hand-written fixtures were guessed into rather than
+    /// observed: `items[].files` as a NESTED BLOCK SEQUENCE under an indented
+    /// key, and explicit `null` scalars for `commit` / `proof` / `departure`
+    /// rather than absent keys.
+    #[test]
+    fn the_letter_bee_actually_composed_parses() {
+        let letter = parse_letter("20260830T114615Z-bi5-scratch-run.md", REAL_BEE_LETTER)
+            .expect("a letter bee's own emitter wrote must be readable");
+
+        assert_eq!(letter.id, "20260830T114615Z-bi5-scratch-run.md");
+        assert_eq!(letter.subject, "Add the scratch reader file");
+        assert_eq!(letter.run, "bi5-scratch-run");
+        assert_eq!(letter.project, "bi5-scratch");
+        assert_eq!(letter.filed_at, "2026-08-30T11:46:15.336Z");
+        // `read`, because `bee mailbox mark --id … --status read` flipped it.
+        assert_eq!(letter.status, BeeLetterStatus::Read);
+
+        let items = letter.items_or_empty();
+        assert_eq!(items.len(), 2);
+        // The nested block sequence, which no hand-written fixture forced.
+        assert_eq!(items[0].files, vec!["reader.txt".to_string()]);
+        assert_eq!(items[0].commit, None); // an explicit `null`, not an absent key
+        assert_eq!(
+            items[0].proof.as_deref(),
+            Some("true — green — scratch fixture, one file")
+        );
+        assert_eq!(items[0].departure, None); // also an explicit `null`
+        assert!(items[1].files.is_empty());
+        assert_eq!(items[1].proof, None);
+
+        let asks = letter.needs_you_or_empty();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].id, "sx-2");
+        assert_eq!(asks[0].blocks, "Point the scratch reader at the store");
+        assert_eq!(asks[0].kind.as_deref(), Some("question"));
     }
 
     // --- the closed contract, one refusal at a time ---------------------

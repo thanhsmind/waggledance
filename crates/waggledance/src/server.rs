@@ -34425,6 +34425,200 @@ mod bee_route_tests {
             );
         }
     }
+
+    // -- board-visibility bi-5: the same routes, against a letter bee
+    //    actually composed -----------------------------------------------
+    //
+    // Every fixture above this line was written by the same hands that wrote
+    // the parser and the view, so it agrees with them by construction. The
+    // bytes below did not come from here at all: bee composed them, in a
+    // scratch store under `target/`, out of its own real verbs — `bee cells
+    // finish` for the capped item, `bee cells block` for the blocker that
+    // carries the `needs_you`, then `bee work set --status done` firing the
+    // composer — and `bee mailbox mark --id … --status read` is why the
+    // `status` field reads `read` rather than `unread`.
+    //
+    // They are kept as a literal, not read off `target/`, because that tree is
+    // scratch and a clean checkout has none of it; the SHAPE is what must not
+    // regress. Two parts of that shape no hand-written fixture here had ever
+    // forced: `items[].files` as a NESTED BLOCK SEQUENCE under an indented
+    // key, and explicit `null` scalars where a fixture would simply have
+    // omitted the key. The twin of this constant, same bytes and same sha,
+    // pins the reader in `waggledance-core/src/bee/mailbox.rs`.
+    //
+    // Recorded leg by leg in `docs/history/board-visibility/proof-slice-2.md`.
+    //
+    // sha256 f48f7c17d453cb9ae2c18978c1d48a20dee909d0d96f22c7b3a1eb744ac15e00
+    const REAL_BEE_LETTER: &str = r#"---
+subject: "Add the scratch reader file"
+run: "bi5-scratch-run"
+project: "bi5-scratch"
+filed_at: "2026-08-30T11:46:15.336Z"
+status: "read"
+items:
+  - what: "Add the scratch reader file"
+    files:
+      - "reader.txt"
+    commit: null
+    proof: "true — green — scratch fixture, one file"
+    departure: null
+  - what: "the store path is not settled — the scratch reader needs a decision on where it reads from"
+    files: []
+    commit: null
+    proof: null
+    departure: null
+needs_you:
+  - id: "sx-2"
+    what: "the store path is not settled — the scratch reader needs a decision on where it reads from"
+    blocks: "Point the scratch reader at the store"
+    kind: "question"
+    needs_human_decision: true
+---
+
+## Done
+
+- Add the scratch reader file
+
+## Broken or unfinished
+
+- the store path is not settled — the scratch reader needs a decision on where it reads from
+
+## Needs your call
+
+- [sx-2] the store path is not settled — the scratch reader needs a decision on where it reads from — blocks: Point the scratch reader at the store
+"#;
+
+    /// The letter's own file name, which human-mailbox D11 makes its only id.
+    const REAL_BEE_LETTER_NAME: &str = "20260830T114615Z-bi5-scratch-run.md";
+
+    fn real_letter_file(dir: &Path, name: &str, bytes: &str) {
+        write(dir, &format!(".bee/human-mailbox/{name}"), bytes);
+    }
+
+    /// Leg (b): what `GET /inbox` makes of the real letter. Each assertion
+    /// names the frontmatter field it is checking against, so the render is
+    /// held to the DATA rather than to itself.
+    ///
+    /// The `println!` is the proof artifact: `cargo test … -- --nocapture`
+    /// dumps the rendered page verbatim into the proof document. cargo
+    /// captures it on an ordinary run, so a normal test run pays nothing.
+    #[tokio::test]
+    async fn the_inbox_renders_the_letter_bee_actually_composed() {
+        let root = fresh_root("inbox-real-letter");
+        real_letter_file(&root, REAL_BEE_LETTER_NAME, REAL_BEE_LETTER);
+        let st = build_state();
+        let project = register(&st, &root, "Scratch");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        println!("--- GET /inbox ---\n{body}\n--- end ---");
+
+        // `subject: "Add the scratch reader file"`
+        assert!(body.contains("Add the scratch reader file"), "{body}");
+        // `project: "bi5-scratch"` — the row says whose night it was.
+        assert!(body.contains("bi5-scratch"), "{body}");
+        // `filed_at: "2026-08-30T11:46:15.336Z"`, rendered as bee filed it.
+        assert!(body.contains("2026-08-30T11:46:15.336Z"), "{body}");
+        // `status: "read"` — as a word, and never as the unread chip.
+        assert!(body.contains("Đã đọc"), "{body}");
+        assert!(!body.contains("Chưa đọc"), "{body}");
+        // The row opens the letter under its own name, the id D11 gives it.
+        assert!(
+            body.contains(&format!("/inbox/{}/{REAL_BEE_LETTER_NAME}", project.id)),
+            "{body}"
+        );
+        // Nothing here parsed as unreadable.
+        assert!(!body.contains("Không đọc được"), "{body}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Leg (c): the same real letter with one of human-mailbox D3's five
+    /// required fields cut out. It must reach the page BY NAME and say it
+    /// could not be read — bee's own rule, that a silently missing letter
+    /// reads to the human as a quiet night rather than as a broken store.
+    #[tokio::test]
+    async fn a_real_letter_with_a_required_field_removed_renders_as_unreadable() {
+        let root = fresh_root("inbox-real-letter-torn");
+        let torn: String = REAL_BEE_LETTER
+            .lines()
+            .filter(|l| !l.starts_with("filed_at:"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(!torn.contains("filed_at:"), "the cut must have landed");
+        real_letter_file(&root, REAL_BEE_LETTER_NAME, &torn);
+        let st = build_state();
+        register(&st, &root, "Scratch");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        println!("--- GET /inbox (filed_at removed) ---\n{body}\n--- end ---");
+
+        assert!(body.contains(REAL_BEE_LETTER_NAME), "by name: {body}");
+        assert!(body.contains("Không đọc được"), "{body}");
+        assert!(
+            body.contains("filed_at"),
+            "and names the field that is missing, not just the file: {body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Leg (d), the render half. `bee mailbox mark --id … --status read`
+    /// answered `{"status":"read","previous_status":"unread","changed":true}`
+    /// and flipped the field inside the file; this is the page reading that
+    /// flipped field back — the letter opened, shown as read, offering the
+    /// flip in the other direction and nothing else.
+    #[tokio::test]
+    async fn opening_the_real_letter_shows_the_state_the_mark_command_set() {
+        let root = fresh_root("inbox-real-letter-open");
+        real_letter_file(&root, REAL_BEE_LETTER_NAME, REAL_BEE_LETTER);
+        let st = build_state();
+        let project = register(&st, &root, "Scratch");
+
+        let uri = format!("/inbox/{}/{REAL_BEE_LETTER_NAME}", project.id);
+        let body = body_string(get(router(st), &uri).await).await;
+        println!("--- GET {uri} ---\n{body}\n--- end ---");
+
+        assert!(
+            body.contains("Đã đọc"),
+            "the flipped state, as a word: {body}"
+        );
+        assert!(
+            body.contains(r#"name="status" value="unread""#),
+            "a read letter offers only the flip back: {body}"
+        );
+        // The prose below the frontmatter, through the markdown pipeline.
+        assert!(body.contains("Add the scratch reader file"), "{body}");
+        assert!(
+            body.contains("the store path is not settled"),
+            "the unfinished item reaches the page: {body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Leg (f): zero letters. Printed whole, because the empty state is a
+    /// first-class deliverable of this slice (D6) and its whole job is to be
+    /// read by someone who does not know bee's internals.
+    #[tokio::test]
+    async fn the_zero_letter_inbox_renders_its_whole_explanation() {
+        let root = fresh_root("inbox-real-empty");
+        write(&root, ".bee/state.json", "{}");
+        let st = build_state();
+        register(&st, &root, "Scratch");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        println!("--- GET /inbox (no letters) ---\n{body}\n--- end ---");
+
+        assert!(body.contains("Chưa có lá thư nào"), "{body}");
+        assert!(body.contains("không có người ngồi trực"), "{body}");
+        assert!(
+            body.contains("bình thường"),
+            "it must say the emptiness is normal, not a fault: {body}"
+        );
+        assert!(!body.contains("Không đọc được"), "{body}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 /// afr-1: the precedence ladder in [`resolve_session_feature`], one test per
