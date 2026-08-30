@@ -460,6 +460,17 @@ fn router(state: AppState) -> Router {
         // every containment boundary the project routes below live inside.
         .route("/guide", get(guide_index_handler))
         .route("/guide/:slug", get(guide_chapter_handler))
+        // board-visibility bi-2: the human mailbox. Cross-project like `/`
+        // and unlike every `/p/:id/…` route below — one list gathering the
+        // letters bee filed in EVERY registered project — so it is mounted
+        // here beside the guide rather than under a project. Reached from the
+        // same top bar menu the guide is (`views::inbox_page`'s doc comment
+        // names why it is not on the handset tab bar). The `:letter` segment
+        // is a letter's file name, which human-mailbox D11 makes its only id;
+        // `inbox_letter_handler` resolves it by matching an entry the mailbox
+        // reader already listed, never by joining the URL onto a path.
+        .route("/inbox", get(inbox_page_handler))
+        .route("/inbox/:project/:letter", get(inbox_letter_handler))
         .route("/api/config", get(api_config).post(update_config))
         // toa-1 (D5/D11): the method-mismatch-oracle this family used to
         // close with an extra method-checking extractor existed only to
@@ -1494,6 +1505,203 @@ async fn guide_chapter_handler(Path(slug): Path<String>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// board-visibility bi-2: the roll-up read both inbox routes make — every
+/// registered project whose root holds a `.bee/` (`is_bee_project`, the same
+/// D3 rule the boards apply), read through the SAME fingerprinted cache and
+/// the same `spawn_blocking` fan-out the home page uses
+/// (`cross_project_rollup`), so opening the inbox costs no `.bee/` walk the
+/// board has not already paid for. A host with nothing registered, or nothing
+/// bee-shaped, yields an empty vector — and `views::inbox_page` renders its
+/// explaining empty state from that, which is the state of this machine today.
+async fn inbox_rollups(
+    st: &AppState,
+) -> Vec<(
+    waggledance_core::domain::Project,
+    waggledance_core::bee::BeeProjectRollup,
+)> {
+    let projects: Vec<waggledance_core::domain::Project> = st
+        .engine
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_bee_project)
+        .collect();
+    if projects.is_empty() {
+        return Vec::new();
+    }
+    cross_project_rollup(st.bee_cache.clone(), projects).await
+}
+
+/// Every project's letters as one list, newest first.
+///
+/// The sort key is the letter's FILE NAME, descending, not its `filed_at`:
+/// human-mailbox D11 names each letter `<UTC-timestamp>-<run-slug>.md`
+/// precisely so that "a directory listing is the index", so the name sorts
+/// chronologically by construction, needs no timestamp parsing, and gives an
+/// `Unreadable` entry — which has no parsed `filed_at` at all — its correct
+/// place in the sequence instead of banishing it to one end. Ties break on the
+/// project id so two letters filed in the same second render in a stable
+/// order rather than one that follows registration order.
+fn inbox_rows(
+    rollups: &[(
+        waggledance_core::domain::Project,
+        waggledance_core::bee::BeeProjectRollup,
+    )],
+) -> Vec<views::InboxRow> {
+    let mut entries: Vec<(
+        &waggledance_core::domain::Project,
+        &waggledance_core::bee::BeeMailboxEntry,
+    )> = rollups
+        .iter()
+        .flat_map(|(project, rollup)| {
+            rollup
+                .snapshot
+                .mailbox
+                .iter()
+                .map(move |entry| (project, entry))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.1.file().cmp(a.1.file()).then_with(|| a.0.id.cmp(&b.0.id)));
+    entries
+        .into_iter()
+        .map(|(project, entry)| inbox_row(project, entry))
+        .collect()
+}
+
+/// One mailbox entry, flattened for the view. An `Unreadable` entry keeps its
+/// file name and its reason and gets no link: there is no parsed letter to
+/// open, and hiding it would turn a broken store into a quiet night — bee's
+/// own words at the reader this reads from.
+fn inbox_row(
+    project: &waggledance_core::domain::Project,
+    entry: &waggledance_core::bee::BeeMailboxEntry,
+) -> views::InboxRow {
+    match entry {
+        waggledance_core::bee::BeeMailboxEntry::Letter(letter) => views::InboxRow {
+            href: Some(format!("/inbox/{}/{}", project.id, letter.id)),
+            subject: letter.subject.clone(),
+            // The letter's own `project` line, not the checkout's registered
+            // name: bee wrote it, and it is what the letter is about.
+            project: letter.project.clone(),
+            filed_at: letter.filed_at.clone(),
+            file: letter.id.clone(),
+            unread: entry.is_unread(),
+            unreadable: None,
+        },
+        waggledance_core::bee::BeeMailboxEntry::Unreadable { file, reason } => views::InboxRow {
+            href: None,
+            subject: String::new(),
+            // Nothing parsed, so the letter's own `project` line is not
+            // available — the checkout the file was found in is the only thing
+            // that can be named honestly here.
+            project: project.name.clone(),
+            filed_at: String::new(),
+            file: file.clone(),
+            unread: false,
+            unreadable: Some(reason.clone()),
+        },
+    }
+}
+
+/// `GET /inbox`.
+async fn inbox_page_handler(State(st): State<AppState>) -> Response {
+    let rollups = inbox_rollups(&st).await;
+    Html(views::inbox_page(&inbox_rows(&rollups))).into_response()
+}
+
+/// The markdown pipeline a letter's body goes through: `waggledance-core`'s
+/// ordinary `RenderService` — the very one every indexed document on this
+/// host is rendered by, ammonia sanitize included.
+///
+/// Built once and kept, because `RenderService::default` loads syntect's whole
+/// default syntax set; a per-request construction would put that on the
+/// request thread. `Engine` owns one of these privately and only renders
+/// files it has INDEXED, and a letter is never indexed — `.bee/human-mailbox/`
+/// is git-ignored runtime state outside the docs tree — so the inbox reaches
+/// the pipeline directly rather than making a second one of its own.
+fn letter_render_service() -> &'static waggledance_core::render::RenderService {
+    static SERVICE: std::sync::OnceLock<waggledance_core::render::RenderService> =
+        std::sync::OnceLock::new();
+    SERVICE.get_or_init(waggledance_core::render::RenderService::new)
+}
+
+/// `GET /inbox/:project/:letter` — one letter, opened.
+///
+/// The `:letter` segment is never joined onto a path as it arrives. It is
+/// matched against the file names the mailbox reader already listed for that
+/// project, and the path is built from the entry that matched — so a segment
+/// carrying `..`, an absolute path, or an encoded separator resolves to no
+/// entry and answers 404 like any other unknown letter, rather than reaching
+/// the filesystem at all.
+///
+/// An entry that exists but could not be parsed answers 404 too, and says so
+/// by name: the list never links one, so arriving here means a stale link, and
+/// a page pretending to render it would be the silence bee's own rule forbids.
+async fn inbox_letter_handler(
+    State(st): State<AppState>,
+    Path((project_id, letter_id)): Path<(String, String)>,
+) -> Response {
+    let rollups = inbox_rollups(&st).await;
+    let Some((project, rollup)) = rollups.iter().find(|(p, _)| p.id == project_id) else {
+        return not_found_letter();
+    };
+    let Some(entry) = rollup
+        .snapshot
+        .mailbox
+        .iter()
+        .find(|entry| entry.file() == letter_id)
+    else {
+        return not_found_letter();
+    };
+    let Some(letter) = entry.letter() else {
+        return not_found_letter();
+    };
+    let row = inbox_row(project, entry);
+    let path = waggledance_core::bee::mailbox_dir(&project.root_path).join(&letter.id);
+    let project_id = project.id.clone();
+    let root = project.root_path.clone();
+    // Reading the file and rendering it are both synchronous, CPU-and-disk
+    // work, so they go off the request thread together — the same
+    // `spawn_blocking` rule every other filesystem read in this file follows.
+    let rendered = tokio::task::spawn_blocking(move || {
+        let source = std::fs::read_to_string(&path).ok()?;
+        // An empty index: a letter is not part of any project's indexed file
+        // set, so no internal link in one resolves to an indexed page. The
+        // pipeline marks those links rather than rewriting them, which is the
+        // honest answer for a file that lives outside the docs tree.
+        let index: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        Some(letter_render_service().render(&source, &path, &project_id, &root, &index))
+    })
+    .await;
+    let Ok(Some(page)) = rendered else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(views::error_page(
+                500,
+                "Không đọc được nội dung lá thư này trên đĩa.",
+            )),
+        )
+            .into_response();
+    };
+    Html(views::inbox_letter_page(
+        &row,
+        &views::SanitizedLetterBody::from_rendered(&page),
+    ))
+    .into_response()
+}
+
+/// The one 404 both unknown-letter cases answer with — an unknown project, an
+/// unknown file name, and a file that exists but could not be parsed all mean
+/// the same thing to the reader who followed the link: there is no letter here
+/// to read.
+fn not_found_letter() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Html(views::error_page(404, "Không có lá thư nào như vậy.")),
+    )
+        .into_response()
 }
 
 async fn settings_page_handler(
@@ -33520,6 +33728,173 @@ mod bee_route_tests {
             catch_body.contains("location.reload();"),
             "the one catch is where every failure actually reloads: {catch_body}"
         );
+    }
+
+    // -- board-visibility bi-2: the inbox, end to end ---------------------
+    //
+    // These drive `router()` rather than `views::inbox_page` directly, and
+    // they start from a letter file on disk. That is the point: the promise
+    // is user-visible ("I can see what happened in every project"), and every
+    // seam between the mailbox reader, the cross-project roll-up, the route
+    // and the view belongs to no single unit test
+    // (`docs/knowledge/patterns/prove-the-whole-path.md`). There are zero real
+    // letters on this machine — bee files one only from an unattended run and
+    // no checkout has armed one — so the fixtures below are written in bee's
+    // own emitter shape (`verbs/mailbox.rs::render_letter`).
+
+    /// One letter on disk, in the bytes bee's emitter writes.
+    fn letter_file(dir: &Path, name: &str, subject: &str, project: &str, filed_at: &str, status: &str, body: &str) {
+        write(
+            dir,
+            &format!(".bee/human-mailbox/{name}"),
+            &format!(
+                "---\nsubject: {}\nrun: {}\nproject: {}\nfiled_at: {}\nstatus: {}\nitems: []\nneeds_you: []\n---\n\n{body}\n",
+                serde_json::to_string(subject).unwrap(),
+                serde_json::to_string("2026-08-30-run").unwrap(),
+                serde_json::to_string(project).unwrap(),
+                serde_json::to_string(filed_at).unwrap(),
+                serde_json::to_string(status).unwrap(),
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_inbox_lists_every_projects_letters_newest_first() {
+        let alpha = fresh_root("inbox-alpha");
+        let beta = fresh_root("inbox-beta-two");
+        letter_file(&alpha, "2026-08-30T04-12-07Z-late.md", "Alpha's newest night", "alpha", "2026-08-30T04:12:07Z", "unread", "## Đã làm\n\n- alpha work\n");
+        letter_file(&alpha, "2026-08-28T01-00-00Z-early.md", "Alpha's oldest night", "alpha", "2026-08-28T01:00:00Z", "read", "nothing much\n");
+        letter_file(&beta, "2026-08-29T02-00-00Z-mid.md", "Beta's one night", "beta", "2026-08-29T02:00:00Z", "unread", "beta work\n");
+        let st = build_state();
+        register(&st, &alpha, "Alpha");
+        register(&st, &beta, "Beta");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("the inbox must carry {needle}: {body}"))
+        };
+        let (newest, middle, oldest) = (
+            at("Alpha's newest night"),
+            at("Beta's one night"),
+            at("Alpha's oldest night"),
+        );
+        assert!(
+            newest < middle && middle < oldest,
+            "newest first, interleaving projects rather than grouping them: {body}"
+        );
+        // The row's own three facts, and the read state as a word.
+        assert!(body.contains("2026-08-29T02:00:00Z"), "{body}");
+        assert!(body.contains("beta"), "{body}");
+        assert!(
+            body.contains("2 chưa đọc"),
+            "the page counts what it is showing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_letter_reaches_the_inbox_naming_its_file() {
+        let root = fresh_root("inbox-unreadable");
+        letter_file(&root, "2026-08-30T05-00-00Z-fine.md", "A readable one", "gamma", "2026-08-30T05:00:00Z", "read", "ok\n");
+        // `filed_at` is one of the five human-mailbox D3 requires at read.
+        write(
+            &root,
+            ".bee/human-mailbox/2026-08-30T06-00-00Z-torn.md",
+            "---\nsubject: \"Half a letter\"\nrun: \"r\"\nproject: \"gamma\"\nstatus: \"unread\"\nitems: []\nneeds_you: []\n---\n\nbody\n",
+        );
+        let st = build_state();
+        register(&st, &root, "Gamma");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        assert!(
+            body.contains("2026-08-30T06-00-00Z-torn.md"),
+            "the torn letter is on the page, by name: {body}"
+        );
+        assert!(
+            body.contains("Không đọc được"),
+            "and says plainly that it could not be read: {body}"
+        );
+        assert!(
+            body.contains("A readable one"),
+            "without costing the readable letter beside it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inbox_with_no_letters_explains_why_rather_than_showing_a_zero() {
+        let root = fresh_root("inbox-empty-state");
+        write(&root, ".bee/state.json", "{}");
+        let st = build_state();
+        register(&st, &root, "Quiet");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        assert!(body.contains("Chưa có lá thư nào"), "{body}");
+        assert!(
+            body.contains("không có người ngồi trực"),
+            "the empty page names the one thing that files a letter: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_letter_renders_its_body_through_the_sanitizing_pipeline() {
+        let root = fresh_root("inbox-open-letter");
+        letter_file(
+            &root,
+            "2026-08-30T07-00-00Z-open.md",
+            "The night's work, in one page",
+            "delta",
+            "2026-08-30T07:00:00Z",
+            "unread",
+            "## Đã làm\n\n- một việc thật\n\n<script>alert(1)</script>\n",
+        );
+        let st = build_state();
+        let project = register(&st, &root, "Delta");
+        let app = router(st);
+
+        let list = body_string(get(app.clone(), "/inbox").await).await;
+        let href = format!("/inbox/{}/2026-08-30T07-00-00Z-open.md", project.id);
+        assert!(
+            list.contains(&format!("href=\"{href}\"")),
+            "the row must link to its own letter: {list}"
+        );
+
+        let letter = body_string(get(app, &href).await).await;
+        assert!(
+            letter.contains("một việc thật") && letter.contains("Đã làm"),
+            "the letter's own prose renders: {letter}"
+        );
+        assert!(
+            !letter.contains("<script>alert(1)</script>"),
+            "through the SANITIZING pipeline, never the guide's trusted path: {letter}"
+        );
+        assert!(
+            letter.contains("2026-08-30T07:00:00Z") && letter.contains("delta"),
+            "and the header keeps the letter's own frontmatter: {letter}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_letter_url_that_names_nothing_answers_not_found() {
+        let root = fresh_root("inbox-unknown-letter");
+        letter_file(&root, "2026-08-30T08-00-00Z-real.md", "Real", "eps", "2026-08-30T08:00:00Z", "read", "ok\n");
+        let st = build_state();
+        let project = register(&st, &root, "Eps");
+        let app = router(st);
+
+        for uri in [
+            format!("/inbox/{}/nothing-like-this.md", project.id),
+            // The segment is matched against the names the reader listed, so
+            // it never reaches the filesystem as a path fragment.
+            format!("/inbox/{}/..%2f..%2fetc%2fpasswd", project.id),
+            "/inbox/no-such-project/2026-08-30T08-00-00Z-real.md".to_string(),
+        ] {
+            let resp = get(app.clone(), &uri).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} names no letter, so it must say so rather than render one"
+            );
+        }
     }
 }
 

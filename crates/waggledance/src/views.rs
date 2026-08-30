@@ -525,6 +525,14 @@ const HOME_RAIL_BACKDROP: &str =
 /// reachable from a phone without opening the top bar's menu, and the CSS
 /// grid widened to five columns in the same edit.
 ///
+/// board-visibility bi-2 stopped there: the inbox (`/inbox`) is reached from
+/// the top bar menu on every page ([`topbar_full`]) and is deliberately NOT a
+/// sixth column here. Widening this bar is a layout decision its owner took
+/// once already (dcfbda20, four columns to five, with the stylesheet's grid
+/// changed to match), and a sixth 60px-wide destination on a handset is a
+/// decision to take deliberately rather than inherit from whoever adds the
+/// next page. The menu has no such ceiling, so nothing is unreachable.
+///
 /// Four of the five are real anchors, for the same reason every other
 /// navigation control on this page is: they have to survive the full page
 /// reload and work with scripting off. `Projects` is the exception, and
@@ -9938,7 +9946,8 @@ fn topbar(center: &str) -> String {
 /// on these pages is "Waggle Dance" by a locked decision (`bee-cockpit.md`),
 /// never the identifier the command line uses.
 ///
-/// The nav slot, the Hướng dẫn link (guide-vi) and the Settings link share
+/// The nav slot, the Hộp thư link (board-visibility bi-2), the Hướng dẫn link
+/// (guide-vi) and the Settings link share
 /// one menu. On a wide screen the
 /// stylesheet hides its control and lays the panel out inline, so the bar
 /// reads exactly as it did before this existed. On a narrow one the control
@@ -9984,6 +9993,7 @@ fn topbar_full(lead: &str, center: &str, actions: &str, nav: &str) -> String {
       <label class="topbar-menu__button" for="topbar-menu-toggle" title="Menu"><span class="menu-label">Menu</span><span aria-hidden="true">☰</span></label>
       <div class="topbar-menu__panel">
         {nav}
+        <a class="nav-link nav-link--icon" href="/inbox" title="Hộp thư"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"></rect><polyline points="3 7 12 13 21 7"></polyline></svg><span class="nav-link__txt">Hộp thư</span></a>
         <a class="nav-link nav-link--icon" href="/guide" title="Hướng dẫn"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg><span class="nav-link__txt">Hướng dẫn</span></a>
         <a class="nav-link nav-link--icon" href="/settings" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg><span class="nav-link__txt">Settings</span></a>
       </div>
@@ -10256,6 +10266,221 @@ pub fn settings_page(
         orchestration_rows = orchestration_rows,
     );
     layout_with_drawer("Settings", "", &body, false)
+}
+
+// ---------------------------------------------------------------------------
+// board-visibility bi-2 — the inbox: every project's filed letters, one list.
+// ---------------------------------------------------------------------------
+
+/// A letter's body, ALREADY through `waggledance-core`'s ordinary sanitizing
+/// markdown pipeline (`render::RenderService::render` — comrak, then the same
+/// ammonia sanitize every document page on this host goes through).
+///
+/// The newtype exists to make that non-negotiable at the type level, because
+/// the other prose surface in this file deliberately goes the opposite way:
+/// [`guide_chapter_page`] embeds `chapter.body` verbatim and UNSANITIZED, and
+/// it may — those fragments are authored by us and compiled into the binary
+/// with `include_str!` (decision d7efc6fe, and [`crate::guide`]'s own module
+/// docs). A letter is not ours. Another program composed it, in another
+/// project's checkout, out of that run's entries, and the file sits in a
+/// git-ignored runtime directory. So it takes the untrusted path, and the
+/// only constructor here takes a `RenderedPage` — a caller cannot hand
+/// [`inbox_letter_page`] a raw string even by accident, and no second
+/// pipeline is written for it.
+pub struct SanitizedLetterBody(String);
+
+impl SanitizedLetterBody {
+    /// The one door in. `RenderedPage::html` is the pipeline's sanitized
+    /// output, and nothing else can produce one.
+    pub fn from_rendered(page: &RenderedPage) -> Self {
+        Self(page.html.clone())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One row of the inbox: a letter bee filed for the human, flattened for the
+/// view. Built in `server.rs` from `BeeSnapshot::mailbox` (bi-1's reader) —
+/// the view never touches disk.
+///
+/// `unreadable` carries the reason a letter could not be parsed, and is the
+/// discriminator: a row with `Some(..)` names its file and why instead of
+/// pretending to be a letter, and has no `href`, because there is no parsed
+/// letter behind it to open. That row is never dropped — bee's own reason,
+/// quoted at `waggledance_core::bee::mailbox`: a silently missing letter reads
+/// to the human as a quiet night rather than as a broken store.
+pub struct InboxRow {
+    /// Where this row leads, or `None` for an unreadable entry.
+    pub href: Option<String>,
+    /// The letter's one-line subject; empty for an unreadable entry.
+    pub subject: String,
+    /// Which project this letter is about. For a letter, the `project` field
+    /// the letter itself carries (bee's own word for it); for an unreadable
+    /// entry — which has no parsed fields at all — the registered name of the
+    /// checkout the file was found in, the only thing we can honestly name.
+    pub project: String,
+    /// The letter's `filed_at`, verbatim; empty for an unreadable entry.
+    pub filed_at: String,
+    /// The file name, which human-mailbox D11 makes the letter's only id.
+    pub file: String,
+    /// True only for a letter that parsed and is still unread.
+    pub unread: bool,
+    /// Why this file could not be read as a letter, when it could not be.
+    pub unreadable: Option<String>,
+}
+
+/// What the inbox says when it holds nothing — and it holds nothing on this
+/// machine today, which is the normal state, not a broken one.
+///
+/// This is written for a reader who does not know bee's internals, because it
+/// is the whole page for them. Every clause behind it is a measured fact: bee
+/// files a letter only from an unattended run (its D9), and its `armed()`
+/// requires BOTH a `herding` block in `.bee/config.json` AND the owner's own
+/// marker file `<main-root>/.bee/tmp/bee-herding.enable`. The block is present
+/// in these checkouts; the marker is not, in any of them. So zero letters
+/// exist, and the honest thing to render is the reason — never a bare "0" and
+/// never an empty list frame, which would read as a store that is broken or as
+/// a page that has not finished loading.
+const INBOX_EMPTY: &str = r#"<div class="fg-card">
+  <div class="fg-card__head"><div class="fg-card__title">Chưa có lá thư nào</div></div>
+  <div class="fg-card__body fg-prose">
+    <p>Thư ở đây không phải do bạn hay tôi ngồi viết: mỗi lượt chạy <strong>không có người ngồi trực</strong> sẽ tự để lại đúng một lá thư khi nó xong việc — kể lại đã làm gì, đi chệch kế hoạch ở đâu, hỏng chỗ nào, và có câu nào chỉ bạn mới trả lời được.</p>
+    <p>Máy này chưa bật chế độ chạy không người trực, nên chưa lượt chạy nào tới lúc phải viết thư. Hộp thư trống vì vậy là <strong>bình thường</strong>, không phải hỏng hóc — khi nào bạn bật nó lên và một lượt chạy kết thúc, lá thư đầu tiên sẽ nằm ở đây.</p>
+  </div>
+</div>"#;
+
+/// `GET /inbox` — one cross-project list of every letter every registered
+/// project has filed, newest first.
+///
+/// **Where it is reached from, and why only there.** From the shared top bar
+/// menu ([`topbar_full`]), on every page, beside Hướng dẫn and Settings — the
+/// same slot and the same shape the guide already uses. Deliberately NOT from
+/// the handset tab bar ([`home_tabbar`]): decision dcfbda20 records that
+/// adding the guide there widened that bar from four columns to five, so
+/// there is no free slot left, and widening it a second time is a layout
+/// decision its owner already took once and would have to take again. The top
+/// bar menu has no such ceiling — it is a list that scrolls — so a phone still
+/// reaches the inbox in two presses, through the same menu it reaches
+/// everything else that leaves the page.
+///
+/// Rows arrive already ordered by the caller and are rendered in that order:
+/// sorting is over the file NAME, since human-mailbox D11 makes the name a UTC
+/// timestamp followed by a run slug precisely so that "a directory listing is
+/// the index" — which also gives an unreadable entry, with no parsed
+/// `filed_at` to sort on, its correct place in the sequence.
+pub fn inbox_page(rows: &[InboxRow]) -> String {
+    let unread = rows.iter().filter(|r| r.unread).count();
+    // A summary of what is on THIS page, not the home page's own number (bi-4
+    // owns that one). It renders only when non-zero, for the same reason the
+    // board does: zero unread needs no pill to say so.
+    let aside = if unread > 0 {
+        format!(
+            r#"<div class="fg-pagehead__aside"><span class="fg-chip fg-chip--accent">{unread} chưa đọc</span></div>"#
+        )
+    } else {
+        String::new()
+    };
+    let list = if rows.is_empty() {
+        INBOX_EMPTY.to_string()
+    } else {
+        rows.iter().map(inbox_row_html).collect::<String>()
+    };
+    let body = format!(
+        r#"{topbar}
+<main class="fg-page">
+  <header class="fg-pagehead">
+    <div class="fg-pagehead__eyebrow">Hộp thư</div>
+    <h1 class="fg-pagehead__title">Thư từ các lượt chạy</h1>
+    {aside}
+  </header>
+  {list}
+</main>"#,
+        topbar = topbar("<span class=\"crumb\">Hộp thư</span>"),
+        aside = aside,
+        list = list,
+    );
+    layout_with_drawer("Hộp thư", "", &body, false)
+}
+
+/// One row. A readable letter is an anchor to its own body; an unreadable
+/// entry is a plain block naming the file and the reason — louder than an
+/// ordinary row on purpose, and never a link, because there is no parsed
+/// letter on the other side of one.
+fn inbox_row_html(row: &InboxRow) -> String {
+    if let Some(reason) = &row.unreadable {
+        return format!(
+            r#"<div class="fg-card fg-card--rule">
+  <div class="fg-card__head"><div class="fg-card__title">{file}</div><span class="fg-chip fg-chip--danger">Không đọc được</span></div>
+  <div class="fg-card__sub">{project}</div>
+  <div class="fg-card__body">{reason}</div>
+</div>"#,
+            file = esc(&row.file),
+            project = esc(&row.project),
+            reason = esc(reason),
+        );
+    }
+    format!(
+        r#"<a class="fg-card" href="{href}">
+  <div class="fg-card__head"><div class="fg-card__title">{subject}</div>{mark}</div>
+  <div class="fg-card__sub">{project} · {filed_at}</div>
+</a>"#,
+        href = esc(row.href.as_deref().unwrap_or("/inbox")),
+        subject = esc(&row.subject),
+        mark = unread_mark(row.unread),
+        project = esc(&row.project),
+        filed_at = esc(&row.filed_at),
+    )
+}
+
+/// The read/unread marker. A word, never colour alone, so the state survives a
+/// greyscale screen and reaches a screen reader as text.
+fn unread_mark(unread: bool) -> &'static str {
+    if unread {
+        r#"<span class="fg-chip fg-chip--accent">Chưa đọc</span>"#
+    } else {
+        r#"<span class="fg-chip fg-chip--neutral">Đã đọc</span>"#
+    }
+}
+
+/// One letter, opened. The header is the typed frontmatter bi-1 parsed; the
+/// prose below it is the letter's own body, rendered through the sanitizing
+/// pipeline — see [`SanitizedLetterBody`] for why it can be nothing else.
+///
+/// bi-3 owns the control that flips this letter's read state, so there is none
+/// here yet and this page opens no file for writing.
+pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
+    // A letter whose run recorded nothing has an empty prose body (bee emits
+    // the frontmatter and stops). Saying so beats an unexplained blank.
+    let prose = if body.as_str().trim().is_empty() {
+        r#"<p class="fg-empty">Lá thư này không có phần nội dung — tất cả những gì nó nói nằm ở dòng tiêu đề bên trên.</p>"#.to_string()
+    } else {
+        body.as_str().to_string()
+    };
+    let body_html = format!(
+        r#"{topbar}
+<main class="fg-page">
+  <header class="fg-pagehead">
+    <div class="fg-pagehead__eyebrow">{project} · {filed_at}</div>
+    <h1 class="fg-pagehead__title">{subject}</h1>
+    <div class="fg-pagehead__aside">{mark}</div>
+  </header>
+  <article class="fg-prose">{prose}</article>
+  <p class="fg-card__sub">{file}</p>
+</main>"#,
+        topbar = topbar(&format!(
+            "<span class=\"crumb\"><a href=\"/inbox\">Hộp thư</a> · {}</span>",
+            esc(&row.subject)
+        )),
+        project = esc(&row.project),
+        filed_at = esc(&row.filed_at),
+        subject = esc(&row.subject),
+        mark = unread_mark(row.unread),
+        prose = prose,
+        file = esc(&row.file),
+    );
+    layout_with_drawer(&format!("{} · Hộp thư", row.subject), "", &body_html, false)
 }
 
 /// guide-vi: the built-in guide's own chapter rail, on every guide page.
@@ -21585,6 +21810,181 @@ mod tests {
             "a hostile request id must never open a live script tag: {html}"
         );
         assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    // -- board-visibility bi-2: the inbox ---------------------------------
+
+    fn letter_row(subject: &str, project: &str, filed_at: &str, unread: bool) -> InboxRow {
+        InboxRow {
+            href: Some(format!("/inbox/p/{filed_at}-run.md")),
+            subject: subject.into(),
+            project: project.into(),
+            filed_at: filed_at.into(),
+            file: format!("{filed_at}-run.md"),
+            unread,
+            unreadable: None,
+        }
+    }
+
+    /// A row has to answer four things at a glance, or the list is a list of
+    /// nothing: what the letter says, which project it is about, when it was
+    /// filed, and whether it has been read.
+    #[test]
+    fn an_inbox_row_names_subject_project_filed_at_and_read_state() {
+        let html = inbox_page(&[letter_row("Fixed the rail pill", "waggledance", "2026-08-30T09:00:00Z", true)]);
+        for needle in [
+            "Fixed the rail pill",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            "Chưa đọc",
+            r#"href="/inbox/p/2026-08-30T09:00:00Z-run.md""#,
+        ] {
+            assert!(html.contains(needle), "the row must carry {needle}: {html}");
+        }
+        // Read state is a word, not a colour: the read row says so too.
+        let read = inbox_page(&[letter_row("Already seen", "beehive", "2026-08-29T09:00:00Z", false)]);
+        assert!(read.contains("Đã đọc") && !read.contains("Chưa đọc"), "{read}");
+    }
+
+    /// bee's own rule, quoted at the reader this list reads from: a silently
+    /// missing letter reads to the human as a quiet night rather than as a
+    /// broken store. So a letter that could not be parsed is ON the page, by
+    /// name, with its reason — and it is not a link, because there is no
+    /// parsed letter behind it to open.
+    #[test]
+    fn an_unreadable_letter_is_named_on_the_inbox_and_never_linked() {
+        let html = inbox_page(&[InboxRow {
+            href: None,
+            subject: String::new(),
+            project: "waggledance".into(),
+            filed_at: String::new(),
+            file: "2026-08-30T10-00-00Z-broken.md".into(),
+            unread: false,
+            unreadable: Some("missing required field `filed_at`".into()),
+        }]);
+        assert!(
+            html.contains("2026-08-30T10-00-00Z-broken.md"),
+            "the unreadable letter must name its file: {html}"
+        );
+        assert!(
+            html.contains("missing required field `filed_at`"),
+            "and why it could not be read: {html}"
+        );
+        assert!(
+            html.contains("Không đọc được"),
+            "and say plainly that it could not be: {html}"
+        );
+        assert!(
+            !html.contains(r#"<a class="fg-card" href="/inbox/"#),
+            "an unreadable entry has no letter to open, so it is no link: {html}"
+        );
+    }
+
+    /// Zero letters is this machine's normal state, not a fault — bee files a
+    /// letter only from an unattended run, and no checkout here has armed one.
+    /// The page has to SAY that. A bare count, or an empty list frame, would
+    /// read as a broken store or as a page that never loaded.
+    #[test]
+    fn an_empty_inbox_explains_the_unattended_run_instead_of_showing_a_zero() {
+        let html = inbox_page(&[]);
+        assert!(
+            html.contains("Chưa có lá thư nào"),
+            "the empty inbox must say it is empty in words: {html}"
+        );
+        assert!(
+            html.contains("không có người ngồi trực"),
+            "and name the one condition that files a letter: {html}"
+        );
+        assert!(
+            html.contains("Máy này chưa bật chế độ chạy không người trực"),
+            "and say that this machine has not armed it: {html}"
+        );
+        assert!(
+            !html.contains("fg-pagehead__aside"),
+            "no unread pill when there is nothing to have read: {html}"
+        );
+    }
+
+    /// Where the inbox is reached from (bi-2's own decision): the shared top
+    /// bar menu, on every page, beside Hướng dẫn and Settings.
+    #[test]
+    fn the_inbox_is_reached_from_the_top_bar_menu_on_every_page() {
+        for (page, html) in [
+            ("error", error_page(404, "nope")),
+            ("guide", guide_index_page()),
+            ("inbox", inbox_page(&[])),
+        ] {
+            let start = html
+                .find(r#"<div class="topbar-menu js-menu">"#)
+                .unwrap_or_else(|| panic!("{page} has no top bar menu"));
+            let end = start + html[start..].find("</header>").expect("unclosed top bar");
+            let menu = &html[start..end];
+            assert!(
+                menu.contains(r#"href="/inbox""#) && menu.contains("Hộp thư"),
+                "the {page} page's menu must reach the inbox beside the guide and Settings: {menu}"
+            );
+        }
+    }
+
+    /// dcfbda20 records that adding the guide widened the handset tab bar from
+    /// four columns to five, stylesheet grid included. bi-2 does not widen it
+    /// again: the inbox is reached from the menu instead, and this test is the
+    /// guard that keeps a later edit from quietly making it six.
+    #[test]
+    fn the_handset_tab_bar_keeps_the_five_destinations_it_was_widened_to() {
+        let bar = home_tabbar(HomeTab::Kanban);
+        let items = bar.matches("home-tabbar__item").count()
+            - bar.matches("home-tabbar__item--on").count();
+        assert_eq!(
+            items, 5,
+            "the tab bar's five columns are a recorded layout decision (dcfbda20): {bar}"
+        );
+        assert!(
+            !bar.contains("/inbox"),
+            "the inbox lives in the top bar menu, not as a sixth column: {bar}"
+        );
+    }
+
+    /// The letter body takes the UNTRUSTED path — `waggledance-core`'s
+    /// ordinary sanitizing markdown pipeline, the same one every document page
+    /// uses — and never the guide's authored-fragment path (d7efc6fe), because
+    /// another program in another checkout composed the file.
+    ///
+    /// The proof runs the real pipeline over hostile markdown and reads the
+    /// finished page: a `<script>` in a letter must not reach the browser as
+    /// one, while the letter's ordinary prose must survive.
+    #[test]
+    fn a_letters_body_is_rendered_through_the_sanitizing_pipeline() {
+        let source = "## Đã làm\n\n- một việc\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n";
+        let path = std::env::temp_dir().join("waggledance-bi2-letter.md");
+        let index: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        let page = waggledance_core::render::RenderService::new().render(
+            source,
+            &path,
+            "p",
+            std::path::Path::new("/nonexistent"),
+            &index,
+        );
+        let html = inbox_letter_page(
+            &letter_row("Một lượt chạy", "waggledance", "2026-08-30T09:00:00Z", true),
+            &SanitizedLetterBody::from_rendered(&page),
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "a letter's script tag must not survive into the page: {html}"
+        );
+        assert!(
+            !html.contains("onerror"),
+            "nor an inline event handler: {html}"
+        );
+        assert!(
+            html.contains("Đã làm") && html.contains("một việc"),
+            "the letter's own prose must still render: {html}"
+        );
+        assert!(
+            html.contains("Một lượt chạy") && html.contains("2026-08-30T09:00:00Z"),
+            "and the header keeps the letter's own frontmatter: {html}"
+        );
     }
 
     #[test]
