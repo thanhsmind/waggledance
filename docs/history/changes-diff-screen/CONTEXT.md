@@ -89,17 +89,17 @@ These are fixed. Planning must implement them exactly — cited, never reinterpr
 
 ## Outstanding Questions
 
+<!-- bee:not-a-deferral: all three were answered by planning on 2026-08-30 — resolutions recorded in plan.md (Approach) and decision ad275999; kept as the historical question list, nothing left to act on -->
 ### Deferred To Planning
 
-<!-- bee:not-a-deferral: all three were answered by planning on 2026-08-30 — resolutions recorded in plan.md (Approach) and decision ad275999; kept as the historical question list, nothing left to act on -->
 - [x] git2 vs shell-out — resolved: shell-out, 3 read-only calls (plan.md Approach).
 - [x] Large-diff limits — resolved: 2 MiB/side, 100 sections, 48 MiB stdout (plan.md).
 - [x] Rename detection — resolved: R with `old → new` label via `-M` (plan.md).
 <!-- /bee:not-a-deferral -->
 
+<!-- bee:not-a-deferral: out-of-scope register mirrored in plan.md "Out of scope"; these become work only through a new user ask or backlog item, no promise to act rides here -->
 ## Deferred Ideas
 
-<!-- bee:not-a-deferral: out-of-scope register mirrored in plan.md "Out of scope"; these become work only through a new user ask or backlog item, no promise to act rides here -->
 - Base/commit picker (diff vs arbitrary ref) — v2; D2 locks working-tree-only.
 - Nested files-explorer tree + Docs/Code unification (layers 1–3) — explicitly
   out, per D1.
@@ -109,4 +109,4 @@ These are fixed. Planning must implement them exactly — cited, never reinterpr
 ## Handoff Note
 
 CONTEXT.md is the source of truth. Decision IDs are stable. Planning reads locked
-decisions, code context, canonical references, and deferred-to-planning questions.
+decisions, code context, and canonical references.

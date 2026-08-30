@@ -286,6 +286,42 @@ content itself.
 - **Afterwards:** the operator can read a large or dense diagram that would
   otherwise overflow its box, without leaving the page.
 
+### Changes screen (git diff)
+
+- **Triggers:** the section switch on every project page now reads
+  Docs · Code · Changes; opening `/p/<id>/_changes` shows the project's git
+  diff as stacked per-file sections, each a side-by-side two-column table —
+  line numbers per side, both panes syntax-highlighted, removed rows tinted
+  red / added rows green from theme-derived variables (legible in both
+  schemes).
+- **What it shows:** by default the working tree against HEAD — staged,
+  unstaged, and untracked files (untracked as A). A base dropdown in the
+  header lists "Working tree" plus the ~50 most recent commits; picking a
+  commit shows that commit against its parent (`?commit=<sha>`; a root commit
+  diffs against the empty tree). The sidebar lists changed files grouped by
+  directory with M/A/D/R letter badges and per-file `+n −m` counts; clicking
+  a file scrolls to its section and a scrollspy tracks the section in view.
+- **Reviewed marks:** each file section's sticky header carries a checkbox,
+  mirrored on its sidebar row; the header counts N/M reviewed and shows a
+  complete state at N==M. Marks live only in the reader's browser
+  (`localStorage`, keyed per project and per base) against a server-emitted
+  content hash — editing a marked file drops its stale mark on the next load.
+  The server never stores review state.
+- **Boundaries:** paths refused by the project's exclude rules or the
+  denylist never appear; the page shows only an aggregate "N files hidden"
+  count. Caps: 2 MiB per side per file (truncation banner), 100 sections per
+  page, 48 MiB of git output, 10 s per git call. A project that is not a git
+  repository (or a machine without git) gets an explained empty state, never
+  an error page.
+- **Embedded mode:** `?embed=1` (exact value) renders the Changes and Code
+  pages without the top bar for framing inside other pages; in-page links and
+  the base picker carry the flag through.
+- **Terminal split panel:** the terminal page's toolbar offers FILES and
+  DIFF toggles; opening one splits the content area — the top half an
+  embedded Code or Changes frame for the same project, the bottom half the
+  live terminal. Default closed (the page is unchanged until a tab is
+  clicked); the open tab is remembered per project for the browser tab.
+
 ## Actors & Access
 
 Not applicable in the role sense — a single local operator in a browser; no
@@ -432,3 +468,17 @@ snapshot under `docs/specs/visuals/web-interface/` is an open item.
   mark and dot sitting alone above their own name.
 - `crates/waggledance/assets/atelier/components.css` — `.fg-input` / `.fg-select`
   (shared form-field skeleton used by the sidebar search box too).
+- `crates/waggledance-core/src/git_diff.rs` — the Changes screen's git layer:
+  `diff(root, exclude, &DiffBase)` (working tree or commit-vs-parent),
+  `log_entries` (picker list), the sha gate (`is_hex_sha` + `resolve_commit`),
+  caps and subprocess timeout. `crates/waggledance-core/src/engine.rs` —
+  `Engine::changes` wraps it behind the exclude/denylist filter.
+- `crates/waggledance/src/views.rs` — `changes_page` / `changes_nav` /
+  `base_picker` / `terminal_embed_panel`; `PageChrome` threads `embed=1`.
+  `crates/waggledance/src/server.rs` — `changes_screen` handler, `page_chrome`,
+  and the Host/Sec-Fetch guard (`require_loopback_host`: cross-site top-level
+  GET navigations pass; cross-site POSTs and non-navigation requests 421).
+- `crates/waggledance/assets/app.js` — changes scrollspy, base-picker
+  navigation, reviewed-marks module, terminal panel toggle.
+  `crates/waggledance/assets/app.css` — `.changes*`/`.chg-*`/`.diffrow*`
+  palette (`--diff-*` variables), `.layout--embed`, `.term-embed*`/`.term-split`.

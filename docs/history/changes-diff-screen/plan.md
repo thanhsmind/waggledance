@@ -138,6 +138,8 @@ fattest — from growing past review size.
 
 ## Out of scope
 
-- Base/commit picker (D2), files-explorer tree + Docs/Code unification (D1),
-  watcher-driven live refresh, server-side review state — all deferred in
-  CONTEXT.md.
+<!-- bee:not-a-deferral: out-of-scope register mirroring CONTEXT.md's fenced Deferred Ideas; no promise to act rides here. Plan-rev bumped 2026-08-30 for this fence; the commit picker later entered scope as D6 (cds-5/6), the rest stays out. -->
+- Files-explorer tree + Docs/Code unification (D1), watcher-driven live
+  refresh, server-side review state — out of scope. The base/commit picker,
+  out in this plan's first revision, was pulled INTO scope by D6 during uat.
+<!-- /bee:not-a-deferral -->
