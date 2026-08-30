@@ -4223,6 +4223,17 @@ fn bee_hub_style() -> String {
   --bee-hub-project-10: #E873A9;
 }
 .bee-hub { margin-bottom: var(--space-4); }
+/* board-visibility bi-4: the home board's unread-letter strip
+   (`bee_cross_project_unread_strip`) is the shared `.fg-banner` component
+   wearing an anchor instead of a div, so the whole strip is the click target
+   that reaches `/inbox`. These two lines are the entire difference: undo the
+   link underline the banner was never drawn with, and light the text on hover
+   the way `.bee-hub__row` does, so it still reads as somewhere to go.
+   board-live-morph D2: deliberately NO transition and NO animation here --
+   motion belongs to a card that moved, never to a count that changed, and a
+   rule added here would be exactly that mistake. */
+.bee-hub__inbox { text-decoration: none; }
+.bee-hub__inbox:hover { color: var(--color-action); }
 /* board-liveness-3: the live strip's own dense-row idiom, one row per live
    session or granted worktree — deliberately never `.bee-hub__row`'s
    feature-link styling, since a strip row never links anywhere of its
@@ -6181,6 +6192,64 @@ fn bee_cross_project_read_errors_strip(rollups: &[(&Project, &BeeProjectRollup)]
     )
 }
 
+/// board-visibility D3 on the cross-project home page: ONE number — how many
+/// letters bee has filed and nobody has read yet, summed across every
+/// registered project — and a link to `/inbox`, where the reading happens.
+///
+/// **Why a count and not a list.** D3 refuses a home-page section unless the
+/// owner can act on it AND its number can go down. An unread count passes both
+/// clauses: reading a letter lowers it, and the act of reading is one click
+/// away. A list of letter rows here would pass the first and fail the second
+/// the moment letters accumulate — which is not a hypothetical, it is why a
+/// list-shaped block was deleted from this board once already. So the subject
+/// lines stay on `/inbox` ([`inbox_page`]) and only the number comes home.
+///
+/// **Zero renders nothing at all** — no strip, no placeholder, no "0". That is
+/// the same rule [`bee_cross_project_read_errors_strip`] answers to directly
+/// above, and it does not contradict the stat tiles' "a zero tile still
+/// renders": a tile is a fixed slot in a three-up row whose shape would break
+/// with a hole in it, while this is a strip that either has something to say
+/// or has no reason to exist. On this machine zero is the ordinary state (bee
+/// files a letter only from an unattended run), so a permanent "0 unread"
+/// would be furniture, not information.
+///
+/// **Unread only, never the unreadable ones.** `BeeMailboxEntry::is_unread`
+/// is false for an entry that failed to parse — an unreadable letter is its
+/// own, louder signal and the inbox names it there; folding it into this
+/// number would let a broken store read as "one more thing to read".
+///
+/// **board-live-morph D1/D2.** This strip is a DIRECT child of the
+/// `data-feature-hub` section, sitting outside `.bee-hub__groups` and
+/// `.bee-hub__archive` — which is exactly the set `app.js`'s
+/// `hubPatchWholesale` keeps in place and re-parents around. Every other
+/// direct child is removed and re-inserted from the freshly fetched section
+/// on each patch, so this number is replaced wholesale on every update:
+/// never appended twice, never left showing a stale count. It carries no
+/// `data-hub-key` and neither of the two keyed classes (`.bee-hub__shell`,
+/// `.bee-hub__row`) the patch moves or fades, and `bee_hub_style` gives
+/// `.bee-hub__inbox` no transition of its own — D2 spends motion on the card,
+/// never on a count that changed.
+fn bee_cross_project_unread_strip(rollups: &[(&Project, &BeeProjectRollup)]) -> String {
+    let count: usize = rollups
+        .iter()
+        .map(|(_, rollup)| {
+            rollup
+                .snapshot
+                .mailbox
+                .iter()
+                .filter(|entry| entry.is_unread())
+                .count()
+        })
+        .sum();
+    if count == 0 {
+        return String::new();
+    }
+    format!(
+        r#"<a class="fg-banner fg-banner--info bee-hub__inbox" href="/inbox" data-bee-unread="{count}"><span class="fg-banner__dot"></span><span class="fg-banner__body">{count} lá thư chưa đọc từ các lượt chạy</span><span class="fg-banner__act">Mở hộp thư</span></a>"#,
+        count = count,
+    )
+}
+
 /// board-run-actions D3 hands in `live_runs`, every project's own live board
 /// runs, keyed by project id exactly like the pane map beside it — this page
 /// merges several projects' rows into one column, so a feature name alone
@@ -6439,11 +6508,17 @@ pub fn bee_cross_project_features_section(
     let ready_to_merge_cards = bee_hub_finished_rows(&ready_to_merge_rows);
     let finished_cards = bee_hub_finished_rows(&finished_rows);
     let read_errors_strip = bee_cross_project_read_errors_strip(rollups);
+    // board-visibility bi-4: a direct child of the section, beside the read
+    // errors strip and outside `.bee-hub__groups` -- see
+    // `bee_cross_project_unread_strip` for why that placement is what makes
+    // the in-place board patch replace it rather than duplicate or strand it.
+    let unread_strip = bee_cross_project_unread_strip(rollups);
 
     format!(
         r#"<section class="fg-card bee-hub" data-feature-hub="cross-project">
   <h3 class="bee-panel__head">Features</h3>
   {read_errors_strip}
+  {unread_strip}
   {stat_tiles}
   <div class="bee-hub__groups">
     {todo_group}
@@ -6455,6 +6530,7 @@ pub fn bee_cross_project_features_section(
   {archive_bar}
 </section>"#,
         read_errors_strip = read_errors_strip,
+        unread_strip = unread_strip,
         stat_tiles = bee_hub_stat_tiles(
             in_progress_count,
             in_progress_waiting_count,
@@ -16766,6 +16842,344 @@ mod tests {
         assert!(
             !html.contains("fg-banner--warning") && !html.contains("could not be read"),
             "a clean snapshot must render no warning strip at all: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- board-visibility bi-4: the home page's one unread number ----------
+    //
+    // These go through `read_rollup` from a real letter file on disk rather
+    // than hand-building a `BeeSnapshot`, for the reason
+    // `docs/knowledge/patterns/prove-the-whole-path.md` names: the promise is
+    // user-visible ("I can see there is something to read"), and the seam
+    // between bi-1's mailbox reader, the cross-project roll-up and this strip
+    // belongs to no single unit test. The bytes below are bee's own emitter
+    // shape (`verbs/mailbox.rs::render_letter`); there are zero real letters
+    // on this machine, since bee files one only from an unattended run and no
+    // checkout has armed one.
+
+    /// One letter file on disk, in the bytes bee's emitter writes.
+    fn home_letter_file(root: &std::path::Path, name: &str, subject: &str, status: &str) {
+        let p = root.join(".bee/human-mailbox").join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            p,
+            format!(
+                "---\nsubject: {subject:?}\nrun: \"2026-08-30-run\"\nproject: \"demo\"\nfiled_at: \"2026-08-30T09:00:00Z\"\nstatus: {status:?}\nitems: []\nneeds_you: []\n---\n\nBody of the letter.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The one thing bi-4 puts on the home page: how many letters nobody has
+    /// read yet, summed across EVERY registered project, linking to `/inbox`.
+    /// Two projects contribute here and a read letter sits beside an unread
+    /// one, so a per-project count, a count of all letters, or a count taken
+    /// from the first project alone all read as a different number than 3.
+    #[test]
+    fn the_home_board_shows_one_unread_letter_count_summed_across_every_project() {
+        let root_a = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-a-{}",
+            std::process::id()
+        ));
+        let root_b = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-b-{}",
+            std::process::id()
+        ));
+        for r in [&root_a, &root_b] {
+            let _ = std::fs::remove_dir_all(r);
+            std::fs::create_dir_all(r.join(".bee")).unwrap();
+        }
+        home_letter_file(&root_a, "2026-08-30T09-00-00Z-one.md", "Letter one", "unread");
+        home_letter_file(&root_a, "2026-08-30T10-00-00Z-two.md", "Letter two", "unread");
+        home_letter_file(
+            &root_a,
+            "2026-08-30T11-00-00Z-old.md",
+            "Already seen",
+            "read",
+        );
+        home_letter_file(
+            &root_b,
+            "2026-08-30T12-00-00Z-far.md",
+            "Letter from the other project",
+            "unread",
+        );
+
+        let mut project_a = sample_project();
+        project_a.id = "proj-unread-a".into();
+        project_a.root_path = root_a.clone();
+        let mut project_b = sample_project();
+        project_b.id = "proj-unread-b".into();
+        project_b.root_path = root_b.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(&[root_a.clone(), root_b.clone()]);
+        let pairs: Vec<(&Project, &BeeProjectRollup)> =
+            vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            html.contains(r#"data-bee-unread="3""#),
+            "the count must be 3 -- every project's unread letters and only the unread ones: {html}"
+        );
+        assert!(
+            html.contains("3 lá thư chưa đọc"),
+            "the number must be readable as words, not only as an attribute: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/inbox""#),
+            "the count must lead to the inbox, where the reading that lowers it happens: {html}"
+        );
+        // D3's second clause is what forbids the letters themselves here.
+        for subject in [
+            "Letter one",
+            "Letter two",
+            "Already seen",
+            "Letter from the other project",
+        ] {
+            assert!(
+                !html.contains(subject),
+                "no letter subject may reach the home board -- only the number does: {html}"
+            );
+        }
+        assert!(
+            !html.contains("/inbox/p/"),
+            "no per-letter link may reach the home board either: {html}"
+        );
+
+        for r in [&root_a, &root_b] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// The mirror, and the harder half of the rule: at zero unread the home
+    /// board renders NOTHING -- no strip, no placeholder, no "0 chưa đọc".
+    /// Zero is the ordinary state on this machine, so a permanent zero would
+    /// be furniture. A project with letters that have all been read is the
+    /// case that separates "nothing to show" from "no mailbox at all", so
+    /// this one has a read letter on disk rather than an empty directory.
+    #[test]
+    fn the_home_board_shows_nothing_at_all_when_no_letter_is_unread() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-zero-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-seen.md", "Already seen", "read");
+
+        let mut project = sample_project();
+        project.id = "proj-unread-zero".into();
+        project.root_path = root.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            !html.contains("data-bee-unread"),
+            "zero unread renders no strip at all, not an empty one: {html}"
+        );
+        assert!(
+            !html.contains("chưa đọc") && !html.contains("bee-hub__inbox"),
+            "zero unread must not leave a placeholder or a bare 0 behind: {html}"
+        );
+        assert!(
+            !html.contains(r#"href="/inbox""#),
+            "with nothing to read there is nothing on the board to lead to it: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// board-live-morph D1 (decision 5dce3301): the home board does NOT
+    /// full-page reload -- it refetches its own HTML and patches
+    /// `[data-feature-hub]` in place. This asserts the whole path rather
+    /// than assuming it:
+    ///
+    /// 1. the strip is INSIDE the patched section, and a direct child of it,
+    ///    sitting before `.bee-hub__groups`;
+    /// 2. `app.js`'s `hubPatchWholesale` -- the function that actually runs
+    ///    on every patch -- removes every direct child except
+    ///    `.bee-hub__groups`/`.bee-hub__archive` and re-inserts the fetched
+    ///    section's own, which is exactly what makes (1) mean "replaced",
+    ///    never "appended twice";
+    /// 3. a second render with a different number carries the new count and
+    ///    only the new count, and still exactly one strip.
+    #[test]
+    fn the_home_unread_count_rides_the_patched_fragment_and_is_replaced_not_duplicated() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-patch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "unread");
+        home_letter_file(&root, "2026-08-30T10-00-00Z-b.md", "B", "unread");
+
+        let mut project = sample_project();
+        project.id = "proj-unread-patch".into();
+        project.root_path = root.clone();
+
+        let render = |root: &std::path::PathBuf, project: &Project| -> String {
+            let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(root));
+            let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(project, &rollups[0])];
+            bee_cross_project_features_section(
+                &pairs,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            )
+        };
+
+        let html = render(&root, &project);
+
+        // (1) Inside the refetched fragment, and outside the two containers
+        // the patch keeps -- i.e. a direct child of the section.
+        let section_at = html
+            .find(r#"data-feature-hub="cross-project""#)
+            .expect("the cross-project board renders the patched section");
+        let strip_at = html
+            .find(r#"data-bee-unread="2""#)
+            .expect("two unread letters render the strip");
+        let groups_at = html
+            .find(r#"<div class="bee-hub__groups">"#)
+            .expect("the board renders its groups container");
+        assert!(
+            section_at < strip_at && strip_at < groups_at,
+            "the strip must sit inside [data-feature-hub] and before .bee-hub__groups, \
+             so the patch replaces it wholesale: {html}"
+        );
+        assert_eq!(
+            html.matches("data-bee-unread").count(),
+            1,
+            "exactly one strip is rendered, so a patch has exactly one node to replace: {html}"
+        );
+
+        // (2) The patch function itself, pinned: what it spares, and what it
+        // therefore replaces. A future edit that started sparing more, or
+        // stopped re-inserting, would strand this number stale.
+        let js = APP_JS;
+        let start = js
+            .find("function hubPatchWholesale(oldSection, newSection) {")
+            .expect("hubPatchWholesale must exist");
+        let end = js[start..]
+            .find("\n  function ")
+            .map(|i| start + i)
+            .expect("hubPatchWholesale is followed by another function");
+        let block = &js[start..end];
+        assert!(
+            block.contains(
+                "if (child !== oldGroups && child !== oldArchive) oldSection.removeChild(child);"
+            ),
+            "every direct child but the groups and archive containers is removed on a patch: {block}"
+        );
+        assert!(
+            block
+                .contains("oldSection.insertBefore(document.importNode(before[i], true), oldGroups)"),
+            "and the fetched section's own pre-groups children are inserted back: {block}"
+        );
+
+        // (3) One letter read: the number moves, and only one strip survives.
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "read");
+        let next = render(&root, &project);
+        assert!(
+            next.contains(r#"data-bee-unread="1""#) && !next.contains(r#"data-bee-unread="2""#),
+            "the refetched fragment carries the NEW count, never the stale one: {next}"
+        );
+        assert_eq!(
+            next.matches("data-bee-unread").count(),
+            1,
+            "and still exactly one strip, never a second appended beside it: {next}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// board-live-morph D2 (decision 7871e652): motion is spent on the card
+    /// as a whole -- "Text, badges and counts inside a card" do not animate.
+    /// This count is exactly such a number, so it must not animate when it
+    /// changes. Two things make that true and both are pinned here: it is
+    /// none of the elements `app.js` moves or fades (it carries no
+    /// `data-hub-key`, and neither of the two keyed classes the board's own
+    /// transition rule names), and `bee_hub_style` gives `.bee-hub__inbox`
+    /// no transition or animation of its own.
+    #[test]
+    fn the_home_unread_count_does_not_animate_when_it_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-still-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "unread");
+
+        let mut project = sample_project();
+        project.id = "proj-unread-still".into();
+        project.root_path = root.clone();
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        let strip_at = html
+            .find(r#"class="fg-banner fg-banner--info bee-hub__inbox""#)
+            .expect("one unread letter renders the strip");
+        let strip_end = html[strip_at..]
+            .find("</a>")
+            .map(|i| strip_at + i)
+            .expect("the strip closes");
+        let strip = &html[strip_at..strip_end];
+        assert!(
+            !strip.contains("data-hub-key"),
+            "the strip must not be a keyed element -- those are what the patch moves and fades: {strip}"
+        );
+        assert!(
+            !strip.contains("bee-hub__shell") && !strip.contains("bee-hub__row"),
+            "nor may it wear either class the board's own transition rule names: {strip}"
+        );
+
+        // The comments in this stylesheet talk ABOUT motion (including the
+        // one beside this very rule, explaining why it has none), so they are
+        // stripped before the declarations are read -- otherwise the scan
+        // below would be matching prose, not CSS.
+        let style = bee_hub_style();
+        let mut css = String::with_capacity(style.len());
+        let mut rest = style.as_str();
+        while let Some(open) = rest.find("/*") {
+            css.push_str(&rest[..open]);
+            rest = match rest[open..].find("*/") {
+                Some(close) => &rest[open + close + 2..],
+                None => "",
+            };
+        }
+        css.push_str(rest);
+        for rule in css.split('}') {
+            if !rule.contains("bee-hub__inbox") {
+                continue;
+            }
+            assert!(
+                !rule.contains("transition") && !rule.contains("animation"),
+                "D2: a count that changed earns no motion -- {rule}"
+            );
+        }
+        assert!(
+            css.contains(".bee-hub__inbox"),
+            "the scan above must actually have a rule to read: {css}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
