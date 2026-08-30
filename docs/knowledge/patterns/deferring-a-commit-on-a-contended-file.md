@@ -46,3 +46,26 @@ worktree held the other.
 - At scribing time, check where a `commit_pending` change actually ended up
   before describing it. The cell's own trace is frozen at cap and will still
   claim the work is uncommitted long after someone else has committed it.
+
+## Why the path-scoped commit is the rule, not a preference
+
+The first bullet reads like style advice. It is not: concurrent workers in one
+worktree race on the **git index**, and the index is not a path.
+
+Five workers each reserved disjoint files, wrote only their own, then each ran a
+scoped `git add <its own paths>` followed by a bare `git commit`. There is one
+index per worktree, so whoever committed second swept in whatever a sibling had
+staged and not yet committed — one cell's commit swallowed another's scaffolding.
+Nothing is lost and no file is corrupted, which is precisely why it stays
+invisible: the damage is to attribution, and it only shows when someone reads the
+commit boundaries.
+
+**Reservations cannot prevent this.** They guard paths; the index is not a path,
+so no reservation covers it. A file reservation cannot protect a tree.
+
+`git commit -- <paths>` commits those paths *ignoring the index*, which is why it
+is the safe form — it never picks up a sibling's staged work. This has since been
+escalated from prose to a guard: `git add` is now refused outright while sibling
+workers are live in the checkout, and the refusal names the path-scoped commit as
+its remedy. That escalation is the intended end state for a pattern that recurs —
+a durable owner rather than a warning someone has to remember.

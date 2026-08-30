@@ -65,3 +65,14 @@ consumer that never arrived.
 
 This pattern now carries a `bee.signature`, so `bee knowledge report` counts its
 recurrences instead of leaving the count to memory.
+
+## Related
+
+- [existence-is-not-evidence](existence-is-not-evidence.md) is this discipline one
+  layer up: this pattern guards the **cap** — no slice is done until one proof
+  crosses the seams. That one guards the **plan** — no claim is load-bearing until
+  it was read or run rather than inferred. A slice can satisfy either and still
+  fail the other, and in 2026-08-30's two features it failed each in turn.
+- [the-binary-you-ran-is-not-the-one-you-built](the-binary-you-ran-is-not-the-one-you-built.md)
+  is what defeats a whole-path proof even when the proof is correctly scoped: the
+  path ran, but not on the artifact under test.

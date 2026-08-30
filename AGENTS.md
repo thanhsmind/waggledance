@@ -294,12 +294,22 @@ For the dev loop — rebuilding the daemon to test a change — use the `fast`
 profile, never `--release`:
 
 ```sh
-cargo build --profile fast -p waggledance   # binary at target/fast/waggledance
+cargo build --profile fast -p waggledance
 ```
 
 `release` carries fat LTO + `codegen-units = 1`, which pin one core for ~43 s on
 a one-line change; `fast` does the same rebuild in ~1 s. Reserve `--release` for
 release builds and size checks — CI and `release.yml` already use it.
+
+**Never assume where the binary landed.** `CARGO_TARGET_DIR` is redirected on at
+least one dev host, so the in-repo `target/fast/waggledance` can be days stale
+while reporting the same version as the fresh one. Resolve the path cargo actually
+wrote, from `cargo build --profile fast -p waggledance --message-format=json`
+(`compiler-artifact.executable`) — and when a proof depends on running the new
+code, confirm the artifact by content (`strings <path> | rg '<a literal only the
+change contains>'`), never by its version string. Two further disguises of the
+same trap, including one that defeats the JSON path itself, are in
+`docs/knowledge/patterns/the-binary-you-ran-is-not-the-one-you-built.md`.
 
 <!-- waggledance:START -->
 ## Documentation Viewing (Waggledance)
