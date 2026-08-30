@@ -688,11 +688,31 @@ async fn await_run_with_poll_interval(
         let delta = delta_from_baseline(&run.baseline, &read.text);
 
         if status == Some(AgentStatus::Blocked) {
-            return finish(engine, run, RunStatus::Blocked, delta, notify_store).await;
+            return finish(
+                herdr,
+                engine,
+                run,
+                RunStatus::Blocked,
+                Completion::Observed,
+                delta,
+                notify_store,
+            )
+            .await;
         }
 
         if !marker_is_stale_from_start && read.text.contains(run.marker.as_str()) {
-            return finish(engine, run, RunStatus::Done, delta, notify_store).await;
+            // The one declared completion in this loop: the agent's own
+            // marker, freshly printed by the agent itself.
+            return finish(
+                herdr,
+                engine,
+                run,
+                RunStatus::Done,
+                Completion::Declared,
+                delta,
+                notify_store,
+            )
+            .await;
         }
 
         if status == Some(AgentStatus::Unknown) || status.is_none() {
@@ -704,7 +724,19 @@ async fn await_run_with_poll_interval(
                 stable_reads = 1;
             }
             if stable_reads >= STABILITY_READS {
-                return finish(engine, run, RunStatus::Done, delta, notify_store).await;
+                // `Done` by inference, from a screen that stopped moving --
+                // equally true of an agent paused on a tool call, so this
+                // one never closes a pane (D2).
+                return finish(
+                    herdr,
+                    engine,
+                    run,
+                    RunStatus::Done,
+                    Completion::Observed,
+                    delta,
+                    notify_store,
+                )
+                .await;
             }
         } else {
             stable_reads = 0;
@@ -718,11 +750,42 @@ async fn await_run_with_poll_interval(
             } else {
                 RunStatus::Working
             };
-            return finish(engine, run, timed_out_status, delta, notify_store).await;
+            return finish(
+                herdr,
+                engine,
+                run,
+                timed_out_status,
+                Completion::Observed,
+                delta,
+                notify_store,
+            )
+            .await;
         }
         let remaining = deadline.saturating_duration_since(now);
         tokio::time::sleep(poll_interval.min(remaining)).await;
     }
+}
+
+/// How this run's completion was learned -- the ONE thing the pane-close
+/// guard is allowed to read about it.
+///
+/// D2: completion is an explicit declaration, never an inferred state. A
+/// pane's observed state cannot tell a finished agent from one working
+/// quietly in the background, so only the agent's own word may retire its
+/// pane. This is a WHITELIST of one producer, deliberately not a blacklist
+/// of bad states: a future `RunStatus`, or a second code path that decides
+/// a run is `Done`, gets `Observed` by default and cannot silently acquire
+/// the right to kill an agent process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Completion {
+    /// The agent itself printed `HERDR_DONE_<nonce>` into its pane -- it
+    /// said it was finished, in its own output. The only value that may
+    /// close a pane.
+    Declared,
+    /// Everything else waggledance concluded by looking: the content
+    /// stability fallback, the blocked-status read, the await deadline.
+    /// Every one of these can be true of an agent that is still working.
+    Observed,
 }
 
 /// Persist `run`'s terminal-for-this-call status transition (D7) and, when
@@ -735,10 +798,35 @@ async fn await_run_with_poll_interval(
 /// existing drain delivers it, so the opt-in switch (D6) keeps governing
 /// delivery untouched. `notify_store: None` still persists the status --
 /// it just raises nothing.
+///
+/// Last, and only under all three guards below, the run's pane is closed
+/// (D1 -- close the pane on completion; defect B: every spawn-dispatch
+/// used to leak a live agent process):
+///
+/// 1. `completion` is [`Completion::Declared`] -- the agent printed its own
+///    marker. NOT "status == Done": the content-stability fallback in
+///    `await_run_with_poll_interval` also returns `Done`, after ~1.5s of
+///    static screen for a pane whose agent status is `Unknown` or missing
+///    entirely, which is equally true of an agent paused on a tool call.
+/// 2. `run.preset_label.is_some()` -- waggledance spawned this pane.
+///    `DispatchTarget::Pane` dispatches into a pre-existing pane the user
+///    owns and leaves `preset_label` `None` exactly there, and D1's
+///    rationale reaches only what waggledance made.
+/// 3. The final transcript was stored -- otherwise closing the pane would
+///    destroy the only remaining record of what the run did.
+///
+/// Nothing else is read: no `agent_status`, no pane liveness, no screen
+/// stability. The honest cost is that a run finishing without printing its
+/// marker keeps its pane -- the leak is narrowed, not eliminated, which is
+/// the correct trade when the alternative risks killing a working agent.
+/// A close failure never changes the run's status: the work finished, the
+/// pane is bookkeeping.
 async fn finish(
+    herdr: &dyn Herdr,
     engine: &Engine,
     run: &Run,
     status: RunStatus,
+    completion: Completion,
     delta: String,
     notify_store: Option<&NotifyStore>,
 ) -> Result<AwaitOutcome, OrchestrateError> {
@@ -749,9 +837,12 @@ async fn finish(
     // nothing to show. A still-`Working` run has no final delta to store
     // -- its screen is not final -- so the column staying NULL is what
     // makes "has a transcript" mean "is over".
-    if status.is_terminal() {
+    let transcript_stored = if status.is_terminal() {
         engine.set_run_final_transcript(&run.id, &delta)?;
-    }
+        true
+    } else {
+        false
+    };
     engine.update_run_status(&run.id, status.as_str(), &now_rfc3339(), None, None)?;
     if let Some(store) = notify_store {
         if notify::is_run_notifiable(status) {
@@ -765,6 +856,14 @@ async fn finish(
             ) {
                 tracing::warn!("failed to enqueue run notification for {}: {e}", run.id);
             }
+        }
+    }
+    if completion == Completion::Declared && run.preset_label.is_some() && transcript_stored {
+        if let Err(e) = herdr.close_pane(&run.pane_id).await {
+            // The run is over either way -- a pane that outlives it costs
+            // machine performance, and reporting the run as anything but
+            // finished would cost the result the agent already produced.
+            tracing::warn!("failed to close pane {} for run {}: {e}", run.pane_id, run.id);
         }
     }
     Ok(AwaitOutcome { status, delta })
@@ -946,6 +1045,9 @@ mod tests {
             argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
             self.inner.agent_start(pane_id, argv).await
+        }
+        async fn close_pane(&self, pane_id: &str) -> herdr::Result<()> {
+            self.inner.close_pane(pane_id).await
         }
     }
 
@@ -1553,6 +1655,214 @@ mod tests {
             "an Unknown-status pane with unchanging content must settle via stability, not time out"
         );
 
+        let stored = engine.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(stored.status, "done");
+    }
+
+    /// The close guard's own fixture: a run waggledance SPAWNED, which is
+    /// what `preset_label: Some(..)` means (a `DispatchTarget::Pane` run
+    /// into a pane the user already owns leaves it `None`).
+    fn build_spawned_run(id: &str, pane_id: &str, baseline: &str, marker: &str) -> Run {
+        Run {
+            preset_label: Some("claude".to_string()),
+            ..build_run(id, pane_id, baseline, marker)
+        }
+    }
+
+    /// Print `marker` into `pane` as the agent's own later output -- the
+    /// only way the joined marker string reaches a pane in these tests, and
+    /// therefore the only thing that can produce a DECLARED completion.
+    async fn agent_declares_done(herdr: &FakeHerdr, pane: &str, marker: &str) {
+        herdr.send_input(pane, marker, false).await.unwrap();
+    }
+
+    /// The whole point of the feature: the agent said it was done, in its
+    /// own output, on a pane waggledance made -- so the pane goes away.
+    #[tokio::test]
+    async fn a_declared_done_on_a_spawned_pane_closes_exactly_that_pane() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        let run = build_spawned_run("run-close", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+        agent_declares_done(&herdr, pane, &marker.joined()).await;
+
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert_eq!(
+            herdr.closed_panes().await,
+            vec![pane.to_string()],
+            "the agent declared itself done on a pane waggledance spawned -- exactly one close"
+        );
+        // The close does not cost the run its record: a repeat await still
+        // answers from the store (dsr-3), which is why capture lands first.
+        assert!(
+            engine.run_final_transcript(&run.id).unwrap().is_some(),
+            "the transcript must already be stored when the pane is closed"
+        );
+    }
+
+    /// D2, structurally: the guard reads how completion was LEARNED, never
+    /// `RunStatus`. `finish` is called here with `RunStatus::Done` on a
+    /// spawned run -- everything the close needs except the agent's own
+    /// declaration -- and must close nothing. A future edit that loosens the
+    /// guard to "status == Done" fails exactly here.
+    #[tokio::test]
+    async fn a_done_that_the_agent_never_declared_closes_nothing() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let run = build_spawned_run("run-observed-done", "w2:p4", "base", "HERDR_DONE_x");
+        engine.insert_run(&run, None).unwrap();
+
+        let outcome = finish(
+            &herdr,
+            &engine,
+            &run,
+            RunStatus::Done,
+            Completion::Observed,
+            "some output".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert!(
+            herdr.closed_panes().await.is_empty(),
+            "a Done nobody declared is an inference -- it may never close a pane"
+        );
+    }
+
+    /// The concrete producer the test above generalizes: an `Unknown`-status
+    /// pane whose screen simply stopped moving. That is equally true of an
+    /// agent paused on a tool call, so its `Done` closes nothing.
+    #[tokio::test]
+    async fn a_stability_done_closes_nothing() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        herdr.set_status(pane, AgentStatus::Unknown).await.unwrap();
+        let fixed_text = "a screen that never changes\n";
+        herdr.seed_scroll_pane(pane, fixed_text, fixed_text, None);
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker(); // never printed -- only stability can end this run.
+        let run = build_spawned_run("run-stable-done", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+
+        let outcome = await_run_with_poll_interval(
+            &herdr,
+            &engine,
+            &run,
+            Duration::from_millis(200),
+            Duration::from_millis(2),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            RunStatus::Done,
+            "stability still ends the run"
+        );
+        assert!(
+            herdr.closed_panes().await.is_empty(),
+            "a screen that merely stopped moving must never kill the agent behind it"
+        );
+    }
+
+    /// `DispatchTarget::Pane` dispatches into a pane the USER owns and leaves
+    /// `preset_label` `None` exactly there. Even a declared done leaves it
+    /// alone -- D1's rationale reaches only what waggledance made.
+    #[tokio::test]
+    async fn a_declared_done_on_a_pane_the_user_owns_closes_nothing() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        // build_run, not build_spawned_run: preset_label stays None.
+        let run = build_run("run-user-pane", pane, &baseline, &marker.joined());
+        assert!(run.preset_label.is_none(), "the case under test");
+        engine.insert_run(&run, None).unwrap();
+        agent_declares_done(&herdr, pane, &marker.joined()).await;
+
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert!(
+            herdr.closed_panes().await.is_empty(),
+            "waggledance never made this pane, so it never takes it away"
+        );
+    }
+
+    /// The three non-`Done` statuses that reach `finish`, each on a spawned
+    /// run so `preset_label` cannot be what saves them. `Blocked` matters
+    /// most: it is an agent waiting on a human, and the human needs the pane
+    /// to answer in.
+    #[tokio::test]
+    async fn a_run_that_did_not_finish_closes_nothing() {
+        for status in [RunStatus::Working, RunStatus::Timeout, RunStatus::Blocked] {
+            let herdr = FakeHerdr::new();
+            let engine = test_engine();
+            let run = build_spawned_run("run-open", "w2:p4", "base", "HERDR_DONE_x");
+            engine.insert_run(&run, None).unwrap();
+
+            finish(
+                &herdr,
+                &engine,
+                &run,
+                status,
+                Completion::Observed,
+                "partial output".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                herdr.closed_panes().await.is_empty(),
+                "{status:?} is not a completion -- it must close nothing"
+            );
+        }
+    }
+
+    /// A leaked pane costs machine performance; losing the run's own result
+    /// costs the work. So a refused close is logged and swallowed -- the run
+    /// still reports Done, and the store still carries its answer.
+    #[tokio::test]
+    async fn a_close_that_fails_still_reports_the_run_as_done() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        herdr.fail_close_pane("herdr refused the close").await;
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        let run = build_spawned_run("run-close-fails", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+        agent_declares_done(&herdr, pane, &marker.joined()).await;
+
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            RunStatus::Done,
+            "the work finished; the pane is bookkeeping"
+        );
+        assert_eq!(
+            herdr.closed_panes().await,
+            vec![pane.to_string()],
+            "the close was attempted -- it just did not take"
+        );
         let stored = engine.get_run(&run.id).unwrap().unwrap();
         assert_eq!(stored.status, "done");
     }

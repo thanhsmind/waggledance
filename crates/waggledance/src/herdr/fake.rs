@@ -37,6 +37,16 @@ struct Inner {
     /// test assert exactly when (and whether) a scroller escalated, without
     /// inferring it from timing.
     sent_text: Mutex<Vec<(String, String)>>,
+    /// Every `close_pane` call, in order -- a test asserting "nothing was
+    /// closed" needs to see zero entries, and one asserting "exactly this
+    /// pane" needs the id. Recorded even for a pane this fake does not
+    /// know, so a close aimed at the wrong pane shows up as a recorded
+    /// call rather than vanishing into an error.
+    closed_panes: Mutex<Vec<String>>,
+    /// When set, `close_pane` refuses with this remote error instead of
+    /// closing -- the seam for "a close that errors still reports the run
+    /// as Done".
+    close_error: Mutex<Option<String>>,
 }
 
 /// One pane's fake screen state -- history-aware so a test can construct all
@@ -263,6 +273,8 @@ impl FakeHerdr {
                 available: std::sync::atomic::AtomicBool::new(true),
                 next_created_id: std::sync::atomic::AtomicU64::new(1),
                 sent_text: Mutex::new(Vec::new()),
+                closed_panes: Mutex::new(Vec::new()),
+                close_error: Mutex::new(None),
             }),
         }
     }
@@ -362,6 +374,20 @@ impl FakeHerdr {
             .filter(|(p, _)| p == pane_id)
             .map(|(_, bytes)| bytes.clone())
             .collect()
+    }
+
+    /// Every pane id `close_pane` was called with, in call order. The
+    /// empty vec is the assertion that matters most here: a pane closed on
+    /// an inferred completion is a killed working agent.
+    pub async fn closed_panes(&self) -> Vec<String> {
+        self.inner.closed_panes.lock().await.clone()
+    }
+
+    /// Test-only: make every subsequent `close_pane` refuse with `message`.
+    /// The call is still recorded -- the close was attempted, it just did
+    /// not take.
+    pub async fn fail_close_pane(&self, message: &str) {
+        *self.inner.close_error.lock().await = Some(message.to_string());
     }
 
     /// Drive an agent's status (as a live change would).
@@ -645,6 +671,29 @@ impl Herdr for FakeHerdr {
                 "agent on {pane_id} did not reach {until:?} (observed {status:?})"
             )))
         }
+    }
+
+    async fn close_pane(&self, pane_id: &str) -> Result<()> {
+        self.ensure_up()?;
+        // Logged before the refusal check and before the pane is looked up:
+        // the record is "a close was attempted on this pane", which is the
+        // fact every test here asserts on.
+        self.inner
+            .closed_panes
+            .lock()
+            .await
+            .push(pane_id.to_string());
+        if let Some(message) = self.inner.close_error.lock().await.clone() {
+            return Err(HerdrError::Remote {
+                code: "pane_close_failed".into(),
+                message,
+            });
+        }
+        self.inner.screens.lock().await.remove(pane_id);
+        let mut snap = self.inner.snapshot.lock().await;
+        snap.agents.retain(|a| a.pane_id != pane_id);
+        snap.panes.retain(|p| p.pane_id != pane_id);
+        Ok(())
     }
 
     async fn send_keys(&self, pane_id: &str, keys: &[String]) -> Result<()> {

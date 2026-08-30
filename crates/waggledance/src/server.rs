@@ -20731,6 +20731,9 @@ mod bee_route_tests {
         ) -> herdr::Result<herdr::AgentStarted> {
             unimplemented!("index_page never starts an agent")
         }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unimplemented!("index_page never closes a pane")
+        }
     }
 
     /// D6: `index_page` wraps its one herdr snapshot in an explicit
@@ -24706,6 +24709,10 @@ mod bee_route_tests {
                 name: "recorded-agent".into(),
             })
         }
+
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unreachable!("spawn-recording tests never close a pane")
+        }
     }
 
     /// A `herdr::Snapshot` with exactly one workspace ("w") whose D2 anchor
@@ -24817,6 +24824,9 @@ mod bee_route_tests {
             _argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
             unreachable!("page-selection tests never start an agent")
+        }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unreachable!("page-selection tests never close a pane")
         }
     }
 
@@ -32631,6 +32641,12 @@ mod bee_route_tests {
                 pane_id: self.spawned_pane.clone(),
                 name: "board-agent".into(),
             })
+        }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            // The run-action tests never reach a marker completion, the one
+            // path that closes a pane -- and a close arriving here would be
+            // the guard leaking, worth a panic rather than a silent Ok.
+            unreachable!("run-action tests never close a pane")
         }
     }
 

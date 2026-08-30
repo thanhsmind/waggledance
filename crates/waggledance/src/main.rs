@@ -872,6 +872,9 @@ mod terminal_background_tests {
         ) -> crate::herdr::Result<crate::herdr::AgentStarted> {
             unimplemented!("not exercised by the supervisor")
         }
+        async fn close_pane(&self, _pane_id: &str) -> crate::herdr::Result<()> {
+            unimplemented!("not exercised by the supervisor")
+        }
     }
 
     /// Defect (5): a rapid off-then-on must never leave two supervisor

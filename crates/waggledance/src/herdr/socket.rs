@@ -757,6 +757,19 @@ impl Herdr for SocketHerdr {
         Ok(TabCreated { tab_id })
     }
 
+    async fn close_pane(&self, pane_id: &str) -> Result<()> {
+        // `PaneTarget { pane_id }` -- confirmed against
+        // `herdr api schema --json`. The `pane_closed` reply carries only
+        // `pane_id`/`workspace_id`, nothing a caller needs, so success is
+        // the whole answer; a pane already gone answers `pane_not_found`,
+        // which is not one of `parse_response`'s special-cased codes and so
+        // arrives as `Remote { code: "pane_not_found" }` -- deliberately
+        // left generic, because the only caller treats every close failure
+        // the same way: log it, change nothing.
+        self.call("pane.close", json!({ "pane_id": pane_id })).await?;
+        Ok(())
+    }
+
     async fn agent_start(&self, pane_id: &str, argv: &[String]) -> Result<AgentStarted> {
         retry_on_name_collision(generate_agent_name, |name| async move {
             self.agent_start_named(&name, pane_id, argv).await
@@ -1585,6 +1598,37 @@ mod tests {
             !outcome.iter().any(|r| r["method"] == "pane.read"),
             "submit=false must never run the settle wait: {outcome:?}"
         );
+    }
+
+    /// `pane.close` takes a `PaneTarget { pane_id }` -- the one wire fact
+    /// `FakeHerdr` cannot prove, and the one that decides whether the real
+    /// daemon retires a pane or refuses the call. Exactly one request goes
+    /// out: this method has no settle wait and no follow-up read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closepane_sends_a_single_pane_target_request() {
+        let (result, requests) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("herdr.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = SocketHerdr::new(path.clone());
+
+            let server = tokio::spawn(run_fixed_count_mock_server(listener, 1));
+            let result = client.close_pane("w1:p1").await;
+            let requests = server.await.unwrap();
+            (result, requests)
+        })
+        .await
+        .expect("close_pane must not hang");
+
+        assert!(result.is_ok());
+        assert_eq!(
+            requests.len(),
+            1,
+            "closing a pane is one request, nothing else: {requests:?}"
+        );
+        assert_eq!(requests[0]["method"], "pane.close");
+        assert_eq!(requests[0]["params"]["pane_id"], "w1:p1");
     }
 
     /// terminal-attach-submit-race: empty text with `submit: true` sends

@@ -305,6 +305,22 @@ pub trait Herdr: Send + Sync {
     /// old hazard this doc used to warn about, where omitting `cwd` started
     /// an agent in herdr's own process directory.
     async fn agent_start(&self, pane_id: &str, argv: &[String]) -> Result<AgentStarted>;
+
+    /// Close one pane — the teardown counterpart the spawn verbs above
+    /// never had (dispatch-submit-and-reclaim defect B: every
+    /// spawn-dispatch left its agent process alive). Wraps herdr's
+    /// `pane.close`, whose params are a `PaneTarget { pane_id }` and whose
+    /// reply is `pane_closed` (`herdr api schema --json`); a pane that is
+    /// already gone answers `pane_not_found`, which arrives here as a
+    /// generic [`HerdrError::Remote`] carrying that code.
+    ///
+    /// This kills a process. Nothing in this crate may call it from an
+    /// INFERRED completion: `orchestrate::finish` closes only for a run
+    /// whose agent printed its own done marker (D2 — completion is an
+    /// explicit declaration, never an inferred state), because a pane's
+    /// observed state cannot tell a finished agent from one working
+    /// quietly in the background.
+    async fn close_pane(&self, pane_id: &str) -> Result<()>;
 }
 
 /// Why a trust seeding did not happen. Never fatal — see
@@ -863,6 +879,9 @@ mod tests {
             Ok(TabCreated {
                 tab_id: "w1:new-tab".into(),
             })
+        }
+        async fn close_pane(&self, _: &str) -> Result<()> {
+            unreachable!()
         }
         async fn agent_start(&self, pane_id: &str, _: &[String]) -> Result<AgentStarted> {
             *self.starts.lock().unwrap() += 1;
