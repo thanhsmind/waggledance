@@ -266,6 +266,12 @@ pub fn home_page(
     // simply absent from the map, so its row stays byte-identical to
     // before this feature.
     paseo_by_project: &std::collections::HashMap<String, Vec<PaseoAgentBadge>>,
+    // board-visibility bv-4: the per-project bee roll-up `server.rs::index_page`
+    // already read for the Kanban section, keyed by project id and forwarded
+    // verbatim into [`project_sidebar`] — plumbing only, never a second read.
+    // A project with no `.bee/` (or with the roll-up read skipped entirely) is
+    // simply absent from the map and its row stays exactly as it was.
+    bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
 ) -> String {
     // console-theme-kanban (ctk-12), retargeting homepage-tabs edge (b):
     // this line used to force the Projects tab, because that was the only
@@ -315,6 +321,7 @@ pub fn home_page(
                     // button is what is current here.
                     None,
                     paseo_by_project,
+                    bee_by_project,
                 ),
                 // D1 (backlog-groom-2): an empty `cross_features_html`
                 // (D9 — no registered project carries a `.bee` board) used
@@ -368,6 +375,7 @@ pub fn home_page(
                     effective_pane(terminals_panes, terminals_selected_pane)
                         .map(|p| p.view.pane_id.as_str()),
                     paseo_by_project,
+                    bee_by_project,
                 ),
                 body = terminals_tab(
                     terminals_panes,
@@ -1115,6 +1123,11 @@ fn bee_hub_kind_naming_columnar(agent: Option<&BeeCardAgent>) -> String {
 ///
 /// Returns the `<nav>` element alone; the shell around it, the topbar and
 /// `layout` wrapping stay the caller's own job.
+// Same reason [`home_page`] carries this allow: every parameter is an
+// independent render input assembled by `server.rs::index_page`, and each
+// one is documented where it stands — bundling them into a struct would
+// move those doc comments away from the thing they describe.
+#[allow(clippy::too_many_arguments)]
 fn project_sidebar(
     projects: &[(Project, usize, Vec<TerminalPaneView>)],
     unassigned_visible: bool,
@@ -1135,6 +1148,13 @@ fn project_sidebar(
     // name — forwarded here unchanged, looked up per row by project id
     // beside [`project_badges`]'s herdr badges.
     paseo_by_project: &std::collections::HashMap<String, Vec<PaseoAgentBadge>>,
+    // board-visibility bv-4: see [`home_page`]'s own parameter of the same
+    // name — looked up per row by project id, exactly as `paseo_by_project`
+    // is, and rendered by [`proj_row_bee`] into the same `{badges}` slot.
+    // This rail is the page's per-project surface, so "what is this project
+    // doing, and does it want me" belongs on the row rather than in the
+    // feature-column section beside it.
+    bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
 ) -> String {
     let listing = if projects.is_empty() {
         "<p class=\"fg-empty\">Chưa có project nào trong Waggle Dance. Đăng ký: <code>waggledance register &lt;dir&gt;</code> hoặc gọi MCP <code>waggledance_view_file</code>.</p>".to_string()
@@ -1225,7 +1245,12 @@ fn project_sidebar(
                     // `{badges}` slot — no new markup block, no change to
                     // the template literal above.
                     badges = format!(
-                        "{}{}",
+                        "{}{}{}",
+                        // board-visibility bv-4: a worktree branch is its own
+                        // registered project with its own `.bee/`, so it reads
+                        // its own row's line here rather than borrowing its
+                        // parent's.
+                        proj_row_bee(bee_by_project.get(&bp.id).copied()),
                         project_badges(&bp.id, bpanes),
                         paseo_badges_nav(
                             paseo_by_project
@@ -1282,7 +1307,12 @@ fn project_sidebar(
                 meta = proj_row_meta(*count, &p.last_seen_at),
                 // paseo-support ps-2: same fold as the branch row above.
                 badges = format!(
-                    "{}{}",
+                    "{}{}{}",
+                    // board-visibility bv-4: the bee line leads the row's
+                    // badge block — what the project is DOING is what the
+                    // reader came to this rail for; the agents running there
+                    // annotate it.
+                    proj_row_bee(bee_by_project.get(&p.id).copied()),
                     project_badges(&p.id, panes),
                     paseo_badges_nav(
                         paseo_by_project
@@ -1601,6 +1631,165 @@ fn proj_row_meta(count: usize, last_seen_at: &str) -> String {
         seen = esc(last_seen_at),
         seen_short = esc(&short_instant(last_seen_at)),
     )
+}
+
+/// (board-visibility bv-6) The bare words the rail's wait pill says when it
+/// has nothing better -- the "derived" side of the quality comparison in
+/// [`proj_row_bee`], exactly as the card's derived sentence is the derived
+/// side of its own.
+const RAIL_WAIT_LABEL: &str = "Waiting on you";
+
+/// (board-visibility bv-6) How much of a recorded subject the rail pill
+/// spends on screen. The rail is a 259px column (`app.css`, ctk-13) and this
+/// row must stay ONE line, so a subject that is free text of any length gets
+/// a hard character budget here rather than being handed to the layout to
+/// cope with. The full text is never lost -- it rides the pill's `title`,
+/// and the nested `.proj-row__badge-title` (the same clip-and-ellipsis span
+/// a pane's own free-text title already wears) adds the browser's ellipsis
+/// on top for a column narrower than even this budget.
+const RAIL_WAIT_SUBJECT_CHARS: usize = 48;
+
+/// (board-visibility bv-6) Clip a recorded subject to the rail's budget on a
+/// word boundary, ending in an ellipsis so a reader can see it was cut.
+///
+/// Cuts at the last space inside the budget when that space still leaves at
+/// least two thirds of the budget standing; a subject whose first word runs
+/// longer than that is cut mid-word instead, because dropping it whole would
+/// say less than a truncated version of it. Trailing punctuation goes before
+/// the ellipsis, so the pill never reads `"foo,…"`.
+///
+/// Character counts, never byte counts: this store's own live subject is
+/// Vietnamese (`"Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"`
+/// is the one mark that reaches this pill today, and its neighbours carry
+/// diacritics), and a byte slice landing inside a multi-byte char panics.
+fn bee_rail_wait_clip(subject: &str, max_chars: usize) -> String {
+    let subject = subject.trim();
+    if subject.chars().count() <= max_chars {
+        return subject.to_string();
+    }
+    let cut = subject
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(subject.len());
+    let head = &subject[..cut];
+    let kept = match head
+        .rfind(char::is_whitespace)
+        .filter(|i| head[..*i].chars().count() * 3 >= max_chars * 2)
+    {
+        Some(i) => &head[..i],
+        None => head,
+    };
+    let kept = kept
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-' | '—'));
+    let kept = if kept.is_empty() { head } else { kept };
+    format!("{kept}…")
+}
+
+/// board-visibility bv-4: one rail row's own bee line -- what this project
+/// is working on, and whether it is waiting on the reader.
+///
+/// Two facts, and deliberately only two. D3 refuses a section unless the
+/// owner can ACT on it from this page AND its number can go DOWN: a feature
+/// finishes and a gate gets answered, and the row is already a link into
+/// the project where both happen. Knowledge-debt fails that test in the
+/// second half -- it only ever climbs, and nothing on this page lowers it --
+/// so it is absent here on purpose, as are `config.gate_bypass` and
+/// `running_workers`, which are recorded deletions from this board
+/// (board-trim D1, board-declutter) and not this function's to reverse.
+///
+/// The wait is `BeeState.waiting_on_live`, which board-visibility D4 taught
+/// to exclude the `turn-end` idle mark, so a project reads "Waiting on you"
+/// here only when something is actually owed. The phase comes from
+/// `phase_board` -- the same lanes-∪-active-feature union
+/// [`bee_live_strip_section`] reads -- falling back to `state.phase` for an
+/// active feature whose lane record carries none.
+///
+/// A project with no active feature and no live wait renders the EMPTY
+/// STRING: no container, no placeholder, no "idle" word. An idle row must
+/// stay exactly the row it was before this feature, so the rail's ink is
+/// spent only where something is happening.
+///
+/// (bv-6) The wait pill also NAMES what is owed, when the project recorded
+/// something worth naming. The judgment is [`bee_hub_subject_beats_derived`]
+/// -- bv-3's rule, CALLED here and not copied here -- with the pill's own
+/// generic label as the derived side: a subject that is blank, one bare word
+/// (`"AskUserQuestion"`, which four lanes of this store record), or an echo
+/// of "waiting on you" keeps the plain pill, and a sentence a human actually
+/// wrote wins it. This is the surface that widening lives on because it is
+/// the surface that renders: measured against all three registered projects
+/// (`docs/history/board-visibility/proof.md`), the card's waiting sentence
+/// appeared zero times and this pill appeared once, so a subject placed
+/// anywhere else on this page says nothing to anybody today.
+///
+/// Markup reuses the row's existing badge vocabulary (`.proj-row__badges`
+/// plus `.proj-row__badge`, the same classes the herdr and paseo badges
+/// wear) rather than minting a rail stylesheet of its own -- the block is
+/// one flex line under the name, and the modifier classes are style hooks
+/// that need no rule to render correctly. The wait says its own word, so it
+/// never depends on colour to be read.
+fn proj_row_bee(rollup: Option<&BeeProjectRollup>) -> String {
+    let Some(rollup) = rollup else {
+        return String::new();
+    };
+    let Some(state) = rollup.snapshot.state.as_ref() else {
+        return String::new();
+    };
+    let work = state
+        .feature
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|feature| {
+            let phase = rollup
+                .snapshot
+                .phase_board
+                .iter()
+                .find(|f| f.feature == feature)
+                .and_then(|f| f.phase.as_deref())
+                .or(state.phase.as_deref())
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            match phase {
+                Some(phase) => format!("{} · {}", esc(feature), esc(phase)),
+                None => esc(feature),
+            }
+        });
+    if work.is_none() && !state.waiting_on_live {
+        return String::new();
+    }
+    let mut pills = String::new();
+    if let Some(work) = work {
+        pills.push_str(&format!(
+            r#"<span class="proj-row__badge proj-row__badge--bee">{work}</span>"#,
+        ));
+    }
+    if state.waiting_on_live {
+        // (bv-6) The recorded subject is offered THE SAME pill -- never a
+        // second pill, never a second line -- and wins it only by beating the
+        // bare label, which is `bee_hub_subject_beats_derived`'s judgment
+        // rather than a second copy of it. `waiting_on_live` already stands
+        // in front of this, so a `turn-end` mark never lends its words to a
+        // wait (D4); and since a live mark always carries a well-formed
+        // `waiting_on`, the `None` arm below is the REFUSED-subject arm, not
+        // the absent-mark one.
+        let subject = state
+            .waiting_on
+            .as_ref()
+            .map(|w| w.subject.trim())
+            .filter(|s| bee_hub_subject_beats_derived(s, RAIL_WAIT_LABEL));
+        match subject {
+            Some(subject) => pills.push_str(&format!(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="{full}">{RAIL_WAIT_LABEL}<span class="proj-row__badge-title">— {shown}</span></span>"#,
+                full = esc(&format!("{RAIL_WAIT_LABEL} — {subject}")),
+                shown = esc(&bee_rail_wait_clip(subject, RAIL_WAIT_SUBJECT_CHARS)),
+            )),
+            None => pills.push_str(&format!(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait">{RAIL_WAIT_LABEL}</span>"#
+            )),
+        }
+    }
+    format!(r#"<div class="proj-row__badges proj-row__badges--bee">{pills}</div>"#)
 }
 
 /// A rail row's actions menu -- a native `<details>`, so it opens and
@@ -5230,6 +5419,42 @@ fn bee_phase_is_terminal(phase: Option<&str>) -> bool {
     matches!(phase, Some("idle") | Some("compounding-complete"))
 }
 
+/// (board-visibility bv-3) Does `state.json`'s recorded `waiting_on.subject`
+/// tell the reader more than the sentence the card derives on its own?
+///
+/// The whole point of the widening this answers is that the card's derived
+/// wording is already good — *"Shape gate awaiting your decision"* — so a
+/// recorded subject only ever replaces it by being BETTER. The reader
+/// (`BeeState::waiting_on`) deliberately passes no judgment on the string;
+/// this is where the judgment lives, at the one surface that knows what it
+/// would be giving up.
+///
+/// Three refusals, each measured against what this repo's own store
+/// actually records:
+///
+/// - **Blank.** Nothing to say. (The reader already turns a blank field into
+///   `None`, so this is belt-and-braces, not the live path.)
+/// - **A single word.** Four lanes in this store record the literal subject
+///   `"AskUserQuestion"` — the name of the tool that asked — and a bare
+///   `"shape"` is no better. One token names a mechanism or a gate key; it
+///   never names a decision, and the derived sentence already says the gate.
+/// - **An echo.** A subject the derived sentence already contains
+///   (case-insensitively) adds nothing by definition, so the wording that
+///   was written for the card wins on punctuation and capitalisation.
+///
+/// Everything else wins — including a subject this function has never seen
+/// the shape of. That default is the same one `waiting_on_is_live` takes for
+/// unknown kinds: a real sentence a human wrote is the thing the board is
+/// short of, so the doubt goes to rendering it, and the refusals grow only
+/// on evidence, one measured shape at a time.
+fn bee_hub_subject_beats_derived(subject: &str, derived: &str) -> bool {
+    let subject = subject.trim();
+    if subject.is_empty() || subject.split_whitespace().count() < 2 {
+        return false;
+    }
+    !derived.to_lowercase().contains(&subject.to_lowercase())
+}
+
 fn bee_classify_features(
     snapshot: &BeeSnapshot,
     archived_features: &std::collections::HashSet<String>,
@@ -5393,13 +5618,38 @@ fn bee_classify_features(
             // gate stop or a paused handoff no longer moves the feature to
             // a separate column, it only adds the `Waiting on you — ` line
             // to this same card.
+            //
+            // (board-visibility bv-3) `state.json`'s recorded
+            // `waiting_on.subject` is offered THAT SAME sentence — never a
+            // second line, never a second surface — and wins it only when
+            // it beats the derived wording
+            // ([`bee_hub_subject_beats_derived`]). Two gates stand before
+            // that comparison, both deliberate: `is_active`, because
+            // `state.json` names one feature at a time and a sibling card's
+            // wait is not this card's; and `waiting_on_live`, so a
+            // `turn-end` mark — D4's "nothing owed" — never lends its words
+            // to a sentence about a real stop.
+            let live_wait = if is_active {
+                snapshot
+                    .state
+                    .as_ref()
+                    .filter(|s| s.waiting_on_live)
+                    .and_then(|s| s.waiting_on.as_ref())
+            } else {
+                None
+            };
             let reason = if !working_now && (gate_stop.is_some() || waiting_via_handoff) {
-                Some(match gate_stop {
-                    Some((_, label)) => {
-                        format!("Waiting on you — {label} gate awaiting your decision")
-                    }
-                    None => "Waiting on you — Work is parked, waiting on your decision".to_string(),
-                })
+                let derived = match gate_stop {
+                    Some((_, label)) => format!("{label} gate awaiting your decision"),
+                    None => "Work is parked, waiting on your decision".to_string(),
+                };
+                let recorded = live_wait
+                    .map(|w| w.subject.as_str())
+                    .filter(|s| bee_hub_subject_beats_derived(s, &derived));
+                Some(format!(
+                    "Waiting on you — {}",
+                    recorded.unwrap_or(derived.as_str())
+                ))
             } else {
                 None
             };
@@ -10298,6 +10548,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
@@ -10327,6 +10578,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -10361,6 +10613,7 @@ mod tests {
                 None,
                 true,
                 &[],
+                &std::collections::HashMap::new(),
                 &std::collections::HashMap::new(),
             );
             assert!(
@@ -10424,6 +10677,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let select = body
@@ -10543,6 +10797,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         for hook in [
             "data-new-task-open",
@@ -10591,6 +10846,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             home_html.contains("data-agent-drawer-homepage"),
@@ -10634,6 +10890,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -10790,6 +11047,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         // The board itself is still here — the rail joined the Kanban tab,
@@ -10908,6 +11166,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         let shell_at = body
@@ -10964,6 +11223,7 @@ mod tests {
             &[],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             rail.contains(
@@ -10978,6 +11238,342 @@ mod tests {
         assert!(
             !rail.contains(r#"<ul class="pinned-list">"#),
             "an empty Agents group must render no list at all: {rail}"
+        );
+    }
+
+    /// board-visibility bv-4: the rail is this page's per-project surface,
+    /// so a row says what its own project is working on and whether that
+    /// project wants the reader -- and a project with neither says nothing
+    /// at all rather than rendering an empty shell. The facts D3 refuses
+    /// (knowledge-debt) and the two recorded deletions (`gate_bypass`,
+    /// `running_workers`) are present in these fixtures on purpose: the
+    /// rail must stay silent about all three.
+    #[test]
+    fn a_project_row_names_its_live_feature_and_its_own_wait() {
+        let busy_root = std::env::temp_dir().join(format!(
+            "waggledance-views-rail-bee-busy-{}",
+            std::process::id()
+        ));
+        let idle_root = std::env::temp_dir().join(format!(
+            "waggledance-views-rail-bee-idle-{}",
+            std::process::id()
+        ));
+        for r in [&busy_root, &idle_root] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        let write = |root: &std::path::Path, rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+
+        // The busy project: an active feature on a phase, a live `gate`
+        // wait, and -- deliberately -- a knowledge-debt stub, a recorded
+        // `gate_bypass` and a named worker for the rail to stay quiet about.
+        write(
+            &busy_root,
+            ".bee/state.json",
+            r#"{
+                "feature": "board-visibility",
+                "phase": "executing",
+                "workers": [{"name": "rail-ghost-worker", "cell": "bv-4"}],
+                "waiting_on": {"kind": "gate", "subject": "Shape + execution approval"}
+            }"#,
+        );
+        write(&busy_root, ".bee/config.json", r#"{"gate_bypass": "full"}"#);
+        write(
+            &busy_root,
+            ".bee/capture-queue.jsonl",
+            "{\"kind\": \"stub\", \"id\": \"cap-1\"}\n",
+        );
+
+        // The idle project: no active feature, and the one mark AGENTS.md
+        // gives every ordinary turn end -- "control back with the human and
+        // nothing owed" (D4). Neither fact is a demand, so neither renders.
+        write(
+            &idle_root,
+            ".bee/state.json",
+            r#"{
+                "phase": "exploring",
+                "waiting_on": {"kind": "turn-end", "subject": "Không còn gì chờ bạn"}
+            }"#,
+        );
+
+        let mut busy = sample_project();
+        busy.id = "busy".into();
+        busy.name = "Busy".into();
+        busy.root_path = busy_root.clone();
+        let mut idle = sample_project();
+        idle.id = "idle".into();
+        idle.name = "Idle".into();
+        idle.root_path = idle_root.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(&[busy_root.clone(), idle_root.clone()]);
+        let bee_by_project: std::collections::HashMap<String, &BeeProjectRollup> = vec![
+            ("busy".to_string(), &rollups[0]),
+            ("idle".to_string(), &rollups[1]),
+        ]
+        .into_iter()
+        .collect();
+        let projects = vec![(busy, 3, Vec::new()), (idle, 0, Vec::new())];
+
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &bee_by_project,
+        );
+
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee">board-visibility · executing</span>"#
+            ),
+            "the busy row must name its active feature and that feature's phase: {rail}"
+        );
+        // (bv-6) The busy fixture's subject is a real sentence, so it wins
+        // the pill -- the pill still leads with its own word, and the wait
+        // is still one pill on one row.
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Shape + execution approval">Waiting on you<span class="proj-row__badge-title">— Shape + execution approval</span></span>"#
+            ),
+            "a live gate wait must read as a need on the project's own row, and name it: {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badges--bee").count(),
+            1,
+            "only the busy project has anything to say, so the idle row must render no bee \
+             block at all -- not an empty one: {rail}"
+        );
+        assert!(
+            !rail.contains("exploring"),
+            "the idle project's phase belongs to no active feature, so nothing of it renders: \
+             {rail}"
+        );
+        // Counted by the pill's own class, not by its words: since bv-6 the
+        // label appears twice inside ONE pill (its hover title repeats it
+        // ahead of the subject), so counting the phrase would count markup
+        // rather than rows.
+        assert_eq!(
+            rail.matches("proj-row__badge--bee-wait").count(),
+            1,
+            "the turn-end mark is the idle mark, not a demand -- exactly one row waits: {rail}"
+        );
+        // D3's refusal and the two recorded deletions, seen from the rail.
+        for absent in [
+            "knowledge-debt",
+            "gate_bypass",
+            "gate bypass",
+            "rail-ghost-worker",
+        ] {
+            assert!(
+                !rail.contains(absent),
+                "the rail must never carry {absent}: {rail}"
+            );
+        }
+        // One line per project: the bee block is a single flex row, never a
+        // list of its own.
+        assert!(
+            !rail.contains(r#"<ul class="proj-row__badges"#)
+                && !rail.contains("proj-row__bee-list"),
+            "the bee line must stay one row, never a nested list: {rail}"
+        );
+
+        // The whole path, not the helper alone: the same map threaded
+        // through `home_page` -- which is all `server.rs::index_page` does
+        // with it -- reaches the rendered board's own rail.
+        let page = home_page(
+            &projects,
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Kanban,
+            &[],
+            None,
+            true,
+            &[],
+            &std::collections::HashMap::new(),
+            &bee_by_project,
+        );
+        assert!(
+            page.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee">board-visibility · executing</span>"#
+            ) && page.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Shape + execution approval">Waiting on you<span class="proj-row__badge-title">— Shape + execution approval</span></span>"#
+            ),
+            "the board page's own rail must carry both facts: {page}"
+        );
+
+        for r in [&busy_root, &idle_root] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// board-visibility bv-6: the rail's wait pill says WHAT the project is
+    /// waiting for, and only when the recorded subject beats the bare label
+    /// it would otherwise print. The three refusals are
+    /// [`bee_hub_subject_beats_derived`]'s, called here rather than
+    /// re-implemented, so a bare tool name and an echo of the label both keep
+    /// the plain pill -- and a project that is not waiting still renders no
+    /// pill at all.
+    #[test]
+    fn a_rail_wait_pill_names_the_subject_only_when_it_beats_the_bare_label() {
+        let root_for = |slug: &str| {
+            std::env::temp_dir().join(format!(
+                "waggledance-views-rail-wait-{slug}-{}",
+                std::process::id()
+            ))
+        };
+        // `named` carries the one subject that reaches this pill on the live
+        // store today (jarvis's, verbatim from `proof.md`) -- 56 characters,
+        // so it also exercises the clip.
+        let named_root = root_for("named");
+        let tool_root = root_for("tool");
+        let echo_root = root_for("echo");
+        let quiet_root = root_for("quiet");
+        let roots = [&named_root, &tool_root, &echo_root, &quiet_root];
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        let write = |root: &std::path::Path, body: &str| {
+            let p = root.join(".bee/state.json");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            &named_root,
+            r#"{"waiting_on": {"kind": "question",
+               "subject": "Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"}}"#,
+        );
+        write(
+            &tool_root,
+            r#"{"waiting_on": {"kind": "gate", "subject": "AskUserQuestion"}}"#,
+        );
+        write(
+            &echo_root,
+            r#"{"waiting_on": {"kind": "gate", "subject": "Waiting on you"}}"#,
+        );
+        write(
+            &quiet_root,
+            r#"{"waiting_on": {"kind": "turn-end", "subject": "Nothing is owed"}}"#,
+        );
+
+        let mut projects = Vec::new();
+        for (id, root) in [
+            ("named", &named_root),
+            ("tool", &tool_root),
+            ("echo", &echo_root),
+            ("quiet", &quiet_root),
+        ] {
+            let mut p = sample_project();
+            p.id = id.into();
+            p.name = id.into();
+            p.root_path = root.clone();
+            projects.push((p, 0, Vec::new()));
+        }
+        let owned: Vec<std::path::PathBuf> = vec![
+            named_root.clone(),
+            tool_root.clone(),
+            echo_root.clone(),
+            quiet_root.clone(),
+        ];
+        let rollups = waggledance_core::bee::read_rollup(&owned);
+        let bee_by_project: std::collections::HashMap<String, &BeeProjectRollup> = projects
+            .iter()
+            .map(|(p, _, _)| p.id.clone())
+            .zip(rollups.iter())
+            .collect();
+
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &bee_by_project,
+        );
+
+        // A sentence a human wrote wins the pill: the label still leads it,
+        // the clipped text follows in the row's own free-text span, and the
+        // whole subject survives in the hover title.
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Chon muc do tich hop Jarvis vao Super+Space tren Omarchy">Waiting on you<span class="proj-row__badge-title">— Chon muc do tich hop Jarvis vao Super+Space…</span></span>"#
+            ),
+            "the recorded subject must name the wait on the rail, clipped for display with the \
+             whole of it kept in the title: {rail}"
+        );
+        // The two refused shapes keep the pill exactly as bv-4 wrote it --
+        // same markup, no title, nothing added.
+        assert_eq!(
+            rail.matches(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#
+            )
+            .count(),
+            2,
+            "a bare tool name and an echo of the label must both keep the plain pill: {rail}"
+        );
+        assert!(
+            !rail.contains("AskUserQuestion"),
+            "a one-word subject names a mechanism, never a decision, so it must not render: \
+             {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badge--bee-wait").count(),
+            3,
+            "the turn-end project is not waiting, so it renders no pill at all -- and no \
+             project ever renders two: {rail}"
+        );
+        assert!(
+            !rail.contains("Nothing is owed"),
+            "a turn-end mark's words must never reach the rail: {rail}"
+        );
+        // One line, still: the wait is one pill inside the row's own badge
+        // block, never a list and never a second block.
+        assert_eq!(
+            rail.matches("proj-row__badges--bee").count(),
+            3,
+            "each waiting row carries exactly one bee block and the quiet row none: {rail}"
+        );
+
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// board-visibility bv-6: the rail is a 259px column and its row stays
+    /// one line, so a free-text subject is clipped in Rust rather than left
+    /// to the layout -- on a word boundary where there is one, by characters
+    /// and never by bytes.
+    #[test]
+    fn a_long_wait_subject_is_clipped_on_a_word_boundary_never_mid_char() {
+        assert_eq!(
+            bee_rail_wait_clip("Shape + execution approval", 48),
+            "Shape + execution approval",
+            "a subject inside the budget is rendered whole"
+        );
+        assert_eq!(
+            bee_rail_wait_clip("Chon muc do tich hop Jarvis vao Super+Space tren Omarchy", 48),
+            "Chon muc do tich hop Jarvis vao Super+Space…",
+            "the live subject clips at its last space inside the budget"
+        );
+        assert_eq!(
+            bee_rail_wait_clip("Quyết định, mức độ tích hợp Jarvis vào Super+Space", 14),
+            "Quyết định…",
+            "diacritics count as characters, not bytes, and trailing punctuation goes before \
+             the ellipsis"
+        );
+        assert_eq!(
+            bee_rail_wait_clip("supercalifragilisticexpialidocious ok", 20),
+            "supercalifragilistic…",
+            "a first word longer than the budget is cut mid-word rather than dropped whole"
         );
     }
 
@@ -11000,6 +11596,7 @@ mod tests {
             None,
             &[pane],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
 
@@ -11040,6 +11637,7 @@ mod tests {
             &[plain],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             quiet.contains(r#"<span class="pinned-row__meta">· agent</span>"#),
@@ -11070,6 +11668,7 @@ mod tests {
             Some("does-not-exist"),
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -11139,6 +11738,7 @@ mod tests {
             &[],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -11182,6 +11782,7 @@ mod tests {
             None,
             &pinned,
             Some("w1:p2"),
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert_eq!(
@@ -11296,6 +11897,7 @@ mod tests {
             None,
             &[],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
 
@@ -11472,6 +12074,7 @@ mod tests {
             None,
             &[],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -12784,6 +13387,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             page_html.contains(r#"<main class="fg-page fg-page--tight">"#),
@@ -13962,6 +14566,291 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (board-visibility bv-3) The half the widening exists for: when the
+    /// project recorded what it is actually waiting for — a sentence a
+    /// human wrote, not a tool name — that sentence takes the card's
+    /// waiting line, in place of the derived wording and never beside it.
+    /// The board's answer to "what does this project need from me?" is the
+    /// subject itself; `Shape gate awaiting your decision` was only ever
+    /// the best guess available without one.
+    #[test]
+    fn hub_renders_the_recorded_waiting_subject_when_it_beats_the_derived_sentence() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-hub-subject-informative-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            ".bee/state.json",
+            r#"{"feature": "subject-feat", "phase": "executing", "waiting_on": {"kind": "gate", "subject": "Agent logo marks — shape + execution approval"}}"#,
+        );
+        write(
+            ".bee/lanes/subject-feat.json",
+            r#"{
+                "feature": "subject-feat",
+                "phase": "executing",
+                "mode": "standard",
+                "next_action": "keep going",
+                "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+            }"#,
+        );
+
+        let snapshot = waggledance_core::bee::read_snapshot(&root);
+        let mut project = sample_project();
+        project.root_path = root.clone();
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
+        );
+
+        assert!(
+            html.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Agent logo marks — shape + execution approval</p>"#
+            ),
+            "a real recorded subject must become the card's waiting sentence: {html}"
+        );
+        assert!(
+            !html.contains("Shape gate awaiting your decision"),
+            "the recorded subject replaces the derived sentence, it never joins it: {html}"
+        );
+        assert_eq!(
+            html.matches("bee-hub__reason").count(),
+            1,
+            "one waiting line, not a second surface beside it: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (board-visibility bv-3) The recorded `waiting_on.subject` replaces
+    /// the card's own derived sentence ONLY when it says more to a human
+    /// than that sentence already does. A bare one-word subject never
+    /// does: four lanes in this repo's own store record the literal
+    /// subject `"AskUserQuestion"` — the name of the tool that asked,
+    /// which says nothing about what is being asked — and rendering it
+    /// would replace a good sentence with a worse one. Written before the
+    /// widening in [`bee_classify_features`] that renders a good subject,
+    /// because the fallback is the half of that rule the board can be hurt
+    /// by.
+    #[test]
+    fn hub_keeps_the_derived_waiting_sentence_when_the_recorded_subject_is_a_bare_tool_name() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-hub-subject-tool-name-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            ".bee/state.json",
+            r#"{"feature": "subject-feat", "phase": "executing", "waiting_on": {"kind": "gate", "subject": "AskUserQuestion"}}"#,
+        );
+        write(
+            ".bee/lanes/subject-feat.json",
+            r#"{
+                "feature": "subject-feat",
+                "phase": "executing",
+                "mode": "standard",
+                "next_action": "keep going",
+                "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+            }"#,
+        );
+
+        let snapshot = waggledance_core::bee::read_snapshot(&root);
+        let mut project = sample_project();
+        project.root_path = root.clone();
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
+        );
+
+        assert!(
+            html.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#
+            ),
+            "a bare tool name must leave the card's own derived sentence standing: {html}"
+        );
+        assert!(
+            !html.contains("AskUserQuestion"),
+            "the name of the tool that asked must never reach the card: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (board-visibility bv-3) The other two ways a recorded subject earns
+    /// nothing: it is blank, or it only echoes the sentence the card
+    /// derives anyway. The echo case is spelled in a different case from
+    /// the derived wording precisely so the assertion can tell the two
+    /// apart — if the subject won, the card would say `shape gate`
+    /// lowercase.
+    #[test]
+    fn hub_keeps_the_derived_waiting_sentence_for_a_blank_or_echoing_recorded_subject() {
+        let render = |suffix: &str, waiting_on: &str| -> String {
+            let root = std::env::temp_dir().join(format!(
+                "waggledance-views-hub-subject-{suffix}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |rel: &str, body: &str| {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            };
+            write(
+                ".bee/state.json",
+                &format!(
+                    r#"{{"feature": "subject-feat", "phase": "executing", "waiting_on": {waiting_on}}}"#
+                ),
+            );
+            write(
+                ".bee/lanes/subject-feat.json",
+                r#"{
+                    "feature": "subject-feat",
+                    "phase": "executing",
+                    "mode": "standard",
+                    "next_action": "keep going",
+                    "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+                }"#,
+            );
+            let snapshot = waggledance_core::bee::read_snapshot(&root);
+            let mut project = sample_project();
+            project.root_path = root.clone();
+            let html = bee_feature_hub_section(
+                &project,
+                &snapshot,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &BeeHubLiveRuns::new(),
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            html
+        };
+
+        let derived = r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#;
+
+        let blank = render("blank", r#"{"kind": "gate", "subject": "   "}"#);
+        assert!(
+            blank.contains(derived),
+            "a blank subject must leave the derived sentence standing: {blank}"
+        );
+
+        let echo = render(
+            "echo",
+            r#"{"kind": "gate", "subject": "shape gate awaiting your decision"}"#,
+        );
+        assert!(
+            echo.contains(derived),
+            "a subject that only echoes the derived sentence must leave it standing: {echo}"
+        );
+        assert!(
+            !echo.contains("Waiting on you — shape gate"),
+            "the echoing subject must not be rendered in place of the sentence it echoes: {echo}"
+        );
+    }
+
+    /// (board-visibility bv-3, D4 seen from the view) A `turn-end` mark is
+    /// AGENTS.md's "control back with the human and nothing owed" — the
+    /// idle mark, not a demand — so bv-1 already made it read not-live.
+    /// From the board that has to be visible twice over: a project whose
+    /// ONLY wait is `turn-end` gets no waiting line at all, and a project
+    /// that really is gate-stopped never borrows a `turn-end` subject for
+    /// the sentence it does draw. The subject used here is a live lane's
+    /// own, and it means "nothing is waiting on you" — the exact string
+    /// that must never be rendered as a demand.
+    #[test]
+    fn hub_draws_no_waiting_line_for_a_turn_end_mark_and_never_borrows_its_subject() {
+        let render = |suffix: &str, gates: &str| -> String {
+            let root = std::env::temp_dir().join(format!(
+                "waggledance-views-hub-turn-end-{suffix}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |rel: &str, body: &str| {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            };
+            write(
+                ".bee/state.json",
+                r#"{"feature": "quiet-feat", "phase": "executing", "waiting_on": {"kind": "turn-end", "subject": "Không còn gì chờ bạn"}}"#,
+            );
+            write(
+                ".bee/lanes/quiet-feat.json",
+                &format!(
+                    r#"{{
+                        "feature": "quiet-feat",
+                        "phase": "executing",
+                        "mode": "standard",
+                        "next_action": "keep going",
+                        "approved_gates": {gates}
+                    }}"#
+                ),
+            );
+            let snapshot = waggledance_core::bee::read_snapshot(&root);
+            let mut project = sample_project();
+            project.root_path = root.clone();
+            let html = bee_feature_hub_section(
+                &project,
+                &snapshot,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &BeeHubLiveRuns::new(),
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            html
+        };
+
+        // Every gate that can be a stop is approved, so nothing else is
+        // pulling a waiting line onto this card: the `turn-end` mark is
+        // the only wait this project records.
+        let only_turn_end = render(
+            "alone",
+            r#"{"context": true, "shape": true, "execution": true, "review": false}"#,
+        );
+        assert!(
+            only_turn_end.contains(r#"href="/p/proj-1/_bee/feature/quiet-feat""#),
+            "the feature is still active work, so its card must render: {only_turn_end}"
+        );
+        assert!(
+            !only_turn_end.contains("bee-hub__reason"),
+            "a finished turn is nothing owed: the card must carry no waiting line: {only_turn_end}"
+        );
+        assert!(
+            !only_turn_end.contains("Không còn gì chờ bạn"),
+            "a not-live mark's subject must not reach the card at all: {only_turn_end}"
+        );
+
+        let gate_stopped = render(
+            "with-gate",
+            r#"{"context": true, "shape": false, "execution": false, "review": false}"#,
+        );
+        assert!(
+            gate_stopped.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#
+            ),
+            "a real gate stop still draws its own sentence: {gate_stopped}"
+        );
+        assert!(
+            !gate_stopped.contains("Không còn gì chờ bạn"),
+            "a not-live subject must never be borrowed for the sentence a real stop draws: {gate_stopped}"
+        );
     }
 
     /// (waiting-means-stopped-1) A pause handoff naming the active feature,

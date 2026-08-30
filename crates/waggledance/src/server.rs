@@ -1105,6 +1105,15 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                     &live_runs,
                 )
             };
+            // board-visibility bv-4: the rail's own view of the SAME roll-up
+            // the Kanban section above was built from — no extra read, no
+            // extra `spawn_blocking`, no store access this page did not
+            // already make. `rollups` is empty exactly when D9 skipped the
+            // read, and then every rail row renders as it did before.
+            let bee_by_project: std::collections::HashMap<
+                String,
+                &waggledance_core::bee::BeeProjectRollup,
+            > = rollups.iter().map(|(p, r)| (p.id.clone(), r)).collect();
             // home-terminal-parity-2: the same configured D8 preset labels
             // `terminal_page_inner` already threads into `terminal_page`, so
             // the Terminals tab's own create controls offer the same set.
@@ -1121,6 +1130,7 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 terminals_herdr_ok,
                 &terminals_presets,
                 &paseo_by_project,
+                &bee_by_project,
             ))
             .into_response()
         }
