@@ -32575,14 +32575,25 @@ mod bee_route_tests {
                 .push((pane_id.to_string(), text.to_string()));
             Ok(())
         }
+        /// The run actions DO prompt now: `orchestrate::send_task` submits
+        /// through `agent.prompt` so a swallowed Enter refuses the dispatch
+        /// instead of hanging the run (dispatch-submit-and-reclaim defect
+        /// A). Logged as an input, exactly like the `send_input(.., true)`
+        /// it replaced, so every assertion about what reached a pane still
+        /// reads one list.
         async fn agent_prompt(
             &self,
-            _pane_id: &str,
-            _text: &str,
+            pane_id: &str,
+            text: &str,
             _until: &[herdr::AgentStatus],
             _timeout_ms: u64,
         ) -> herdr::Result<herdr::AgentStatus> {
-            unreachable!("the run actions never prompt an agent")
+            self.log
+                .lock()
+                .unwrap()
+                .inputs
+                .push((pane_id.to_string(), text.to_string()));
+            Ok(herdr::AgentStatus::Working)
         }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("the run actions never send raw bytes")

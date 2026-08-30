@@ -254,13 +254,52 @@ pub async fn capture_baseline(herdr: &dyn Herdr, pane_id: &str) -> herdr::Result
     Ok(read.text)
 }
 
+/// The observed agent states [`send_task`] accepts as proof the submit
+/// actually landed. `Working` alone is too narrow: a short turn can go
+/// `Working` → `Idle` between the daemon's own observer samples and never
+/// match, so a perfectly good send would report as a failure
+/// (dispatch-submit-and-reclaim plan, "the decisive finding"). Each of the
+/// three is a state the agent could only be observed in after taking input.
+const SUBMIT_UNTIL: &[AgentStatus] = &[AgentStatus::Working, AgentStatus::Idle, AgentStatus::Done];
+
+/// [`send_task`]'s wait budget, deliberately ABOVE the daemon's own ~5000ms
+/// change-detection window. A genuine no-change then surfaces as
+/// [`HerdrError::AgentPromptStalled`] — the answer dispatch needs — instead
+/// of being masked as a plain [`HerdrError::Timeout`], which means something
+/// else entirely here (see [`send_task`]).
+const SUBMIT_TIMEOUT_MS: u64 = 8_000;
+
 /// Send `task` into `pane_id`, followed by `marker`'s instruction, as one
 /// submitted reply — the only pane write this module performs, and only
 /// ever after a caller has already run [`preflight`] and captured a
-/// baseline. `submit: true`: herdr's own send≠submit split
-/// (`Herdr::send_input`'s doc) means the Enter has to be requested
-/// explicitly for the task to actually reach the agent, not just sit typed
-/// in the composer.
+/// baseline.
+///
+/// Routed through [`Herdr::agent_prompt`], never `send_input(.., true)`:
+/// that older path fires its Enter blind, on a 1500ms settle heuristic that
+/// reports nothing back, so a cold-starting agent swallowed the keystroke
+/// and the run hung forever against a byte-identical delta
+/// (dispatch-submit-and-reclaim defect A). A timing heuristic cannot know
+/// whether a keystroke was accepted; only the agent's own observed state
+/// can. Both dispatch targets reach this one call site, and both are
+/// agent-tracked by the time they do — a `Pane` target was preflighted
+/// through [`preflight`], which refuses `NoSuchPane` for a pane absent from
+/// the snapshot's agents, and a `Spawn` target's `agent.start` only returns
+/// once the agent is registered and ready for input.
+///
+/// The three failure shapes are not symmetric, and the asymmetry is the
+/// point:
+///
+/// - [`HerdrError::AgentBlocked`] — nothing was submitted at all;
+/// - [`HerdrError::AgentPromptStalled`] — the text WAS submitted and the
+///   agent never visibly reacted;
+/// - [`HerdrError::Timeout`] — a state change WAS observed first, so the
+///   text landed and merely did not reach a state in [`SUBMIT_UNTIL`]
+///   within the budget. "The text went in" is the whole question dispatch
+///   asks, so this is **success**, not a failed send.
+///
+/// A stall is never retried. The text is already in the composer, so a
+/// second send would re-type the task on top of itself
+/// (dispatch-submit-and-reclaim P2-3); a stall is reported, never resent.
 pub async fn send_task(
     herdr: &dyn Herdr,
     pane_id: &str,
@@ -268,7 +307,14 @@ pub async fn send_task(
     marker: &Marker,
 ) -> herdr::Result<()> {
     let text = format!("{task}\n\n{}", marker.instruction());
-    herdr.send_input(pane_id, &text, true).await
+    match herdr
+        .agent_prompt(pane_id, &text, SUBMIT_UNTIL, SUBMIT_TIMEOUT_MS)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(HerdrError::Timeout(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Dispatch one task and record the run it started (D5's whole sequence in
@@ -349,6 +395,11 @@ pub async fn dispatch_run(
         .await
         .map_err(|e| DispatchRefusal::BaselineFailed(e.to_string()))?;
     let marker = mint_marker();
+    // A confirming submit ([`send_task`]): a stalled or blocked one refuses
+    // the whole dispatch through `SendFailed`, carrying herdr's own words so
+    // the refusal names the stall rather than saying "send failed". Nothing
+    // below this line runs for a refused send, which is what keeps a wedged
+    // dispatch from leaving a `working` run row behind forever.
     send_task(herdr, &pane_id, task, &marker)
         .await
         .map_err(|e| DispatchRefusal::SendFailed(e.to_string()))?;
@@ -725,6 +776,388 @@ mod tests {
             DispatchRefusal::Unverifiable { pane_id, .. } => assert_eq!(pane_id, "w1:p1"),
             other => panic!("expected Unverifiable, got {other:?}"),
         }
+    }
+
+    /// What `agent.prompt` answered, scripted per test. `FakeHerdr` alone
+    /// cannot express two of these live: it has no clock, so it never
+    /// returns the daemon's `timeout`, and it starts every spawned agent
+    /// `Idle` — a state `SUBMIT_UNTIL` accepts — so a spawn-path stall or
+    /// block is unreachable through it.
+    #[derive(Clone, Copy)]
+    enum SubmitOutcome {
+        /// A matching state was observed: an ordinary good send.
+        Accepted,
+        /// The text went in and the agent never visibly reacted.
+        Stalled,
+        /// Refused BEFORE any input was sent.
+        Blocked,
+        /// A state change WAS observed, then the budget ran out. The text
+        /// landed, which is all dispatch asks.
+        TimedOutAfterChange,
+    }
+
+    /// A `Herdr` that delegates every method to a real [`FakeHerdr`] except
+    /// `agent_prompt`, which answers a scripted [`SubmitOutcome`] and
+    /// records the call. The recording is what lets a test assert the
+    /// dispatch send went through `agent_prompt` — and went through it
+    /// exactly once, since a stall must never be retried — instead of
+    /// assuming it from the source.
+    struct ScriptedSubmit {
+        inner: FakeHerdr,
+        outcome: SubmitOutcome,
+        prompts: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ScriptedSubmit {
+        fn new(outcome: SubmitOutcome) -> Self {
+            Self {
+                inner: FakeHerdr::new(),
+                outcome,
+                prompts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<(String, String)> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Herdr for ScriptedSubmit {
+        async fn snapshot(&self) -> herdr::Result<herdr::Snapshot> {
+            self.inner.snapshot().await
+        }
+        async fn ping(&self) -> herdr::Result<herdr::ProtocolInfo> {
+            self.inner.ping().await
+        }
+        async fn read_pane(
+            &self,
+            pane_id: &str,
+            source: ReadSource,
+            lines: usize,
+        ) -> herdr::Result<herdr::ScreenRead> {
+            self.inner.read_pane(pane_id, source, lines).await
+        }
+        async fn send_input(&self, pane_id: &str, text: &str, submit: bool) -> herdr::Result<()> {
+            self.inner.send_input(pane_id, text, submit).await
+        }
+        async fn agent_prompt(
+            &self,
+            pane_id: &str,
+            text: &str,
+            until: &[AgentStatus],
+            timeout_ms: u64,
+        ) -> herdr::Result<AgentStatus> {
+            self.prompts
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
+            assert_eq!(
+                until,
+                SUBMIT_UNTIL,
+                "the dispatch send must wait on every state that proves the text landed"
+            );
+            assert_eq!(
+                timeout_ms, SUBMIT_TIMEOUT_MS,
+                "the budget must stay above the daemon's own change-detection window, \
+                 or a stall comes back disguised as a timeout"
+            );
+            match self.outcome {
+                // Blocked is the one outcome that withholds the input.
+                SubmitOutcome::Blocked => Err(HerdrError::AgentBlocked(format!(
+                    "agent on {pane_id} is blocked"
+                ))),
+                other => {
+                    self.inner.send_input(pane_id, text, true).await?;
+                    match other {
+                        SubmitOutcome::Accepted => Ok(AgentStatus::Working),
+                        SubmitOutcome::Stalled => Err(HerdrError::AgentPromptStalled(format!(
+                            "no state change observed on {pane_id}"
+                        ))),
+                        SubmitOutcome::TimedOutAfterChange => Err(HerdrError::Timeout(
+                            "state changed, then the budget ran out".to_string(),
+                        )),
+                        SubmitOutcome::Blocked => unreachable!("handled above"),
+                    }
+                }
+            }
+        }
+        async fn send_text(&self, pane_id: &str, bytes: &str) -> herdr::Result<()> {
+            self.inner.send_text(pane_id, bytes).await
+        }
+        async fn send_keys(&self, pane_id: &str, keys: &[String]) -> herdr::Result<()> {
+            self.inner.send_keys(pane_id, keys).await
+        }
+        async fn tab_create(
+            &self,
+            workspace_id: &str,
+            cwd: Option<&str>,
+        ) -> herdr::Result<herdr::TabCreated> {
+            self.inner.tab_create(workspace_id, cwd).await
+        }
+        async fn agent_start(
+            &self,
+            pane_id: &str,
+            argv: &[String],
+        ) -> herdr::Result<herdr::AgentStarted> {
+            self.inner.agent_start(pane_id, argv).await
+        }
+    }
+
+    fn test_project(root: &std::path::Path) -> waggledance_core::domain::Project {
+        let now = now_rfc3339();
+        waggledance_core::domain::Project {
+            id: "proj-1".to_string(),
+            name: "proj".to_string(),
+            root_path: root.to_path_buf(),
+            created_at: now.clone(),
+            last_seen_at: now,
+            orchestration_enabled: true,
+        }
+    }
+
+    /// A directory that exists on disk, because `Boundary` resolves against
+    /// the real filesystem — a spawn destination cannot be invented.
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-orchestrate-{tag}-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Point the fake's own w2 panes at a real directory so a `Spawn`
+    /// dispatch has a destination that survives boundary validation, and
+    /// hand back the project rooted there.
+    async fn spawnable_project(
+        herdr: &ScriptedSubmit,
+        root: &std::path::Path,
+    ) -> waggledance_core::domain::Project {
+        let dir = root.to_string_lossy().into_owned();
+        for pane in ["w1:p1", "w2:p3", "w2:p4", "w2:p5"] {
+            herdr
+                .inner
+                .set_pane_dirs(pane, Some(&dir), Some(&dir))
+                .await
+                .unwrap();
+        }
+        test_project(root)
+    }
+
+    /// The defect this feature exists for: the task used to go out as
+    /// `send_input(.., submit = true)`, a blind Enter behind a 1500ms settle
+    /// heuristic that reported nothing back. It goes through `agent_prompt`
+    /// now, so a submit the agent never reacted to is an ERROR the caller
+    /// can see rather than a run that hangs forever.
+    #[tokio::test]
+    async fn send_task_reports_a_stall_instead_of_firing_a_blind_enter() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Stalled);
+        let marker = mint_marker();
+        let err = send_task(&herdr, "w2:p4", "do the thing", &marker)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HerdrError::AgentPromptStalled(_)),
+            "a stall must surface as a stall, not as a silent success: {err:?}"
+        );
+        let prompts = herdr.prompts();
+        assert_eq!(prompts.len(), 1, "the send goes through agent.prompt, once");
+        assert_eq!(prompts[0].0, "w2:p4");
+        assert!(
+            prompts[0].1.contains("do the thing") && prompts[0].1.contains(&marker.suffix),
+            "task and marker instruction travel as one submitted reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_run_into_a_pane_records_the_run_when_the_submit_is_confirmed() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Accepted);
+        let engine = test_engine();
+        let root = temp_root("dispatch-pane");
+        let project = test_project(&root);
+
+        // w2:p4 is seeded Idle -- a legal send target.
+        let dispatched = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Pane("w2:p4".to_string()),
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect("a confirmed submit dispatches");
+
+        assert_eq!(dispatched.run.pane_id, "w2:p4");
+        assert_eq!(dispatched.run.status, "working");
+        assert_eq!(
+            herdr.prompts().len(),
+            1,
+            "the pane target sends through agent.prompt"
+        );
+        let stored = engine.get_run(&dispatched.run.id).unwrap();
+        assert!(stored.is_some(), "a dispatched run is persisted");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The refusal that keeps a wedged dispatch from poisoning the store: a
+    /// stalled submit must leave NOTHING behind, or a `working` row nobody
+    /// can complete holds a feature's run lock forever.
+    #[tokio::test]
+    async fn dispatch_run_refuses_a_stalled_submit_and_stores_no_run() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Stalled);
+        let engine = test_engine();
+        let root = temp_root("dispatch-stalled");
+        let project = test_project(&root);
+
+        let refusal = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Pane("w2:p4".to_string()),
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a stalled submit must refuse the dispatch");
+
+        match &refusal {
+            DispatchRefusal::SendFailed(msg) => assert!(
+                msg.contains("stalled"),
+                "the refusal must name the stall, not just 'send failed': {msg}"
+            ),
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+        assert!(
+            engine.list_runs(&project.id, 10).unwrap().is_empty(),
+            "a refused send must insert no run row"
+        );
+        assert_eq!(
+            herdr.prompts().len(),
+            1,
+            "a stall is never retried -- the text is already in the composer"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `timeout` is not a failed send: the daemon only reports it once it
+    /// has already observed a state change, so the text landed. Dispatch
+    /// asks nothing more than that.
+    #[tokio::test]
+    async fn dispatch_run_treats_a_timeout_after_an_observed_change_as_a_good_send() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::TimedOutAfterChange);
+        let engine = test_engine();
+        let root = temp_root("dispatch-timeout");
+        let project = test_project(&root);
+
+        let dispatched = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Pane("w2:p4".to_string()),
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect("a timeout after an observed change still means the text went in");
+
+        assert_eq!(dispatched.run.status, "working");
+        assert!(engine.get_run(&dispatched.run.id).unwrap().is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The spawn target takes the same confirming send as the pane target —
+    /// the two branches meet at one `send_task` call, and neither is allowed
+    /// its own blind Enter.
+    #[tokio::test]
+    async fn dispatch_run_into_a_spawned_pane_sends_through_the_confirming_submit() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Accepted);
+        let engine = test_engine();
+        let root = temp_root("dispatch-spawn");
+        let project = spawnable_project(&herdr, &root).await;
+
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["claude".to_string()],
+            env: Vec::new(),
+            workspace_trust: None,
+        };
+        let dispatched = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Spawn {
+                entry,
+                cwd: Some(root.to_string_lossy().into_owned()),
+            },
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect("a spawn dispatch with a confirmed submit returns a run");
+
+        let prompts = herdr.prompts();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "the spawn target sends through agent.prompt too"
+        );
+        assert_eq!(
+            prompts[0].0, dispatched.run.pane_id,
+            "the prompt goes to the pane the run records"
+        );
+        assert!(engine.get_run(&dispatched.run.id).unwrap().is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `agent.prompt` refuses a blocked agent before sending anything. The
+    /// spawn path is where dispatch can meet one — a `Pane` target was
+    /// already refused by `preflight` — and it must refuse rather than fall
+    /// back to typing into a pane that is waiting on a human.
+    #[tokio::test]
+    async fn dispatch_run_refuses_a_blocked_submit_and_stores_no_run() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Blocked);
+        let engine = test_engine();
+        let root = temp_root("dispatch-blocked");
+        let project = spawnable_project(&herdr, &root).await;
+
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["claude".to_string()],
+            env: Vec::new(),
+            workspace_trust: None,
+        };
+        let refusal = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Spawn {
+                entry,
+                cwd: Some(root.to_string_lossy().into_owned()),
+            },
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a blocked agent must refuse the dispatch");
+
+        match &refusal {
+            DispatchRefusal::SendFailed(msg) => assert!(
+                msg.contains("blocked"),
+                "the refusal must name the block: {msg}"
+            ),
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+        assert!(
+            engine.list_runs(&project.id, 10).unwrap().is_empty(),
+            "a refused send must insert no run row"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
