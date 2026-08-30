@@ -177,5 +177,4 @@ board once for exactly that.
 - No answering a `needs_you` item — bee's D13 ships no reply path and says so.
 - No writing to `.bee/human-mailbox/`, ever, in any form.
 - No arming of herding in the user's checkouts.
-- No push notification of letter subjects — beehive's handover names it out of scope and
-  ours to decide later.
+- No push notification of letter subjects — beehive's handover names it out of scope and ours to decide later, held by `board-visibility-push-the-letter-s-subje__f35f3da6`.

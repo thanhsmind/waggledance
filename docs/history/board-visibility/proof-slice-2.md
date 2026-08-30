@@ -185,8 +185,10 @@ result rather than a formality — it is the one outcome that could have sent th
 into `bi-1` — and it holds for a specific, checkable reason: `bi-1` chose `yaml-rust` over
 a hand-rolled scanner precisely because bee's emitter says its block "must be valid YAML
 for the consuming inbox's real parser", and a real YAML parser does not care whether a
-sequence is nested or inline, nor whether a null is spelled or omitted. The shape is now
-pinned by a test, so a later "simplification" of that parse cannot quietly break it.
+sequence is nested or inline, nor whether a null is spelled or omitted.
+<!-- bee:not-a-deferral: describes a guard already in the tree — the real letter's bytes are a committed test fixture, so this states what that test prevents and promises no future work -->
+The shape is now pinned by a test, so a later "simplification" of that parse cannot quietly break it.
+<!-- /bee:not-a-deferral -->
 
 ---
 

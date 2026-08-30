@@ -145,7 +145,9 @@ the board (board-trim D1, board-declutter). Restoring either reverses a recorded
 slice 1 leaves them out. If the owner wants the bypass level visible, that is a supersession
 they make, not one the agent takes.
 
-## Later slices — headlines only, no cells yet
+## Later slices — headlines only, no cells yet · `board-visibility-slice-3-parse-and-surfa__f35f3da6`
+
+Slice 2 shipped, merged at 199d03c. Slice 3 is held by the trigger cited in the heading above — `board-visibility-slice-3-parse-and-surfa__f35f3da6`.
 
 - **Slice 2 — the inbox.** Read `.bee/human-mailbox/`, list letters newest-first across
   projects, render frontmatter (`subject`, `needs_you[]`), flip read/unread by shelling to
