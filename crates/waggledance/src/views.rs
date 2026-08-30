@@ -10343,7 +10343,14 @@ fn base_label(base: &ActiveBase) -> String {
         ActiveBase::Commit(commit) if commit.subject.is_empty() => {
             format!("commit {}", commit.short)
         }
-        ActiveBase::Commit(commit) => format!("{} — {}", commit.short, commit.subject),
+        ActiveBase::Commit(commit) => {
+            let condensed = condense_bee_subject(&commit.subject);
+            format!(
+                "{} — {}",
+                commit.short,
+                condensed.as_deref().unwrap_or(&commit.subject)
+            )
+        }
     }
 }
 
@@ -10468,14 +10475,62 @@ fn base_picker(project: &Project, view: &ChangesView, chrome: PageChrome) -> Str
     )
 }
 
+/// commit-label-condense D1: bee's own machinery names one feature three
+/// ways inside a commit subject — the bare slug, the worktree directory
+/// `<project>--wt--<slug>`, and the branch `wt/<slug>` — so a picker that
+/// shows those subjects verbatim makes one feature read as three. The three
+/// machine shapes condense to `<slug> · <action>` at display time only; the
+/// stored subject and sha are untouched, and any subject a human typed
+/// renders exactly as typed.
+fn condense_bee_subject(subject: &str) -> Option<String> {
+    if let Some(rest) = subject.strip_prefix("Merge worktree ") {
+        if let Some(rest) = rest.strip_suffix(" via bee worktree merge") {
+            if let Some((_, branch)) = rest.split_once(" (branch wt/") {
+                if let Some(slug) = branch.strip_suffix(')') {
+                    if !slug.is_empty() {
+                        return Some(format!("{slug} · worktree merge"));
+                    }
+                }
+            }
+        }
+    }
+    if subject.starts_with("Auto-commit ") {
+        if let Some((_, dir)) = subject.split_once(" bookkeeping before merging worktree ") {
+            if let Some(slug) = wt_dir_slug(dir) {
+                return Some(format!("{slug} · pre-merge bookkeeping"));
+            }
+        }
+    }
+    if let Some(rest) = subject.strip_prefix("Commit ") {
+        if let Some((_, dir)) = rest.split_once(" lane rewrite after merging worktree ") {
+            if let Some(slug) = wt_dir_slug(dir) {
+                return Some(format!("{slug} · lane bookkeeping"));
+            }
+        }
+    }
+    None
+}
+
+/// The slug a worktree directory name carries at its tail
+/// (`<project>--wt--<slug>`), or nothing when the name has no such tail.
+fn wt_dir_slug(dir: &str) -> Option<&str> {
+    match dir.rsplit_once("--wt--") {
+        Some((_, slug)) if !slug.is_empty() => Some(slug),
+        _ => None,
+    }
+}
+
 /// One commit as the picker lists it. The subject is whatever its author
 /// typed — untrusted text, escaped here like everything else this module
-/// renders, and never part of a URL.
+/// renders, and never part of a URL — except that a bee machine subject is
+/// condensed first (commit-label-condense D1).
 fn commit_option(commit: &CommitEntry, selected: bool) -> String {
-    let label = if commit.subject.is_empty() {
+    let condensed = condense_bee_subject(&commit.subject);
+    let subject = condensed.as_deref().unwrap_or(&commit.subject);
+    let label = if subject.is_empty() {
         format!("{} · {}", commit.short, commit.date)
     } else {
-        format!("{} — {} · {}", commit.short, commit.subject, commit.date)
+        format!("{} — {} · {}", commit.short, subject, commit.date)
     };
     format!(
         "<option value=\"{sha}\"{sel}>{label}</option>",
@@ -24379,6 +24434,60 @@ mod tests {
         assert!(
             html.contains("fix &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;"),
             "it renders as the text it is: {html}"
+        );
+    }
+
+    /// commit-label-condense D1: bee's machine commits name one feature
+    /// three ways — slug, `<project>--wt--<slug>`, `wt/<slug>` — and each
+    /// machine shape condenses to the one slug form in the picker, while a
+    /// subject a human typed renders exactly as typed.
+    #[test]
+    fn bee_machine_subjects_condense_to_one_slug_form() {
+        let merge = sample_commit(
+            "1111111111111111111111111111111111111111",
+            "Merge worktree beehive--wt--letter-digest (branch wt/letter-digest) via bee worktree merge",
+        );
+        let auto = sample_commit(
+            "2222222222222222222222222222222222222222",
+            "Auto-commit .bee, docs/decisions, letter-digest's recorded docs/knowledge, and docs/history/letter-digest bookkeeping before merging worktree beehive--wt--letter-digest",
+        );
+        let lane = sample_commit(
+            "3333333333333333333333333333333333333333",
+            "Commit letter-digest's lane rewrite after merging worktree beehive--wt--letter-digest",
+        );
+        let human = sample_commit(
+            "4444444444444444444444444444444444444444",
+            "Merge worktree cleanup notes",
+        );
+
+        let html = changes_html_with_commits(
+            changes_fixture(),
+            vec![merge.clone(), auto, lane, human],
+        );
+        assert!(
+            html.contains("1111111 — letter-digest · worktree merge · 2026-08-30"),
+            "the merge subject condenses to the slug form: {html}"
+        );
+        assert!(
+            html.contains("2222222 — letter-digest · pre-merge bookkeeping · 2026-08-30"),
+            "the auto-commit subject condenses to the slug form: {html}"
+        );
+        assert!(
+            html.contains("3333333 — letter-digest · lane bookkeeping · 2026-08-30"),
+            "the lane-rewrite subject condenses to the slug form: {html}"
+        );
+        assert!(
+            html.contains("4444444 — Merge worktree cleanup notes · 2026-08-30"),
+            "a human subject that merely resembles the shape renders verbatim: {html}"
+        );
+
+        // The header names its base by the same condensed form.
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(merge.clone());
+        let html = changes_html_with_commits(diff, vec![merge]);
+        assert!(
+            html.contains("1111111 — letter-digest · worktree merge"),
+            "the header claim condenses too: {html}"
         );
     }
 
