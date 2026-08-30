@@ -613,6 +613,10 @@ fn router(state: AppState) -> Router {
         .route("/paseo/:agent_id/permit", post(paseo_agent_permit))
         .route("/p/:id/_code/", get(code_root))
         .route("/p/:id/_code/*path", get(code_dir_or_file))
+        // The Changes screen. Beside the Code routes and, like them, above
+        // the `/p/:id/*path` catch-all -- registered after it, the catch-all
+        // would swallow `_changes` as a document path.
+        .route("/p/:id/_changes", get(changes_screen))
         .route("/p/:id/*path", get(project_path))
         // review-p1-fixes D1: one layer wrapping every route above, closing
         // three findings at once (DNS-rebinding control of the daemon, CSRF
@@ -7042,6 +7046,27 @@ async fn jump_search(
         .fuzzy_files(&id, &query.q, query.limit)
         .unwrap_or_default();
     Json(hits).into_response()
+}
+
+/// The Changes screen: the project's working tree against HEAD (D2). Every
+/// git call happens inside `Engine::changes`, on a blocking thread -- the
+/// calls have a 10 s budget of their own, and a request holding a runtime
+/// worker that long would starve every other page.
+///
+/// git missing, the project not being a repository, and a killed call are
+/// all a 200 carrying the explained empty state (D3), never a 500 and never
+/// a hidden entry point. Only an unknown project id is a 404.
+async fn changes_screen(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let Ok(Some(project)) = st.engine.get_project(&id) else {
+        return not_found("project not found");
+    };
+    let engine = st.engine.clone();
+    let project_id = id.clone();
+    let view = tokio::task::spawn_blocking(move || engine.changes(&project_id)).await;
+    match view {
+        Ok(Ok(view)) => Html(views::changes_page(&project, &view)).into_response(),
+        _ => not_found("project not found"),
+    }
 }
 
 async fn code_root(State(st): State<AppState>, Path(id): Path<String>) -> Response {
@@ -33519,6 +33544,103 @@ mod bee_route_tests {
         assert!(
             catch_body.contains("location.reload();"),
             "the one catch is where every failure actually reloads: {catch_body}"
+        );
+    }
+
+    /// cds-1: the Changes screen end to end — a real fixture repository, the
+    /// real route, the real page. The parsers have their own unit tests in
+    /// `waggledance-core::git_diff`; what only a route test can prove is that
+    /// `/p/:id/_changes` resolves above the `/p/:id/*path` catch-all and that
+    /// what git reported actually reaches the rendered HTML.
+    fn git_fixture(dir: &Path, args: &[&str]) -> bool {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/nonexistent/waggledance-git-global")
+            .env("GIT_CONFIG_SYSTEM", "/nonexistent/waggledance-git-system")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(s) if s.success())
+    }
+
+    #[tokio::test]
+    async fn changes_route_renders_the_real_working_tree_diff() {
+        let dir = fresh_root("changes-diff");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+        write(&dir, "fresh.txt", "brand new\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-diff");
+        let resp = get(router(st), &format!("/p/{}/_changes", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        assert!(
+            body.contains("mod.txt"),
+            "the changed file is named: {body}"
+        );
+        assert!(
+            body.contains("fresh.txt"),
+            "the untracked file is a row too"
+        );
+        assert!(
+            body.contains("beta") && body.contains("BETA"),
+            "both reconstructed sides reach the page"
+        );
+        assert!(
+            body.contains("brand new"),
+            "an untracked file's content is its added side"
+        );
+        assert!(
+            body.contains("working tree"),
+            "the header says what is being compared (D2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_route_on_a_project_with_no_repository_is_a_page_not_an_error() {
+        let dir = fresh_root("changes-norepo");
+        write(&dir, "readme.md", "# plain\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-norepo");
+        let resp = get(router(st), &format!("/p/{}/_changes", project.id)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "D3: a non-repo project explains itself, never a 500 and never a 404"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("not a git repository") || body.contains("git command line"),
+            "the empty state says why there is nothing to show: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_route_resolves_above_the_project_path_catch_all() {
+        let dir = fresh_root("changes-catchall");
+        write(&dir, "readme.md", "# plain\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-catchall");
+        let body = body_string(get(router(st), &format!("/p/{}/_changes", project.id)).await).await;
+        assert!(
+            body.contains("class=\"changes\""),
+            "the Changes screen answered, not the document catch-all: {body}"
         );
     }
 }

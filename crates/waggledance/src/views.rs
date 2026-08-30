@@ -12,6 +12,10 @@ use waggledance_core::bee::{
 use waggledance_core::code_source::DirListing;
 use waggledance_core::config::Config;
 use waggledance_core::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
+use waggledance_core::engine::ChangesView;
+use waggledance_core::git_diff::{
+    ChangeBody, DiffLine, FileChange, GitDiffError, LineKind, WorkingTreeDiff,
+};
 use waggledance_core::render::HighlightedSource;
 
 pub fn layout(title: &str, head_extra: &str, body: &str) -> String {
@@ -9511,6 +9515,10 @@ fn breadcrumb(project: &Project, base: &str, rel_path: &str, narrow: bool, right
 enum Section {
     Docs,
     Code,
+    /// The Changes screen. `section_switch` marks neither Docs nor Code
+    /// current for it — the third link itself lands with the screen's own
+    /// polish rather than changing every Docs and Code page here.
+    Changes,
 }
 
 /// Docs|Code toggle for the top bar. The only change `file_page` makes to
@@ -9714,6 +9722,206 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
 /// script in `app.js` wires the folder bar's click-to-toggle behavior once
 /// at load (this HTML needs no JS to render correctly, only to become
 /// interactive).
+/// The Changes screen: the project's working tree against HEAD (D2), one
+/// stacked section per changed file, each a side-by-side two-column diff.
+///
+/// Phase 1 of the screen — the data is real end to end (statuses, both
+/// reconstructed sides, line numbers straight from the patch), the styling
+/// is not: the sidebar, the badges, the diff palette and the reviewed
+/// counter land on top of this markup rather than beside it.
+///
+/// Git being unavailable, the project not being a repository, and a call
+/// that had to be killed all render an explained empty state here (D3) —
+/// the entry point stays, only its content changes.
+pub fn changes_page(project: &Project, view: &ChangesView) -> String {
+    let main = match view {
+        ChangesView::Unavailable(reason) => changes_unavailable(reason),
+        ChangesView::Diff(diff) => changes_body(diff),
+    };
+    let body_html = format!(
+        r#"{topbar}
+<div class="layout layout--changes">
+  <main class="content content--changes">
+    <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">working tree</span></div></nav>
+    <div class="changes">{main}</div>
+  </main>
+</div>"#,
+        topbar = topbar_full("", &section_switch(project, Section::Changes), "", ""),
+        pid = esc(&project.id),
+        name = esc(&project.name),
+        main = main,
+    );
+    layout_with_drawer("Changes", "", &body_html, false)
+}
+
+/// D3's empty state, in the user's terms: what the screen would show, why it
+/// cannot, and never git's own stderr — a path or a repository name from
+/// inside that message would be the one thing this daemon must not disclose.
+fn changes_unavailable(reason: &GitDiffError) -> String {
+    let text = match reason {
+        GitDiffError::NotARepo => {
+            "This project is not a git repository, so there is no working tree to compare."
+        }
+        GitDiffError::GitUnavailable(_) => {
+            "The Changes screen reads the working tree with the git command line, and this machine has none available."
+        }
+        GitDiffError::Timeout(_) => {
+            "git took too long to answer for this project, so the call was stopped. A very large working tree can do this."
+        }
+    };
+    format!("<p class=\"changes__empty\">{}</p>", esc(text))
+}
+
+fn plural_files(n: usize) -> &'static str {
+    if n == 1 {
+        "file"
+    } else {
+        "files"
+    }
+}
+
+fn changes_body(diff: &WorkingTreeDiff) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<p class=\"changes__summary\">working tree &middot; {n} changed {word}</p>",
+        n = diff.files.len(),
+        word = plural_files(diff.files.len()),
+    ));
+    if diff.hidden > 0 {
+        // D5: the count, never the names — naming them would disclose
+        // exactly what the project's exclude rules exist to hide.
+        out.push_str(&format!(
+            "<p class=\"changes__note\">{n} {word} hidden by this project's exclude rules.</p>",
+            n = diff.hidden,
+            word = plural_files(diff.hidden),
+        ));
+    }
+    if diff.stdout_truncated {
+        out.push_str("<p class=\"changes__note\">This diff was too large to read whole — part of it is missing.</p>");
+    }
+    if diff.sections_capped {
+        out.push_str("<p class=\"changes__note\">Only the first files are shown with their contents; the rest are listed without.</p>");
+    }
+    if diff.files.is_empty() {
+        out.push_str("<p class=\"changes__empty\">Nothing has changed in the working tree.</p>");
+        return out;
+    }
+    for (i, file) in diff.files.iter().enumerate() {
+        out.push_str(&changes_section(i, file));
+    }
+    out
+}
+
+fn changes_section(index: usize, file: &FileChange) -> String {
+    let name = match &file.old_path {
+        Some(old) => format!("{} → {}", old, file.path),
+        None => file.path.clone(),
+    };
+    let note = match &file.note {
+        Some(n) => format!(" <span class=\"changeset__note\">{}</span>", esc(n)),
+        None => String::new(),
+    };
+    let body = match &file.body {
+        ChangeBody::Text {
+            lines, truncated, ..
+        } => {
+            let banner = if *truncated {
+                "<p class=\"changes__note\">Truncated — this file is too large to show whole.</p>"
+            } else {
+                ""
+            };
+            format!(
+                "{banner}<table class=\"changeset__table\">{rows}</table>",
+                rows = changes_rows(lines)
+            )
+        }
+        ChangeBody::Binary => "<p class=\"changeset__flat\">Binary file — no line diff.</p>".to_string(),
+        ChangeBody::Submodule => {
+            "<p class=\"changeset__flat\">Submodule — changed at its own commit.</p>".to_string()
+        }
+        ChangeBody::NoContentChange => {
+            "<p class=\"changeset__flat\">No content changes (a rename, a mode, or line endings).</p>"
+                .to_string()
+        }
+        ChangeBody::Omitted(why) => format!("<p class=\"changeset__flat\">{}</p>", esc(why)),
+    };
+    format!(
+        "<section class=\"changeset\" id=\"f{index}\">\
+         <h2 class=\"changeset__head\"><span class=\"changeset__badge\">{badge}</span> \
+         <span class=\"changeset__path\">{name}</span>{note} \
+         <span class=\"changeset__stat\">+{added} &minus;{removed}</span></h2>{body}</section>",
+        index = index,
+        badge = file.status.letter(),
+        name = esc(&name),
+        note = note,
+        added = file.added,
+        removed = file.removed,
+        body = body,
+    )
+}
+
+/// The side-by-side pairing: a run of removed lines sits beside the run of
+/// added lines that replaced it, row by row, and a context line fills both
+/// columns. The line numbers come from the patch itself, so neither column
+/// has to be counted here.
+fn changes_rows(lines: &[DiffLine]) -> String {
+    let mut out = String::new();
+    let mut removed: Vec<&DiffLine> = Vec::new();
+    let mut added: Vec<&DiffLine> = Vec::new();
+    for line in lines {
+        match line.kind {
+            LineKind::Removed => removed.push(line),
+            LineKind::Added => added.push(line),
+            LineKind::Context => {
+                flush_change_rows(&mut out, &mut removed, &mut added);
+                out.push_str(&changes_row(Some(line), Some(line), "ctx"));
+            }
+        }
+    }
+    flush_change_rows(&mut out, &mut removed, &mut added);
+    out
+}
+
+fn flush_change_rows(out: &mut String, removed: &mut Vec<&DiffLine>, added: &mut Vec<&DiffLine>) {
+    let pairs = removed.len().max(added.len());
+    for i in 0..pairs {
+        let left = removed.get(i).copied();
+        let right = added.get(i).copied();
+        let cls = match (left.is_some(), right.is_some()) {
+            (true, true) => "chg",
+            (true, false) => "del",
+            _ => "add",
+        };
+        out.push_str(&changes_row(left, right, cls));
+    }
+    removed.clear();
+    added.clear();
+}
+
+fn changes_row(left: Option<&DiffLine>, right: Option<&DiffLine>, cls: &str) -> String {
+    fn cell(side: Option<&DiffLine>, number: fn(&DiffLine) -> Option<usize>) -> String {
+        match side {
+            Some(line) => format!(
+                "<td class=\"diffrow__num\">{n}</td><td class=\"diffrow__side\"><code>{text}</code></td>",
+                n = number(line).map(|n| n.to_string()).unwrap_or_default(),
+                text = esc(&line.text),
+            ),
+            // The side this row has no line for: an empty gutter and an
+            // empty cell, so the two columns stay aligned row for row.
+            None => {
+                "<td class=\"diffrow__num\"></td><td class=\"diffrow__side diffrow__side--none\"></td>"
+                    .to_string()
+            }
+        }
+    }
+    format!(
+        "<tr class=\"diffrow diffrow--{cls}\">{old}{new}</tr>",
+        cls = cls,
+        old = cell(left, |l| l.old_no),
+        new = cell(right, |l| l.new_no),
+    )
+}
+
 fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>) -> String {
     let mut out = String::from(
         "<div class=\"fg-sidebar-search\">\

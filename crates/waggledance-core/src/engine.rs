@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
 use crate::error::{Error, Result};
 use crate::fuzzy::{self, FuzzyHit};
+use crate::git_diff::{self, GitDiffError, WorkingTreeDiff};
 use crate::indexer::{self, IndexService};
 use crate::render::{self, HighlightedSource, RenderService};
 use crate::repository::SqliteStore;
@@ -530,6 +531,36 @@ impl Engine {
             }
         }
     }
+
+    /// The project's working-tree diff for the Changes screen (D2: staged +
+    /// unstaged + untracked, against HEAD). Mirrors `code_path` above: the
+    /// HTTP layer never touches `git_diff` itself, and the project's own
+    /// exclude patterns travel with the call so D5's filter runs inside the
+    /// git layer rather than after it.
+    ///
+    /// Git being missing, the project not being a repository, and a call
+    /// that had to be killed are all `Ok(ChangesView::Unavailable)`, not
+    /// `Err`: they are states the screen explains (D3), not failures of the
+    /// request. Only an unknown project id is an `Err`.
+    pub fn changes(&self, project_id: &str) -> Result<ChangesView> {
+        let project = self
+            .store
+            .get_project(project_id)?
+            .ok_or_else(|| Error::ProjectNotFound(project_id.to_string()))?;
+        let exclude = &self.config.indexing.exclude_patterns;
+        Ok(
+            match git_diff::working_tree_diff(&project.root_path, exclude) {
+                Ok(diff) => ChangesView::Diff(diff),
+                Err(reason) => ChangesView::Unavailable(reason),
+            },
+        )
+    }
+}
+
+/// What the Changes screen renders — see `Engine::changes`.
+pub enum ChangesView {
+    Diff(WorkingTreeDiff),
+    Unavailable(GitDiffError),
 }
 
 /// Result of resolving a Code-section path — see `Engine::code_path`.
