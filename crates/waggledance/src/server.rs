@@ -19,11 +19,11 @@ use axum::{
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use waggledance_core::indexer::now_rfc3339;
-use waggledance_core::render::theme_css;
+use waggledance_core::render::{theme_css, RenderService};
 use waggledance_core::Engine;
 
 #[derive(Clone)]
@@ -7056,17 +7056,39 @@ async fn jump_search(
 /// git missing, the project not being a repository, and a killed call are
 /// all a 200 carrying the explained empty state (D3), never a 500 and never
 /// a hidden entry point. Only an unknown project id is a 404.
+///
+/// Highlighting both sides of every section is as CPU-bound as the git calls
+/// are I/O-bound, so the whole page — read, highlight, format — is built on
+/// the same blocking thread and only the finished HTML crosses back.
 async fn changes_screen(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     let Ok(Some(project)) = st.engine.get_project(&id) else {
         return not_found("project not found");
     };
     let engine = st.engine.clone();
     let project_id = id.clone();
-    let view = tokio::task::spawn_blocking(move || engine.changes(&project_id)).await;
-    match view {
-        Ok(Ok(view)) => Html(views::changes_page(&project, &view)).into_response(),
+    let page = tokio::task::spawn_blocking(move || {
+        engine
+            .changes(&project_id)
+            .map(|view| views::changes_page(&project, &view, changes_highlighter()))
+    })
+    .await;
+    match page {
+        Ok(Ok(html)) => Html(html).into_response(),
         _ => not_found("project not found"),
     }
+}
+
+/// The syntax set the Changes screen highlights with. `Engine` keeps its own
+/// renderer private (the Code section reaches it through `Engine::code_path`,
+/// which returns one already-highlighted file), and the diff needs to
+/// highlight two reconstructed texts per section that never exist on disk —
+/// so this section owns a renderer of its own. Built once, on the first
+/// request that asks for it: `SyntaxSet::load_defaults_newlines` deserializes
+/// a several-megabyte dump, far too much to pay per request, and a project
+/// that never opens Changes never pays it at all.
+fn changes_highlighter() -> &'static RenderService {
+    static HIGHLIGHTER: OnceLock<RenderService> = OnceLock::new();
+    HIGHLIGHTER.get_or_init(RenderService::new)
 }
 
 async fn code_root(State(st): State<AppState>, Path(id): Path<String>) -> Response {
@@ -33577,9 +33599,13 @@ mod bee_route_tests {
         }
         git_fixture(&dir, &["config", "core.autocrlf", "false"]);
         write(&dir, "mod.txt", "alpha\nbeta\n");
+        // cds-2: a file with a syntax, so the page's highlighting is provable
+        // from the route rather than only from the view unit tests.
+        write(&dir, "src/lib.rs", "fn main() {\n    let old = 1;\n}\n");
         git_fixture(&dir, &["add", "-A"]);
         git_fixture(&dir, &["commit", "-q", "-m", "init"]);
         write(&dir, "mod.txt", "alpha\nBETA\n");
+        write(&dir, "src/lib.rs", "fn main() {\n    let new = 2;\n}\n");
         write(&dir, "fresh.txt", "brand new\n");
 
         let st = build_state();
@@ -33607,6 +33633,26 @@ mod bee_route_tests {
         assert!(
             body.contains("working tree"),
             "the header says what is being compared (D2)"
+        );
+        // cds-2: the polished screen, proved through the same real route —
+        // the sidebar row, the section it anchors to, and both panes coming
+        // back highlighted rather than as plain text.
+        assert!(
+            body.contains("class=\"chap-file chg-row\" href=\"#f0\"")
+                && body.contains("<section class=\"changeset\" id=\"f0\">"),
+            "a sidebar row links to a section that exists: {body}"
+        );
+        assert!(
+            body.contains("diffrow__side--old") && body.contains("diffrow__side--new"),
+            "both panes render, each addressable by side: {body}"
+        );
+        assert!(
+            body.contains("<span class=\"source rust\">"),
+            "the panes come back syntax-highlighted: {body}"
+        );
+        assert!(
+            body.contains("href=\"/p/") && body.contains("_changes\" aria-current=\"page\""),
+            "the topbar marks Changes as the section being read: {body}"
         );
     }
 

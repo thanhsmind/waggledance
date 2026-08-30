@@ -1617,6 +1617,54 @@
     headings.forEach(function (h) { observer.observe(h); });
   })();
 
+  // Changes-screen scrollspy: mark the sidebar row for the file section
+  // currently in view. Same idiom as the TOC spy above (the sidebar rows are
+  // ordinary "#f<n>" links, so the scroll itself is the browser's — this only
+  // adds the highlight), with the sections standing in for headings and the
+  // `.chap-file.active` state standing in for the TOC's own.
+  (function () {
+    var nav = document.querySelector(".changes-nav");
+    if (!nav) return;
+
+    var links = Array.prototype.slice.call(nav.querySelectorAll("a[href^='#']"));
+    if (!links.length) return;
+
+    var linkByHash = {};
+    links.forEach(function (a) { linkByHash[a.getAttribute("href")] = a; });
+
+    var sections = links
+      .map(function (a) { return document.getElementById(a.getAttribute("href").slice(1)); })
+      .filter(Boolean);
+    if (!sections.length) return;
+
+    var current = null;
+    function setActive(hash) {
+      if (hash === current) return;
+      if (current && linkByHash[current]) linkByHash[current].classList.remove("active");
+      current = hash;
+      if (current && linkByHash[current]) linkByHash[current].classList.add("active");
+    }
+
+    // A click marks its own row at once: a jump to a section already in view
+    // fires no new intersection, and the row would otherwise stay unmarked.
+    links.forEach(function (a) {
+      a.addEventListener("click", function () { setActive(a.getAttribute("href")); });
+    });
+
+    var observer = new IntersectionObserver(
+      function (entries) {
+        var visible = entries.filter(function (e) { return e.isIntersecting; });
+        if (!visible.length) return;
+        // Highest-on-page visible section wins.
+        visible.sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
+        setActive("#" + visible[0].target.id);
+      },
+      { rootMargin: "-53px 0px -70% 0px", threshold: 0 }
+    );
+    sections.forEach(function (s) { observer.observe(s); });
+  })();
+
+
   // Live reload, targeted (PRD FR-19): the watcher broadcasts
   // {"changed":["<project_id>/<rel_path>", ...]}. A file page reloads only
   // when its own document is in the list; project-scoped pages (home,
