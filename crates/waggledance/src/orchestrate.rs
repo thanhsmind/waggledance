@@ -254,13 +254,52 @@ pub async fn capture_baseline(herdr: &dyn Herdr, pane_id: &str) -> herdr::Result
     Ok(read.text)
 }
 
+/// The observed agent states [`send_task`] accepts as proof the submit
+/// actually landed. `Working` alone is too narrow: a short turn can go
+/// `Working` → `Idle` between the daemon's own observer samples and never
+/// match, so a perfectly good send would report as a failure
+/// (dispatch-submit-and-reclaim plan, "the decisive finding"). Each of the
+/// three is a state the agent could only be observed in after taking input.
+const SUBMIT_UNTIL: &[AgentStatus] = &[AgentStatus::Working, AgentStatus::Idle, AgentStatus::Done];
+
+/// [`send_task`]'s wait budget, deliberately ABOVE the daemon's own ~5000ms
+/// change-detection window. A genuine no-change then surfaces as
+/// [`HerdrError::AgentPromptStalled`] — the answer dispatch needs — instead
+/// of being masked as a plain [`HerdrError::Timeout`], which means something
+/// else entirely here (see [`send_task`]).
+const SUBMIT_TIMEOUT_MS: u64 = 8_000;
+
 /// Send `task` into `pane_id`, followed by `marker`'s instruction, as one
 /// submitted reply — the only pane write this module performs, and only
 /// ever after a caller has already run [`preflight`] and captured a
-/// baseline. `submit: true`: herdr's own send≠submit split
-/// (`Herdr::send_input`'s doc) means the Enter has to be requested
-/// explicitly for the task to actually reach the agent, not just sit typed
-/// in the composer.
+/// baseline.
+///
+/// Routed through [`Herdr::agent_prompt`], never `send_input(.., true)`:
+/// that older path fires its Enter blind, on a 1500ms settle heuristic that
+/// reports nothing back, so a cold-starting agent swallowed the keystroke
+/// and the run hung forever against a byte-identical delta
+/// (dispatch-submit-and-reclaim defect A). A timing heuristic cannot know
+/// whether a keystroke was accepted; only the agent's own observed state
+/// can. Both dispatch targets reach this one call site, and both are
+/// agent-tracked by the time they do — a `Pane` target was preflighted
+/// through [`preflight`], which refuses `NoSuchPane` for a pane absent from
+/// the snapshot's agents, and a `Spawn` target's `agent.start` only returns
+/// once the agent is registered and ready for input.
+///
+/// The three failure shapes are not symmetric, and the asymmetry is the
+/// point:
+///
+/// - [`HerdrError::AgentBlocked`] — nothing was submitted at all;
+/// - [`HerdrError::AgentPromptStalled`] — the text WAS submitted and the
+///   agent never visibly reacted;
+/// - [`HerdrError::Timeout`] — a state change WAS observed first, so the
+///   text landed and merely did not reach a state in [`SUBMIT_UNTIL`]
+///   within the budget. "The text went in" is the whole question dispatch
+///   asks, so this is **success**, not a failed send.
+///
+/// A stall is never retried. The text is already in the composer, so a
+/// second send would re-type the task on top of itself
+/// (dispatch-submit-and-reclaim P2-3); a stall is reported, never resent.
 pub async fn send_task(
     herdr: &dyn Herdr,
     pane_id: &str,
@@ -268,7 +307,14 @@ pub async fn send_task(
     marker: &Marker,
 ) -> herdr::Result<()> {
     let text = format!("{task}\n\n{}", marker.instruction());
-    herdr.send_input(pane_id, &text, true).await
+    match herdr
+        .agent_prompt(pane_id, &text, SUBMIT_UNTIL, SUBMIT_TIMEOUT_MS)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(HerdrError::Timeout(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Dispatch one task and record the run it started (D5's whole sequence in
@@ -349,6 +395,11 @@ pub async fn dispatch_run(
         .await
         .map_err(|e| DispatchRefusal::BaselineFailed(e.to_string()))?;
     let marker = mint_marker();
+    // A confirming submit ([`send_task`]): a stalled or blocked one refuses
+    // the whole dispatch through `SendFailed`, carrying herdr's own words so
+    // the refusal names the stall rather than saying "send failed". Nothing
+    // below this line runs for a refused send, which is what keeps a wedged
+    // dispatch from leaving a `working` run row behind forever.
     send_task(herdr, &pane_id, task, &marker)
         .await
         .map_err(|e| DispatchRefusal::SendFailed(e.to_string()))?;
@@ -520,6 +571,30 @@ impl RunStatus {
             RunStatus::Timeout => "timeout",
         }
     }
+
+    /// Whether this status ends the run. `Working` is the one open
+    /// status — its own doc says the run "stays open for a later
+    /// `await_run` call" — and the store agrees: the per-feature run lock
+    /// holds exactly the `working` rows and calls every other status
+    /// terminal.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, RunStatus::Working)
+    }
+
+    /// The terminal status a stored `Run::status` string names, or `None`
+    /// when the row is still open.
+    ///
+    /// Derived from [`RunStatus::as_str`] so the two spellings cannot
+    /// drift, and deliberately a whitelist: `working` reads as open by
+    /// name, and so does any other string — a `pending` row, or a status a
+    /// future build wrote that this one does not know. An unrecognized
+    /// value costs one poll of a live pane, never a wrong answer from the
+    /// ledger.
+    pub fn terminal_from_stored(status: &str) -> Option<RunStatus> {
+        [RunStatus::Done, RunStatus::Blocked, RunStatus::Timeout]
+            .into_iter()
+            .find(|s| s.as_str() == status)
+    }
 }
 
 /// `await_run`'s result: the terminal-for-this-call status plus the
@@ -578,6 +653,17 @@ async fn await_run_with_poll_interval(
     poll_interval: Duration,
     notify_store: Option<&NotifyStore>,
 ) -> Result<AwaitOutcome, OrchestrateError> {
+    // A run the ledger already records as finished is answered from the
+    // ledger (P2-4). Once a finished run's pane can be closed, re-reading
+    // it would turn a repeat await into a propagated pane error, and even
+    // an open pane has moved on since -- so the status and the transcript
+    // `finish` stored are the honest answer. Nothing on this path touches
+    // herdr at all: no snapshot, no `read_pane`.
+    if let Some(status) = RunStatus::terminal_from_stored(&run.status) {
+        let delta = engine.run_final_transcript(&run.id)?.unwrap_or_default();
+        return Ok(AwaitOutcome { status, delta });
+    }
+
     let deadline = tokio::time::Instant::now() + clamp_timeout(timeout);
     // A marker string minted for THIS run but already sitting in ITS OWN
     // baseline can only mean the joined string reached the pane some other
@@ -602,11 +688,31 @@ async fn await_run_with_poll_interval(
         let delta = delta_from_baseline(&run.baseline, &read.text);
 
         if status == Some(AgentStatus::Blocked) {
-            return finish(engine, run, RunStatus::Blocked, delta, notify_store).await;
+            return finish(
+                herdr,
+                engine,
+                run,
+                RunStatus::Blocked,
+                Completion::Observed,
+                delta,
+                notify_store,
+            )
+            .await;
         }
 
         if !marker_is_stale_from_start && read.text.contains(run.marker.as_str()) {
-            return finish(engine, run, RunStatus::Done, delta, notify_store).await;
+            // The one declared completion in this loop: the agent's own
+            // marker, freshly printed by the agent itself.
+            return finish(
+                herdr,
+                engine,
+                run,
+                RunStatus::Done,
+                Completion::Declared,
+                delta,
+                notify_store,
+            )
+            .await;
         }
 
         if status == Some(AgentStatus::Unknown) || status.is_none() {
@@ -618,7 +724,19 @@ async fn await_run_with_poll_interval(
                 stable_reads = 1;
             }
             if stable_reads >= STABILITY_READS {
-                return finish(engine, run, RunStatus::Done, delta, notify_store).await;
+                // `Done` by inference, from a screen that stopped moving --
+                // equally true of an agent paused on a tool call, so this
+                // one never closes a pane (D2).
+                return finish(
+                    herdr,
+                    engine,
+                    run,
+                    RunStatus::Done,
+                    Completion::Observed,
+                    delta,
+                    notify_store,
+                )
+                .await;
             }
         } else {
             stable_reads = 0;
@@ -632,11 +750,42 @@ async fn await_run_with_poll_interval(
             } else {
                 RunStatus::Working
             };
-            return finish(engine, run, timed_out_status, delta, notify_store).await;
+            return finish(
+                herdr,
+                engine,
+                run,
+                timed_out_status,
+                Completion::Observed,
+                delta,
+                notify_store,
+            )
+            .await;
         }
         let remaining = deadline.saturating_duration_since(now);
         tokio::time::sleep(poll_interval.min(remaining)).await;
     }
+}
+
+/// How this run's completion was learned -- the ONE thing the pane-close
+/// guard is allowed to read about it.
+///
+/// D2: completion is an explicit declaration, never an inferred state. A
+/// pane's observed state cannot tell a finished agent from one working
+/// quietly in the background, so only the agent's own word may retire its
+/// pane. This is a WHITELIST of one producer, deliberately not a blacklist
+/// of bad states: a future `RunStatus`, or a second code path that decides
+/// a run is `Done`, gets `Observed` by default and cannot silently acquire
+/// the right to kill an agent process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Completion {
+    /// The agent itself printed `HERDR_DONE_<nonce>` into its pane -- it
+    /// said it was finished, in its own output. The only value that may
+    /// close a pane.
+    Declared,
+    /// Everything else waggledance concluded by looking: the content
+    /// stability fallback, the blocked-status read, the await deadline.
+    /// Every one of these can be true of an agent that is still working.
+    Observed,
 }
 
 /// Persist `run`'s terminal-for-this-call status transition (D7) and, when
@@ -649,13 +798,51 @@ async fn await_run_with_poll_interval(
 /// existing drain delivers it, so the opt-in switch (D6) keeps governing
 /// delivery untouched. `notify_store: None` still persists the status --
 /// it just raises nothing.
+///
+/// Last, and only under all three guards below, the run's pane is closed
+/// (D1 -- close the pane on completion; defect B: every spawn-dispatch
+/// used to leak a live agent process):
+///
+/// 1. `completion` is [`Completion::Declared`] -- the agent printed its own
+///    marker. NOT "status == Done": the content-stability fallback in
+///    `await_run_with_poll_interval` also returns `Done`, after ~1.5s of
+///    static screen for a pane whose agent status is `Unknown` or missing
+///    entirely, which is equally true of an agent paused on a tool call.
+/// 2. `run.preset_label.is_some()` -- waggledance spawned this pane.
+///    `DispatchTarget::Pane` dispatches into a pre-existing pane the user
+///    owns and leaves `preset_label` `None` exactly there, and D1's
+///    rationale reaches only what waggledance made.
+/// 3. The final transcript was stored -- otherwise closing the pane would
+///    destroy the only remaining record of what the run did.
+///
+/// Nothing else is read: no `agent_status`, no pane liveness, no screen
+/// stability. The honest cost is that a run finishing without printing its
+/// marker keeps its pane -- the leak is narrowed, not eliminated, which is
+/// the correct trade when the alternative risks killing a working agent.
+/// A close failure never changes the run's status: the work finished, the
+/// pane is bookkeeping.
 async fn finish(
+    herdr: &dyn Herdr,
     engine: &Engine,
     run: &Run,
     status: RunStatus,
+    completion: Completion,
     delta: String,
     notify_store: Option<&NotifyStore>,
 ) -> Result<AwaitOutcome, OrchestrateError> {
+    // Transcript first, status second: a row that reads terminal then
+    // always carries the transcript it was capped with, which is exactly
+    // what the short-circuit above hands a second await. A failed write
+    // leaves the run open and re-awaitable rather than finished with
+    // nothing to show. A still-`Working` run has no final delta to store
+    // -- its screen is not final -- so the column staying NULL is what
+    // makes "has a transcript" mean "is over".
+    let transcript_stored = if status.is_terminal() {
+        engine.set_run_final_transcript(&run.id, &delta)?;
+        true
+    } else {
+        false
+    };
     engine.update_run_status(&run.id, status.as_str(), &now_rfc3339(), None, None)?;
     if let Some(store) = notify_store {
         if notify::is_run_notifiable(status) {
@@ -669,6 +856,14 @@ async fn finish(
             ) {
                 tracing::warn!("failed to enqueue run notification for {}: {e}", run.id);
             }
+        }
+    }
+    if completion == Completion::Declared && run.preset_label.is_some() && transcript_stored {
+        if let Err(e) = herdr.close_pane(&run.pane_id).await {
+            // The run is over either way -- a pane that outlives it costs
+            // machine performance, and reporting the run as anything but
+            // finished would cost the result the agent already produced.
+            tracing::warn!("failed to close pane {} for run {}: {e}", run.pane_id, run.id);
         }
     }
     Ok(AwaitOutcome { status, delta })
@@ -725,6 +920,399 @@ mod tests {
             DispatchRefusal::Unverifiable { pane_id, .. } => assert_eq!(pane_id, "w1:p1"),
             other => panic!("expected Unverifiable, got {other:?}"),
         }
+    }
+
+    /// What `agent.prompt` answered, scripted per test. `FakeHerdr` alone
+    /// cannot express two of these live: it has no clock, so it never
+    /// returns the daemon's `timeout`, and it starts every spawned agent
+    /// `Idle` — a state `SUBMIT_UNTIL` accepts — so a spawn-path stall or
+    /// block is unreachable through it.
+    #[derive(Clone, Copy)]
+    enum SubmitOutcome {
+        /// A matching state was observed: an ordinary good send.
+        Accepted,
+        /// The text went in and the agent never visibly reacted.
+        Stalled,
+        /// Refused BEFORE any input was sent.
+        Blocked,
+        /// A state change WAS observed, then the budget ran out. The text
+        /// landed, which is all dispatch asks.
+        TimedOutAfterChange,
+    }
+
+    /// A `Herdr` that delegates every method to a real [`FakeHerdr`] except
+    /// `agent_prompt`, which answers a scripted [`SubmitOutcome`] and
+    /// records the call. The recording is what lets a test assert the
+    /// dispatch send went through `agent_prompt` — and went through it
+    /// exactly once, since a stall must never be retried — instead of
+    /// assuming it from the source.
+    struct ScriptedSubmit {
+        inner: FakeHerdr,
+        outcome: SubmitOutcome,
+        prompts: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ScriptedSubmit {
+        fn new(outcome: SubmitOutcome) -> Self {
+            Self {
+                inner: FakeHerdr::new(),
+                outcome,
+                prompts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<(String, String)> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Herdr for ScriptedSubmit {
+        async fn snapshot(&self) -> herdr::Result<herdr::Snapshot> {
+            self.inner.snapshot().await
+        }
+        async fn ping(&self) -> herdr::Result<herdr::ProtocolInfo> {
+            self.inner.ping().await
+        }
+        async fn read_pane(
+            &self,
+            pane_id: &str,
+            source: ReadSource,
+            lines: usize,
+        ) -> herdr::Result<herdr::ScreenRead> {
+            self.inner.read_pane(pane_id, source, lines).await
+        }
+        async fn send_input(&self, pane_id: &str, text: &str, submit: bool) -> herdr::Result<()> {
+            self.inner.send_input(pane_id, text, submit).await
+        }
+        async fn agent_prompt(
+            &self,
+            pane_id: &str,
+            text: &str,
+            until: &[AgentStatus],
+            timeout_ms: u64,
+        ) -> herdr::Result<AgentStatus> {
+            self.prompts
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
+            assert_eq!(
+                until,
+                SUBMIT_UNTIL,
+                "the dispatch send must wait on every state that proves the text landed"
+            );
+            assert_eq!(
+                timeout_ms, SUBMIT_TIMEOUT_MS,
+                "the budget must stay above the daemon's own change-detection window, \
+                 or a stall comes back disguised as a timeout"
+            );
+            match self.outcome {
+                // Blocked is the one outcome that withholds the input.
+                SubmitOutcome::Blocked => Err(HerdrError::AgentBlocked(format!(
+                    "agent on {pane_id} is blocked"
+                ))),
+                other => {
+                    self.inner.send_input(pane_id, text, true).await?;
+                    match other {
+                        SubmitOutcome::Accepted => Ok(AgentStatus::Working),
+                        SubmitOutcome::Stalled => Err(HerdrError::AgentPromptStalled(format!(
+                            "no state change observed on {pane_id}"
+                        ))),
+                        SubmitOutcome::TimedOutAfterChange => Err(HerdrError::Timeout(
+                            "state changed, then the budget ran out".to_string(),
+                        )),
+                        SubmitOutcome::Blocked => unreachable!("handled above"),
+                    }
+                }
+            }
+        }
+        async fn agent_wait(
+            &self,
+            pane_id: &str,
+            until: &[AgentStatus],
+            timeout_ms: u64,
+        ) -> herdr::Result<AgentStatus> {
+            self.inner.agent_wait(pane_id, until, timeout_ms).await
+        }
+        async fn send_text(&self, pane_id: &str, bytes: &str) -> herdr::Result<()> {
+            self.inner.send_text(pane_id, bytes).await
+        }
+        async fn send_keys(&self, pane_id: &str, keys: &[String]) -> herdr::Result<()> {
+            self.inner.send_keys(pane_id, keys).await
+        }
+        async fn tab_create(
+            &self,
+            workspace_id: &str,
+            cwd: Option<&str>,
+        ) -> herdr::Result<herdr::TabCreated> {
+            self.inner.tab_create(workspace_id, cwd).await
+        }
+        async fn agent_start(
+            &self,
+            pane_id: &str,
+            argv: &[String],
+        ) -> herdr::Result<herdr::AgentStarted> {
+            self.inner.agent_start(pane_id, argv).await
+        }
+        async fn close_pane(&self, pane_id: &str) -> herdr::Result<()> {
+            self.inner.close_pane(pane_id).await
+        }
+    }
+
+    fn test_project(root: &std::path::Path) -> waggledance_core::domain::Project {
+        let now = now_rfc3339();
+        waggledance_core::domain::Project {
+            id: "proj-1".to_string(),
+            name: "proj".to_string(),
+            root_path: root.to_path_buf(),
+            created_at: now.clone(),
+            last_seen_at: now,
+            orchestration_enabled: true,
+        }
+    }
+
+    /// A directory that exists on disk, because `Boundary` resolves against
+    /// the real filesystem — a spawn destination cannot be invented.
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-orchestrate-{tag}-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Point the fake's own w2 panes at a real directory so a `Spawn`
+    /// dispatch has a destination that survives boundary validation, and
+    /// hand back the project rooted there.
+    async fn spawnable_project(
+        herdr: &ScriptedSubmit,
+        root: &std::path::Path,
+    ) -> waggledance_core::domain::Project {
+        let dir = root.to_string_lossy().into_owned();
+        for pane in ["w1:p1", "w2:p3", "w2:p4", "w2:p5"] {
+            herdr
+                .inner
+                .set_pane_dirs(pane, Some(&dir), Some(&dir))
+                .await
+                .unwrap();
+        }
+        test_project(root)
+    }
+
+    /// The defect this feature exists for: the task used to go out as
+    /// `send_input(.., submit = true)`, a blind Enter behind a 1500ms settle
+    /// heuristic that reported nothing back. It goes through `agent_prompt`
+    /// now, so a submit the agent never reacted to is an ERROR the caller
+    /// can see rather than a run that hangs forever.
+    #[tokio::test]
+    async fn send_task_reports_a_stall_instead_of_firing_a_blind_enter() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Stalled);
+        let marker = mint_marker();
+        let err = send_task(&herdr, "w2:p4", "do the thing", &marker)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HerdrError::AgentPromptStalled(_)),
+            "a stall must surface as a stall, not as a silent success: {err:?}"
+        );
+        let prompts = herdr.prompts();
+        assert_eq!(prompts.len(), 1, "the send goes through agent.prompt, once");
+        assert_eq!(prompts[0].0, "w2:p4");
+        assert!(
+            prompts[0].1.contains("do the thing") && prompts[0].1.contains(&marker.suffix),
+            "task and marker instruction travel as one submitted reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_run_into_a_pane_records_the_run_when_the_submit_is_confirmed() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Accepted);
+        let engine = test_engine();
+        let root = temp_root("dispatch-pane");
+        let project = test_project(&root);
+
+        // w2:p4 is seeded Idle -- a legal send target.
+        let dispatched = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Pane("w2:p4".to_string()),
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect("a confirmed submit dispatches");
+
+        assert_eq!(dispatched.run.pane_id, "w2:p4");
+        assert_eq!(dispatched.run.status, "working");
+        assert_eq!(
+            herdr.prompts().len(),
+            1,
+            "the pane target sends through agent.prompt"
+        );
+        let stored = engine.get_run(&dispatched.run.id).unwrap();
+        assert!(stored.is_some(), "a dispatched run is persisted");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The refusal that keeps a wedged dispatch from poisoning the store: a
+    /// stalled submit must leave NOTHING behind, or a `working` row nobody
+    /// can complete holds a feature's run lock forever.
+    #[tokio::test]
+    async fn dispatch_run_refuses_a_stalled_submit_and_stores_no_run() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Stalled);
+        let engine = test_engine();
+        let root = temp_root("dispatch-stalled");
+        let project = test_project(&root);
+
+        let refusal = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Pane("w2:p4".to_string()),
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a stalled submit must refuse the dispatch");
+
+        match &refusal {
+            DispatchRefusal::SendFailed(msg) => assert!(
+                msg.contains("stalled"),
+                "the refusal must name the stall, not just 'send failed': {msg}"
+            ),
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+        assert!(
+            engine.list_runs(&project.id, 10).unwrap().is_empty(),
+            "a refused send must insert no run row"
+        );
+        assert_eq!(
+            herdr.prompts().len(),
+            1,
+            "a stall is never retried -- the text is already in the composer"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `timeout` is not a failed send: the daemon only reports it once it
+    /// has already observed a state change, so the text landed. Dispatch
+    /// asks nothing more than that.
+    #[tokio::test]
+    async fn dispatch_run_treats_a_timeout_after_an_observed_change_as_a_good_send() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::TimedOutAfterChange);
+        let engine = test_engine();
+        let root = temp_root("dispatch-timeout");
+        let project = test_project(&root);
+
+        let dispatched = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Pane("w2:p4".to_string()),
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect("a timeout after an observed change still means the text went in");
+
+        assert_eq!(dispatched.run.status, "working");
+        assert!(engine.get_run(&dispatched.run.id).unwrap().is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The spawn target takes the same confirming send as the pane target —
+    /// the two branches meet at one `send_task` call, and neither is allowed
+    /// its own blind Enter.
+    #[tokio::test]
+    async fn dispatch_run_into_a_spawned_pane_sends_through_the_confirming_submit() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Accepted);
+        let engine = test_engine();
+        let root = temp_root("dispatch-spawn");
+        let project = spawnable_project(&herdr, &root).await;
+
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["claude".to_string()],
+            env: Vec::new(),
+            workspace_trust: None,
+        };
+        let dispatched = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Spawn {
+                entry,
+                cwd: Some(root.to_string_lossy().into_owned()),
+            },
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect("a spawn dispatch with a confirmed submit returns a run");
+
+        let prompts = herdr.prompts();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "the spawn target sends through agent.prompt too"
+        );
+        assert_eq!(
+            prompts[0].0, dispatched.run.pane_id,
+            "the prompt goes to the pane the run records"
+        );
+        assert!(engine.get_run(&dispatched.run.id).unwrap().is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `agent.prompt` refuses a blocked agent before sending anything. The
+    /// spawn path is where dispatch can meet one — a `Pane` target was
+    /// already refused by `preflight` — and it must refuse rather than fall
+    /// back to typing into a pane that is waiting on a human.
+    #[tokio::test]
+    async fn dispatch_run_refuses_a_blocked_submit_and_stores_no_run() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Blocked);
+        let engine = test_engine();
+        let root = temp_root("dispatch-blocked");
+        let project = spawnable_project(&herdr, &root).await;
+
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["claude".to_string()],
+            env: Vec::new(),
+            workspace_trust: None,
+        };
+        let refusal = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Spawn {
+                entry,
+                cwd: Some(root.to_string_lossy().into_owned()),
+            },
+            "do the thing",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a blocked agent must refuse the dispatch");
+
+        match &refusal {
+            DispatchRefusal::SendFailed(msg) => assert!(
+                msg.contains("blocked"),
+                "the refusal must name the block: {msg}"
+            ),
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+        assert!(
+            engine.list_runs(&project.id, 10).unwrap().is_empty(),
+            "a refused send must insert no run row"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
@@ -835,6 +1423,91 @@ mod tests {
             store.undelivered().unwrap().is_empty(),
             "Working never notifies (D1)"
         );
+        assert_eq!(
+            engine.run_final_transcript(&run.id).unwrap(),
+            None,
+            "a run that stays open has no FINAL transcript -- the column filling in \
+             is what marks the run over"
+        );
+    }
+
+    /// Every status that ends a run leaves its transcript on the row, so the
+    /// answer outlives the pane it was read from.
+    #[tokio::test]
+    async fn finish_stores_the_final_transcript_on_a_terminal_status() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4"; // seeded Idle -- a legal send target.
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        let run = build_run("run-transcript", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+
+        send_task(&herdr, pane, &run.task, &marker).await.unwrap();
+        herdr
+            .send_input(pane, &marker.joined(), false)
+            .await
+            .unwrap();
+
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert_eq!(
+            engine.run_final_transcript(&run.id).unwrap().as_deref(),
+            Some(outcome.delta.as_str()),
+            "the delta the caller was handed is the delta the store keeps"
+        );
+    }
+
+    /// P2-4: a second await on a run the ledger already records as finished
+    /// answers from the store. `set_available(false)` makes EVERY herdr call
+    /// -- `snapshot` and `read_pane` alike -- return an error, so an `Ok`
+    /// here can only mean zero pane reads were attempted. That is what keeps
+    /// a re-await honest once the run's pane has been closed.
+    #[tokio::test]
+    async fn await_run_answers_a_finished_run_from_the_store_without_reading_the_pane() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let mut run = build_run("run-reawait", "w2:p4", "baseline", "HERDR_DONE_x");
+        run.status = "done".into();
+        engine.insert_run(&run, None).unwrap();
+        engine
+            .set_run_final_transcript(&run.id, "all the work\nHERDR_DONE_x")
+            .unwrap();
+
+        herdr.set_available(false);
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .expect("a finished run must answer without touching herdr at all");
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert_eq!(outcome.delta, "all the work\nHERDR_DONE_x");
+    }
+
+    /// The short-circuit reads the three terminal spellings and nothing
+    /// else: `working` is open by name, and so is any status this build does
+    /// not know -- an unrecognized value costs a poll, never a wrong answer.
+    #[test]
+    fn only_the_terminal_statuses_answer_from_the_store() {
+        assert_eq!(
+            RunStatus::terminal_from_stored("done"),
+            Some(RunStatus::Done)
+        );
+        assert_eq!(
+            RunStatus::terminal_from_stored("blocked"),
+            Some(RunStatus::Blocked)
+        );
+        assert_eq!(
+            RunStatus::terminal_from_stored("timeout"),
+            Some(RunStatus::Timeout)
+        );
+        assert_eq!(RunStatus::terminal_from_stored("working"), None);
+        assert_eq!(RunStatus::terminal_from_stored("pending"), None);
+        assert_eq!(RunStatus::terminal_from_stored("Done"), None);
+        assert!(!RunStatus::Working.is_terminal());
+        for status in [RunStatus::Done, RunStatus::Blocked, RunStatus::Timeout] {
+            assert!(status.is_terminal(), "{status:?} ends the run");
+        }
     }
 
     #[tokio::test]
@@ -990,6 +1663,214 @@ mod tests {
             "an Unknown-status pane with unchanging content must settle via stability, not time out"
         );
 
+        let stored = engine.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(stored.status, "done");
+    }
+
+    /// The close guard's own fixture: a run waggledance SPAWNED, which is
+    /// what `preset_label: Some(..)` means (a `DispatchTarget::Pane` run
+    /// into a pane the user already owns leaves it `None`).
+    fn build_spawned_run(id: &str, pane_id: &str, baseline: &str, marker: &str) -> Run {
+        Run {
+            preset_label: Some("claude".to_string()),
+            ..build_run(id, pane_id, baseline, marker)
+        }
+    }
+
+    /// Print `marker` into `pane` as the agent's own later output -- the
+    /// only way the joined marker string reaches a pane in these tests, and
+    /// therefore the only thing that can produce a DECLARED completion.
+    async fn agent_declares_done(herdr: &FakeHerdr, pane: &str, marker: &str) {
+        herdr.send_input(pane, marker, false).await.unwrap();
+    }
+
+    /// The whole point of the feature: the agent said it was done, in its
+    /// own output, on a pane waggledance made -- so the pane goes away.
+    #[tokio::test]
+    async fn a_declared_done_on_a_spawned_pane_closes_exactly_that_pane() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        let run = build_spawned_run("run-close", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+        agent_declares_done(&herdr, pane, &marker.joined()).await;
+
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert_eq!(
+            herdr.closed_panes().await,
+            vec![pane.to_string()],
+            "the agent declared itself done on a pane waggledance spawned -- exactly one close"
+        );
+        // The close does not cost the run its record: a repeat await still
+        // answers from the store (dsr-3), which is why capture lands first.
+        assert!(
+            engine.run_final_transcript(&run.id).unwrap().is_some(),
+            "the transcript must already be stored when the pane is closed"
+        );
+    }
+
+    /// D2, structurally: the guard reads how completion was LEARNED, never
+    /// `RunStatus`. `finish` is called here with `RunStatus::Done` on a
+    /// spawned run -- everything the close needs except the agent's own
+    /// declaration -- and must close nothing. A future edit that loosens the
+    /// guard to "status == Done" fails exactly here.
+    #[tokio::test]
+    async fn a_done_that_the_agent_never_declared_closes_nothing() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let run = build_spawned_run("run-observed-done", "w2:p4", "base", "HERDR_DONE_x");
+        engine.insert_run(&run, None).unwrap();
+
+        let outcome = finish(
+            &herdr,
+            &engine,
+            &run,
+            RunStatus::Done,
+            Completion::Observed,
+            "some output".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert!(
+            herdr.closed_panes().await.is_empty(),
+            "a Done nobody declared is an inference -- it may never close a pane"
+        );
+    }
+
+    /// The concrete producer the test above generalizes: an `Unknown`-status
+    /// pane whose screen simply stopped moving. That is equally true of an
+    /// agent paused on a tool call, so its `Done` closes nothing.
+    #[tokio::test]
+    async fn a_stability_done_closes_nothing() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        herdr.set_status(pane, AgentStatus::Unknown).await.unwrap();
+        let fixed_text = "a screen that never changes\n";
+        herdr.seed_scroll_pane(pane, fixed_text, fixed_text, None);
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker(); // never printed -- only stability can end this run.
+        let run = build_spawned_run("run-stable-done", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+
+        let outcome = await_run_with_poll_interval(
+            &herdr,
+            &engine,
+            &run,
+            Duration::from_millis(200),
+            Duration::from_millis(2),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            RunStatus::Done,
+            "stability still ends the run"
+        );
+        assert!(
+            herdr.closed_panes().await.is_empty(),
+            "a screen that merely stopped moving must never kill the agent behind it"
+        );
+    }
+
+    /// `DispatchTarget::Pane` dispatches into a pane the USER owns and leaves
+    /// `preset_label` `None` exactly there. Even a declared done leaves it
+    /// alone -- D1's rationale reaches only what waggledance made.
+    #[tokio::test]
+    async fn a_declared_done_on_a_pane_the_user_owns_closes_nothing() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        // build_run, not build_spawned_run: preset_label stays None.
+        let run = build_run("run-user-pane", pane, &baseline, &marker.joined());
+        assert!(run.preset_label.is_none(), "the case under test");
+        engine.insert_run(&run, None).unwrap();
+        agent_declares_done(&herdr, pane, &marker.joined()).await;
+
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert!(
+            herdr.closed_panes().await.is_empty(),
+            "waggledance never made this pane, so it never takes it away"
+        );
+    }
+
+    /// The three non-`Done` statuses that reach `finish`, each on a spawned
+    /// run so `preset_label` cannot be what saves them. `Blocked` matters
+    /// most: it is an agent waiting on a human, and the human needs the pane
+    /// to answer in.
+    #[tokio::test]
+    async fn a_run_that_did_not_finish_closes_nothing() {
+        for status in [RunStatus::Working, RunStatus::Timeout, RunStatus::Blocked] {
+            let herdr = FakeHerdr::new();
+            let engine = test_engine();
+            let run = build_spawned_run("run-open", "w2:p4", "base", "HERDR_DONE_x");
+            engine.insert_run(&run, None).unwrap();
+
+            finish(
+                &herdr,
+                &engine,
+                &run,
+                status,
+                Completion::Observed,
+                "partial output".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                herdr.closed_panes().await.is_empty(),
+                "{status:?} is not a completion -- it must close nothing"
+            );
+        }
+    }
+
+    /// A leaked pane costs machine performance; losing the run's own result
+    /// costs the work. So a refused close is logged and swallowed -- the run
+    /// still reports Done, and the store still carries its answer.
+    #[tokio::test]
+    async fn a_close_that_fails_still_reports_the_run_as_done() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        herdr.fail_close_pane("herdr refused the close").await;
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        let run = build_spawned_run("run-close-fails", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+        agent_declares_done(&herdr, pane, &marker.joined()).await;
+
+        let outcome = await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            RunStatus::Done,
+            "the work finished; the pane is bookkeeping"
+        );
+        assert_eq!(
+            herdr.closed_panes().await,
+            vec![pane.to_string()],
+            "the close was attempted -- it just did not take"
+        );
         let stored = engine.get_run(&run.id).unwrap().unwrap();
         assert_eq!(stored.status, "done");
     }

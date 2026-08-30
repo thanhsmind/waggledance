@@ -217,6 +217,38 @@ impl SqliteStore {
             .flatten())
     }
 
+    /// Record the transcript delta a run ended with.
+    ///
+    /// Written only once a run reaches a terminal status, so a non-NULL
+    /// column means "this run is over, and this is what it left on screen"
+    /// — which is what lets a second await answer from the ledger instead
+    /// of re-reading a pane that may already have been closed.
+    ///
+    /// Column-only, like `feature`, and for the same reason: see [`Run`]'s
+    /// own doc on why neither becomes a struct field.
+    pub fn set_run_final_transcript(&self, id: &str, transcript: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET final_transcript=?2 WHERE id=?1",
+            params![id, transcript],
+        )?;
+        Ok(())
+    }
+
+    /// The `final_transcript` column of one run row. `Ok(None)` for an
+    /// unknown id, for a run that has not finished, and for every row
+    /// written before the column existed — all three are honestly "no
+    /// stored transcript", and the caller treats them alike.
+    pub fn run_final_transcript(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT final_transcript FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
+    }
+
     // ---- files ----
 
     pub fn upsert_file(&self, f: &IndexedFile, content: &str) -> Result<()> {
@@ -477,10 +509,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (1, migration_1_path_hash),
     (2, migration_2_orchestration_enabled),
     (3, migration_3_runs_feature),
+    (4, migration_4_runs_final_transcript),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -544,6 +577,19 @@ fn migration_2_orchestration_enabled(conn: &Connection) -> Result<()> {
 fn migration_3_runs_feature(conn: &Connection) -> Result<()> {
     if !has_column(conn, "runs", "feature")? {
         conn.execute("ALTER TABLE runs ADD COLUMN feature TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// v4 (dispatch-submit-and-reclaim P2-4) — the transcript a run finished
+/// with. Once a finished run's pane can be closed, the pane is no longer
+/// there to re-read, so the answer a repeat await gets has to be one the
+/// store already holds. Nullable with no default, for the same reason
+/// `feature` is: a run still working genuinely has no final transcript, and
+/// so does every row written before this column existed.
+fn migration_4_runs_final_transcript(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "runs", "final_transcript")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN final_transcript TEXT", [])?;
     }
     Ok(())
 }
@@ -633,7 +679,8 @@ CREATE TABLE IF NOT EXISTS runs (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    feature TEXT
+    feature TEXT,
+    final_transcript TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
 "#;
@@ -1184,6 +1231,102 @@ mod tests {
             s.list_live_runs_for_feature("p1", "feat-x").unwrap().len(),
             1,
             "the migrated database takes a feature-carrying run"
+        );
+    }
+
+    /// dispatch-submit-and-reclaim P2-4: the transcript a run finished with
+    /// is stored on its own row, so the answer survives the pane. A run
+    /// still working has none — that is what makes a non-NULL column mean
+    /// "over".
+    #[test]
+    fn a_runs_final_transcript_round_trips_and_is_empty_until_it_finishes() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        s.insert_run(&sample_run(), None).unwrap();
+
+        assert_eq!(
+            s.run_final_transcript("r1").unwrap(),
+            None,
+            "a run that has not finished carries no final transcript"
+        );
+        assert_eq!(
+            s.run_final_transcript("r-unknown").unwrap(),
+            None,
+            "an unknown run reads back the same honest none"
+        );
+
+        s.set_run_final_transcript("r1", "the last delta\nHERDR_DONE_abc123")
+            .unwrap();
+        assert_eq!(
+            s.run_final_transcript("r1").unwrap().as_deref(),
+            Some("the last delta\nHERDR_DONE_abc123"),
+            "the transcript a run ended with must survive the round trip"
+        );
+        assert_eq!(
+            s.get_run("r1").unwrap().unwrap().status,
+            "pending",
+            "writing the transcript touches no other column"
+        );
+    }
+
+    /// A database whose `runs` table predates `final_transcript`: as with
+    /// `feature`, only the migration can add it, and running the migration
+    /// twice (a second open of the same file) must stay a no-op.
+    #[test]
+    fn migrate_adds_the_runs_final_transcript_column_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO runs VALUES('r-old','p1','pane-1',NULL,'t','','m','done','t','t');",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            assert!(
+                has_column(&c, "runs", "final_transcript").unwrap(),
+                "the migration must add the column an older build never had"
+            );
+            // A second open runs `migrate` again against the same database.
+            // `has_column` guards the ALTER, and `user_version` already
+            // stands at the target, so the step must not error or double-add.
+            super::migrate(&c).unwrap();
+            super::migration_4_runs_final_transcript(&c)
+                .expect("re-running the step against a migrated database is a no-op");
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+        }
+
+        assert_eq!(
+            s.run_final_transcript("r-old").unwrap(),
+            None,
+            "a row written before the column existed has no stored transcript"
+        );
+        s.set_run_final_transcript("r-old", "recovered").unwrap();
+        assert_eq!(
+            s.run_final_transcript("r-old").unwrap().as_deref(),
+            Some("recovered"),
+            "the migrated column is writable"
         );
     }
 

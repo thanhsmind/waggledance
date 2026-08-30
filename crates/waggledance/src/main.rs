@@ -843,6 +843,23 @@ mod terminal_background_tests {
         ) -> crate::herdr::Result<()> {
             unimplemented!("not exercised by the supervisor")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[crate::herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> crate::herdr::Result<crate::herdr::AgentStatus> {
+            unimplemented!("not exercised by the supervisor")
+        }
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[crate::herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> crate::herdr::Result<crate::herdr::AgentStatus> {
+            unimplemented!("not exercised by the supervisor")
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> crate::herdr::Result<()> {
             unimplemented!("not exercised by the supervisor")
         }
@@ -861,6 +878,9 @@ mod terminal_background_tests {
             _pane_id: &str,
             _argv: &[String],
         ) -> crate::herdr::Result<crate::herdr::AgentStarted> {
+            unimplemented!("not exercised by the supervisor")
+        }
+        async fn close_pane(&self, _pane_id: &str) -> crate::herdr::Result<()> {
             unimplemented!("not exercised by the supervisor")
         }
     }

@@ -69,6 +69,28 @@ pub enum HerdrError {
         tab_id: String,
         workspace_id: String,
     },
+    /// `agent.prompt` refused before sending anything -- the agent was
+    /// already `Blocked` (dispatch-submit-and-reclaim plan, "the decisive
+    /// finding"). Distinct from [`HerdrError::AgentPromptStalled`]: here
+    /// nothing was submitted at all, so there is nothing to worry about
+    /// re-sending.
+    #[error("agent is blocked and refused the prompt: {0}")]
+    AgentBlocked(String),
+    /// `agent.prompt` submitted the text, but the agent never showed even
+    /// one observed state change within the daemon's own ~5000ms window --
+    /// the daemon's `agent_prompt_stalled`. The text already went in
+    /// (dispatch-submit-and-reclaim P2-3: never retry a stall, it would
+    /// re-type into a composer that may already hold it). Kept distinct
+    /// from [`HerdrError::Timeout`] so a caller can branch on "no confirmed
+    /// change" without also catching an ordinary deadline.
+    #[error("agent prompt stalled: no confirmed state change observed ({0})")]
+    AgentPromptStalled(String),
+    /// `agent.prompt`'s own `timeout_ms` elapsed before the agent reached
+    /// any of the requested `until` states. Unlike
+    /// [`HerdrError::AgentPromptStalled`], a state change WAS observed
+    /// first, so the text still went in -- the daemon's `timeout` code.
+    #[error("agent prompt timed out waiting for a matching state: {0}")]
+    Timeout(String),
     #[error("herdr refused the request ({code}): {message}")]
     Remote { code: String, message: String },
 }
@@ -197,6 +219,45 @@ pub trait Herdr: Send + Sync {
     /// settle wait entirely — see `SocketHerdr::wait_for_pane_to_settle`.
     async fn send_input(&self, pane_id: &str, text: &str, submit: bool) -> Result<()>;
 
+    /// Submit text into a pane's REGISTERED agent and confirm the daemon
+    /// itself observed the agent respond, rather than firing a blind Enter
+    /// and hoping (`send_input`'s failure mode --
+    /// dispatch-submit-and-reclaim defect A: a settle-race heuristic cannot
+    /// know whether a keystroke was accepted; only the agent's own observed
+    /// state can answer that). Wraps herdr's `agent.prompt`, whose own
+    /// contract (`herdr agent prompt --help`, confirmed via
+    /// `herdr api schema --json`) is:
+    ///
+    /// - an agent already `Blocked` refuses with [`HerdrError::AgentBlocked`]
+    ///   BEFORE any input is sent -- nothing was submitted, nothing to
+    ///   worry about re-sending;
+    /// - otherwise the text is submitted, then the daemon waits up to
+    ///   `timeout_ms` for the agent to reach one of `until`. Starting from a
+    ///   non-`Working` state it first requires an observed state CHANGE
+    ///   within its own internal ~5000ms window, or refuses with
+    ///   [`HerdrError::AgentPromptStalled`] -- the text already went in, so
+    ///   the caller must never retry a stall, only report it
+    ///   (dispatch-submit-and-reclaim P2-3);
+    /// - a `timeout_ms` shorter than that pending change instead refuses
+    ///   with [`HerdrError::Timeout`] -- kept distinct from a stall because
+    ///   a state change WAS observed, so the text still landed.
+    ///
+    /// `AgentBlocked`, `AgentPromptStalled` and `Timeout` are three
+    /// deliberately distinct variants (never folded into the generic
+    /// `Remote`) so a caller can branch on "definitely nothing sent" versus
+    /// "sent but no confirmed change" without also catching an ordinary
+    /// deadline that still means success.
+    ///
+    /// On success, returns the agent's own observed [`AgentStatus`] --
+    /// whichever member of `until` it matched.
+    async fn agent_prompt(
+        &self,
+        pane_id: &str,
+        text: &str,
+        until: &[AgentStatus],
+        timeout_ms: u64,
+    ) -> Result<AgentStatus>;
+
     /// Send raw bytes into a pane via herdr's `pane.send_text` channel — no
     /// bracketed-paste wrapping, no named-key translation, exactly the bytes
     /// given. Used to replay a VT escape sequence an alt-screen agent's own
@@ -244,6 +305,53 @@ pub trait Herdr: Send + Sync {
     /// old hazard this doc used to warn about, where omitting `cwd` started
     /// an agent in herdr's own process directory.
     async fn agent_start(&self, pane_id: &str, argv: &[String]) -> Result<AgentStarted>;
+
+    /// Wait for a pane's registered agent to reach one of `until`, and answer
+    /// the status it actually reached. This is the readiness hop
+    /// [`Herdr::agent_start`] does **not** perform, and it is not optional:
+    /// over the socket `agent.start` is ASYNCHRONOUS. Replaying
+    /// waggledance's own params — `timeout_ms` included — returns in 0.00 s
+    /// carrying `launch_pending: true` and `agent_status: unknown`
+    /// (dispatch-submit-and-reclaim **D4**, probed at the wire 2026-08-30).
+    /// `AgentStartParams.timeout_ms` is a *startup* timeout, never a
+    /// wait-for-interactive-ready; the 30 s readiness wait that
+    /// `herdr agent start --help` describes is the herdr **CLI's** own,
+    /// performed client-side after the call. Prompt the pane in between and
+    /// the daemon answers `agent_not_ready` in ~0.2 s — the whole dispatch
+    /// regression this method closes.
+    ///
+    /// Wraps herdr's `agent.wait` (`AgentWaitParams { target, until,
+    /// timeout_ms }`, reply `agent_info`; confirmed via
+    /// `herdr api schema --json` and a live probe). Measured 3.41 s to
+    /// `agent_status: idle` / `interactive_ready: true`, after which
+    /// `agent.prompt` succeeded in 0.60 s.
+    ///
+    /// The daemon owns the waiting. waggledance never polls for readiness
+    /// itself and never retries this call — a target with no registered
+    /// agent refuses `agent_not_found`, and a budget that runs out refuses
+    /// too. Both are real failures of the spawn, not something to paper over.
+    async fn agent_wait(
+        &self,
+        pane_id: &str,
+        until: &[AgentStatus],
+        timeout_ms: u64,
+    ) -> Result<AgentStatus>;
+
+    /// Close one pane — the teardown counterpart the spawn verbs above
+    /// never had (dispatch-submit-and-reclaim defect B: every
+    /// spawn-dispatch left its agent process alive). Wraps herdr's
+    /// `pane.close`, whose params are a `PaneTarget { pane_id }` and whose
+    /// reply is `pane_closed` (`herdr api schema --json`); a pane that is
+    /// already gone answers `pane_not_found`, which arrives here as a
+    /// generic [`HerdrError::Remote`] carrying that code.
+    ///
+    /// This kills a process. Nothing in this crate may call it from an
+    /// INFERRED completion: `orchestrate::finish` closes only for a run
+    /// whose agent printed its own done marker (D2 — completion is an
+    /// explicit declaration, never an inferred state), because a pane's
+    /// observed state cannot tell a finished agent from one working
+    /// quietly in the background.
+    async fn close_pane(&self, pane_id: &str) -> Result<()>;
 }
 
 /// Why a trust seeding did not happen. Never fatal — see
@@ -462,10 +570,37 @@ pub async fn start_declared_agent(
                 tokio::time::sleep(PANE_READY_INTERVAL).await;
             }
             Err(e) => return Err(e),
-            Ok(started) => return Ok(SpawnOutcome { started, warnings }),
+            Ok(started) => {
+                // D4: `agent.start` answering means the launch was accepted,
+                // never that the agent is promptable — over the socket it
+                // returns in ~0.00s with `launch_pending: true`. Readiness is
+                // its own hop, and it belongs HERE, to the spawn: a caller
+                // that just received a SpawnOutcome must be able to prompt
+                // that pane without knowing any of this, so the send path
+                // never learns about readiness at all.
+                herdr
+                    .agent_wait(&started.pane_id, AGENT_READY_UNTIL, AGENT_READY_TIMEOUT_MS)
+                    .await?;
+                return Ok(SpawnOutcome { started, warnings });
+            }
         }
     }
 }
+
+/// The states that mean a freshly spawned agent is registered and can take a
+/// prompt. `Idle` is the ordinary answer; `Working` and `Done` are here
+/// because an agent that ran straight into work — or finished a first turn —
+/// between the start and this wait is just as promptable, and waiting only
+/// on `Idle` would time out against an agent that is plainly up.
+const AGENT_READY_UNTIL: &[AgentStatus] =
+    &[AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done];
+
+/// How long the daemon may take to report a spawned agent ready. Sized off
+/// the live measurement behind D4 (3.41 s to `interactive_ready` for a cold
+/// `claude`) with generous headroom for a loaded machine, and matched to the
+/// herdr CLI's own 30 s default so waggledance waits neither less nor longer
+/// than herdr's own front door does.
+const AGENT_READY_TIMEOUT_MS: u64 = 30_000;
 
 /// bee's environment-key rule: `[A-Za-z_][A-Za-z0-9_]*`. A key outside it
 /// drops its own entry and nothing else.
@@ -734,6 +869,20 @@ mod tests {
         starts: std::sync::Mutex<u32>,
         snapshots: std::sync::Mutex<u32>,
         inputs: std::sync::Mutex<Vec<String>>,
+        /// Every `agent_wait` call, in order — see [`WaitCall`].
+        waits: std::sync::Mutex<Vec<WaitCall>>,
+    }
+
+    /// One recorded `agent_wait`: the arguments it carried, plus the number
+    /// of `agent_start` attempts that had already happened when it arrived.
+    /// That last field is what proves the wait comes AFTER a successful start
+    /// rather than merely alongside it.
+    #[derive(Debug)]
+    struct WaitCall {
+        pane_id: String,
+        until: Vec<AgentStatus>,
+        timeout_ms: u64,
+        starts_before: u32,
     }
 
     impl FlakyPane {
@@ -744,6 +893,7 @@ mod tests {
                 starts: std::sync::Mutex::new(0),
                 snapshots: std::sync::Mutex::new(0),
                 inputs: std::sync::Mutex::new(Vec::new()),
+                waits: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -754,6 +904,7 @@ mod tests {
                 starts: std::sync::Mutex::new(0),
                 snapshots: std::sync::Mutex::new(0),
                 inputs: std::sync::Mutex::new(Vec::new()),
+                waits: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -783,6 +934,30 @@ mod tests {
             self.inputs.lock().unwrap().push(text.to_string());
             Ok(())
         }
+        async fn agent_prompt(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[AgentStatus],
+            _: u64,
+        ) -> Result<AgentStatus> {
+            unreachable!()
+        }
+        async fn agent_wait(
+            &self,
+            pane_id: &str,
+            until: &[AgentStatus],
+            timeout_ms: u64,
+        ) -> Result<AgentStatus> {
+            let starts_before = *self.starts.lock().unwrap();
+            self.waits.lock().unwrap().push(WaitCall {
+                pane_id: pane_id.to_string(),
+                until: until.to_vec(),
+                timeout_ms,
+                starts_before,
+            });
+            Ok(AgentStatus::Idle)
+        }
         async fn send_text(&self, _: &str, _: &str) -> Result<()> {
             unreachable!()
         }
@@ -793,6 +968,9 @@ mod tests {
             Ok(TabCreated {
                 tab_id: "w1:new-tab".into(),
             })
+        }
+        async fn close_pane(&self, _: &str) -> Result<()> {
+            unreachable!()
         }
         async fn agent_start(&self, pane_id: &str, _: &[String]) -> Result<AgentStarted> {
             *self.starts.lock().unwrap() += 1;
@@ -810,6 +988,107 @@ mod tests {
                 name: "started".into(),
             })
         }
+    }
+
+    /// D4, and the whole point of this cell: `agent.start` answering does not
+    /// mean the agent can take a prompt — over the socket it returns in
+    /// ~0.00s with `launch_pending: true`, and the `agent.prompt` that
+    /// follows dies with `agent_not_ready`. So the spawn waits, explicitly,
+    /// on its own hop: once, after a SUCCESSFUL start, against the pane the
+    /// caller is about to prompt, and never before the start.
+    #[tokio::test]
+    async fn a_spawn_waits_for_the_agent_to_report_ready_before_it_returns() {
+        let h = FlakyPane::refusing(2);
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: vec!["claude".to_string()],
+            env: Vec::new(),
+            workspace_trust: None,
+        };
+
+        let outcome = start_declared_agent(&h, "w1", None, &entry).await.unwrap();
+
+        let waits = h.waits.lock().unwrap();
+        assert_eq!(
+            waits.len(),
+            1,
+            "readiness is waited for once, not per start attempt: {waits:?}"
+        );
+        let wait = &waits[0];
+        assert_eq!(
+            wait.pane_id, outcome.started.pane_id,
+            "the wait must name the pane the caller will prompt"
+        );
+        assert_eq!(
+            wait.starts_before, 3,
+            "the wait comes AFTER the start that succeeded, never before it"
+        );
+        assert_eq!(
+            wait.until,
+            [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done],
+            "an agent that went straight to work is promptable too — waiting \
+             only on Idle would time out against an agent that is plainly up"
+        );
+        assert_eq!(wait.timeout_ms, 30_000);
+    }
+
+    /// A readiness wait that fails is a failed spawn. Returning the
+    /// `AgentStarted` anyway would hand the caller a pane it cannot prompt —
+    /// exactly the regression, one layer further in.
+    #[tokio::test]
+    async fn a_spawn_whose_agent_never_reports_ready_fails_instead_of_returning_the_pane() {
+        struct NeverReady(FlakyPane);
+
+        #[async_trait::async_trait]
+        impl Herdr for NeverReady {
+            async fn snapshot(&self) -> Result<Snapshot> {
+                self.0.snapshot().await
+            }
+            async fn ping(&self) -> Result<ProtocolInfo> {
+                unreachable!()
+            }
+            async fn read_pane(&self, _: &str, _: ReadSource, _: usize) -> Result<ScreenRead> {
+                unreachable!()
+            }
+            async fn send_input(&self, p: &str, t: &str, s: bool) -> Result<()> {
+                self.0.send_input(p, t, s).await
+            }
+            async fn agent_prompt(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[AgentStatus],
+                _: u64,
+            ) -> Result<AgentStatus> {
+                unreachable!("a spawn that never became ready must never be prompted")
+            }
+            async fn agent_wait(&self, p: &str, _: &[AgentStatus], _: u64) -> Result<AgentStatus> {
+                Err(HerdrError::Timeout(format!("{p} never became ready")))
+            }
+            async fn send_text(&self, _: &str, _: &str) -> Result<()> {
+                unreachable!()
+            }
+            async fn send_keys(&self, _: &str, _: &[String]) -> Result<()> {
+                unreachable!()
+            }
+            async fn tab_create(&self, w: &str, c: Option<&str>) -> Result<TabCreated> {
+                self.0.tab_create(w, c).await
+            }
+            async fn agent_start(&self, p: &str, a: &[String]) -> Result<AgentStarted> {
+                self.0.agent_start(p, a).await
+            }
+            async fn close_pane(&self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+        }
+
+        let h = NeverReady(FlakyPane::refusing(0));
+        let err = start_agent_in_new_tab(&h, "w1", None, &["claude".to_string()])
+            .await
+            .expect_err("a pane whose agent never reports ready is not a spawn that worked");
+        assert!(
+            matches!(err, HerdrError::Timeout(_)),
+            "herdr's own refusal must surface, unwrapped: {err:?}"
+        );
     }
 
     /// The race this exists for: herdr refuses the brand-new pane twice while

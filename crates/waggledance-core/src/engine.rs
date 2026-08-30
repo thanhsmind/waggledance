@@ -423,6 +423,19 @@ impl Engine {
         self.store.run_feature(id)
     }
 
+    /// Record the transcript a run ended with, on its own row. Called once
+    /// a run reaches a terminal status, so the answer outlives the pane it
+    /// was read from.
+    pub fn set_run_final_transcript(&self, id: &str, transcript: &str) -> Result<()> {
+        self.store.set_run_final_transcript(id, transcript)
+    }
+
+    /// The transcript a finished run ended with — `None` while it is still
+    /// working, and for rows written before the column existed.
+    pub fn run_final_transcript(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_final_transcript(id)
+    }
+
     pub fn list_files(&self, project_id: &str) -> Result<Vec<IndexedFile>> {
         self.store.list_files(project_id)
     }
@@ -989,6 +1002,13 @@ mod tests {
         let listed = engine.list_runs(&project.id, 10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "r1");
+
+        assert_eq!(engine.run_final_transcript("r1").unwrap(), None);
+        engine.set_run_final_transcript("r1", "final delta").unwrap();
+        assert_eq!(
+            engine.run_final_transcript("r1").unwrap().as_deref(),
+            Some("final delta")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

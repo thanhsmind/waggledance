@@ -20702,6 +20702,23 @@ mod bee_route_tests {
         ) -> herdr::Result<()> {
             unimplemented!("index_page never sends input")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unimplemented!("index_page never prompts an agent")
+        }
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unimplemented!("index_page never waits on an agent")
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unimplemented!("index_page never sends text")
         }
@@ -20721,6 +20738,9 @@ mod bee_route_tests {
             _argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
             unimplemented!("index_page never starts an agent")
+        }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unimplemented!("index_page never closes a pane")
         }
     }
 
@@ -24648,6 +24668,27 @@ mod bee_route_tests {
         ) -> herdr::Result<()> {
             unreachable!("create routes never send input")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("create routes never prompt an agent")
+        }
+        /// The spawn DOES wait now: `start_declared_agent` asks the daemon to
+        /// confirm the agent is promptable before it returns
+        /// (dispatch-submit-and-reclaim D4), so this must answer ready rather
+        /// than be unreachable — a create route reaches it on every spawn.
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            Ok(herdr::AgentStatus::Idle)
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("create routes never send text")
         }
@@ -24687,6 +24728,10 @@ mod bee_route_tests {
                 pane_id: pane_id.to_string(),
                 name: "recorded-agent".into(),
             })
+        }
+
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unreachable!("spawn-recording tests never close a pane")
         }
     }
 
@@ -24771,6 +24816,23 @@ mod bee_route_tests {
         ) -> herdr::Result<()> {
             unreachable!("page-selection tests never send input")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("page-selection tests never prompt an agent")
+        }
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("page-selection tests never wait on an agent")
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("page-selection tests never send text")
         }
@@ -24790,6 +24852,9 @@ mod bee_route_tests {
             _argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
             unreachable!("page-selection tests never start an agent")
+        }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unreachable!("page-selection tests never close a pane")
         }
     }
 
@@ -32548,6 +32613,39 @@ mod bee_route_tests {
                 .push((pane_id.to_string(), text.to_string()));
             Ok(())
         }
+        /// The run actions DO prompt now: `orchestrate::send_task` submits
+        /// through `agent.prompt` so a swallowed Enter refuses the dispatch
+        /// instead of hanging the run (dispatch-submit-and-reclaim defect
+        /// A). Logged as an input, exactly like the `send_input(.., true)`
+        /// it replaced, so every assertion about what reached a pane still
+        /// reads one list.
+        async fn agent_prompt(
+            &self,
+            pane_id: &str,
+            text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            self.log
+                .lock()
+                .unwrap()
+                .inputs
+                .push((pane_id.to_string(), text.to_string()));
+            Ok(herdr::AgentStatus::Working)
+        }
+        /// A spawn waits for its agent to report ready before the dispatch
+        /// prompts it (dispatch-submit-and-reclaim D4), so this is on the
+        /// run-action path and answers ready. Nothing is logged: the wait is
+        /// not something that reached a PANE, and folding it into `inputs`
+        /// would corrupt every assertion about what the agent was sent.
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            Ok(herdr::AgentStatus::Idle)
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("the run actions never send raw bytes")
         }
@@ -32584,6 +32682,12 @@ mod bee_route_tests {
                 pane_id: self.spawned_pane.clone(),
                 name: "board-agent".into(),
             })
+        }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            // The run-action tests never reach a marker completion, the one
+            // path that closes a pane -- and a close arriving here would be
+            // the guard leaking, worth a panic rather than a silent Ok.
+            unreachable!("run-action tests never close a pane")
         }
     }
 

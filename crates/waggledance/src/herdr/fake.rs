@@ -37,6 +37,16 @@ struct Inner {
     /// test assert exactly when (and whether) a scroller escalated, without
     /// inferring it from timing.
     sent_text: Mutex<Vec<(String, String)>>,
+    /// Every `close_pane` call, in order -- a test asserting "nothing was
+    /// closed" needs to see zero entries, and one asserting "exactly this
+    /// pane" needs the id. Recorded even for a pane this fake does not
+    /// know, so a close aimed at the wrong pane shows up as a recorded
+    /// call rather than vanishing into an error.
+    closed_panes: Mutex<Vec<String>>,
+    /// When set, `close_pane` refuses with this remote error instead of
+    /// closing -- the seam for "a close that errors still reports the run
+    /// as Done".
+    close_error: Mutex<Option<String>>,
 }
 
 /// One pane's fake screen state -- history-aware so a test can construct all
@@ -263,6 +273,8 @@ impl FakeHerdr {
                 available: std::sync::atomic::AtomicBool::new(true),
                 next_created_id: std::sync::atomic::AtomicU64::new(1),
                 sent_text: Mutex::new(Vec::new()),
+                closed_panes: Mutex::new(Vec::new()),
+                close_error: Mutex::new(None),
             }),
         }
     }
@@ -362,6 +374,20 @@ impl FakeHerdr {
             .filter(|(p, _)| p == pane_id)
             .map(|(_, bytes)| bytes.clone())
             .collect()
+    }
+
+    /// Every pane id `close_pane` was called with, in call order. The
+    /// empty vec is the assertion that matters most here: a pane closed on
+    /// an inferred completion is a killed working agent.
+    pub async fn closed_panes(&self) -> Vec<String> {
+        self.inner.closed_panes.lock().await.clone()
+    }
+
+    /// Test-only: make every subsequent `close_pane` refuse with `message`.
+    /// The call is still recorded -- the close was attempted, it just did
+    /// not take.
+    pub async fn fail_close_pane(&self, message: &str) {
+        *self.inner.close_error.lock().await = Some(message.to_string());
     }
 
     /// Drive an agent's status (as a live change would).
@@ -597,6 +623,109 @@ impl Herdr for FakeHerdr {
             entry.recent.push('\n');
         }
         entry.revision += 1; // revision bumps so a poller re-renders
+        Ok(())
+    }
+
+    /// Mirrors the real daemon's decision points (see `Herdr::agent_prompt`'s
+    /// doc) with no timing model: `FakeHerdr` has no clock to simulate the
+    /// daemon's own "observed a state change within 5000ms" wait, so it
+    /// answers synchronously from whatever status the agent already carries
+    /// at call time -- a test scripts the outcome it wants with `set_status`
+    /// BEFORE calling `agent_prompt`, exactly the same seam `set_status`
+    /// already serves for every other status-driven test in this module.
+    /// `Blocked` refuses before the text is sent, same as production; a
+    /// status already inside `until` (or an empty `until`) accepts and
+    /// delivers the text via `send_input`'s own submit path; anything else
+    /// is a stall. `timeout_ms` has no effect here -- there is nothing to
+    /// time out against without a clock, so this fake never returns
+    /// `HerdrError::Timeout`; only the real socket path can prove that arm.
+    async fn agent_prompt(
+        &self,
+        pane_id: &str,
+        text: &str,
+        until: &[AgentStatus],
+        _timeout_ms: u64,
+    ) -> Result<AgentStatus> {
+        self.ensure_up()?;
+        let status = {
+            let snap = self.inner.snapshot.lock().await;
+            let agent = snap
+                .agents
+                .iter()
+                .find(|a| a.pane_id == pane_id)
+                .ok_or_else(|| HerdrError::NoSuchPane(pane_id.to_string()))?;
+            if agent.status == AgentStatus::Blocked {
+                return Err(HerdrError::AgentBlocked(format!(
+                    "agent on {pane_id} is blocked"
+                )));
+            }
+            agent.status
+        };
+
+        self.send_input(pane_id, text, true).await?;
+
+        if until.is_empty() || until.contains(&status) {
+            Ok(status)
+        } else {
+            Err(HerdrError::AgentPromptStalled(format!(
+                "agent on {pane_id} did not reach {until:?} (observed {status:?})"
+            )))
+        }
+    }
+
+    /// The readiness hop, with the same no-clock honesty as `agent_prompt`:
+    /// `FakeHerdr` cannot simulate the daemon spending 3.41s watching an
+    /// agent come up, so it answers from the status the agent already
+    /// carries. `agent_start_named` registers a new agent as `Idle`, which
+    /// is inside every caller's `until`, so a spawn through this fake sails
+    /// through exactly as a real ready agent would. A pane with no
+    /// registered agent refuses `NoSuchPane` -- the fake's spelling of
+    /// herdr's own `agent_not_found` -- and a status outside `until` is the
+    /// budget running out, since with no clock there is nothing else a
+    /// non-matching state could become.
+    async fn agent_wait(
+        &self,
+        pane_id: &str,
+        until: &[AgentStatus],
+        _timeout_ms: u64,
+    ) -> Result<AgentStatus> {
+        self.ensure_up()?;
+        let snap = self.inner.snapshot.lock().await;
+        let agent = snap
+            .agents
+            .iter()
+            .find(|a| a.pane_id == pane_id)
+            .ok_or_else(|| HerdrError::NoSuchPane(pane_id.to_string()))?;
+        if until.is_empty() || until.contains(&agent.status) {
+            Ok(agent.status)
+        } else {
+            Err(HerdrError::Timeout(format!(
+                "agent on {pane_id} did not reach {until:?} (observed {:?})",
+                agent.status
+            )))
+        }
+    }
+
+    async fn close_pane(&self, pane_id: &str) -> Result<()> {
+        self.ensure_up()?;
+        // Logged before the refusal check and before the pane is looked up:
+        // the record is "a close was attempted on this pane", which is the
+        // fact every test here asserts on.
+        self.inner
+            .closed_panes
+            .lock()
+            .await
+            .push(pane_id.to_string());
+        if let Some(message) = self.inner.close_error.lock().await.clone() {
+            return Err(HerdrError::Remote {
+                code: "pane_close_failed".into(),
+                message,
+            });
+        }
+        self.inner.screens.lock().await.remove(pane_id);
+        let mut snap = self.inner.snapshot.lock().await;
+        snap.agents.retain(|a| a.pane_id != pane_id);
+        snap.panes.retain(|p| p.pane_id != pane_id);
         Ok(())
     }
 
@@ -836,6 +965,54 @@ mod tests {
         let f = FakeHerdr::new();
         assert!(matches!(
             f.send_keys("nope", &["up".into()]).await,
+            Err(HerdrError::NoSuchPane(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_accepted_delivers_text_and_returns_status() {
+        let f = FakeHerdr::new();
+        // w1:p1 seeds Working, which is inside `until` -- an accepted send.
+        let status = f
+            .agent_prompt("w1:p1", "go", &[AgentStatus::Working], 8000)
+            .await
+            .unwrap();
+        assert_eq!(status, AgentStatus::Working);
+        let after = f.read_pane("w1:p1", ReadSource::Visible, 0).await.unwrap();
+        assert!(after.text.contains("go"), "text must still be delivered");
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_blocked_refuses_before_send() {
+        let f = FakeHerdr::new();
+        let before = f.read_pane("w1:p2", ReadSource::Visible, 0).await.unwrap();
+        // w1:p2 seeds Blocked -- refused before any input reaches the pane.
+        let result = f
+            .agent_prompt("w1:p2", "go", &[AgentStatus::Working], 8000)
+            .await;
+        assert!(matches!(result, Err(HerdrError::AgentBlocked(_))));
+        let after = f.read_pane("w1:p2", ReadSource::Visible, 0).await.unwrap();
+        assert_eq!(after.text, before.text, "blocked must send nothing");
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_stalled_when_status_not_in_until() {
+        let f = FakeHerdr::new();
+        // w2:p4 seeds Idle, which is not in `until` -- a stall, distinct
+        // from both AgentBlocked and Timeout.
+        let result = f
+            .agent_prompt("w2:p4", "go", &[AgentStatus::Working], 8000)
+            .await;
+        assert!(matches!(result, Err(HerdrError::AgentPromptStalled(_))));
+        assert!(!matches!(result, Err(HerdrError::AgentBlocked(_))));
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_unknown_pane_errors() {
+        let f = FakeHerdr::new();
+        assert!(matches!(
+            f.agent_prompt("nope", "go", &[AgentStatus::Working], 8000)
+                .await,
             Err(HerdrError::NoSuchPane(_))
         ));
     }
