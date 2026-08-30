@@ -1692,12 +1692,18 @@
   // hidden field carries for the scripting-off path) the navigation keeps
   // `embed=1` on it — picking a base inside an iframe must not replace the
   // frame with a full-chrome page.
+  //
+  // home-terminal-panel (UAT): `data-panel="1"` rides along the same way, and
+  // for the same reason one step in — inside the homepage panel the page is
+  // rendered without its own changed-file sidebar (the one beside the frame
+  // is it), and picking a base must not grow that duplicate column back.
   (function () {
     var sel = document.querySelector(".changes__base-select[data-base-url]");
     if (!sel) return;
     var url = sel.getAttribute("data-base-url");
     if (!url) return;
     var embed = sel.getAttribute("data-embed") === "1";
+    var panel = sel.getAttribute("data-panel") === "1";
     var go = sel.form && sel.form.querySelector(".changes__base-go");
     if (go) go.hidden = true;
     sel.addEventListener("change", function () {
@@ -1706,6 +1712,7 @@
       var q = [];
       if (v) q.push("commit=" + encodeURIComponent(v));
       if (embed) q.push("embed=1");
+      if (panel) q.push("panel=1");
       window.location.href = q.length ? url + "?" + q.join("&") : url;
     });
   })();

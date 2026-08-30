@@ -7466,6 +7466,11 @@ struct ChangesQuery {
     /// `embed` itself.
     #[serde(default)]
     nav: Option<String>,
+    /// The other narrowing flag (UAT): the embedded page without its own
+    /// in-page sidebar. Same standing again — read beside `embed`, by
+    /// [`page_chrome`] and nothing else.
+    #[serde(default)]
+    panel: Option<String>,
 }
 
 /// The two view flags alone, for the two Code routes — the same fields
@@ -7476,6 +7481,8 @@ struct CodeQuery {
     embed: Option<String>,
     #[serde(default)]
     nav: Option<String>,
+    #[serde(default)]
+    panel: Option<String>,
 }
 
 /// D9: how much chrome a Code or Changes page renders, decided from the
@@ -7494,10 +7501,21 @@ struct CodeQuery {
 /// page — a narrowing of the embed mode is not something a URL can ask for
 /// on its own, so a stray `nav` in a bookmark can never strip a normal page
 /// down to a sidebar.
-fn page_chrome(embed: Option<&str>, nav: Option<&str>) -> views::PageChrome {
-    match (embed.map(str::trim), nav.map(str::trim)) {
-        (Some("1"), Some("1")) => views::PageChrome::Nav,
-        (Some("1"), _) => views::PageChrome::Embed,
+///
+/// The UAT's `panel` is the third value on that same ladder and obeys every
+/// word of it: `embed=1&panel=1` is the embedded page without its own
+/// in-page sidebar, `panel=1` alone is the ordinary page, and anything but
+/// the exact `1` is nothing at all. `nav` wins where both are asked for —
+/// the nav IS a sidebar, so "no sidebar" has nothing to say to it.
+fn page_chrome(embed: Option<&str>, nav: Option<&str>, panel: Option<&str>) -> views::PageChrome {
+    match (
+        embed.map(str::trim),
+        nav.map(str::trim),
+        panel.map(str::trim),
+    ) {
+        (Some("1"), Some("1"), _) => views::PageChrome::Nav,
+        (Some("1"), _, Some("1")) => views::PageChrome::Panel,
+        (Some("1"), _, _) => views::PageChrome::Embed,
         _ => views::PageChrome::Full,
     }
 }
@@ -7534,7 +7552,11 @@ async fn changes_screen(
         Some(sha) => DiffBase::Commit(sha.to_string()),
         None => DiffBase::WorkingTree,
     };
-    let chrome = page_chrome(query.embed.as_deref(), query.nav.as_deref());
+    let chrome = page_chrome(
+        query.embed.as_deref(),
+        query.nav.as_deref(),
+        query.panel.as_deref(),
+    );
     let engine = st.engine.clone();
     let project_id = id.clone();
     let page = tokio::task::spawn_blocking(move || {
@@ -7571,7 +7593,11 @@ async fn code_root(
         &st,
         &id,
         "",
-        page_chrome(query.embed.as_deref(), query.nav.as_deref()),
+        page_chrome(
+            query.embed.as_deref(),
+            query.nav.as_deref(),
+            query.panel.as_deref(),
+        ),
     )
     .await
 }
@@ -7585,7 +7611,11 @@ async fn code_dir_or_file(
         &st,
         &id,
         &path,
-        page_chrome(query.embed.as_deref(), query.nav.as_deref()),
+        page_chrome(
+            query.embed.as_deref(),
+            query.nav.as_deref(),
+            query.panel.as_deref(),
+        ),
     )
     .await
 }
@@ -35384,8 +35414,12 @@ needs_you:
             "and is the changed-file list: {body}"
         );
         assert!(
-            body.contains(&format!("href=\"/p/{}/_changes?embed=1#f0\"", project.id)),
-            "each row deep-links the embedded page at its own section: {body}"
+            body.contains(&format!(
+                "href=\"/p/{}/_changes?embed=1&amp;panel=1#f0\"",
+                project.id
+            )),
+            "each row deep-links the embedded page at its own section, without \
+             the in-page sidebar this nav already is: {body}"
         );
         assert!(
             !body.contains("changeset__head") && !body.contains("class=\"layout"),
@@ -35452,10 +35486,11 @@ needs_you:
         .await;
         assert!(
             body.contains(&format!(
-                "href=\"/p/{}/_code/src/main.rs?embed=1\"",
+                "href=\"/p/{}/_code/src/main.rs?embed=1&amp;panel=1\"",
                 project.id
             )),
-            "a file row is an absolute embed link the base target carries away: {body}"
+            "a file row is an absolute embed link the base target carries away, \
+             sidebar-less because this nav is that sidebar: {body}"
         );
         assert!(
             !body.contains("_code/src/main.rs?embed=1&amp;nav=1"),
@@ -35468,6 +35503,115 @@ needs_you:
         assert!(
             body.contains("<header class=\"topbar\">") && !body.contains("nav-only"),
             "nav=1 without embed=1 is the ordinary Code page: {body}"
+        );
+    }
+
+    /// UAT / htp-3: `?embed=1&panel=1` on the Changes route serves the
+    /// embedded screen without its own changed-file sidebar — the homepage
+    /// panel this renders into already has that list beside it — and keeps
+    /// the header the user reads it by. The route is what this pins: the
+    /// view tests own the markup, this owns the query reaching them.
+    #[tokio::test]
+    async fn changes_route_with_panel_drops_the_in_page_sidebar_only() {
+        let dir = fresh_root("changes-panel");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the view unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-panel");
+        let app = router(st);
+
+        let resp = get(
+            app.clone(),
+            &format!("/p/{}/_changes?embed=1&panel=1", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("<aside id=\"sidebar\"") && !body.contains("changes-nav"),
+            "the duplicated changed-file column is gone: {body}"
+        );
+        assert!(
+            body.contains("class=\"layout layout--embed layout--panel\""),
+            "and the layout says so beside the embed class: {body}"
+        );
+        assert!(
+            body.contains("changes__count")
+                && body.contains("changes__base-select")
+                && body.contains("changes__reviewed"),
+            "the header — count, picker, reviewed counter — stays: {body}"
+        );
+        assert!(
+            body.contains("changeset__head") && body.contains("mod.txt"),
+            "and so does the diff the frame was opened for: {body}"
+        );
+
+        // The narrowing is a narrowing of embed mode, never something a URL
+        // can ask for on its own.
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_changes?panel=1", project.id)).await)
+                .await;
+        assert!(
+            body.contains("<header class=\"topbar\">")
+                && body.contains("<aside id=\"sidebar\"")
+                && !body.contains("layout--panel"),
+            "panel=1 without embed=1 is the ordinary page, sidebar and all: {body}"
+        );
+    }
+
+    /// UAT / htp-3 on the Code section: same narrowing, same one column
+    /// removed — the file tree, whose copy is the sidebar beside the panel.
+    #[tokio::test]
+    async fn code_routes_with_panel_drop_the_tree_and_keep_the_file() {
+        let dir = fresh_root("code-panel");
+        write(&dir, "src/main.rs", "fn main() {}\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "code-panel");
+        let app = router(st);
+
+        let resp = get(
+            app.clone(),
+            &format!("/p/{}/_code/src/main.rs?embed=1&panel=1", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("<aside id=\"sidebar\"") && !body.contains("chap-crumbs"),
+            "the tree column the sidebar beside the panel already shows is gone: {body}"
+        );
+        assert!(
+            body.contains("class=\"codeview__table\"")
+                && body.contains("class=\"layout layout--embed layout--panel\""),
+            "the file itself is served, in a layout that names the mode: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "href=\"/p/{}/_code/?embed=1&amp;panel=1\"",
+                project.id
+            )),
+            "and its breadcrumb keeps the reader in the panel: {body}"
+        );
+
+        let body = body_string(
+            get(
+                app.clone(),
+                &format!("/p/{}/_code/src/main.rs?panel=1", project.id),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && body.contains("<aside id=\"sidebar\""),
+            "panel=1 without embed=1 is the ordinary Code page: {body}"
         );
     }
 }

@@ -3844,3 +3844,20 @@ html:has(.nav-only) {
 .nav-only .chg-stat {
   flex: none;
 }
+
+/* ============================================================
+   PANEL MODE (home-terminal-panel, UAT)
+   `?embed=1&panel=1` is embed mode minus the page's OWN sidebar. The frame
+   this renders into — the panel above the homepage terminal — sits directly
+   beside the sidebar that already lists these changed files (or this file
+   tree), so a second copy inside the frame is the same list twice at half
+   the width each. The markup drops `#sidebar` and its backdrop; `.content`
+   then takes the whole frame from `.layout`'s own flex, and this block only
+   states what must stay true of it. `layout--panel` always rides BESIDE
+   `layout--embed`, so every sticky offset above is already handled and
+   nothing here repeats it.
+   ============================================================ */
+.layout--panel > .content {
+  width: 100%;
+  max-width: none;
+}

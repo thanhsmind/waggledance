@@ -2947,7 +2947,7 @@ fn home_term_sidebar(project_id: Option<&str>) -> String {
             .to_string();
     };
     format!(
-        r#"<aside class="home-term__side" aria-label="Files and diff" data-panel-src="/p/{pid}/_changes?embed=1">
+        r#"<aside class="home-term__side" aria-label="Files and diff" data-panel-src="/p/{pid}/_changes?embed=1&amp;panel=1">
   <div class="home-term__tabs" role="group" aria-label="Show this project's files or diff">
     <button type="button" class="home-term__tab" data-nav-tab="files" data-nav-src="/p/{pid}/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>
     <button type="button" class="home-term__tab" data-nav-tab="diff" data-nav-src="/p/{pid}/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>
@@ -9811,14 +9811,32 @@ pub enum PageChrome {
     /// panel frame above the terminal instead of replacing this narrow
     /// sidebar with a full diff (D3).
     Nav,
+    /// home-terminal-panel (UAT): `embed=1&panel=1` — the whole page as
+    /// `Embed` renders it, minus the one thing the frame it lands in already
+    /// has beside it. The panel above the homepage terminal sits next to the
+    /// sidebar that IS this page's changed-file list (or its file tree), so
+    /// an in-page `#sidebar` inside the frame is the same list twice, at half
+    /// the width each. Only that column goes: the header — file count, base
+    /// picker, reviewed counter — the diff sections and the reviewed marks
+    /// are every bit of them still here, now across the whole frame.
+    ///
+    /// It is meaningful only WITH `embed=1` (`server.rs`'s `page_chrome`
+    /// reads it exactly like `nav`), and it is not a fourth render path
+    /// either: the same functions render it, one `if` shorter.
+    Panel,
 }
 
 impl PageChrome {
-    /// True for `Nav` as well: nav mode IS an embed — same dropped topbar,
-    /// same `embed=1` on the links it emits — narrowed to the navigation.
-    /// Nothing that asks this question wants nav mode to answer differently.
+    /// True for `Nav` and `Panel` as well: both ARE embeds — same dropped
+    /// topbar, same flag on the links they emit — each narrowed one step
+    /// further, one to the navigation alone and one to the page without its
+    /// duplicate of that navigation. Nothing that asks this question wants
+    /// either narrowing to answer differently.
     fn is_embed(self) -> bool {
-        matches!(self, PageChrome::Embed | PageChrome::Nav)
+        matches!(
+            self,
+            PageChrome::Embed | PageChrome::Nav | PageChrome::Panel
+        )
     }
 
     /// D2's nav-only rendering, the one thing `is_embed` deliberately does
@@ -9827,20 +9845,32 @@ impl PageChrome {
         self == PageChrome::Nav
     }
 
+    /// The sidebar-less embed (UAT): true only for the mode that drops the
+    /// page's own `#sidebar`, and never for `Embed`, whose whole promise is
+    /// that everything below the bar is untouched.
+    fn is_panel(self) -> bool {
+        self == PageChrome::Panel
+    }
+
     /// The query an in-page link must carry to stay inside the frame it was
     /// clicked in. Only ever appended to a URL this module builds with no
     /// query of its own, so `?` is always the right separator.
     ///
-    /// Nav mode answers `?embed=1`, not `?embed=1&nav=1`, because the links
-    /// this decides are the FILE links (D3): they leave the sidebar for the
-    /// panel frame and must arrive there as the whole embedded page. The
-    /// links that stay in the sidebar — folders and crumbs — ask
+    /// Nav mode answers the PANEL's query, not `?embed=1&nav=1`, because the
+    /// links this decides are the FILE links (D3): they leave the sidebar for
+    /// the panel frame and must arrive there as the whole page — sidebar-less
+    /// (UAT), because the nav they were clicked in IS that sidebar. The links
+    /// that stay in the sidebar — folders and crumbs — ask
     /// [`PageChrome::self_link_query`] instead.
+    ///
+    /// Panel mode answers the same string for the same reason: a link
+    /// followed inside the panel must not grow the duplicate column back.
+    /// Ampersand-escaped, because every one of these lands in an `href`.
     fn link_query(self) -> &'static str {
-        if self.is_embed() {
-            "?embed=1"
-        } else {
-            ""
+        match self {
+            PageChrome::Nav | PageChrome::Panel => "?embed=1&amp;panel=1",
+            PageChrome::Embed => "?embed=1",
+            PageChrome::Full => "",
         }
     }
 
@@ -9871,11 +9901,15 @@ impl PageChrome {
     /// hangs the dropped topbar offset on — with no 53px bar above them,
     /// the sticky sidebar, the code pane and a file section's sticky header
     /// stick to the frame's own top edge instead.
+    /// `layout--panel` rides BESIDE `layout--embed`, never instead of it:
+    /// panel mode is embed mode with one column gone, so every sticky offset
+    /// the embed rules zero stays zeroed and app.css has one thing to say
+    /// about the missing sidebar rather than a second copy of the first.
     fn layout_class(self) -> &'static str {
-        if self.is_embed() {
-            "layout layout--embed"
-        } else {
-            "layout"
+        match self {
+            PageChrome::Panel => "layout layout--embed layout--panel",
+            _ if self.is_embed() => "layout layout--embed",
+            _ => "layout",
         }
     }
 }
@@ -9951,12 +9985,12 @@ pub fn code_page(
     chrome: PageChrome,
 ) -> String {
     let active = base_name(rel_path);
-    let tree = code_tree(project, sidebar, Some(active), chrome);
     // D2: nav mode is the tree alone. Returning before the source is
     // line-numbered and highlighted is the point — a sidebar that renders a
     // whole file's markup and then throws it away costs the same as the page
     // it is meant to be cheaper than.
     if chrome.is_nav() {
+        let tree = code_tree(project, sidebar, Some(active), chrome);
         return code_nav_page(active, &tree);
     }
 
@@ -10009,16 +10043,14 @@ pub fn code_page(
     let body_html = format!(
         r#"{topbar}
 <div class="{layout_cls}">
-  <aside id="sidebar" class="sidebar">{tree}</aside>
-  <div class="sidebar-backdrop"></div>
-  <main class="content content--code">
+  {side}<main class="content content--code">
     {breadcrumb}
     <div class="codeview">{main}</div>
   </main>
 </div>"#,
         topbar = section_topbar(project, Section::Code, chrome),
         layout_cls = chrome.layout_class(),
-        tree = tree,
+        side = code_side(project, sidebar, Some(active), chrome),
         breadcrumb = breadcrumb,
         main = main,
     );
@@ -10029,10 +10061,10 @@ pub fn code_page(
 /// sidebar (compact nav) and the main pane (with sizes) — the two panes
 /// serve different roles, same as a file-explorer's tree-plus-detail split.
 pub fn code_dir_page(project: &Project, listing: &DirListing, chrome: PageChrome) -> String {
-    let tree = code_tree(project, listing, None, chrome);
     // D2: the tree alone, before the main pane's own copy of this listing is
     // built.
     if chrome.is_nav() {
+        let tree = code_tree(project, listing, None, chrome);
         let title = if listing.rel_path.is_empty() {
             project.name.as_str()
         } else {
@@ -10088,20 +10120,48 @@ pub fn code_dir_page(project: &Project, listing: &DirListing, chrome: PageChrome
     let body_html = format!(
         r#"{topbar}
 <div class="{layout_cls}">
-  <aside id="sidebar" class="sidebar">{tree}</aside>
-  <div class="sidebar-backdrop"></div>
-  <main class="content content--code">
+  {side}<main class="content content--code">
     {breadcrumb}
     <div class="codelist">{rows}</div>
   </main>
 </div>"#,
         topbar = section_topbar(project, Section::Code, chrome),
         layout_cls = chrome.layout_class(),
-        tree = tree,
+        side = code_side(project, listing, None, chrome),
         breadcrumb = breadcrumb,
         rows = rows,
     );
     layout_with_drawer(&title, "", &body_html, false)
+}
+
+/// The `#sidebar` column and the drawer backdrop under it, as the three
+/// pages that carry them have always emitted the pair — trailing indent
+/// included, so the markup around the call is byte-for-byte what it was.
+/// One place to build it is what lets panel mode (UAT) drop it in one place.
+fn sidebar_column(tree: &str) -> String {
+    format!(
+        "<aside id=\"sidebar\" class=\"sidebar\">{tree}</aside>\n  \
+         <div class=\"sidebar-backdrop\"></div>\n  "
+    )
+}
+
+/// The sidebar column of a Code page — or, in panel mode (UAT), the nothing
+/// that stands in for it.
+///
+/// The frame this page loads into on the homepage sits beside the file tree
+/// it was opened FROM, so a tree inside the frame is that tree twice. Panel
+/// mode drops the column and never builds [`code_tree`] for it; every other
+/// mode gets exactly the column both Code pages have always shown.
+fn code_side(
+    project: &Project,
+    listing: &DirListing,
+    active_file: Option<&str>,
+    chrome: PageChrome,
+) -> String {
+    if chrome.is_panel() {
+        return String::new();
+    }
+    sidebar_column(&code_tree(project, listing, active_file, chrome))
 }
 
 /// home-terminal-panel D2: a Code page reduced to its tree, for the homepage
@@ -10166,10 +10226,13 @@ fn changes_nav_page(project: &Project, view: &ChangesView, picker: &str) -> Stri
 fn changes_deep_link_prefix(project: &Project, view: &ChangesView) -> String {
     let sha = active_sha(&view.base);
     if sha.is_empty() {
-        format!("/p/{pid}/_changes?embed=1", pid = esc(&project.id))
+        format!(
+            "/p/{pid}/_changes?embed=1&amp;panel=1",
+            pid = esc(&project.id)
+        )
     } else {
         format!(
-            "/p/{pid}/_changes?embed=1&amp;commit={sha}",
+            "/p/{pid}/_changes?embed=1&amp;panel=1&amp;commit={sha}",
             pid = esc(&project.id),
             sha = esc(sha),
         )
@@ -10223,33 +10286,40 @@ pub fn changes_page(
     if chrome.is_nav() {
         return changes_nav_page(project, view, &picker);
     }
-    let (tree, main) = match &view.content {
-        ChangesContent::Unavailable(reason) => (
-            changes_nav_empty("No file list — see the note beside it."),
-            changes_unavailable(reason),
-        ),
-        ChangesContent::Diff(diff) if diff.files.is_empty() => (
-            changes_nav_empty("No changed files."),
-            changes_body(project, diff, &picker, render),
-        ),
-        ChangesContent::Diff(diff) => (
-            changes_nav(diff, ""),
-            changes_body(project, diff, &picker, render),
-        ),
+    let main = match &view.content {
+        ChangesContent::Unavailable(reason) => changes_unavailable(reason),
+        ChangesContent::Diff(diff) => changes_body(project, diff, &picker, render),
+    };
+    // UAT: in panel mode the changed-file list is already on screen — it is
+    // the sidebar this frame was opened FROM — so the page renders without
+    // its own copy, and without the backdrop the mobile drawer opens behind
+    // it. `changes_nav` is not built at all on that path: a list nobody can
+    // see is markup nobody asked for.
+    let side = if chrome.is_panel() {
+        String::new()
+    } else {
+        let tree = match &view.content {
+            ChangesContent::Unavailable(_) => {
+                changes_nav_empty("No file list — see the note beside it.")
+            }
+            ChangesContent::Diff(diff) if diff.files.is_empty() => {
+                changes_nav_empty("No changed files.")
+            }
+            ChangesContent::Diff(diff) => changes_nav(diff, ""),
+        };
+        sidebar_column(&tree)
     };
     let body_html = format!(
         r#"{topbar}
 <div class="{layout_cls}">
-  <aside id="sidebar" class="sidebar">{tree}</aside>
-  <div class="sidebar-backdrop"></div>
-  <main class="content content--changes">
+  {side}<main class="content content--changes">
     <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">{scope}</span></div></nav>
     <div class="changes" data-project-id="{pid}" data-base="{base}">{main}</div>
   </main>
 </div>"#,
         topbar = section_topbar(project, Section::Changes, chrome),
         layout_cls = chrome.layout_class(),
-        tree = tree,
+        side = side,
         pid = esc(&project.id),
         name = esc(&project.name),
         scope = esc(&scope),
@@ -10340,6 +10410,23 @@ fn base_picker(project: &Project, view: &ChangesView, chrome: PageChrome) -> Str
             "",
             String::new(),
             " target=\"_self\"",
+        )
+    } else if chrome.is_panel() {
+        // UAT: the picker is one of the header controls panel mode KEEPS, so
+        // both of its paths carry `panel=1` the way they already carry
+        // `embed=1` — the GET form as a second hidden field, the scripted
+        // handler as a second data attribute. A base picked inside the panel
+        // must come back as a panel page, not as one with the duplicate
+        // sidebar grown back.
+        (
+            "<input type=\"hidden\" name=\"embed\" value=\"1\">\
+             <input type=\"hidden\" name=\"panel\" value=\"1\">",
+            " data-embed=\"1\" data-panel=\"1\"",
+            format!(
+                "data-base-url=\"/p/{pid}/_changes\"",
+                pid = esc(&project.id)
+            ),
+            "",
         )
     } else if chrome.is_embed() {
         (
@@ -15316,8 +15403,8 @@ mod tests {
             "Diff must carry the Changes page's own nav-mode URL: {html}"
         );
         assert!(
-            html.contains(r#"data-panel-src="/p/proj-1/_changes?embed=1""#),
-            "the sidebar must carry the embedded Changes page the Diff tab drops into the panel (D1): {html}"
+            html.contains(r#"data-panel-src="/p/proj-1/_changes?embed=1&amp;panel=1""#),
+            "the sidebar must carry the embedded Changes page the Diff tab drops into the panel (D1), sidebar-less because this sidebar is it: {html}"
         );
         assert!(
             html.contains(r#"<div class="home-term__panel" hidden>"#),
@@ -24715,8 +24802,9 @@ mod tests {
     fn nav_changes_rows_deep_link_into_the_embedded_page() {
         let html = changes_html_nav(changes_fixture());
         assert!(
-            html.contains("href=\"/p/proj-1/_changes?embed=1#f0\""),
-            "the first row deep-links the embedded page at its section: {html}"
+            html.contains("href=\"/p/proj-1/_changes?embed=1&amp;panel=1#f0\""),
+            "the first row deep-links the embedded page at its section, and asks \
+             for it without the in-page sidebar this nav already is: {html}"
         );
         assert!(
             !html.contains("href=\"#f0\""),
@@ -24738,8 +24826,10 @@ mod tests {
         });
         let html = changes_html_nav(diff);
         assert!(
-            html.contains("href=\"/p/proj-1/_changes?embed=1&amp;commit=abc123def456#f0\""),
-            "the row carries the nav's own base: {html}"
+            html.contains(
+                "href=\"/p/proj-1/_changes?embed=1&amp;panel=1&amp;commit=abc123def456#f0\""
+            ),
+            "the row carries the nav's own base, panel mode and all: {html}"
         );
     }
 
@@ -24842,8 +24932,10 @@ mod tests {
             "and so does a subfolder: {html}"
         );
         assert!(
-            html.contains("<a class=\"chap-file\" href=\"/p/proj-1/_code/src/main.rs?embed=1\">"),
-            "a file row is an absolute embed link with no nav and no target: {html}"
+            html.contains(
+                "<a class=\"chap-file\" href=\"/p/proj-1/_code/src/main.rs?embed=1&amp;panel=1\">"
+            ),
+            "a file row is an absolute panel link with no nav and no target: {html}"
         );
         assert!(
             !html.contains("/p/proj-1/_code/src/main.rs?embed=1&amp;nav=1"),
@@ -24873,5 +24965,212 @@ mod tests {
                 "it is the same embedded page it was: {html}"
             );
         }
+    }
+
+    /// UAT: a Changes page in panel mode, so the panel tests below differ
+    /// from their embed twins by exactly one argument.
+    fn changes_html_panel(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &changes_view(diff),
+            &RenderService::new(),
+            PageChrome::Panel,
+        )
+    }
+
+    /// UAT, the whole of it: inside the homepage panel the page keeps every
+    /// part of itself EXCEPT the changed-file column, because that column is
+    /// already on screen as the sidebar the frame was opened from. The
+    /// header the user pointed at — count, base picker, reviewed counter —
+    /// and the diff sections themselves are untouched, now across the whole
+    /// frame.
+    #[test]
+    fn a_panel_changes_page_drops_the_duplicate_sidebar_and_keeps_the_screen() {
+        let html = changes_html_panel(changes_fixture());
+
+        assert!(
+            !html.contains("<aside id=\"sidebar\""),
+            "the in-page sidebar is the duplicate this mode exists to remove: {html}"
+        );
+        assert!(
+            !html.contains("changes-nav") && !html.contains("sidebar-backdrop"),
+            "and neither the list inside it nor the drawer backdrop under it \
+             is left behind: {html}"
+        );
+        assert!(
+            html.contains("class=\"layout layout--embed layout--panel\""),
+            "the layout marks itself panel BESIDE embed, so every sticky offset \
+             embed mode zeroes stays zeroed: {html}"
+        );
+
+        assert!(
+            html.contains("<span class=\"changes__count\">2 files changed</span>"),
+            "the header's file count stays: {html}"
+        );
+        assert!(
+            html.contains("changes__base-select"),
+            "the base picker stays: {html}"
+        );
+        assert!(
+            html.contains("changes__reviewed"),
+            "the reviewed counter stays: {html}"
+        );
+        assert!(
+            html.contains("changeset__head") && html.contains("changeset__review"),
+            "and every diff section, with its own reviewed mark: {html}"
+        );
+        assert!(
+            !html.contains("<header class=\"topbar\">"),
+            "panel mode is still an embed: no outer bar: {html}"
+        );
+    }
+
+    /// UAT: navigating inside the panel must come back as a panel page — a
+    /// picked base that returned the ordinary embed would put the duplicate
+    /// column straight back. Both of the picker's paths carry the flag, the
+    /// scripting-off form as a field and `app.js` as an attribute, exactly
+    /// as they already carry `embed`.
+    #[test]
+    fn a_panel_changes_page_carries_panel_through_its_base_picker() {
+        let html = changes_html_panel(changes_fixture());
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"embed\" value=\"1\">")
+                && html.contains("<input type=\"hidden\" name=\"panel\" value=\"1\">"),
+            "the scripting-off form submits both flags: {html}"
+        );
+        assert!(
+            html.contains("data-embed=\"1\" data-panel=\"1\""),
+            "and the scripted path is told about both: {html}"
+        );
+        assert!(
+            html.contains("data-base-url=\"/p/proj-1/_changes\""),
+            "the scripted handler still binds here — unlike nav mode, this \
+             page's picker navigates the frame it is in: {html}"
+        );
+    }
+
+    /// The JS half of the line above: the handler that rebuilds the picker's
+    /// URL reads the panel flag and puts it back on. Without this the panel
+    /// silently falls out of panel mode on the first base change.
+    #[test]
+    fn app_js_keeps_panel_on_the_base_pickers_own_navigation() {
+        let script = include_str!("../assets/app.js");
+        assert!(
+            script.contains(r#"var panel = sel.getAttribute("data-panel") === "1";"#)
+                && script.contains(r#"if (panel) q.push("panel=1");"#),
+            "the scripted base change must carry panel=1 the way it carries embed=1: {script}"
+        );
+    }
+
+    /// UAT on the Code section: the tree is the duplicate there — the Files
+    /// sidebar beside the frame is the same tree — so the panel gets the
+    /// file and nothing else. A directory keeps its own main-pane listing,
+    /// which is not a duplicate of anything.
+    #[test]
+    fn a_panel_code_page_drops_the_tree_and_keeps_the_file() {
+        let file = code_page(
+            &sample_project(),
+            "src/main.rs",
+            CodeBody::Binary { size: 42 },
+            &code_listing(),
+            PageChrome::Panel,
+        );
+        assert!(
+            !file.contains("<aside id=\"sidebar\"")
+                && !file.contains("chap-crumbs")
+                && !file.contains("sidebar-backdrop"),
+            "no tree column, and no drawer parts belonging to it: {file}"
+        );
+        assert!(
+            file.contains("class=\"codeview\"") && file.contains("Binary file"),
+            "the file itself is the whole point of the frame: {file}"
+        );
+        assert!(
+            file.contains("class=\"layout layout--embed layout--panel\""),
+            "panel rides beside embed here too: {file}"
+        );
+
+        let dir = code_dir_page(&sample_project(), &code_listing(), PageChrome::Panel);
+        assert!(
+            !dir.contains("<aside id=\"sidebar\"") && !dir.contains("chap-crumbs"),
+            "a directory drops the same column: {dir}"
+        );
+        assert!(
+            dir.contains("class=\"codelist\"") && dir.contains("codelist__row"),
+            "and keeps its own listing, which duplicates nothing: {dir}"
+        );
+    }
+
+    /// UAT: a link followed inside the panel must land back in the panel.
+    /// Every URL these pages build for themselves carries both flags, so
+    /// walking the breadcrumb or a folder row can never grow the duplicate
+    /// column back mid-session.
+    #[test]
+    fn panel_pages_carry_panel_through_their_own_links() {
+        let dir = code_dir_page(&sample_project(), &code_listing(), PageChrome::Panel);
+        assert!(
+            dir.contains("<a href=\"/p/proj-1/_code/?embed=1&amp;panel=1\">"),
+            "the breadcrumb root stays in the panel: {dir}"
+        );
+        assert!(
+            dir.contains("href=\"/p/proj-1/_code/src/app?embed=1&amp;panel=1\""),
+            "and so does a row of the listing: {dir}"
+        );
+        assert!(
+            !dir.contains("nav=1"),
+            "panel mode borrows nothing from nav mode: {dir}"
+        );
+    }
+
+    /// The other half, the one the prohibition names: `Embed` is untouched.
+    /// The project terminal page's own panel (cds-8) embeds these pages with
+    /// their sidebars intact, because there it is the only navigation in the
+    /// frame — so plain embed must keep rendering exactly what it did.
+    #[test]
+    fn embed_mode_is_untouched_by_panel_mode() {
+        for html in [
+            changes_html_embedded(changes_fixture()),
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Embed),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Embed,
+            ),
+        ] {
+            assert!(
+                html.contains("<aside id=\"sidebar\" class=\"sidebar\">")
+                    && html.contains("<div class=\"sidebar-backdrop\"></div>"),
+                "an embedded page keeps its own sidebar and backdrop: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout layout--embed\""),
+                "and its own layout class, with no panel modifier: {html}"
+            );
+            assert!(
+                !html.contains("panel=1") && !html.contains("data-panel"),
+                "and mentions the panel narrowing nowhere: {html}"
+            );
+        }
+    }
+
+    /// cds-8's panel, pinned as the thing this change must NOT touch: the
+    /// project terminal page embeds the same two pages, and there the
+    /// embedded sidebar is the only navigation in the frame. Its URLs stay
+    /// plain `?embed=1`.
+    #[test]
+    fn the_project_terminal_panel_stays_on_plain_embed_urls() {
+        let html = terminal_embed_panel("proj-1");
+        assert!(
+            html.contains(r#"data-embed-src="/p/proj-1/_code/?embed=1""#)
+                && html.contains(r#"data-embed-src="/p/proj-1/_changes?embed=1""#),
+            "the project page's panel embeds whole pages, sidebars included: {html}"
+        );
+        assert!(
+            !html.contains("panel=1"),
+            "it must never ask for the sidebar-less rendering — that sidebar is \
+             all the navigation this panel has: {html}"
+        );
     }
 }
