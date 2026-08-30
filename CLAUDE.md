@@ -7,7 +7,6 @@ AGENTS.md at context-load time. Never wrap it in backticks; that disables it.
 
 @AGENTS.md
 
-<!-- waggledance:START -->
 ## Building (Waggledance)
 
 For the dev loop — rebuilding the daemon to test a change — use the `fast`
@@ -21,6 +20,7 @@ cargo build --profile fast -p waggledance   # binary at target/fast/waggledance
 a one-line change; `fast` does the same rebuild in ~1 s. Reserve `--release` for
 release builds and size checks — CI and `release.yml` already use it.
 
+<!-- waggledance:START -->
 ## Documentation Viewing (Waggledance)
 
 After creating or updating any markdown file, make it viewable in ONE call —
