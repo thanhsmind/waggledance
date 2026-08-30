@@ -33,6 +33,7 @@
 .codex/hooks.json.bak
 .bee/mailbox/
 .bee/human-mailbox/
+.bee/result-inbox/
 # BEE:END
 # DISTILL:START
 /upstreams/
