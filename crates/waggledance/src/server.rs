@@ -7112,6 +7112,34 @@ async fn jump_search(
 struct ChangesQuery {
     #[serde(default)]
     commit: Option<String>,
+    /// D9's view flag, carried on the same query as `commit`. Read only by
+    /// [`page_chrome`], never by anything that touches the repository.
+    #[serde(default)]
+    embed: Option<String>,
+}
+
+/// The `embed` flag alone, for the two Code routes — the same field
+/// `ChangesQuery` carries, with nothing else on it.
+#[derive(serde::Deserialize)]
+struct CodeQuery {
+    #[serde(default)]
+    embed: Option<String>,
+}
+
+/// D9: how much chrome a Code or Changes page renders, decided from the
+/// `embed` query value and nothing else.
+///
+/// `embed=1` — and only that — asks for the chrome-less rendering. Absent,
+/// empty, `0`, `true`, or anything a reader made up all fall through to the
+/// full page, so an unrecognised value can never produce a stranger page
+/// than the one that route has always served. The value never reaches a
+/// filesystem path, a git argument, or the response body: it selects between
+/// two constants in `views` and stops there.
+fn page_chrome(embed: Option<&str>) -> views::PageChrome {
+    match embed.map(str::trim) {
+        Some("1") => views::PageChrome::Embed,
+        _ => views::PageChrome::Full,
+    }
 }
 
 /// The Changes screen: the project's working tree against HEAD (D2), or one
@@ -7146,12 +7174,13 @@ async fn changes_screen(
         Some(sha) => DiffBase::Commit(sha.to_string()),
         None => DiffBase::WorkingTree,
     };
+    let chrome = page_chrome(query.embed.as_deref());
     let engine = st.engine.clone();
     let project_id = id.clone();
     let page = tokio::task::spawn_blocking(move || {
         engine
             .changes(&project_id, &base)
-            .map(|view| views::changes_page(&project, &view, changes_highlighter()))
+            .map(|view| views::changes_page(&project, &view, changes_highlighter(), chrome))
     })
     .await;
     match page {
@@ -7173,15 +7202,20 @@ fn changes_highlighter() -> &'static RenderService {
     HIGHLIGHTER.get_or_init(RenderService::new)
 }
 
-async fn code_root(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    code_response(&st, &id, "").await
+async fn code_root(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CodeQuery>,
+) -> Response {
+    code_response(&st, &id, "", page_chrome(query.embed.as_deref())).await
 }
 
 async fn code_dir_or_file(
     State(st): State<AppState>,
     Path((id, path)): Path<(String, String)>,
+    Query(query): Query<CodeQuery>,
 ) -> Response {
-    code_response(&st, &id, &path).await
+    code_response(&st, &id, &path, page_chrome(query.embed.as_deref())).await
 }
 
 /// Shared body for both Code-section routes. Every filesystem access goes
@@ -7189,13 +7223,13 @@ async fn code_dir_or_file(
 /// this section — this function never computes a path itself. A denied path
 /// and a missing path return the identical 404 body: a distinguishing
 /// message would itself disclose that a denied file exists.
-async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
+async fn code_response(st: &AppState, id: &str, path: &str, chrome: views::PageChrome) -> Response {
     let Ok(Some(project)) = st.engine.get_project(id) else {
         return not_found("file not found");
     };
     match st.engine.code_path(id, path) {
         Ok(waggledance_core::engine::CodeView::Dir(listing)) => {
-            Html(views::code_dir_page(&project, &listing)).into_response()
+            Html(views::code_dir_page(&project, &listing, chrome)).into_response()
         }
         Ok(waggledance_core::engine::CodeView::File {
             highlighted,
@@ -7212,6 +7246,7 @@ async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
                     size,
                 },
                 &sidebar,
+                chrome,
             ))
             .into_response()
         }
@@ -7222,6 +7257,7 @@ async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
                 path,
                 views::CodeBody::Binary { size },
                 &sidebar,
+                chrome,
             ))
             .into_response()
         }
@@ -34074,6 +34110,114 @@ mod bee_route_tests {
         assert!(
             body.contains("class=\"changes\""),
             "the Changes screen answered, not the document catch-all: {body}"
+        );
+    }
+
+    /// cds-7 / D9: `?embed=1` on the Changes route serves the same screen
+    /// with no topbar, so a same-origin iframe carries one application bar
+    /// rather than two. The whole point is that only the bar goes: the
+    /// changed-file sidebar, the base picker and the reviewed marks are all
+    /// still on the page, and a real repository is what proves it — the
+    /// picker only renders where there is a diff to pick a base for.
+    #[tokio::test]
+    async fn changes_route_with_embed_drops_the_topbar_and_keeps_the_screen() {
+        let dir = fresh_root("changes-embed");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the view unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-embed");
+        let app = router(st);
+
+        let plain =
+            body_string(get(app.clone(), &format!("/p/{}/_changes", project.id)).await).await;
+        assert!(
+            plain.contains("<header class=\"topbar\">"),
+            "the ordinary page still has its bar: {plain}"
+        );
+
+        let resp = get(app.clone(), &format!("/p/{}/_changes?embed=1", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("<header class=\"topbar\">") && !body.contains("section-switch"),
+            "embed=1 serves the screen with no outer chrome: {body}"
+        );
+        assert!(
+            body.contains("class=\"layout layout--embed\""),
+            "and says so, so app.css can drop the topbar offset: {body}"
+        );
+        assert!(
+            body.contains("changes-nav") && body.contains("mod.txt"),
+            "the changed-file sidebar is still the point of the screen: {body}"
+        );
+        assert!(
+            body.contains("changes__base-select") && body.contains("data-embed=\"1\""),
+            "the base picker stays and keeps the reader in the frame: {body}"
+        );
+        assert!(
+            body.contains("changeset__review"),
+            "the reviewed marks stay: {body}"
+        );
+
+        // Anything that is not `embed=1` is the page as it always was.
+        for raw in ["0", "true", "", "yes"] {
+            let body = body_string(
+                get(
+                    app.clone(),
+                    &format!("/p/{}/_changes?embed={raw}", project.id),
+                )
+                .await,
+            )
+            .await;
+            assert!(
+                body.contains("<header class=\"topbar\">"),
+                "an unrecognised embed value renders normal chrome ({raw}): {body}"
+            );
+        }
+    }
+
+    /// cds-7 / D9 on the Code section: the tree is the whole reason to embed
+    /// this page, so its links have to keep the reader inside the frame they
+    /// were clicked in.
+    #[tokio::test]
+    async fn code_routes_with_embed_drop_the_topbar_and_keep_the_tree_embedded() {
+        let dir = fresh_root("code-embed");
+        write(&dir, "src/main.rs", "fn main() {}\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "code-embed");
+        let app = router(st);
+
+        for path in ["_code/", "_code/src", "_code/src/main.rs"] {
+            let resp = get(app.clone(), &format!("/p/{}/{path}?embed=1", project.id)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = body_string(resp).await;
+            assert!(
+                !body.contains("<header class=\"topbar\">") && !body.contains("section-switch"),
+                "embed=1 drops the chrome on {path}: {body}"
+            );
+            assert!(
+                body.contains("class=\"layout layout--embed\""),
+                "and marks the layout embedded on {path}: {body}"
+            );
+            assert!(
+                body.contains(&format!("href=\"/p/{}/_code/?embed=1\"", project.id)),
+                "the tree's root crumb carries embed on {path}: {body}"
+            );
+        }
+
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_code/src", project.id)).await).await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && !body.contains("embed=1"),
+            "without the param the Code page is untouched: {body}"
         );
     }
 }

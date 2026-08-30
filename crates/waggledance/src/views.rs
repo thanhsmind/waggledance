@@ -9358,7 +9358,14 @@ pub fn file_page(
 ) -> String {
     let tree = file_tree(project, files, &file.rel_path);
     let right = right_panel(project, page, backlinks);
-    let breadcrumb = breadcrumb(project, "", &file.rel_path, true, copy_md_button());
+    let breadcrumb = breadcrumb(
+        project,
+        "",
+        &file.rel_path,
+        true,
+        copy_md_button(),
+        PageChrome::Full,
+    );
     // Raw markdown source for copy-as-markdown: the client maps a DOM selection
     // (via data-sourcepos line ranges) back to these source lines. Escape `<`
     // so a source containing "</script>" can't break out of the tag.
@@ -9495,12 +9502,24 @@ fn right_panel(project: &Project, page: &RenderedPage, backlinks: &[(String, Str
 /// copy-as-markdown button, or a code file's type/size) — `""` for pages
 /// with nothing to put there. `narrow`, true for Docs only, caps the bar's
 /// width to match `.fg-reading` (the markdown column below it); Code's bar
-/// stays full-width, matching its own full-width main pane.
-fn breadcrumb(project: &Project, base: &str, rel_path: &str, narrow: bool, right: &str) -> String {
+/// stays full-width, matching its own full-width main pane. `chrome` is D9:
+/// the one crumb that IS a link carries `?embed=1` when the page is
+/// embedded, so clicking the project root inside a frame stays inside it.
+/// Docs always passes `PageChrome::Full` — `/p/:id/` has no embed mode to
+/// carry into.
+fn breadcrumb(
+    project: &Project,
+    base: &str,
+    rel_path: &str,
+    narrow: bool,
+    right: &str,
+    chrome: PageChrome,
+) -> String {
     let mut crumbs = format!(
-        "<a href=\"/p/{pid}/{base}\">{name}</a>",
+        "<a href=\"/p/{pid}/{base}{q}\">{name}</a>",
         pid = esc(&project.id),
         base = base,
+        q = chrome.link_query(),
         name = esc(&project.name)
     );
     for seg in rel_path.split('/').filter(|s| !s.is_empty()) {
@@ -9523,6 +9542,54 @@ enum Section {
     Code,
     /// The Changes screen — the working-tree diff (D2).
     Changes,
+}
+
+/// D9: how much of the outer chrome a Code or Changes page renders.
+///
+/// `Embed` is what `?embed=1` asks for: the SAME page, minus the topbar —
+/// so a same-origin iframe (the terminal screen's FILES | DIFF panel, D8)
+/// shows the file list, the base picker and the reviewed marks without a
+/// second application bar stacked inside the frame. Everything inside the
+/// `.layout` is untouched; only the bar above it, and the sticky offsets
+/// that were measured against it, differ.
+///
+/// It is not a second render path (D9): the same functions render both,
+/// and any value other than `embed=1` — absent, empty, `0`, anything —
+/// lands on `Full`, which is byte-for-byte the page as it was before this
+/// existed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PageChrome {
+    Full,
+    Embed,
+}
+
+impl PageChrome {
+    fn is_embed(self) -> bool {
+        self == PageChrome::Embed
+    }
+
+    /// The query an in-page link must carry to stay inside the frame it was
+    /// clicked in. Only ever appended to a URL this module builds with no
+    /// query of its own, so `?` is always the right separator.
+    fn link_query(self) -> &'static str {
+        if self.is_embed() {
+            "?embed=1"
+        } else {
+            ""
+        }
+    }
+
+    /// The `.layout` element's class list. `layout--embed` is what app.css
+    /// hangs the dropped topbar offset on — with no 53px bar above them,
+    /// the sticky sidebar, the code pane and a file section's sticky header
+    /// stick to the frame's own top edge instead.
+    fn layout_class(self) -> &'static str {
+        if self.is_embed() {
+            "layout layout--embed"
+        } else {
+            "layout"
+        }
+    }
 }
 
 /// Docs|Code toggle for the top bar. The only change `file_page` makes to
@@ -9552,6 +9619,24 @@ fn section_switch(project: &Project, active: Section) -> String {
     )
 }
 
+/// The top bar a Code or Changes page renders — or, under D9's `embed=1`,
+/// the nothing it renders instead.
+///
+/// The whole of the outer chrome these two sections carry lives on that one
+/// bar: the section switch, the mobile drawer's hamburger, the menu, the
+/// agent and theme toggles. Dropping the bar therefore drops all of it in
+/// one place, and every element the page is actually FOR — the sidebar, the
+/// base picker, the reviewed marks — is below it and untouched. The
+/// `.layout` class beside this ([`PageChrome::layout_class`]) is what tells
+/// app.css that the 53px every sticky offset below assumes is no longer
+/// there.
+fn section_topbar(project: &Project, section: Section, chrome: PageChrome) -> String {
+    if chrome.is_embed() {
+        return String::new();
+    }
+    topbar_full(sidebar_toggle(), &section_switch(project, section), "", "")
+}
+
 /// What the main pane of a Code-section file page shows: highlighted source,
 /// or a binary notice (never a garbled render of raw bytes).
 pub enum CodeBody<'a> {
@@ -9575,9 +9660,10 @@ pub fn code_page(
     rel_path: &str,
     body: CodeBody,
     sidebar: &DirListing,
+    chrome: PageChrome,
 ) -> String {
     let active = base_name(rel_path);
-    let tree = code_tree(project, sidebar, Some(active));
+    let tree = code_tree(project, sidebar, Some(active), chrome);
 
     let (main, meta) = match body {
         CodeBody::Binary { size } => (
@@ -9623,11 +9709,11 @@ pub fn code_page(
             (main, meta)
         }
     };
-    let breadcrumb = breadcrumb(project, "_code/", rel_path, false, &meta);
+    let breadcrumb = breadcrumb(project, "_code/", rel_path, false, &meta, chrome);
 
     let body_html = format!(
         r#"{topbar}
-<div class="layout">
+<div class="{layout_cls}">
   <aside id="sidebar" class="sidebar">{tree}</aside>
   <div class="sidebar-backdrop"></div>
   <main class="content content--code">
@@ -9635,12 +9721,8 @@ pub fn code_page(
     <div class="codeview">{main}</div>
   </main>
 </div>"#,
-        topbar = topbar_full(
-            sidebar_toggle(),
-            &section_switch(project, Section::Code),
-            "",
-            "",
-        ),
+        topbar = section_topbar(project, Section::Code, chrome),
+        layout_cls = chrome.layout_class(),
         tree = tree,
         breadcrumb = breadcrumb,
         main = main,
@@ -9651,17 +9733,18 @@ pub fn code_page(
 /// A directory in the Code section: the same listing rendered both in the
 /// sidebar (compact nav) and the main pane (with sizes) — the two panes
 /// serve different roles, same as a file-explorer's tree-plus-detail split.
-pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
-    let tree = code_tree(project, listing, None);
-    let breadcrumb = breadcrumb(project, "_code/", &listing.rel_path, false, "");
+pub fn code_dir_page(project: &Project, listing: &DirListing, chrome: PageChrome) -> String {
+    let tree = code_tree(project, listing, None, chrome);
+    let breadcrumb = breadcrumb(project, "_code/", &listing.rel_path, false, "", chrome);
 
     let mut rows = String::new();
     if !listing.rel_path.is_empty() {
         let parent = parent_dir(&listing.rel_path);
         rows.push_str(&format!(
-            "<a class=\"codelist__row codelist__row--dir\" href=\"/p/{pid}/_code/{parent}\">.. </a>",
+            "<a class=\"codelist__row codelist__row--dir\" href=\"/p/{pid}/_code/{parent}{q}\">.. </a>",
             pid = esc(&project.id),
             parent = esc(parent),
+            q = chrome.link_query(),
         ));
     }
     for entry in &listing.entries {
@@ -9682,10 +9765,11 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
             format_size(entry.size)
         };
         rows.push_str(&format!(
-            "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}\"><span class=\"codelist__name\">{label}</span><span class=\"codelist__size\">{size}</span></a>",
+            "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}{q}\"><span class=\"codelist__name\">{label}</span><span class=\"codelist__size\">{size}</span></a>",
             cls = cls,
             pid = esc(&project.id),
             rel = esc(&rel),
+            q = chrome.link_query(),
             label = esc(&label),
             size = size,
         ));
@@ -9698,7 +9782,7 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
     };
     let body_html = format!(
         r#"{topbar}
-<div class="layout">
+<div class="{layout_cls}">
   <aside id="sidebar" class="sidebar">{tree}</aside>
   <div class="sidebar-backdrop"></div>
   <main class="content content--code">
@@ -9706,12 +9790,8 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
     <div class="codelist">{rows}</div>
   </main>
 </div>"#,
-        topbar = topbar_full(
-            sidebar_toggle(),
-            &section_switch(project, Section::Code),
-            "",
-            "",
-        ),
+        topbar = section_topbar(project, Section::Code, chrome),
+        layout_cls = chrome.layout_class(),
         tree = tree,
         breadcrumb = breadcrumb,
         rows = rows,
@@ -9745,9 +9825,20 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
 /// Git being unavailable, the project not being a repository, and a call
 /// that had to be killed all render an explained empty state here (D3) —
 /// the entry point stays, only its content changes.
-pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderService) -> String {
+///
+/// `chrome` is D9: `PageChrome::Embed` renders this exact page without the
+/// topbar, for a same-origin iframe. Nothing inside the `.layout` changes —
+/// the changed-file sidebar, the base picker and the reviewed marks are all
+/// still here — and the picker carries the flag onward so a base change
+/// inside a frame stays inside it.
+pub fn changes_page(
+    project: &Project,
+    view: &ChangesView,
+    render: &RenderService,
+    chrome: PageChrome,
+) -> String {
     let scope = base_label(&view.base);
-    let picker = base_picker(project, view);
+    let picker = base_picker(project, view, chrome);
     let (tree, main) = match &view.content {
         ChangesContent::Unavailable(reason) => (
             changes_nav_empty("No file list — see the note beside it."),
@@ -9764,7 +9855,7 @@ pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderServic
     };
     let body_html = format!(
         r#"{topbar}
-<div class="layout">
+<div class="{layout_cls}">
   <aside id="sidebar" class="sidebar">{tree}</aside>
   <div class="sidebar-backdrop"></div>
   <main class="content content--changes">
@@ -9772,12 +9863,8 @@ pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderServic
     <div class="changes" data-project-id="{pid}" data-base="{base}">{main}</div>
   </main>
 </div>"#,
-        topbar = topbar_full(
-            sidebar_toggle(),
-            &section_switch(project, Section::Changes),
-            "",
-            "",
-        ),
+        topbar = section_topbar(project, Section::Changes, chrome),
+        layout_cls = chrome.layout_class(),
         tree = tree,
         pid = esc(&project.id),
         name = esc(&project.name),
@@ -9831,7 +9918,7 @@ fn active_sha(base: &ActiveBase) -> &str {
 /// lower case is the page's own claim about what it is showing (the
 /// breadcrumb, the header's empty state), and a picker that always offers
 /// the choice must not be mistaken for the page making that claim.
-fn base_picker(project: &Project, view: &ChangesView) -> String {
+fn base_picker(project: &Project, view: &ChangesView, chrome: PageChrome) -> String {
     let active = active_sha(&view.base);
     let mut options = format!(
         "<option value=\"\"{sel}>Working tree</option>",
@@ -9848,15 +9935,30 @@ fn base_picker(project: &Project, view: &ChangesView) -> String {
     for commit in &view.commits {
         options.push_str(&commit_option(commit, commit.sha == active));
     }
+    // D9: a picked base must not navigate the frame out of embed mode. A GET
+    // form drops any query already in its `action`, so the flag rides as a
+    // field of the form itself; `data-embed` is the same answer for the
+    // scripted path, which builds its own URL in `app.js`.
+    let (embed_field, embed_attr) = if chrome.is_embed() {
+        (
+            "<input type=\"hidden\" name=\"embed\" value=\"1\">",
+            " data-embed=\"1\"",
+        )
+    } else {
+        ("", "")
+    };
     format!(
         "<form class=\"changes__base\" method=\"get\" action=\"/p/{pid}/_changes\">\
          <label class=\"changes__base-label\" for=\"changes-base\">Comparing</label>\
          <select class=\"changes__base-select\" id=\"changes-base\" name=\"commit\" \
-         data-base-url=\"/p/{pid}/_changes\">{options}</select>\
+         data-base-url=\"/p/{pid}/_changes\"{embed_attr}>{options}</select>\
+         {embed_field}\
          <button class=\"changes__base-go\" type=\"submit\">Show</button>\
          </form>",
         pid = esc(&project.id),
+        embed_attr = embed_attr,
         options = options,
+        embed_field = embed_field,
     )
 }
 
@@ -10326,7 +10428,12 @@ fn changes_row(
 /// script in `app.js` wires the folder bar's click-to-toggle behavior once
 /// at load (this HTML needs no JS to render correctly, only to become
 /// interactive).
-fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>) -> String {
+fn code_tree(
+    project: &Project,
+    listing: &DirListing,
+    active_file: Option<&str>,
+    chrome: PageChrome,
+) -> String {
     let mut out = String::from(
         "<div class=\"fg-sidebar-search\">\
          <input class=\"fg-input\" placeholder=\"Search…\" autocomplete=\"off\" disabled></div>\
@@ -10334,8 +10441,9 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
     );
 
     let mut crumbs = format!(
-        "<a class=\"chap-seg\" href=\"/p/{pid}/_code/\">{name}</a>",
+        "<a class=\"chap-seg\" href=\"/p/{pid}/_code/{q}\">{name}</a>",
         pid = esc(&project.id),
+        q = chrome.link_query(),
         name = esc(&project.name),
     );
     let mut acc = String::new();
@@ -10345,9 +10453,10 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
         }
         acc.push_str(seg);
         crumbs.push_str(&format!(
-            "<span class=\"chap-sep\">›</span><a class=\"chap-seg\" href=\"/p/{pid}/_code/{acc}\">{seg}</a>",
+            "<span class=\"chap-sep\">›</span><a class=\"chap-seg\" href=\"/p/{pid}/_code/{acc}{q}\">{seg}</a>",
             pid = esc(&project.id),
             acc = esc(&acc),
+            q = chrome.link_query(),
             seg = esc(seg),
         ));
     }
@@ -10361,9 +10470,10 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
         if entry.is_dir {
             dir_count += 1;
             dirs.push_str(&format!(
-                "<a class=\"chap-subfolder\" href=\"/p/{pid}/_code/{rel}\">{name}</a>",
+                "<a class=\"chap-subfolder\" href=\"/p/{pid}/_code/{rel}{q}\">{name}</a>",
                 pid = esc(&project.id),
                 rel = esc(&rel),
+                q = chrome.link_query(),
                 name = esc(&entry.name),
             ));
         } else {
@@ -10373,10 +10483,11 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
                 "chap-file"
             };
             files.push_str(&format!(
-                "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}\">{name}</a>",
+                "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}{q}\">{name}</a>",
                 cls = cls,
                 pid = esc(&project.id),
                 rel = esc(&rel),
+                q = chrome.link_query(),
                 name = esc(&entry.name),
             ));
         }
@@ -22343,6 +22454,18 @@ mod tests {
             &sample_project(),
             &changes_view(diff),
             &RenderService::new(),
+            PageChrome::Full,
+        )
+    }
+
+    /// The same page under D9's `embed=1`, so an embed test differs from its
+    /// full-chrome twin by exactly one argument.
+    fn changes_html_embedded(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &changes_view(diff),
+            &RenderService::new(),
+            PageChrome::Embed,
         )
     }
 
@@ -22475,6 +22598,7 @@ mod tests {
                 commits,
             },
             &RenderService::new(),
+            PageChrome::Full,
         )
     }
 
@@ -22740,6 +22864,7 @@ mod tests {
                 base: ActiveBase::WorkingTree,
             },
             &RenderService::new(),
+            PageChrome::Full,
         );
         assert!(
             html.contains("git command line"),
@@ -22778,6 +22903,152 @@ mod tests {
             assert!(
                 nav.contains(&format!("href=\"{current_href}\" aria-current=\"page\"")),
                 "the active section is the marked one: {nav}"
+            );
+        }
+    }
+
+    /// A directory a Code page can be rendered from: one subfolder and one
+    /// file, so both kinds of sidebar link are on the page at once.
+    fn code_listing() -> DirListing {
+        DirListing {
+            rel_path: "src".into(),
+            entries: vec![
+                waggledance_core::code_source::DirEntry {
+                    name: "app".into(),
+                    is_dir: true,
+                    size: 0,
+                },
+                waggledance_core::code_source::DirEntry {
+                    name: "main.rs".into(),
+                    is_dir: false,
+                    size: 42,
+                },
+            ],
+        }
+    }
+
+    /// D9: `embed=1` takes the topbar off the Changes screen and nothing
+    /// else. What the screen is FOR — the changed-file sidebar, the base
+    /// picker, the reviewed marks — is still every bit of it there, and the
+    /// layout says it is embedded so app.css can drop the 53px offset its
+    /// sticky elements were measured against.
+    #[test]
+    fn an_embedded_changes_page_drops_the_topbar_and_keeps_the_screen() {
+        let html = changes_html_embedded(changes_fixture());
+
+        assert!(
+            !html.contains("<header class=\"topbar\">"),
+            "no topbar inside the frame: {html}"
+        );
+        assert!(
+            !html.contains("section-switch"),
+            "and none of the chrome that lived on it: {html}"
+        );
+        assert!(
+            !html.contains("id=\"sidebar-toggle\""),
+            "including the drawer toggle: {html}"
+        );
+
+        assert!(
+            html.contains("class=\"layout layout--embed\""),
+            "the layout marks itself embedded: {html}"
+        );
+        assert!(
+            html.contains("changes-nav"),
+            "the changed-file sidebar stays: {html}"
+        );
+        assert!(
+            html.contains("changes__base-select"),
+            "the base picker stays: {html}"
+        );
+        assert!(
+            html.contains("changeset__review"),
+            "the reviewed marks stay: {html}"
+        );
+    }
+
+    /// D9: navigating inside the frame must stay inside it. The picker is the
+    /// one control on this screen that navigates, and it has two paths — the
+    /// plain GET form (which drops any query already in its `action`, so the
+    /// flag rides as a field) and `app.js` (which reads `data-embed`).
+    #[test]
+    fn an_embedded_changes_page_carries_embed_through_its_base_picker() {
+        let html = changes_html_embedded(changes_fixture());
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"embed\" value=\"1\">"),
+            "the scripting-off form submits the flag: {html}"
+        );
+        assert!(
+            html.contains("data-embed=\"1\""),
+            "and the scripted path is told about it: {html}"
+        );
+    }
+
+    /// D9 on the Code section: same page, no bar, and every link the tree
+    /// offers keeps the reader in the frame — the crumbs up, the subfolders
+    /// down, and the files themselves.
+    #[test]
+    fn an_embedded_code_page_carries_embed_through_its_sidebar_links() {
+        for html in [
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Embed),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Embed,
+            ),
+        ] {
+            assert!(
+                !html.contains("<header class=\"topbar\">"),
+                "no topbar inside the frame: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout layout--embed\""),
+                "the layout marks itself embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/?embed=1\""),
+                "the root crumb stays embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/src/app?embed=1\""),
+                "a subfolder link stays embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/src/main.rs?embed=1\""),
+                "a file link stays embedded: {html}"
+            );
+        }
+    }
+
+    /// The other half of D9: without the flag these pages are the pages they
+    /// have always been — the bar is there, no link carries a query it never
+    /// carried, and nothing claims to be embedded.
+    #[test]
+    fn without_the_embed_flag_the_pages_keep_their_chrome() {
+        for html in [
+            changes_html(changes_fixture()),
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Full),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Full,
+            ),
+        ] {
+            assert!(
+                html.contains("<header class=\"topbar\">"),
+                "the topbar is where it was: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout\""),
+                "and the layout carries no embed modifier: {html}"
+            );
+            assert!(
+                !html.contains("embed=1"),
+                "no link and no field mentions embedding: {html}"
             );
         }
     }

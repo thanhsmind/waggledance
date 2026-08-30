@@ -1659,7 +1659,16 @@
         visible.sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
         setActive("#" + visible[0].target.id);
       },
-      { rootMargin: "-53px 0px -70% 0px", threshold: 0 }
+      // The top inset is the topbar's own rendered height, so a section
+      // counts as "current" from the moment it clears the bar. Under D9's
+      // `embed=1` there IS no bar (`.layout--embed`), and keeping the inset
+      // would hand the highlight to the next section 53px early.
+      {
+        rootMargin:
+          (document.querySelector(".layout--embed") ? "0px" : "-53px") +
+          " 0px -70% 0px",
+        threshold: 0,
+      }
     );
     sections.forEach(function (s) { observer.observe(s); });
   })();
@@ -1678,17 +1687,26 @@
   // The surrounding `<form>` is what works with scripting off, so the submit
   // button only earns its place there — here it is hidden, because the
   // change handler has already done the navigating.
+  //
+  // D9: on an embedded page (`data-embed="1"`, the same flag the form's own
+  // hidden field carries for the scripting-off path) the navigation keeps
+  // `embed=1` on it — picking a base inside an iframe must not replace the
+  // frame with a full-chrome page.
   (function () {
     var sel = document.querySelector(".changes__base-select[data-base-url]");
     if (!sel) return;
     var url = sel.getAttribute("data-base-url");
     if (!url) return;
+    var embed = sel.getAttribute("data-embed") === "1";
     var go = sel.form && sel.form.querySelector(".changes__base-go");
     if (go) go.hidden = true;
     sel.addEventListener("change", function () {
       var v = sel.value || "";
       if (v && !/^[0-9a-f]{4,40}$/.test(v)) return;
-      window.location.href = v ? url + "?commit=" + encodeURIComponent(v) : url;
+      var q = [];
+      if (v) q.push("commit=" + encodeURIComponent(v));
+      if (embed) q.push("embed=1");
+      window.location.href = q.length ? url + "?" + q.join("&") : url;
     });
   })();
 

@@ -3657,3 +3657,42 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
     padding-right: var(--space-3);
   }
 }
+
+/* ============================================================
+   EMBED MODE (changes-diff-screen, D9)
+   `?embed=1` renders the Code and Changes pages without the topbar, for a
+   same-origin iframe (the terminal screen's FILES | DIFF panel). The markup
+   below the bar is unchanged — the only thing that has to move is the sticky
+   geometry, because every offset above was measured against the topbar's
+   53px and there is now nothing above them at all. Each rule here is exactly
+   one of those offsets, zeroed. Placed last in the file on purpose: the
+   drawer rules it overrides carry the same specificity, so source order is
+   what decides.
+   ============================================================ */
+.layout--embed > .sidebar,
+.layout--embed > .rightbar {
+  height: 100vh;
+  top: 0;
+}
+.layout--embed > .content--code {
+  height: 100vh;
+}
+/* A file section's own sticky header: it stopped under the bar, now it stops
+   at the frame's top edge. */
+.layout--embed .changeset__head {
+  top: 0;
+}
+/* Anchor navigation (a sidebar row jumping to its section) reserved the bar's
+   height so the target never landed under it; with no bar, that reserve is
+   just a gap above every jump. */
+html:has(.layout--embed) {
+  scroll-padding-top: var(--space-3);
+}
+@media (max-width: 700px) {
+  .layout--embed.sidebar-open .sidebar {
+    top: 0;
+  }
+  .layout--embed.sidebar-open .sidebar-backdrop {
+    inset: 0;
+  }
+}
