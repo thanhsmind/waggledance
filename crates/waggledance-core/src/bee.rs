@@ -205,9 +205,14 @@ pub struct BeeState {
     /// `waiting_on_is_live`: `true` only when `waiting_on` is a JSON object
     /// carrying a non-empty (after trim) string `kind` AND a non-empty
     /// (after trim) string `subject`; `null`, an absent key, a non-object
-    /// value, or an empty field all read `false`. Deliberately carries no
-    /// whitelist of `kind` values, so a `kind` bee introduces later still
-    /// reads live here. Badge semantics: a live mark means "a human is
+    /// value, or an empty field all read `false`. Exactly one `kind` is
+    /// excluded by name (board-visibility D4): `turn-end`, which AGENTS.md
+    /// gives the Stop hook for every ordinary turn end — "control back with
+    /// the human and nothing owed" — is the idle mark, not a demand, and
+    /// reads `false`. There is deliberately no whitelist in the other
+    /// direction: a `kind` bee introduces later still reads live here, so an
+    /// unrecognised demand surfaces instead of disappearing.
+    /// Badge semantics: a live mark means "a human is
     /// being waited on right now" — `run_state == "awaiting-approval"`
     /// alone must not earn the danger badge, because bee derives that
     /// run_state whenever any gate is pending with none later approved,
@@ -1933,9 +1938,29 @@ fn waiting_on_is_live(v: &Value) -> bool {
             let non_empty = |key: &str| {
                 w.get(key)
                     .and_then(Value::as_str)
-                    .is_some_and(|s| !s.trim().is_empty())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
             };
-            non_empty("kind") && non_empty("subject")
+            let Some(kind) = non_empty("kind") else {
+                return false;
+            };
+            if non_empty("subject").is_none() {
+                return false;
+            }
+            // board-visibility D4: `turn-end` is the one kind that is not a
+            // demand. AGENTS.md defines it as the mark the Stop hook sets on
+            // every ordinary turn end — "control back with the human and
+            // nothing owed" — so it records that a session went idle, not
+            // that anyone is being waited on. Matched literally (trimmed,
+            // case-sensitive) against the string bee itself writes.
+            //
+            // Every other kind — including one bee introduces after this was
+            // written — stays live, and that default is deliberate: an
+            // unrecognised kind that really is a demand must show on the
+            // board and be argued with, never be silently swallowed by a
+            // reader that has not heard of it. This exclusion grows only on
+            // evidence, one named kind at a time.
+            kind != "turn-end"
         })
         .unwrap_or(false)
 }
@@ -11153,6 +11178,90 @@ mod tests {
         assert!(
             !snap.state.as_ref().unwrap().waiting_on_live,
             "a whitespace-only subject must never read as live"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // board-visibility D4: a finished turn is not a wait on the human.
+
+    /// The `turn-end` mark AGENTS.md gives the Stop hook means "control back
+    /// with the human and nothing owed" — the store's own live lanes carry
+    /// subjects like "Không còn gì chờ bạn" ("nothing is waiting on you")
+    /// under it — so it must never light a needs-you surface, however
+    /// well-formed its `subject` is.
+    #[test]
+    fn state_json_waiting_on_turn_end_reads_not_live() {
+        for subject in ["Không còn gì chờ bạn", "board is green"] {
+            let root = fresh_root("state-waiting-on-turn-end");
+            write(
+                &root,
+                ".bee/state.json",
+                &format!(
+                    r#"{{"phase":"swarming","waiting_on":{{"kind":"turn-end","subject":"{subject}"}}}}"#
+                ),
+            );
+            let snap = read_snapshot(&root);
+            assert!(
+                !snap.state.as_ref().unwrap().waiting_on_live,
+                "a turn-end mark is the idle mark, never a wait on the human \
+                 (subject {subject:?})"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // Only the exact string bee writes is excluded — a kind that merely
+        // contains or resembles it is still a demand.
+        let root = fresh_root("state-waiting-on-turn-end-lookalike");
+        write(
+            &root,
+            ".bee/state.json",
+            r#"{"phase":"swarming","waiting_on":{"kind":"turn-ended","subject":"still owed"}}"#,
+        );
+        let snap = read_snapshot(&root);
+        assert!(
+            snap.state.as_ref().unwrap().waiting_on_live,
+            "only the literal kind \"turn-end\" is excluded"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The two kinds an agent may set itself stay live, and so does a kind
+    /// this reader has never heard of: the exclusion is one named kind, not
+    /// a whitelist, so a future demand surfaces rather than disappearing.
+    #[test]
+    fn state_json_waiting_on_gate_question_and_unknown_kinds_read_live() {
+        for kind in ["gate", "question", "some-kind-bee-adds-later"] {
+            let root = fresh_root("state-waiting-on-live-kinds");
+            write(
+                &root,
+                ".bee/state.json",
+                &format!(
+                    r#"{{"phase":"swarming","waiting_on":{{"kind":"{kind}","subject":"shape gate"}}}}"#
+                ),
+            );
+            let snap = read_snapshot(&root);
+            assert!(
+                snap.state.as_ref().unwrap().waiting_on_live,
+                "kind {kind:?} must read as a live wait on the human"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// The kind field carries the same emptiness rule the subject already
+    /// had: a blank kind is not a demand either, and never was.
+    #[test]
+    fn state_json_waiting_on_blank_kind_reads_not_live() {
+        let root = fresh_root("state-waiting-on-blank-kind");
+        write(
+            &root,
+            ".bee/state.json",
+            r#"{"phase":"swarming","waiting_on":{"kind":"   ","subject":"shape gate"}}"#,
+        );
+        let snap = read_snapshot(&root);
+        assert!(
+            !snap.state.as_ref().unwrap().waiting_on_live,
+            "a whitespace-only kind must never read as live"
         );
         std::fs::remove_dir_all(&root).ok();
     }
