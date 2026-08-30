@@ -12,7 +12,12 @@ use waggledance_core::bee::{
 use waggledance_core::code_source::DirListing;
 use waggledance_core::config::Config;
 use waggledance_core::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
-use waggledance_core::render::HighlightedSource;
+use waggledance_core::engine::ChangesView;
+use waggledance_core::git_diff::{
+    ChangeBody, ChangeStatus, DiffLine, FileChange, GitDiffError, LineKind, WorkingTreeDiff,
+};
+use waggledance_core::render::{HighlightedSource, RenderService};
+use waggledance_core::short_link::{path_hash, short_code};
 
 pub fn layout(title: &str, head_extra: &str, body: &str) -> String {
     let title = esc(title);
@@ -9511,6 +9516,8 @@ fn breadcrumb(project: &Project, base: &str, rel_path: &str, narrow: bool, right
 enum Section {
     Docs,
     Code,
+    /// The Changes screen — the working-tree diff (D2).
+    Changes,
 }
 
 /// Docs|Code toggle for the top bar. The only change `file_page` makes to
@@ -9527,8 +9534,16 @@ fn section_switch(project: &Project, active: Section) -> String {
     } else {
         ""
     };
+    // The third link ships on EVERY page the switch renders on, Docs and Code
+    // included — a section the reader can only reach from one of the three is
+    // not a section of this viewer.
+    let changes_current = if active == Section::Changes {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
     format!(
-        "<nav class=\"section-switch\"><a href=\"/p/{pid}/\"{docs_current}>Docs</a><a href=\"/p/{pid}/_code/\"{code_current}>Code</a></nav>"
+        "<nav class=\"section-switch\"><a href=\"/p/{pid}/\"{docs_current}>Docs</a><a href=\"/p/{pid}/_code/\"{code_current}>Code</a><a href=\"/p/{pid}/_changes\"{changes_current}>Changes</a></nav>"
     )
 }
 
@@ -9697,6 +9712,489 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
         rows = rows,
     );
     layout_with_drawer(&title, "", &body_html, false)
+}
+
+/// The Changes screen: the project's working tree against HEAD (D2), one
+/// stacked section per changed file, each a side-by-side two-column diff,
+/// beside a sidebar listing every changed file grouped by directory.
+///
+/// The sidebar is the Code section's own `.chapter` / `.chap-sec` /
+/// `.chap-file` markup, inside the same `#sidebar` / `.layout` /
+/// `.sidebar-backdrop` shell — the mobile drawer script in `app.js` finds
+/// this page's sidebar exactly as it finds Code's, with no change of its
+/// own. Server-rendered rather than a `#filelist` JSON blob: the changed
+/// list is fixed for the life of the page, so there is nothing for a
+/// client renderer to re-render.
+///
+/// Both sides are syntax-highlighted through `render`: `highlight_source`
+/// is handed each reconstructed side WHOLE, so multi-line parse state (a
+/// block comment, a raw string) stays correct, and the per-line fragments
+/// it returns drop straight into the table cells.
+///
+/// Reviewed marks are the reader's own, not the server's (D4): this page
+/// only lays the ground for them — `data-project-id` on the screen root,
+/// `data-path` and a content [`changeset_key`] on every section, a checkbox
+/// in each sticky header and a tick on each sidebar row. Which of them are
+/// ticked lives in the browser's `localStorage` and is never sent anywhere.
+///
+/// Git being unavailable, the project not being a repository, and a call
+/// that had to be killed all render an explained empty state here (D3) —
+/// the entry point stays, only its content changes.
+pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderService) -> String {
+    let (tree, main) = match view {
+        ChangesView::Unavailable(reason) => (
+            changes_nav_empty("No file list — see the note beside it."),
+            changes_unavailable(reason),
+        ),
+        ChangesView::Diff(diff) if diff.files.is_empty() => (
+            changes_nav_empty("No changed files."),
+            changes_body(project, diff, render),
+        ),
+        ChangesView::Diff(diff) => (changes_nav(diff), changes_body(project, diff, render)),
+    };
+    let body_html = format!(
+        r#"{topbar}
+<div class="layout">
+  <aside id="sidebar" class="sidebar">{tree}</aside>
+  <div class="sidebar-backdrop"></div>
+  <main class="content content--changes">
+    <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">working tree</span></div></nav>
+    <div class="changes" data-project-id="{pid}">{main}</div>
+  </main>
+</div>"#,
+        topbar = topbar_full(
+            sidebar_toggle(),
+            &section_switch(project, Section::Changes),
+            "",
+            "",
+        ),
+        tree = tree,
+        pid = esc(&project.id),
+        name = esc(&project.name),
+        main = main,
+    );
+    layout_with_drawer("Changes", "", &body_html, false)
+}
+
+/// D3's empty state, in the user's terms: what the screen would show, why it
+/// cannot, and never git's own stderr — a path or a repository name from
+/// inside that message would be the one thing this daemon must not disclose.
+fn changes_unavailable(reason: &GitDiffError) -> String {
+    let text = match reason {
+        GitDiffError::NotARepo => {
+            "This project is not a git repository, so there is no working tree to compare."
+        }
+        GitDiffError::GitUnavailable(_) => {
+            "The Changes screen reads the working tree with the git command line, and this machine has none available."
+        }
+        GitDiffError::Timeout(_) => {
+            "git took too long to answer for this project, so the call was stopped. A very large working tree can do this."
+        }
+    };
+    format!("<p class=\"changes__empty\">{}</p>", esc(text))
+}
+
+fn plural_files(n: usize) -> &'static str {
+    if n == 1 {
+        "file"
+    } else {
+        "files"
+    }
+}
+
+/// The directory a changed file is listed under in the sidebar. Files at the
+/// project root group under `/` rather than an empty header, so every row on
+/// the list sits below a heading that says where it lives.
+fn changes_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "/",
+    }
+}
+
+/// The changed-file sidebar: one `.chap-sec` header per directory, its files
+/// indented below it as `.chap-file` rows carrying the status badge and the
+/// file's own `+n −m`. Each row links to its section's anchor, so clicking
+/// scrolls there with no script at all; `app.js` only adds the "which
+/// section am I looking at" highlight on top.
+fn changes_nav(diff: &WorkingTreeDiff) -> String {
+    // First-seen directory order (git lists paths sorted), so the sidebar
+    // reads in the same order as the sections beside it.
+    let mut groups: Vec<(&str, Vec<(usize, &FileChange)>)> = Vec::new();
+    for (i, file) in diff.files.iter().enumerate() {
+        let dir = changes_dir(&file.path);
+        match groups.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, files)) => files.push((i, file)),
+            None => groups.push((dir, vec![(i, file)])),
+        }
+    }
+    let mut out = String::from("<nav class=\"chapter changes-nav\">");
+    for (dir, files) in groups {
+        out.push_str(&format!(
+            "<div class=\"chap-sec\">{dir}</div>",
+            dir = esc(dir)
+        ));
+        for (i, file) in files {
+            let label = match &file.old_path {
+                Some(old) => format!("{} → {}", old, file.path),
+                None => file.path.clone(),
+            };
+            // The tick mirrors the section header's checkbox and is never read
+            // back: `app.js` paints it from that one checkbox, which is the
+            // single source of truth for a file's reviewed mark (D4). It ships
+            // in the markup and hides in CSS, so a page with scripting off
+            // shows no tick rather than a control that never moves.
+            out.push_str(&format!(
+                "<a class=\"chap-file chg-row\" href=\"#f{i}\" title=\"{title}\">\
+                 {badge}<span class=\"chg-row__name\">{name}</span>{stat}\
+                 <span class=\"chg-row__check\" aria-hidden=\"true\">\u{2713}</span></a>",
+                i = i,
+                title = esc(&label),
+                badge = chg_badge(file),
+                name = esc(base_name(&file.path)),
+                stat = chg_stat(file),
+            ));
+        }
+    }
+    out.push_str("</nav>");
+    out
+}
+
+/// The sidebar when there is nothing to list — the shell still renders, so
+/// the drawer toggle and the layout columns behave the same as on a page
+/// with a hundred changed files.
+fn changes_nav_empty(note: &str) -> String {
+    format!(
+        "<nav class=\"chapter changes-nav\"><div class=\"chap-sec\">Changed files</div>\
+         <p class=\"changes-nav__empty\">{note}</p></nav>",
+        note = esc(note)
+    )
+}
+
+/// The status letter as the screenshot shows it: one square, one letter, the
+/// colour carried by a modifier class so the palette lives in CSS.
+fn chg_badge(file: &FileChange) -> String {
+    let (letter, modifier, label) = match file.status {
+        ChangeStatus::Modified => ("M", "m", "Modified"),
+        ChangeStatus::Added => ("A", "a", "Added"),
+        ChangeStatus::Deleted => ("D", "d", "Deleted"),
+        ChangeStatus::Renamed => ("R", "r", "Renamed"),
+    };
+    format!(
+        "<span class=\"chg-badge chg-badge--{modifier}\" title=\"{label}\">{letter}</span>",
+        modifier = modifier,
+        label = label,
+        letter = letter,
+    )
+}
+
+fn chg_stat(file: &FileChange) -> String {
+    format!(
+        "<span class=\"chg-stat\"><span class=\"chg-stat__add\">+{added}</span>\
+         <span class=\"chg-stat__del\">&minus;{removed}</span></span>",
+        added = file.added,
+        removed = file.removed,
+    )
+}
+
+fn changes_body(project: &Project, diff: &WorkingTreeDiff, render: &RenderService) -> String {
+    let mut out = String::new();
+    let mut head = format!(
+        "<span class=\"changes__count\">{n} {word} changed</span>\
+         <span class=\"changes__scope\">working tree</span>",
+        n = diff.files.len(),
+        word = plural_files(diff.files.len()),
+    );
+    if !diff.files.is_empty() {
+        // D4's N/M counter. It ships `hidden` and `app.js` unhides it, the
+        // same way every other scripting-only control on this site does: with
+        // scripting off there is no storage to read and no checkbox to count,
+        // and a counter frozen at zero would be a number that lies.
+        head.push_str(&format!(
+            "<span class=\"changes__reviewed\" hidden>0/{n} reviewed</span>",
+            n = diff.files.len(),
+        ));
+    }
+    if diff.hidden > 0 {
+        // D5: the count, never the names — naming them would disclose
+        // exactly what the project's exclude rules exist to hide.
+        head.push_str(&format!(
+            "<span class=\"changes__hidden\">{n} {word} hidden by this project's exclude rules</span>",
+            n = diff.hidden,
+            word = plural_files(diff.hidden),
+        ));
+    }
+    out.push_str(&format!("<header class=\"changes__head\">{head}</header>"));
+    if diff.stdout_truncated {
+        out.push_str("<p class=\"changes__note\">This diff was too large to read whole — part of it is missing.</p>");
+    }
+    if diff.sections_capped {
+        out.push_str("<p class=\"changes__note\">Only the first files are shown with their contents; the rest are listed without.</p>");
+    }
+    if diff.files.is_empty() {
+        out.push_str("<p class=\"changes__empty\">Nothing has changed in the working tree.</p>");
+        return out;
+    }
+    for (i, file) in diff.files.iter().enumerate() {
+        out.push_str(&changes_section(project, i, file, render));
+    }
+    out
+}
+
+fn changes_section(
+    project: &Project,
+    index: usize,
+    file: &FileChange,
+    render: &RenderService,
+) -> String {
+    let name = match &file.old_path {
+        Some(old) => format!("{} → {}", old, file.path),
+        None => file.path.clone(),
+    };
+    let note = match &file.note {
+        Some(n) => format!(" <span class=\"changeset__note\">{}</span>", esc(n)),
+        None => String::new(),
+    };
+    let body = match &file.body {
+        ChangeBody::Text {
+            old_text,
+            new_text,
+            lines,
+            truncated,
+        } => {
+            let banner = if *truncated {
+                format!(
+                    "<p class=\"changes__note\">Truncated — too large to show whole. {link}</p>",
+                    link = code_view_link(project, &file.path),
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{banner}<div class=\"changeset__scroll\"><table class=\"changeset__table\">{rows}</table></div>",
+                banner = banner,
+                rows = changes_rows(file, old_text, new_text, lines, render),
+            )
+        }
+        ChangeBody::Binary => {
+            "<p class=\"changeset__flat\">Binary file changed — no line diff.</p>".to_string()
+        }
+        ChangeBody::Submodule => {
+            "<p class=\"changeset__flat\">Submodule — changed at its own commit.</p>".to_string()
+        }
+        ChangeBody::NoContentChange => {
+            "<p class=\"changeset__flat\">No content changes (a rename, a mode, or line endings).</p>"
+                .to_string()
+        }
+        ChangeBody::Omitted(why) => format!(
+            "<p class=\"changeset__flat\">{why} {link}</p>",
+            why = esc(why),
+            link = code_view_link(project, &file.path),
+        ),
+    };
+    format!(
+        "<section class=\"changeset\" id=\"f{index}\" data-path=\"{path}\" data-key=\"{key}\">\
+         <h2 class=\"changeset__head\">{badge}\
+         <span class=\"changeset__path\">{name}</span>{note}{stat}\
+         <label class=\"changeset__review\" hidden>\
+         <input type=\"checkbox\" class=\"changeset__review-box\">\
+         <span class=\"changeset__review-text\">Reviewed</span></label></h2>\
+         <div class=\"changeset__body\">{body}</div></section>",
+        index = index,
+        path = esc(&file.path),
+        key = changeset_key(file),
+        badge = chg_badge(file),
+        name = esc(&name),
+        note = note,
+        stat = chg_stat(file),
+        body = body,
+    )
+}
+
+/// The content key a reviewed mark is stored against (D4).
+///
+/// A mark is a statement about what the reader SAW, never about a file name,
+/// so it hangs on the section's content: status, the counts, and both
+/// reconstructed sides. Edit a marked file and this key moves, the mark
+/// stored in the reader's browser stops matching, and `app.js` drops it on
+/// the next load — a tick can never end up hiding a change nobody has read.
+///
+/// FNV-1a through [`path_hash`], which is the one hash in this repo written
+/// to stay byte-identical across Rust releases; `DefaultHasher` explicitly
+/// does not promise that, and a value living in someone's `localStorage`
+/// between browser sessions is exactly where that promise matters.
+///
+/// Named limit: a binary file's bytes are not in the diff at all
+/// ([`ChangeBody::Binary`] carries no content), so re-editing one leaves its
+/// key unmoved and its mark standing. There is nothing to hash short of
+/// reading the file, and the section shows no content to re-review.
+fn changeset_key(file: &FileChange) -> String {
+    // \u{1} separates the fields so no concatenation of two of them can be
+    // read as a different pair (a path ending in a digit beside a count).
+    let body = match &file.body {
+        ChangeBody::Text {
+            old_text,
+            new_text,
+            truncated,
+            ..
+        } => format!("text\u{1}{truncated}\u{1}{old_text}\u{1}{new_text}"),
+        ChangeBody::Binary => "binary".to_string(),
+        ChangeBody::Submodule => "submodule".to_string(),
+        ChangeBody::NoContentChange => "unchanged".to_string(),
+        ChangeBody::Omitted(why) => format!("omitted\u{1}{why}"),
+    };
+    let material = format!(
+        "{status}\u{1}{old}\u{1}{added}\u{1}{removed}\u{1}{body}",
+        status = file.status.letter(),
+        old = file.old_path.as_deref().unwrap_or(""),
+        added = file.added,
+        removed = file.removed,
+        body = body,
+    );
+    short_code(&path_hash(&file.path, &material))
+}
+
+/// The same file over in the Code section — the way out of every section
+/// this screen deliberately does not render whole.
+fn code_view_link(project: &Project, rel_path: &str) -> String {
+    format!(
+        "<a class=\"changeset__open\" href=\"/p/{pid}/_code/{path}\">Open in Code view</a>",
+        pid = esc(&project.id),
+        path = esc(rel_path),
+    )
+}
+
+/// One side's highlighted lines, addressed by the line NUMBER the patch
+/// gives them rather than by position: a reconstructed side can begin at
+/// line 1 (the ordinary case) or, in a file so large its first hunk starts
+/// later, at some other line. `base` is that first number, so a fragment is
+/// always looked up at `number - base` — and a lookup that falls outside
+/// renders the patch's own text instead, plain but never wrong.
+struct HighlightedSide<'a> {
+    lines: &'a [String],
+    base: usize,
+}
+
+impl HighlightedSide<'_> {
+    fn fragment(&self, line: &DiffLine, number: Option<usize>) -> String {
+        number
+            .and_then(|n| n.checked_sub(self.base))
+            .and_then(|i| self.lines.get(i))
+            .cloned()
+            .unwrap_or_else(|| esc(&line.text))
+    }
+}
+
+/// The side-by-side pairing: a run of removed lines sits beside the run of
+/// added lines that replaced it, row by row, and a context line fills both
+/// columns. The line numbers come from the patch itself, so neither column
+/// has to be counted here.
+///
+/// Each side is highlighted once, whole, before the walk — never per hunk:
+/// a block comment or a raw string opened above the first changed line only
+/// parses correctly when the parser has seen the file from its top.
+fn changes_rows(
+    file: &FileChange,
+    old_text: &str,
+    new_text: &str,
+    lines: &[DiffLine],
+    render: &RenderService,
+) -> String {
+    let old_name = file.old_path.as_deref().unwrap_or(&file.path);
+    let old_hl = render.highlight_source(std::path::Path::new(old_name), old_text);
+    let new_hl = render.highlight_source(std::path::Path::new(&file.path), new_text);
+    let old_side = HighlightedSide {
+        lines: &old_hl.lines,
+        base: lines.iter().find_map(|l| l.old_no).unwrap_or(1),
+    };
+    let new_side = HighlightedSide {
+        lines: &new_hl.lines,
+        base: lines.iter().find_map(|l| l.new_no).unwrap_or(1),
+    };
+
+    let mut out = String::new();
+    let mut removed: Vec<&DiffLine> = Vec::new();
+    let mut added: Vec<&DiffLine> = Vec::new();
+    for line in lines {
+        match line.kind {
+            LineKind::Removed => removed.push(line),
+            LineKind::Added => added.push(line),
+            LineKind::Context => {
+                flush_change_rows(&mut out, &mut removed, &mut added, &old_side, &new_side);
+                out.push_str(&changes_row(
+                    Some(line),
+                    Some(line),
+                    "ctx",
+                    &old_side,
+                    &new_side,
+                ));
+            }
+        }
+    }
+    flush_change_rows(&mut out, &mut removed, &mut added, &old_side, &new_side);
+    out
+}
+
+fn flush_change_rows(
+    out: &mut String,
+    removed: &mut Vec<&DiffLine>,
+    added: &mut Vec<&DiffLine>,
+    old_side: &HighlightedSide,
+    new_side: &HighlightedSide,
+) {
+    let pairs = removed.len().max(added.len());
+    for i in 0..pairs {
+        let left = removed.get(i).copied();
+        let right = added.get(i).copied();
+        let cls = match (left.is_some(), right.is_some()) {
+            (true, true) => "chg",
+            (true, false) => "del",
+            _ => "add",
+        };
+        out.push_str(&changes_row(left, right, cls, old_side, new_side));
+    }
+    removed.clear();
+    added.clear();
+}
+
+fn changes_row(
+    left: Option<&DiffLine>,
+    right: Option<&DiffLine>,
+    cls: &str,
+    old_side: &HighlightedSide,
+    new_side: &HighlightedSide,
+) -> String {
+    fn cell(
+        side: Option<&DiffLine>,
+        hl: &HighlightedSide,
+        number: fn(&DiffLine) -> Option<usize>,
+        gutter: &str,
+        pane: &str,
+    ) -> String {
+        match side {
+            Some(line) => format!(
+                "<td class=\"diffrow__num diffrow__num--{gutter}\">{n}</td>\
+                 <td class=\"diffrow__side diffrow__side--{pane}\"><code>{text}</code></td>",
+                gutter = gutter,
+                pane = pane,
+                n = number(line).map(|n| n.to_string()).unwrap_or_default(),
+                text = hl.fragment(line, number(line)),
+            ),
+            // The side this row has no line for: an empty gutter and an
+            // empty cell, so the two columns stay aligned row for row.
+            None => format!(
+                "<td class=\"diffrow__num diffrow__num--{gutter}\"></td>\
+                 <td class=\"diffrow__side diffrow__side--none\"></td>",
+                gutter = gutter,
+            ),
+        }
+    }
+    format!(
+        "<tr class=\"diffrow diffrow--{cls}\">{old}{new}</tr>",
+        cls = cls,
+        old = cell(left, old_side, |l| l.old_no, "old", "old"),
+        new = cell(right, new_side, |l| l.new_no, "new", "new"),
+    )
 }
 
 /// Sidebar for the Code section: always exactly one directory's contents
@@ -21598,5 +22096,397 @@ mod tests {
             "{unrecognized}"
         );
         assert!(cli_error.contains("not reachable"), "{cli_error}");
+    }
+
+    /// cds-2: the Changes screen's own markup. `changes_page` renders from
+    /// a `WorkingTreeDiff` alone, so these build the diff by hand — no git,
+    /// no repository, no route — and assert on what the reader sees.
+    fn changes_fixture() -> WorkingTreeDiff {
+        WorkingTreeDiff {
+            files: vec![
+                FileChange {
+                    path: "src/app/main.rs".into(),
+                    old_path: None,
+                    status: ChangeStatus::Modified,
+                    note: None,
+                    added: 2,
+                    removed: 2,
+                    body: ChangeBody::Text {
+                        old_text:
+                            "fn main() {\n    let old = 1;\n    // keep\n    let gone = 0;\n}\n"
+                                .into(),
+                        new_text:
+                            "fn main() {\n    let new = 2;\n    let extra = 3;\n    // keep\n}\n"
+                                .into(),
+                        lines: vec![
+                            DiffLine {
+                                kind: LineKind::Context,
+                                old_no: Some(1),
+                                new_no: Some(1),
+                                text: "fn main() {".into(),
+                            },
+                            // A removal and an addition standing together pair
+                            // into ONE row (`chg`); the second addition has no
+                            // counterpart and takes an `add` row of its own.
+                            DiffLine {
+                                kind: LineKind::Removed,
+                                old_no: Some(2),
+                                new_no: None,
+                                text: "    let old = 1;".into(),
+                            },
+                            DiffLine {
+                                kind: LineKind::Added,
+                                old_no: None,
+                                new_no: Some(2),
+                                text: "    let new = 2;".into(),
+                            },
+                            DiffLine {
+                                kind: LineKind::Added,
+                                old_no: None,
+                                new_no: Some(3),
+                                text: "    let extra = 3;".into(),
+                            },
+                            DiffLine {
+                                kind: LineKind::Context,
+                                old_no: Some(3),
+                                new_no: Some(4),
+                                text: "    // keep".into(),
+                            },
+                            // A removal with nothing beside it: a `del` row.
+                            DiffLine {
+                                kind: LineKind::Removed,
+                                old_no: Some(4),
+                                new_no: None,
+                                text: "    let gone = 0;".into(),
+                            },
+                            DiffLine {
+                                kind: LineKind::Context,
+                                old_no: Some(5),
+                                new_no: Some(5),
+                                text: "}".into(),
+                            },
+                        ],
+                        truncated: false,
+                    },
+                },
+                FileChange {
+                    path: "notes/logo.png".into(),
+                    old_path: None,
+                    status: ChangeStatus::Added,
+                    note: Some("untracked".into()),
+                    added: 0,
+                    removed: 0,
+                    body: ChangeBody::Binary,
+                },
+            ],
+            hidden: 2,
+            stdout_truncated: false,
+            sections_capped: false,
+        }
+    }
+
+    /// The page with its tags stripped — what a reader actually reads. A
+    /// highlighted line is chopped into spans token by token, so the source
+    /// it renders is a claim about the text, not about the markup between
+    /// the words (which the highlighting assertions cover separately).
+    fn text_of(html: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn changes_html(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &ChangesView::Diff(diff),
+            &RenderService::new(),
+        )
+    }
+
+    /// The screenshot's own promise: both panes of a modified file carry
+    /// syntax-highlighted, line-numbered content, and the row that changed
+    /// is tinted per side. The tint itself is CSS, so what the markup owes
+    /// is the class the palette hangs on — one per side, on the right row.
+    #[test]
+    fn both_panes_of_a_modified_file_are_highlighted_and_side_tinted() {
+        let html = changes_html(changes_fixture());
+
+        let text = text_of(&html);
+        assert!(
+            text.contains("let old = 1;") && text.contains("let new = 2;"),
+            "both reconstructed sides render: {html}"
+        );
+        // syntect's class-based output; a pane rendering raw text would
+        // carry the words above but none of these.
+        assert!(
+            html.matches("<span class=\"source").count() >= 2,
+            "each side is highlighted by highlight_source, not dumped as text: {html}"
+        );
+        assert!(
+            html.contains("<tr class=\"diffrow diffrow--chg\">"),
+            "a removal and the addition replacing it share one row: {html}"
+        );
+        assert!(
+            html.contains("<tr class=\"diffrow diffrow--del\">"),
+            "a removal with no counterpart owns a row of its own: {html}"
+        );
+        assert!(
+            html.contains("<tr class=\"diffrow diffrow--add\">"),
+            "and so does an addition with none: {html}"
+        );
+        assert!(
+            html.contains("diffrow__side--none"),
+            "the empty side of a one-sided row keeps the columns aligned: {html}"
+        );
+        assert!(
+            html.contains("diffrow__side--old") && html.contains("diffrow__side--new"),
+            "each pane is addressable, which is what the red/green palette needs: {html}"
+        );
+        assert!(
+            html.contains("<td class=\"diffrow__num diffrow__num--old\">2</td>"),
+            "the old side keeps the patch's own line number: {html}"
+        );
+    }
+
+    /// Every sidebar row points at a section that exists on the page, and
+    /// carries the file's status badge and its own counts. The pairing is
+    /// the whole click-scrolls-to-the-file behaviour (the anchor does the
+    /// scrolling; app.js only adds the in-view highlight).
+    #[test]
+    fn sidebar_rows_anchor_to_the_sections_they_name() {
+        let html = changes_html(changes_fixture());
+
+        assert!(
+            html.contains("<div class=\"chap-sec\">src/app</div>"),
+            "files are grouped under their directory: {html}"
+        );
+        assert!(
+            html.contains("class=\"chap-file chg-row\" href=\"#f0\""),
+            "the row reuses the Code sidebar's own row class and links to its section: {html}"
+        );
+        assert!(
+            html.contains("<section class=\"changeset\" id=\"f0\"")
+                && html.contains("<section class=\"changeset\" id=\"f1\""),
+            "every anchor a row points at exists: {html}"
+        );
+        assert!(
+            html.contains("chg-badge--m") && html.contains("chg-badge--a"),
+            "M and A badges, one per status: {html}"
+        );
+        assert!(
+            html.contains("+2") && html.contains("&minus;2"),
+            "per-file counts ride the row: {html}"
+        );
+    }
+
+    /// The mobile drawer is not re-implemented here: the page hands app.js
+    /// the same `#sidebar` / `.layout` / `.sidebar-backdrop` shell and the
+    /// same toggle button the Code section does, so the drawer script binds
+    /// to this screen unmodified.
+    #[test]
+    fn changes_page_reuses_the_code_drawer_markup() {
+        let html = changes_html(changes_fixture());
+        for needle in [
+            "<div class=\"layout\">",
+            "<aside id=\"sidebar\" class=\"sidebar\">",
+            "<div class=\"sidebar-backdrop\"></div>",
+            "id=\"sidebar-toggle\"",
+        ] {
+            assert!(html.contains(needle), "missing {needle}: {html}");
+        }
+    }
+
+    /// The header states what is compared and how much of it is not shown —
+    /// the hidden count as an aggregate, never a name (D5).
+    #[test]
+    fn changes_header_counts_files_and_names_no_hidden_path() {
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains("2 files changed") && html.contains("working tree"),
+            "the header says what it is: {html}"
+        );
+        assert!(
+            html.contains("2 files hidden by this project's exclude rules"),
+            "the aggregate hidden count is shown: {html}"
+        );
+    }
+
+    /// Every `data-key` on the page, in section order — the content keys a
+    /// reviewed mark is stored against.
+    fn data_keys(html: &str) -> Vec<String> {
+        html.match_indices("data-key=\"")
+            .map(|(i, m)| {
+                let rest = &html[i + m.len()..];
+                rest[..rest.find('"').expect("attribute is closed")].to_string()
+            })
+            .collect()
+    }
+
+    /// cds-3 / D4: the ground the client-side reviewed layer stands on. The
+    /// marks themselves live in the reader's browser, so what the SERVER
+    /// owes is the addressing — the project the marks are scoped to, a path
+    /// and a content key per section, a checkbox to tick and a tick on the
+    /// sidebar row that mirrors it, and the counter's own element.
+    #[test]
+    fn the_page_carries_everything_a_reviewed_mark_hangs_on() {
+        let html = changes_html(changes_fixture());
+
+        assert!(
+            html.contains("<div class=\"changes\" data-project-id=\"proj-1\">"),
+            "marks are scoped per project, so the id is on the screen root: {html}"
+        );
+        assert!(
+            html.contains("<section class=\"changeset\" id=\"f0\" data-path=\"src/app/main.rs\" data-key=\""),
+            "each section names its file and its content key: {html}"
+        );
+        assert_eq!(
+            data_keys(&html).len(),
+            2,
+            "one key per changed file: {html}"
+        );
+        assert!(
+            html.contains("<label class=\"changeset__review\" hidden>")
+                && html.contains("<input type=\"checkbox\" class=\"changeset__review-box\">"),
+            "the checkbox is in the sticky header, shipped hidden for no-script: {html}"
+        );
+        assert_eq!(
+            html.matches("class=\"chg-row__check\"").count(),
+            2,
+            "every sidebar row carries the mirrored tick: {html}"
+        );
+        assert!(
+            html.contains("<span class=\"changes__reviewed\" hidden>0/2 reviewed</span>"),
+            "the N/M counter ships with the file total and stays hidden until app.js counts: {html}"
+        );
+    }
+
+    /// The rule that keeps a tick honest: the key is derived from the
+    /// section's CONTENT, so editing a marked file moves it and the mark
+    /// stored under the old key stops matching (app.js drops it on load).
+    /// Re-rendering the same diff must move nothing, or every mark would
+    /// evaporate on the next reload.
+    #[test]
+    fn editing_a_file_moves_its_content_key_and_leaves_the_others_alone() {
+        let before = data_keys(&changes_html(changes_fixture()));
+        let again = data_keys(&changes_html(changes_fixture()));
+        assert_eq!(
+            before, again,
+            "the same diff renders the same keys, or no mark would ever survive a reload"
+        );
+
+        let mut edited = changes_fixture();
+        if let ChangeBody::Text { new_text, .. } = &mut edited.files[0].body {
+            *new_text = new_text.replace("let new = 2;", "let new = 42;");
+        }
+        let after = data_keys(&changes_html(edited));
+        assert_ne!(
+            before[0], after[0],
+            "an edit to the file's new side moves its key: {before:?} vs {after:?}"
+        );
+        assert_eq!(
+            before[1], after[1],
+            "and moves no other file's: {before:?} vs {after:?}"
+        );
+
+        // A rename with byte-identical content is still a different thing to
+        // have reviewed, so the status is part of the key too.
+        let mut renamed = changes_fixture();
+        renamed.files[0].status = ChangeStatus::Renamed;
+        assert_ne!(before[0], data_keys(&changes_html(renamed))[0]);
+    }
+
+    /// Nothing changed: no sections, so no counter — "0/0 reviewed" beside
+    /// "nothing has changed" would be a number about nothing.
+    #[test]
+    fn an_empty_diff_offers_no_reviewed_counter() {
+        let html = changes_html(WorkingTreeDiff::default());
+        assert!(
+            html.contains("Nothing has changed in the working tree."),
+            "{html}"
+        );
+        assert!(!html.contains("changes__reviewed"), "{html}");
+        assert!(!html.contains("changeset__review"), "{html}");
+    }
+
+    /// A binary file says so instead of rendering bytes; a truncated one
+    /// says so and offers the file whole in the Code section.
+    #[test]
+    fn binary_and_truncated_sections_explain_themselves() {
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains("Binary file changed"),
+            "a binary file gets a row, not a diff: {html}"
+        );
+
+        let mut diff = changes_fixture();
+        if let ChangeBody::Text { truncated, .. } = &mut diff.files[0].body {
+            *truncated = true;
+        }
+        let html = changes_html(diff);
+        assert!(
+            html.contains("Truncated") && html.contains("/p/proj-1/_code/src/app/main.rs"),
+            "a truncated section links the file whole in Code view: {html}"
+        );
+    }
+
+    /// D3: git missing or no repository still renders the screen — sidebar
+    /// shell, topbar and all — with the reason in the reader's terms and
+    /// never git's own words (which could name a path).
+    #[test]
+    fn the_unavailable_state_is_a_page_not_a_stack_trace() {
+        let html = changes_page(
+            &sample_project(),
+            &ChangesView::Unavailable(GitDiffError::GitUnavailable(
+                "/secret/path/git: No such file".into(),
+            )),
+            &RenderService::new(),
+        );
+        assert!(
+            html.contains("git command line"),
+            "the reason is explained: {html}"
+        );
+        assert!(
+            !html.contains("/secret/path/git"),
+            "git's own message never reaches the page: {html}"
+        );
+        assert!(
+            html.contains("<aside id=\"sidebar\" class=\"sidebar\">"),
+            "the layout is the same one a diff renders in: {html}"
+        );
+    }
+
+    /// The covered-contract surface the plan's risk map names: the third
+    /// link ships on Docs and Code pages too, and exactly one link at a
+    /// time is marked current.
+    #[test]
+    fn section_switch_offers_all_three_sections_on_every_section() {
+        let project = sample_project();
+        for (active, current_href) in [
+            (Section::Docs, "/p/proj-1/"),
+            (Section::Code, "/p/proj-1/_code/"),
+            (Section::Changes, "/p/proj-1/_changes"),
+        ] {
+            let nav = section_switch(&project, active);
+            assert!(nav.contains(">Docs</a>"), "{nav}");
+            assert!(nav.contains(">Code</a>"), "{nav}");
+            assert!(nav.contains(">Changes</a>"), "{nav}");
+            assert_eq!(
+                nav.matches("aria-current=\"page\"").count(),
+                1,
+                "exactly one section is current: {nav}"
+            );
+            assert!(
+                nav.contains(&format!("href=\"{current_href}\" aria-current=\"page\"")),
+                "the active section is the marked one: {nav}"
+            );
+        }
     }
 }
