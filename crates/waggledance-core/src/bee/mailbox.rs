@@ -31,6 +31,23 @@
 //!   [`BeeMailboxEntry::Unreadable`] carrying its file name and why, and it
 //!   travels to the board beside the readable ones.
 //!
+//! ## A digest is a second kind of file, told apart by its frontmatter
+//!
+//! bee also folds a period's letters into a digest beside them
+//! (beehive `verbs/mailbox_digest.rs`, `render_digest`). The `digest-` filename
+//! is a CONVENTION; the contract is the frontmatter key `type: "digest"`, and
+//! bee's own emitter says so at the line that writes it: the field is there
+//! "rather than implied by the filename because the filename is a convention
+//! and the frontmatter is the contract". So this reader detects a digest by
+//! that key and never by the name (mailbox-inbox D1). A letter's frontmatter
+//! never carries `type` at all, so a file that carries it with any OTHER value
+//! is a shape neither reader owns — [`BeeMailboxEntry::Unreadable`] naming the
+//! field, never a guessed letter.
+//!
+//! A digest is shown in the same inbox section as the letters and is NEVER
+//! counted as one: it has no read state, so [`BeeMailboxEntry::is_unread`]
+//! is false for it and [`BeeMailboxEntry::letter`] gives `None`.
+//!
 //! ## The id is the file name
 //!
 //! human-mailbox D11: one letter per run, named
@@ -146,6 +163,12 @@ pub struct BeeLetter {
     pub needs_you: Option<Vec<BeeLetterNeedsYou>>,
 }
 
+/// bee's own mark for a run that went silent (beehive `verbs/mailbox.rs`,
+/// `UNFINISHED_SUBJECT_MARK`): it prefixes the composed subject rather than
+/// adding a field, because human-mailbox D3 froze the letter's key set. So the
+/// only honest way to read it here is to read the subject — mailbox-inbox D2.
+const UNFINISHED_SUBJECT_MARK: &str = "Unfinished run:";
+
 impl BeeLetter {
     pub fn items_or_empty(&self) -> &[BeeLetterItem] {
         self.items.as_deref().unwrap_or(&[])
@@ -154,6 +177,42 @@ impl BeeLetter {
     pub fn needs_you_or_empty(&self) -> &[BeeLetterNeedsYou] {
         self.needs_you.as_deref().unwrap_or(&[])
     }
+
+    /// True when bee marked this run as having gone silent. Transcription, not
+    /// invention (mailbox-inbox D2): the mark rides the subject by bee's
+    /// design, no status is derived from it, and the subject is still shown to
+    /// the human exactly as filed.
+    pub fn is_unfinished(&self) -> bool {
+        self.subject.starts_with(UNFINISHED_SUBJECT_MARK)
+    }
+}
+
+/// One readable digest: the fold bee writes over a day or a week of letters.
+/// Like [`BeeLetter`], the body is left on disk for the markdown pipeline.
+///
+/// There is no `status` here and there never will be — a digest carries no
+/// read state, so nothing in the inbox may flip one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeeDigest {
+    /// The file's own name, the same id shape a letter carries.
+    pub id: String,
+    pub subject: String,
+    /// `"day"` or `"week"` today, kept as a plain string on purpose: bee is
+    /// free to widen the period set, and an enum here would turn a widened
+    /// bee into an unreadable digest.
+    pub period: String,
+    /// The period's own id — the UTC day (`2026-08-30`) or ISO week
+    /// (`2026-W35`) the digest folds.
+    pub period_id: String,
+    pub filed_at: String,
+    /// The letter file names this digest folded — names, so each one opens
+    /// through the same route as the letter itself. Empty when bee emitted
+    /// `letters: []`.
+    pub letters: Vec<String>,
+    /// The letters in the period bee could NOT read. bee lists them so a torn
+    /// letter cannot vanish from the record; this reader carries the list
+    /// through for the same reason.
+    pub unreadable: Vec<String>,
 }
 
 /// One entry in a project's mailbox. A letter that cannot be parsed is an
@@ -164,27 +223,41 @@ impl BeeLetter {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BeeMailboxEntry {
     Letter(BeeLetter),
+    /// A period's fold, shown in the same section as the letters and counted
+    /// as none of them (mailbox-inbox D1).
+    Digest(BeeDigest),
     Unreadable { file: String, reason: String },
 }
 
 impl BeeMailboxEntry {
+    /// `None` for a digest as much as for an unreadable file: a digest is not
+    /// a letter, and no caller counting letters may pick one up here.
     pub fn letter(&self) -> Option<&BeeLetter> {
         match self {
             BeeMailboxEntry::Letter(l) => Some(l),
-            BeeMailboxEntry::Unreadable { .. } => None,
+            BeeMailboxEntry::Digest(_) | BeeMailboxEntry::Unreadable { .. } => None,
         }
     }
 
-    /// The file this entry came from, readable or not — the letter's id.
+    pub fn digest(&self) -> Option<&BeeDigest> {
+        match self {
+            BeeMailboxEntry::Digest(d) => Some(d),
+            BeeMailboxEntry::Letter(_) | BeeMailboxEntry::Unreadable { .. } => None,
+        }
+    }
+
+    /// The file this entry came from, readable or not — its id.
     pub fn file(&self) -> &str {
         match self {
             BeeMailboxEntry::Letter(l) => &l.id,
+            BeeMailboxEntry::Digest(d) => &d.id,
             BeeMailboxEntry::Unreadable { file, .. } => file,
         }
     }
 
-    /// True only for a letter that parsed AND is still unread. An unreadable
-    /// entry is never counted as unread — it is its own, louder signal.
+    /// True only for a letter that parsed AND is still unread. A digest is
+    /// never unread — it holds no read state at all — and an unreadable entry
+    /// is never counted as unread either: it is its own, louder signal.
     pub fn is_unread(&self) -> bool {
         matches!(
             self,
@@ -224,11 +297,11 @@ pub(crate) fn read_mailbox(bee_dir: &Path) -> Vec<BeeMailboxEntry> {
         }
     };
     files.sort();
-    files.iter().map(|p| read_letter(p)).collect()
+    files.iter().map(|p| read_entry(p)).collect()
 }
 
-/// One letter file, opened for READING only.
-fn read_letter(path: &Path) -> BeeMailboxEntry {
+/// One mailbox file — letter or digest — opened for READING only.
+fn read_entry(path: &Path) -> BeeMailboxEntry {
     let file = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -243,9 +316,23 @@ fn read_letter(path: &Path) -> BeeMailboxEntry {
             }
         }
     };
-    match parse_letter(&file, &text) {
-        Ok(letter) => BeeMailboxEntry::Letter(letter),
+    match parse_entry(&file, &text) {
+        Ok(entry) => entry,
         Err(reason) => BeeMailboxEntry::Unreadable { file, reason },
+    }
+}
+
+/// Which kind of file this is, decided by the frontmatter and nothing else —
+/// never by the `digest-` name convention (mailbox-inbox D1).
+fn parse_entry(id: &str, text: &str) -> Result<BeeMailboxEntry, String> {
+    let map = frontmatter_map(text)?;
+    match optional_str(&map, "", "type")?.as_deref() {
+        // A letter's frontmatter carries no `type` at all — untouched path.
+        None => parse_letter_map(id, &map).map(BeeMailboxEntry::Letter),
+        Some("digest") => parse_digest_map(id, &map).map(BeeMailboxEntry::Digest),
+        Some(other) => Err(format!(
+            "`type` is {other:?}, and the only typed file bee files in a mailbox is a digest (`type: \"digest\"`)"
+        )),
     }
 }
 
@@ -267,10 +354,10 @@ fn split_frontmatter(text: &str) -> Option<&str> {
     None
 }
 
-/// Parse one letter's frontmatter, or say in one line why it cannot be read.
-/// Every `Err` string here is written to be shown to a human beside the file
-/// name: it names the field, not the parser.
-fn parse_letter(id: &str, text: &str) -> Result<BeeLetter, String> {
+/// The frontmatter block as a key/value map, or the one line saying why it is
+/// not one. Shared by both kinds, so a letter and a digest can never disagree
+/// about what "has frontmatter" means.
+fn frontmatter_map(text: &str) -> Result<Hash, String> {
     let front = split_frontmatter(text).ok_or_else(|| {
         "no YAML frontmatter: a letter opens with a `---` line and closes the block with another"
             .to_string()
@@ -280,10 +367,38 @@ fn parse_letter(id: &str, text: &str) -> Result<BeeLetter, String> {
     let doc = docs
         .first()
         .ok_or_else(|| "frontmatter block is empty".to_string())?;
-    let map = doc
-        .as_hash()
-        .ok_or_else(|| "frontmatter is not a block of key/value pairs".to_string())?;
+    doc.as_hash()
+        .cloned()
+        .ok_or_else(|| "frontmatter is not a block of key/value pairs".to_string())
+}
 
+/// Parse one letter's frontmatter, or say in one line why it cannot be read.
+/// Every `Err` string here is written to be shown to a human beside the file
+/// name: it names the field, not the parser.
+///
+/// The production door is [`parse_entry`], which picks the kind first; this
+/// spelling stays for the tests that pin the letter path on its own.
+#[cfg(test)]
+fn parse_letter(id: &str, text: &str) -> Result<BeeLetter, String> {
+    parse_letter_map(id, &frontmatter_map(text)?)
+}
+
+/// Every field required at read for a digest, in the order bee emits them —
+/// which is also the order a doubly-broken digest names its first missing one.
+fn parse_digest_map(id: &str, map: &Hash) -> Result<BeeDigest, String> {
+    Ok(BeeDigest {
+        id: id.to_string(),
+        subject: required_str(map, "", "subject")?,
+        // Not enumerated on purpose — see [`BeeDigest::period`].
+        period: required_str(map, "", "period")?,
+        period_id: required_str(map, "", "period_id")?,
+        filed_at: required_str(map, "", "filed_at")?,
+        letters: string_list(map, "", "letters")?,
+        unreadable: string_list(map, "", "unreadable")?,
+    })
+}
+
+fn parse_letter_map(id: &str, map: &Hash) -> Result<BeeLetter, String> {
     // The five human-mailbox D3 makes required at read. Order matters only
     // for which one a doubly-broken letter names first.
     let subject = required_str(map, "", "subject")?;
@@ -537,8 +652,36 @@ needs_you:
 - [sx-2] the store path is not settled — the scratch reader needs a decision on where it reads from — blocks: Point the scratch reader at the store
 "#;
 
+    /// A digest EXACTLY as bee's `render_digest` emits one (beehive
+    /// `packages/bee-rs/crates/bee/src/verbs/mailbox_digest.rs`): the same
+    /// JSON-quoted scalars and the same `emit_string_list` shape the letter
+    /// uses, `type` second, and the day subject `What happened on <id>.` its
+    /// `Period::subject()` composes. Read off that emitter, not imagined.
+    const WELL_FORMED_DIGEST: &str = "\
+---
+subject: \"What happened on 2026-08-30.\"
+type: \"digest\"
+period: \"day\"
+period_id: \"2026-08-30\"
+filed_at: \"2026-08-31T00:04:00Z\"
+letters:
+  - \"20260830T041207Z-nightly.md\"
+  - \"20260830T114615Z-bi5-scratch-run.md\"
+unreadable:
+  - \"20260830T060000Z-torn.md\"
+---
+
+## waggledance
+
+- Run finished: 3 cells capped, 1 needs you
+";
+
     fn parse(text: &str) -> Result<BeeLetter, String> {
         parse_letter("2026-08-30T04-12-07Z-nightly.md", text)
+    }
+
+    fn parse_any(name: &str, text: &str) -> Result<BeeMailboxEntry, String> {
+        parse_entry(name, text)
     }
 
     /// Drop the top-level line whose key is `key` (indent 0 only), the way a
@@ -764,6 +907,134 @@ needs_you:
         assert_eq!(parse(&stripped).unwrap(), honest);
     }
 
+    // --- the second kind: digests ---------------------------------------
+
+    #[test]
+    fn a_digest_as_bee_emits_it_parses_every_frontmatter_field() {
+        let entry = parse_any("digest-2026-08-30.md", WELL_FORMED_DIGEST)
+            .expect("bee's own `render_digest` shape must parse");
+        let digest = entry.digest().expect("a `type: digest` file is a digest");
+        assert_eq!(digest.id, "digest-2026-08-30.md");
+        assert_eq!(digest.subject, "What happened on 2026-08-30.");
+        assert_eq!(digest.period, "day");
+        assert_eq!(digest.period_id, "2026-08-30");
+        assert_eq!(digest.filed_at, "2026-08-31T00:04:00Z");
+        assert_eq!(
+            digest.letters,
+            vec![
+                "20260830T041207Z-nightly.md".to_string(),
+                "20260830T114615Z-bi5-scratch-run.md".to_string(),
+            ]
+        );
+        assert_eq!(
+            digest.unreadable,
+            vec!["20260830T060000Z-torn.md".to_string()]
+        );
+
+        // A digest is never a letter and never unread — it holds no read state.
+        assert!(entry.letter().is_none());
+        assert!(!entry.is_unread());
+        assert_eq!(entry.file(), "digest-2026-08-30.md");
+    }
+
+    #[test]
+    fn a_weekly_digest_with_empty_lists_parses() {
+        let text = WELL_FORMED_DIGEST
+            .replace("period: \"day\"", "period: \"week\"")
+            .replace("period_id: \"2026-08-30\"", "period_id: \"2026-W35\"")
+            .replace(
+                "letters:\n  - \"20260830T041207Z-nightly.md\"\n  - \"20260830T114615Z-bi5-scratch-run.md\"\nunreadable:\n  - \"20260830T060000Z-torn.md\"\n",
+                "letters: []\nunreadable: []\n",
+            );
+        let entry = parse_any("digest-2026-W35.md", &text).expect("bee's own empty-list shape");
+        let digest = entry.digest().unwrap();
+        assert_eq!(digest.period, "week");
+        assert_eq!(digest.period_id, "2026-W35");
+        assert!(digest.letters.is_empty());
+        assert!(digest.unreadable.is_empty());
+    }
+
+    #[test]
+    fn a_digest_missing_a_required_field_is_unreadable_and_names_it() {
+        for key in ["subject", "period", "period_id", "filed_at"] {
+            let text = without_top_level(WELL_FORMED_DIGEST, key);
+            let err = parse_any("digest-2026-08-30.md", &text)
+                .expect_err(&format!("a digest's `{key}` is required at read"));
+            assert!(
+                err.contains(key) && err.contains("missing required field"),
+                "the reason must name the missing field, got: {err}"
+            );
+        }
+    }
+
+    /// The detection rule, stated as a refusal: `type` is the contract, and a
+    /// value outside it is a shape neither reader owns.
+    #[test]
+    fn a_type_that_is_not_digest_is_unreadable_and_names_the_field() {
+        let text = WELL_FORMED_DIGEST.replace("type: \"digest\"", "type: \"weekly\"");
+        let err = parse_any("digest-2026-W35.md", &text)
+            .expect_err("`weekly` is not a shape this reader knows");
+        assert!(err.contains("type"), "{err}");
+        assert!(err.contains("weekly"), "{err}");
+    }
+
+    /// The other half of D1: the NAME decides nothing. A file named like a
+    /// digest but carrying a letter's frontmatter is a letter, and a file with
+    /// a letter's name but `type: digest` is a digest.
+    #[test]
+    fn the_kind_is_read_off_the_frontmatter_never_off_the_file_name() {
+        let named_digest = parse_any("digest-2026-08-30.md", WELL_FORMED)
+            .expect("a letter is a letter wherever it is named");
+        assert!(named_digest.letter().is_some());
+        assert!(named_digest.digest().is_none());
+        assert!(named_digest.is_unread());
+
+        let named_letter = parse_any("2026-08-30T04-12-07Z-nightly.md", WELL_FORMED_DIGEST)
+            .expect("a digest is a digest wherever it is named");
+        assert!(named_letter.digest().is_some());
+        assert!(named_letter.letter().is_none());
+    }
+
+    /// Letters must travel the unchanged path: no `type` key, same record, same
+    /// refusals as before digests existed.
+    #[test]
+    fn a_file_without_a_type_key_parses_exactly_as_a_letter_did() {
+        for text in [WELL_FORMED, EMPTY_LISTS, REAL_BEE_LETTER] {
+            let via_entry = parse_any("2026-08-30T04-12-07Z-nightly.md", text).unwrap();
+            let direct = parse_letter("2026-08-30T04-12-07Z-nightly.md", text).unwrap();
+            assert_eq!(via_entry, BeeMailboxEntry::Letter(direct));
+        }
+        let broken = without_top_level(WELL_FORMED, "subject");
+        let err = parse_any("2026-08-30T04-12-07Z-nightly.md", &broken).unwrap_err();
+        assert_eq!(err, parse(&broken).unwrap_err());
+    }
+
+    // --- the unfinished mark, transcribed ---------------------------------
+
+    #[test]
+    fn is_unfinished_reads_bees_own_subject_mark() {
+        let honest = parse(WELL_FORMED).unwrap();
+        assert!(!honest.is_unfinished(), "an ordinary run is not unfinished");
+
+        let text = WELL_FORMED.replace(
+            "subject: \"Run finished:",
+            "subject: \"Unfinished run: Run finished:",
+        );
+        let silent = parse(&text).expect("the mark rides the subject, nothing else moves");
+        assert!(silent.is_unfinished());
+        // The subject is still shown exactly as filed — no field is invented.
+        assert!(silent.subject.starts_with("Unfinished run: "));
+        assert_eq!(silent.status, honest.status);
+        assert_eq!(silent.items, honest.items);
+
+        // Only a LEADING mark counts: the words elsewhere in a sentence do not.
+        let mid = WELL_FORMED.replace(
+            "subject: \"Run finished:",
+            "subject: \"Wrapped the Unfinished run: work:",
+        );
+        assert!(!parse(&mid).unwrap().is_unfinished());
+    }
+
     // --- the directory ---------------------------------------------------
 
     #[test]
@@ -812,6 +1083,36 @@ needs_you:
             "an unreadable entry is never counted as unread"
         );
         assert!(entries[2].letter().is_none());
+    }
+
+    #[test]
+    fn a_digest_comes_back_in_the_same_list_and_is_counted_as_no_letter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bee_dir = tmp.path().join(".bee");
+        let dir = bee_dir.join(MAILBOX_DIR);
+        write_letter(&dir, "2026-08-30T04-12-07Z-nightly.md", WELL_FORMED);
+        write_letter(&dir, "2026-08-30T05-00-00Z-quiet.md", EMPTY_LISTS);
+        write_letter(&dir, "digest-2026-08-30.md", WELL_FORMED_DIGEST);
+
+        let entries = read_mailbox(&bee_dir);
+        // One section, one sorted list — the digest is not filtered out and not
+        // hoisted anywhere: it sorts by name like everything else.
+        assert_eq!(entries.len(), 3, "{entries:#?}");
+        assert_eq!(
+            entries.iter().map(|e| e.file()).collect::<Vec<_>>(),
+            vec![
+                "2026-08-30T04-12-07Z-nightly.md",
+                "2026-08-30T05-00-00Z-quiet.md",
+                "digest-2026-08-30.md",
+            ]
+        );
+        assert!(entries[2].digest().is_some(), "{:#?}", entries[2]);
+
+        // Never counted or folded as a letter: exactly one unread, and the
+        // digest is not it.
+        assert_eq!(entries.iter().filter(|e| e.is_unread()).count(), 1);
+        assert!(!entries[2].is_unread());
+        assert_eq!(entries.iter().filter_map(|e| e.letter()).count(), 2);
     }
 
     #[test]

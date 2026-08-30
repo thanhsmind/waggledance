@@ -1650,7 +1650,31 @@ fn inbox_row(
             filed_at: letter.filed_at.clone(),
             file: letter.id.clone(),
             unread: entry.is_unread(),
-            unreadable: None,
+            // mailbox-inbox D2: bee's own subject mark, read where bee put it.
+            // Nothing here derives a status — `is_unfinished` is a look at the
+            // subject prefix, and the subject still reaches the view whole.
+            kind: views::InboxRowKind::Letter {
+                unfinished: letter.is_unfinished(),
+            },
+        },
+        // A digest rides the SAME list as the letters (mailbox-inbox D1) and is
+        // never one: `unread` is false because a digest holds no read state at
+        // all, and its `project` line is the checkout's — a fold spans every
+        // project of its period, so no single one can be named off the file.
+        // The href is the SAME `/inbox/:project/:file` route a letter takes
+        // (D3): one route, one renderer, read-only on the other side.
+        waggledance_core::bee::BeeMailboxEntry::Digest(digest) => views::InboxRow {
+            href: Some(format!("/inbox/{}/{}", project.id, digest.id)),
+            subject: digest.subject.clone(),
+            project: project.name.clone(),
+            filed_at: digest.filed_at.clone(),
+            file: digest.id.clone(),
+            unread: false,
+            // bee's own period word, carried through unenumerated — see
+            // `BeeDigest::period`.
+            kind: views::InboxRowKind::Digest {
+                period: digest.period.clone(),
+            },
         },
         waggledance_core::bee::BeeMailboxEntry::Unreadable { file, reason } => views::InboxRow {
             href: None,
@@ -1662,7 +1686,9 @@ fn inbox_row(
             filed_at: String::new(),
             file: file.clone(),
             unread: false,
-            unreadable: Some(reason.clone()),
+            kind: views::InboxRowKind::Unreadable {
+                reason: reason.clone(),
+            },
         },
     }
 }
@@ -1689,7 +1715,11 @@ fn letter_render_service() -> &'static waggledance_core::render::RenderService {
     SERVICE.get_or_init(waggledance_core::render::RenderService::new)
 }
 
-/// `GET /inbox/:project/:letter` — one letter, opened.
+/// `GET /inbox/:project/:letter` — one letter, opened. mailbox-inbox D3: a
+/// DIGEST opens through this same route, the same file lookup and the same
+/// sanitized markdown pipeline, read-only — one route and one renderer for
+/// both, because a digest is prose bee composed in exactly the same way and a
+/// second path would be a second thing to keep sanitized.
 ///
 /// The `:letter` segment is never joined onto a path as it arrives. It is
 /// matched against the file names the mailbox reader already listed for that
@@ -1717,11 +1747,20 @@ async fn inbox_letter_handler(
     else {
         return not_found_letter();
     };
-    let Some(letter) = entry.letter() else {
+    // Only an entry that parsed as NEITHER a letter nor a digest answers 404:
+    // there is no prose behind one, the list never links one, and a page
+    // pretending to render it would be the silence bee's own rule forbids.
+    if matches!(
+        entry,
+        waggledance_core::bee::BeeMailboxEntry::Unreadable { .. }
+    ) {
         return not_found_letter();
-    };
+    }
     let row = inbox_row(project, entry);
-    let path = waggledance_core::bee::mailbox_dir(&project.root_path).join(&letter.id);
+    // The name the reader itself listed, never the URL segment — the same
+    // property the letter path already had, now taken off the matched entry so
+    // a digest reaches its file the same way.
+    let path = waggledance_core::bee::mailbox_dir(&project.root_path).join(entry.file());
     let project_id = project.id.clone();
     let root = project.root_path.clone();
     // Reading the file and rendering it are both synchronous, CPU-and-disk
@@ -34437,6 +34476,142 @@ mod bee_route_tests {
                 "{uri} names no letter, so it must say so rather than render one"
             );
         }
+    }
+
+    // -- mailbox-inbox mi-2: digests and unfinished runs, end to end ------
+    //
+    // Same reasoning as the block above: the promise is user-visible ("the
+    // fold bee wrote is in the same inbox, and I can open it"), and the seams
+    // between the reader's new `Digest` entry, the roll-up, the route and the
+    // view belong to no single unit test
+    // (`docs/knowledge/patterns/prove-the-whole-path.md`). The fixture is
+    // bee's own emitter shape (`verbs/mailbox_digest.rs::render_digest`).
+
+    /// One digest on disk. `type: "digest"` is what makes it one
+    /// (mailbox-inbox D1) — the `digest-` file name is bee's convention and
+    /// nothing here reads it.
+    fn digest_file(dir: &Path, name: &str, subject: &str, period: &str, period_id: &str, body: &str) {
+        write(
+            dir,
+            &format!(".bee/human-mailbox/{name}"),
+            &format!(
+                "---\nsubject: {}\ntype: \"digest\"\nperiod: {}\nperiod_id: {}\nfiled_at: \"2026-08-31T00:04:00Z\"\nletters:\n  - \"2026-08-30T04-12-07Z-late.md\"\nunreadable: []\n---\n\n{body}\n",
+                serde_json::to_string(subject).unwrap(),
+                serde_json::to_string(period).unwrap(),
+                serde_json::to_string(period_id).unwrap(),
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_digest_rides_the_same_inbox_list_and_opens_through_the_same_route() {
+        let root = fresh_root("inbox-digest");
+        letter_file(&root, "2026-08-30T04-12-07Z-late.md", "Đêm qua ở alpha", "alpha", "2026-08-30T04:12:07Z", "unread", "alpha work\n");
+        digest_file(&root, "digest-2026-08-30.md", "What happened on 2026-08-30.", "day", "2026-08-30", "## alpha\n\n- Run finished: 3 cells capped\n\n<script>alert(1)</script>\n");
+        let st = build_state();
+        let project = register(&st, &root, "Alpha");
+        let app = router(st);
+
+        let list = body_string(get(app.clone(), "/inbox").await).await;
+        assert!(
+            list.contains("What happened on 2026-08-30.") && list.contains("Đêm qua ở alpha"),
+            "the digest and the letter share one list: {list}"
+        );
+        assert_eq!(
+            list.matches(r#"<main class="fg-page">"#).count(),
+            1,
+            "one section — the digest never opens a second one (D1): {list}"
+        );
+        assert!(
+            list.contains("Bản tổng hợp · ngày"),
+            "the digest says what it is and which period it folds: {list}"
+        );
+        assert!(
+            list.contains("1 chưa đọc"),
+            "and is never counted as a letter: only the one unread letter is: {list}"
+        );
+
+        // D3: the same `/inbox/:project/:file` route, the same renderer.
+        let href = format!("/inbox/{}/digest-2026-08-30.md", project.id);
+        assert!(
+            list.contains(&format!("href=\"{href}\"")),
+            "the digest row links to itself: {list}"
+        );
+        let page = body_string(get(app, &href).await).await;
+        assert!(
+            page.contains("Run finished: 3 cells capped"),
+            "the digest's own prose renders: {page}"
+        );
+        assert!(
+            !page.contains("<script>alert(1)</script>"),
+            "through the same sanitizing pipeline a letter takes: {page}"
+        );
+        assert!(
+            !page.contains("/mark") && !page.contains("Đánh dấu"),
+            "and read-only: no flip control, because a digest has no read state: {page}"
+        );
+    }
+
+    /// mailbox-inbox D2, from the file bee wrote to the badge on the page:
+    /// the mark rides the subject (`UNFINISHED_SUBJECT_MARK`), and the inbox
+    /// transcribes it without touching the subject it shows.
+    #[tokio::test]
+    async fn an_unfinished_letter_reaches_the_inbox_badged_and_subject_intact() {
+        let root = fresh_root("inbox-unfinished");
+        letter_file(&root, "2026-08-30T04-12-07Z-silent.md", "Unfinished run: nightly on alpha", "alpha", "2026-08-30T04:12:07Z", "unread", "nothing came back\n");
+        letter_file(&root, "2026-08-29T04-12-07Z-fine.md", "Đêm yên ả", "alpha", "2026-08-29T04:12:07Z", "unread", "ok\n");
+        let st = build_state();
+        register(&st, &root, "Alpha");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        assert!(
+            body.contains("Lượt chạy chưa kết thúc"),
+            "the run that went silent says so: {body}"
+        );
+        assert_eq!(
+            body.matches("Lượt chạy chưa kết thúc").count(),
+            1,
+            "and only that one letter does: {body}"
+        );
+        assert!(
+            body.contains("Unfinished run: nightly on alpha"),
+            "the subject is still shown exactly as bee filed it: {body}"
+        );
+        assert!(
+            body.contains("2 chưa đọc"),
+            "an unfinished letter is still a letter, still counted: {body}"
+        );
+    }
+
+    /// The other half of "no read state": not just no button, but no route
+    /// either. A hand-made POST at a digest finds no letter behind the name
+    /// and is refused before any bee is reached — `bee mailbox mark` names a
+    /// letter, and a digest is not one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marking_a_digest_read_is_refused_rather_than_reaching_bee() {
+        let root = fresh_root("inbox-digest-mark");
+        let log = fresh_root("inbox-digest-mark-log").join("argv");
+        digest_file(&root, "digest-2026-08-30.md", "What happened on 2026-08-30.", "day", "2026-08-30", "## alpha\n\n- ok\n");
+        fake_bee(&root, &log, "{}", "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Alpha");
+        let app = router(st);
+
+        let resp = app
+            .oneshot(mark_req(
+                &project.id,
+                "digest-2026-08-30.md",
+                "status=read&back=%2Finbox",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !log.exists(),
+            "no bee was run for it either: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
     }
 
     // -- board-visibility bi-3: read and unread, flipped BY BEE -----------

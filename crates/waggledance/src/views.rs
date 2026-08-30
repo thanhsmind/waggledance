@@ -11608,34 +11608,68 @@ impl SanitizedLetterBody {
     }
 }
 
-/// One row of the inbox: a letter bee filed for the human, flattened for the
+/// Which of the three things a row is, and the one fact only that kind has.
+///
+/// mi-2 made this explicit. Before it, "unreadable" was implied by a
+/// `reason: Some(..)` field, which worked while there were exactly two kinds
+/// and stopped working the moment bee's digest became a third
+/// (`BeeMailboxEntry::Digest`, mailbox-inbox D1). The reason now rides its own
+/// variant rather than a parallel `Option` beside the kind: two spellings of
+/// the same discriminator can disagree, and this one decides whether a row
+/// gets a link and a mark control at all.
+pub enum InboxRowKind {
+    /// One run's letter. `unfinished` is bee's own subject mark, transcribed —
+    /// mailbox-inbox D2: `UNFINISHED_SUBJECT_MARK` prefixes the subject
+    /// because human-mailbox D3 froze the letter's key set, so the badge is a
+    /// reading of the subject and never a status this view invented. The
+    /// subject itself is still shown exactly as filed, prefix included.
+    Letter { unfinished: bool },
+    /// A period's fold. `period` is bee's own word — `"day"` or `"week"`
+    /// today, carried as a plain string all the way from
+    /// `BeeDigest::period` so a widened bee reads as an unfamiliar period
+    /// rather than as an unreadable file.
+    ///
+    /// A digest holds NO read state (mailbox-inbox D1): no unread chip, no
+    /// mark control, and never a unit in any letter count.
+    Digest { period: String },
+    /// A file that parsed as neither, with bee's own one-line reason. Never
+    /// dropped — bee's reason, quoted at `waggledance_core::bee::mailbox`: a
+    /// silently missing letter reads to the human as a quiet night rather
+    /// than as a broken store.
+    Unreadable { reason: String },
+}
+
+/// One row of the inbox: something bee filed for the human, flattened for the
 /// view. Built in `server.rs` from `BeeSnapshot::mailbox` (bi-1's reader) —
 /// the view never touches disk.
 ///
-/// `unreadable` carries the reason a letter could not be parsed, and is the
-/// discriminator: a row with `Some(..)` names its file and why instead of
-/// pretending to be a letter, and has no `href`, because there is no parsed
-/// letter behind it to open. That row is never dropped — bee's own reason,
-/// quoted at `waggledance_core::bee::mailbox`: a silently missing letter reads
-/// to the human as a quiet night rather than as a broken store.
+/// Letters and digests share this one shape and one list on purpose
+/// (mailbox-inbox D1: the same `/inbox` section, never a second one). What
+/// differs between them lives in [`InboxRowKind`], which is the discriminator
+/// every branch below reads.
 pub struct InboxRow {
-    /// Where this row leads, or `None` for an unreadable entry.
+    /// Where this row leads, or `None` for an unreadable entry, which has no
+    /// parsed entry behind it to open.
     pub href: Option<String>,
-    /// The letter's one-line subject; empty for an unreadable entry.
+    /// The letter's or digest's one-line subject; empty for an unreadable
+    /// entry.
     pub subject: String,
-    /// Which project this letter is about. For a letter, the `project` field
-    /// the letter itself carries (bee's own word for it); for an unreadable
-    /// entry — which has no parsed fields at all — the registered name of the
-    /// checkout the file was found in, the only thing we can honestly name.
+    /// Which project this row is about. For a letter, the `project` field the
+    /// letter itself carries (bee's own word for it); for a digest — a fold
+    /// spanning a period, which names no single project — and for an
+    /// unreadable entry, which has no parsed fields at all, the registered
+    /// name of the checkout the file was found in.
     pub project: String,
-    /// The letter's `filed_at`, verbatim; empty for an unreadable entry.
+    /// The `filed_at`, verbatim; empty for an unreadable entry.
     pub filed_at: String,
-    /// The file name, which human-mailbox D11 makes the letter's only id.
+    /// The file name, which human-mailbox D11 makes the entry's only id.
     pub file: String,
-    /// True only for a letter that parsed and is still unread.
+    /// True only for a letter that parsed and is still unread. A digest is
+    /// never unread — it carries no read state at all — and an unreadable
+    /// entry is its own, louder signal instead.
     pub unread: bool,
-    /// Why this file could not be read as a letter, when it could not be.
-    pub unreadable: Option<String>,
+    /// Letter, digest, or unreadable — and the one fact that kind carries.
+    pub kind: InboxRowKind,
 }
 
 /// What the inbox says when it holds nothing — and it holds nothing on this
@@ -11678,7 +11712,14 @@ const INBOX_EMPTY: &str = r#"<div class="fg-card">
 /// the index" — which also gives an unreadable entry, with no parsed
 /// `filed_at` to sort on, its correct place in the sequence.
 pub fn inbox_page(rows: &[InboxRow]) -> String {
-    let unread = rows.iter().filter(|r| r.unread).count();
+    // Letters only, and only the unread ones (mailbox-inbox D1: a digest is
+    // never a unit in any letter count). The kind is tested rather than
+    // trusting `unread` to have been left false, so the rule holds here even
+    // if a future builder sets that flag by accident.
+    let unread = rows
+        .iter()
+        .filter(|r| matches!(r.kind, InboxRowKind::Letter { .. }) && r.unread)
+        .count();
     // A summary of what is on THIS page, not the home page's own number (bi-4
     // owns that one). It renders only when non-zero, for the same reason the
     // board does: zero unread needs no pill to say so.
@@ -11724,8 +11765,8 @@ pub fn inbox_page(rows: &[InboxRow]) -> String {
 /// human decides a letter is dealt with. The link itself is unchanged in
 /// target; only how much of the card is clickable.
 fn inbox_row_html(row: &InboxRow) -> String {
-    if let Some(reason) = &row.unreadable {
-        return format!(
+    match &row.kind {
+        InboxRowKind::Unreadable { reason } => format!(
             r#"<div class="fg-card fg-card--rule">
   <div class="fg-card__head"><div class="fg-card__title">{file}</div><span class="fg-chip fg-chip--danger">Không đọc được</span></div>
   <div class="fg-card__sub">{project}</div>
@@ -11734,21 +11775,71 @@ fn inbox_row_html(row: &InboxRow) -> String {
             file = esc(&row.file),
             project = esc(&row.project),
             reason = esc(reason),
-        );
-    }
-    format!(
-        r#"<div class="fg-card">
-  <div class="fg-card__head"><a class="fg-card__title" href="{href}">{subject}</a>{mark}</div>
+        ),
+        // mailbox-inbox D1, rendered: the same card, in the same list, in its
+        // place in the same ordering — but with the badge where the read chip
+        // would be and no flip control under it, because a digest has no read
+        // state for bee to move and a button whose only outcome is a refusal
+        // is not a control, it is a trap.
+        InboxRowKind::Digest { period } => format!(
+            r#"<div class="fg-card">
+  <div class="fg-card__head"><a class="fg-card__title" href="{href}">{subject}</a>{badge}</div>
+  <div class="fg-card__sub">{project} · {filed_at}</div>
+</div>"#,
+            href = esc(row.href.as_deref().unwrap_or("/inbox")),
+            subject = esc(&row.subject),
+            badge = digest_badge(period),
+            project = esc(&row.project),
+            filed_at = esc(&row.filed_at),
+        ),
+        InboxRowKind::Letter { unfinished } => format!(
+            r#"<div class="fg-card">
+  <div class="fg-card__head"><a class="fg-card__title" href="{href}">{subject}</a>{mark}{badge}</div>
   <div class="fg-card__sub">{project} · {filed_at}</div>
   {flip}
 </div>"#,
-        href = esc(row.href.as_deref().unwrap_or("/inbox")),
-        subject = esc(&row.subject),
-        mark = unread_mark(row.unread),
-        project = esc(&row.project),
-        filed_at = esc(&row.filed_at),
-        flip = inbox_mark_form(row, "/inbox"),
+            href = esc(row.href.as_deref().unwrap_or("/inbox")),
+            subject = esc(&row.subject),
+            mark = unread_mark(row.unread),
+            badge = unfinished_badge(*unfinished),
+            project = esc(&row.project),
+            filed_at = esc(&row.filed_at),
+            flip = inbox_mark_form(row, "/inbox"),
+        ),
+    }
+}
+
+/// The digest's badge: what this card is, and which period it folds.
+///
+/// The period is bee's own value translated for the reader — `day` and `week`
+/// are the two bee writes today. An unknown period prints VERBATIM rather
+/// than falling back to a guess or to an empty badge: `BeeDigest::period` is
+/// deliberately not an enum so a bee that grows a third period stays readable
+/// here, and the honest thing to show for a period we have no word for is
+/// bee's own word.
+fn digest_badge(period: &str) -> String {
+    let word = match period {
+        "day" => "ngày",
+        "week" => "tuần",
+        other => other,
+    };
+    format!(
+        r#"<span class="fg-chip fg-chip--neutral">Bản tổng hợp · {word}</span>"#,
+        word = esc(word),
     )
+}
+
+/// The badge for a run that went silent (mailbox-inbox D2). It is a reading of
+/// bee's own subject prefix — `UNFINISHED_SUBJECT_MARK`, which rides the
+/// subject because human-mailbox D3 froze the letter's key set — so this view
+/// transcribes a mark bee wrote and invents no status of its own. The subject
+/// is still rendered exactly as filed, prefix and all.
+fn unfinished_badge(unfinished: bool) -> &'static str {
+    if unfinished {
+        r#"<span class="fg-chip fg-chip--warning">Lượt chạy chưa kết thúc</span>"#
+    } else {
+        ""
+    }
 }
 
 /// The read/unread marker. A word, never colour alone, so the state survives a
@@ -11788,8 +11879,15 @@ fn unread_mark(unread: bool) -> &'static str {
 ///
 /// An unreadable entry (`href: None`) gets no form: bee refuses a mark naming
 /// no filed letter, and a button whose only outcome is a refusal is not a
-/// control, it is a trap.
+/// control, it is a trap. mi-2: a DIGEST gets none for the same reason and a
+/// stronger one — mailbox-inbox D1 gives it no read state at all, so there is
+/// nothing to flip even in principle. The guard is here, at the one place that
+/// emits the control, rather than only at the two call sites, so no third
+/// caller can grow a mark button for a digest by forgetting to check.
 fn inbox_mark_form(row: &InboxRow, back: &str) -> String {
+    let InboxRowKind::Letter { .. } = row.kind else {
+        return String::new();
+    };
     let Some(href) = row.href.as_deref() else {
         return String::new();
     };
@@ -11820,11 +11918,39 @@ fn inbox_mark_form(row: &InboxRow, back: &str) -> String {
 /// finished the letter is the one most likely to mark it read. The control is a
 /// form posting to a bee command; this page still opens no file, for reading or
 /// for writing, beyond the body it was handed.
+///
+/// mi-2: a DIGEST opens here too, through the same route and the same
+/// sanitized pipeline (mailbox-inbox D3) — one renderer, not two, because
+/// nothing about the page differs except what the header may honestly say. So
+/// this stays one function reading [`InboxRow::kind`] rather than a second
+/// spelling that would have to be kept in step with this one: a digest's
+/// header carries its badge and NO read chip and NO flip control, since D1
+/// gives it no read state to show or move.
 pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
-    // A letter whose run recorded nothing has an empty prose body (bee emits
-    // the frontmatter and stops). Saying so beats an unexplained blank.
+    let (mark, flip, badge) = match &row.kind {
+        InboxRowKind::Letter { unfinished } => (
+            unread_mark(row.unread).to_string(),
+            // Back to this letter's own page: a reader who marks it here stays
+            // here, and sees the chip beside the button carry bee's answer.
+            inbox_mark_form(row, row.href.as_deref().unwrap_or("/inbox")),
+            unfinished_badge(*unfinished).to_string(),
+        ),
+        InboxRowKind::Digest { period } => {
+            (String::new(), String::new(), digest_badge(period))
+        }
+        // The list never links one and the route answers 404 for it, so this
+        // arm is unreachable in production — it renders the bare header rather
+        // than claiming a read state no parsed entry stands behind.
+        InboxRowKind::Unreadable { .. } => (String::new(), String::new(), String::new()),
+    };
+    // An entry whose run recorded nothing has an empty prose body (bee emits
+    // the frontmatter and stops). Saying so beats an unexplained blank — and
+    // it says it with the right noun, since a digest is not a letter.
     let prose = if body.as_str().trim().is_empty() {
-        r#"<p class="fg-empty">Lá thư này không có phần nội dung — tất cả những gì nó nói nằm ở dòng tiêu đề bên trên.</p>"#.to_string()
+        match row.kind {
+            InboxRowKind::Digest { .. } => r#"<p class="fg-empty">Bản tổng hợp này không có phần nội dung — tất cả những gì nó nói nằm ở dòng tiêu đề bên trên.</p>"#.to_string(),
+            _ => r#"<p class="fg-empty">Lá thư này không có phần nội dung — tất cả những gì nó nói nằm ở dòng tiêu đề bên trên.</p>"#.to_string(),
+        }
     } else {
         body.as_str().to_string()
     };
@@ -11834,7 +11960,7 @@ pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
   <header class="fg-pagehead">
     <div class="fg-pagehead__eyebrow">{project} · {filed_at}</div>
     <h1 class="fg-pagehead__title">{subject}</h1>
-    <div class="fg-pagehead__aside">{mark}{flip}</div>
+    <div class="fg-pagehead__aside">{mark}{badge}{flip}</div>
   </header>
   <article class="fg-prose">{prose}</article>
   <p class="fg-card__sub">{file}</p>
@@ -11846,10 +11972,9 @@ pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
         project = esc(&row.project),
         filed_at = esc(&row.filed_at),
         subject = esc(&row.subject),
-        mark = unread_mark(row.unread),
-        // Back to this letter's own page: a reader who marks it here stays
-        // here, and sees the chip beside the button carry bee's answer.
-        flip = inbox_mark_form(row, row.href.as_deref().unwrap_or("/inbox")),
+        mark = mark,
+        badge = badge,
+        flip = flip,
         prose = prose,
         file = esc(&row.file),
     );
@@ -18593,6 +18718,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// One digest on disk, in the bytes bee's `render_digest` emits
+    /// (beehive `verbs/mailbox_digest.rs`) -- `type: "digest"` is the contract
+    /// that makes it one (mailbox-inbox D1), never the file name.
+    fn home_digest_file(root: &std::path::Path, name: &str, period: &str, period_id: &str) {
+        let p = root.join(".bee/human-mailbox").join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            p,
+            format!(
+                "---\nsubject: \"What happened on {period_id}.\"\ntype: \"digest\"\nperiod: {period:?}\nperiod_id: {period_id:?}\nfiled_at: \"2026-08-31T00:04:00Z\"\nletters:\n  - \"2026-08-30T09-00-00Z-one.md\"\nunreadable: []\n---\n\n## demo\n\n- Run finished\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// mailbox-inbox D1's hardest clause, pinned where it would be broken
+    /// silently: a digest is NEVER counted as a letter. The home board's strip
+    /// counts through `BeeMailboxEntry::is_unread`, which is false for a
+    /// digest, so this asserts the number the reader sees stays the number of
+    /// unread LETTERS with two digests sitting in the same mailbox.
+    #[test]
+    fn the_home_board_never_counts_a_digest_as_a_letter() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-digest-count-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-one.md", "Letter one", "unread");
+        home_digest_file(&root, "digest-2026-08-30.md", "day", "2026-08-30");
+        home_digest_file(&root, "digest-2026-W35.md", "week", "2026-W35");
+
+        let mut project = sample_project();
+        project.id = "proj-digest-count".into();
+        project.root_path = root.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        // The reader really did see all three files -- otherwise a count of 1
+        // would prove nothing about digests at all.
+        assert_eq!(rollups[0].snapshot.mailbox.len(), 3);
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            html.contains(r#"data-bee-unread="1""#),
+            "one unread letter beside two digests is still one: {html}"
+        );
+        assert!(
+            html.contains("1 lá thư chưa đọc"),
+            "and reads as one in words too: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// board-live-morph D1 (decision 5dce3301): the home board does NOT
     /// full-page reload -- it refetches its own HTML and patches
     /// `[data-feature-hub]` in place. This asserts the whole path rather
@@ -23825,7 +24010,35 @@ mod tests {
             filed_at: filed_at.into(),
             file: format!("{filed_at}-run.md"),
             unread,
-            unreadable: None,
+            // The ordinary letter: bee left no unfinished-run mark on it.
+            kind: InboxRowKind::Letter { unfinished: false },
+        }
+    }
+
+    /// mi-2: the same row for a run bee marked as having gone silent. The
+    /// subject carries bee's own prefix verbatim, exactly as it arrives from
+    /// the reader — the badge is read off it, never off a field.
+    fn unfinished_letter_row(subject: &str, filed_at: &str) -> InboxRow {
+        InboxRow {
+            kind: InboxRowKind::Letter { unfinished: true },
+            ..letter_row(subject, "waggledance", filed_at, true)
+        }
+    }
+
+    /// mi-2: one digest row, in the shape `server.rs::inbox_row` builds from
+    /// `BeeMailboxEntry::Digest` — no read state, and the checkout's own name,
+    /// because a fold spans every project of its period.
+    fn digest_row(subject: &str, filed_at: &str, period: &str) -> InboxRow {
+        InboxRow {
+            href: Some(format!("/inbox/p/digest-{filed_at}.md")),
+            subject: subject.into(),
+            project: "waggledance".into(),
+            filed_at: filed_at.into(),
+            file: format!("digest-{filed_at}.md"),
+            unread: false,
+            kind: InboxRowKind::Digest {
+                period: period.into(),
+            },
         }
     }
 
@@ -23863,7 +24076,9 @@ mod tests {
             filed_at: String::new(),
             file: "2026-08-30T10-00-00Z-broken.md".into(),
             unread: false,
-            unreadable: Some("missing required field `filed_at`".into()),
+            kind: InboxRowKind::Unreadable {
+                reason: "missing required field `filed_at`".into(),
+            },
         }]);
         assert!(
             html.contains("2026-08-30T10-00-00Z-broken.md"),
@@ -24060,6 +24275,168 @@ mod tests {
         assert!(
             html.contains("Một lượt chạy") && html.contains("2026-08-30T09:00:00Z"),
             "and the header keeps the letter's own frontmatter: {html}"
+        );
+    }
+
+    // -- mailbox-inbox mi-2: digests and the unfinished-run mark -----------
+
+    /// mailbox-inbox D1, on a row: a digest is a card in the SAME list, it
+    /// says what it is and which period it folds, and it carries no read
+    /// state at all — no unread chip, no read chip, and nothing to flip.
+    /// bee holds the read field inside a letter and a digest has none, so a
+    /// mark button here could only ever be refused.
+    #[test]
+    fn a_digest_row_names_its_period_and_offers_no_read_state_to_flip() {
+        let html = inbox_page(&[digest_row(
+            "What happened on 2026-08-30.",
+            "2026-08-31T00:04:00Z",
+            "day",
+        )]);
+        assert!(
+            html.contains("What happened on 2026-08-30."),
+            "the digest's own subject is what the row says: {html}"
+        );
+        assert!(
+            html.contains("Bản tổng hợp · ngày"),
+            "and the badge names what it is and the period it folds: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/inbox/p/digest-2026-08-31T00:04:00Z.md""#),
+            "it opens through the same letter route (D3): {html}"
+        );
+        assert!(
+            !html.contains("/mark") && !html.contains("Đánh dấu"),
+            "a digest has no read state, so it offers no control to flip one: {html}"
+        );
+        assert!(
+            !html.contains("Chưa đọc") && !html.contains("Đã đọc"),
+            "nor any chip claiming it has been read or not: {html}"
+        );
+    }
+
+    /// `BeeDigest::period` is deliberately not an enum: bee may widen the set,
+    /// and an unknown period must stay readable rather than render an empty
+    /// badge or a guess. `week` has our word; anything else prints bee's.
+    #[test]
+    fn a_digests_period_is_translated_when_known_and_printed_verbatim_when_not() {
+        let week = inbox_page(&[digest_row("Tuần này", "2026-08-31T00:04:00Z", "week")]);
+        assert!(week.contains("Bản tổng hợp · tuần"), "{week}");
+        let unknown = inbox_page(&[digest_row("Quý này", "2026-09-30T00:04:00Z", "quarter")]);
+        assert!(
+            unknown.contains("Bản tổng hợp · quarter"),
+            "an unfamiliar period reads as bee's own word, never as a blank: {unknown}"
+        );
+    }
+
+    /// mailbox-inbox D2: the badge is a transcription of the mark bee wrote
+    /// into the subject (human-mailbox D3 froze the letter's key set, so the
+    /// mark rides there by design). The subject is still shown exactly as
+    /// filed — prefix included — and no status is invented beside it: the row
+    /// still says plainly whether the letter has been read.
+    #[test]
+    fn an_unfinished_letter_row_badges_the_mark_and_still_shows_the_subject_whole() {
+        let html = inbox_page(&[unfinished_letter_row(
+            "Unfinished run: nightly on waggledance",
+            "2026-08-30T09:00:00Z",
+        )]);
+        assert!(
+            html.contains("Lượt chạy chưa kết thúc"),
+            "the badge names the state bee marked: {html}"
+        );
+        assert!(
+            html.contains("Unfinished run: nightly on waggledance"),
+            "and the subject is still rendered as bee filed it: {html}"
+        );
+        assert!(
+            html.contains("Chưa đọc") && html.contains("/mark"),
+            "an unfinished letter is still a letter: read state and all: {html}"
+        );
+        // The mirror: an ordinary letter grows no badge from nowhere.
+        let ordinary = inbox_page(&[letter_row(
+            "Đêm qua",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            true,
+        )]);
+        assert!(
+            !ordinary.contains("Lượt chạy chưa kết thúc"),
+            "a letter bee did not mark carries no badge: {ordinary}"
+        );
+    }
+
+    /// The whole of mailbox-inbox D1's first clause: ONE section. Letters and
+    /// digests interleave in the caller's order inside the same list, under
+    /// the same one page header — never a second section, never a digest
+    /// block below the letters. And the page's unread pill counts letters
+    /// only: the digest between them adds nothing to it.
+    #[test]
+    fn letters_and_digests_render_as_one_interleaved_list_and_only_letters_are_counted() {
+        let html = inbox_page(&[
+            letter_row("Đêm qua", "waggledance", "2026-08-31T09:00:00Z", true),
+            digest_row("What happened on 2026-08-30.", "2026-08-31T00:04:00Z", "day"),
+            letter_row("Hôm kia", "beehive", "2026-08-29T09:00:00Z", false),
+        ]);
+        let at = |needle: &str| {
+            html.find(needle)
+                .unwrap_or_else(|| panic!("the inbox must carry {needle}: {html}"))
+        };
+        assert!(
+            at("Đêm qua") < at("What happened on 2026-08-30.") && at("What happened on 2026-08-30.") < at("Hôm kia"),
+            "the digest sits where the caller's ordering put it, between the letters: {html}"
+        );
+        assert_eq!(
+            html.matches(r#"<main class="fg-page">"#).count(),
+            1,
+            "one page, one section — a digest never opens a second one: {html}"
+        );
+        assert_eq!(
+            html.matches("fg-pagehead__title").count(),
+            1,
+            "and no second heading introducing the digests: {html}"
+        );
+        assert!(
+            html.contains("1 chưa đọc"),
+            "the pill counts the one unread LETTER, never the digest: {html}"
+        );
+    }
+
+    /// mailbox-inbox D3 at the page: a digest opens through the same renderer
+    /// and the same sanitizing pipeline, read-only. The header carries its
+    /// badge instead of a read chip, and there is nothing on the page to flip.
+    #[test]
+    fn an_opened_digest_renders_its_body_and_offers_nothing_to_flip() {
+        let index: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let page = waggledance_core::render::RenderService::new().render(
+            "## waggledance\n\n- Run finished: 3 cells capped\n\n<script>alert(1)</script>\n",
+            &std::env::temp_dir().join("waggledance-mi2-digest.md"),
+            "p",
+            std::path::Path::new("/nonexistent"),
+            &index,
+        );
+        let html = inbox_letter_page(
+            &digest_row("What happened on 2026-08-30.", "2026-08-31T00:04:00Z", "day"),
+            &SanitizedLetterBody::from_rendered(&page),
+        );
+        assert!(
+            html.contains("Run finished: 3 cells capped"),
+            "the digest's own prose renders: {html}"
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "through the same SANITIZING pipeline a letter takes: {html}"
+        );
+        assert!(
+            html.contains("Bản tổng hợp · ngày"),
+            "the header says what this page is: {html}"
+        );
+        assert!(
+            !html.contains("/mark") && !html.contains("Đánh dấu"),
+            "and offers no flip control, because there is no read state: {html}"
+        );
+        assert!(
+            !html.contains("Chưa đọc") && !html.contains("Đã đọc"),
+            "nor a chip claiming one: {html}"
         );
     }
 
