@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
+use waggledance_core::git_diff::DiffBase;
 use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::render::{theme_css, RenderService};
 use waggledance_core::Engine;
@@ -7098,27 +7099,58 @@ async fn jump_search(
     Json(hits).into_response()
 }
 
-/// The Changes screen: the project's working tree against HEAD (D2). Every
-/// git call happens inside `Engine::changes`, on a blocking thread -- the
-/// calls have a 10 s budget of their own, and a request holding a runtime
-/// worker that long would starve every other page.
+/// The base the Changes screen was asked for (D6). `?commit=<sha>` is the
+/// only value; anything else about the query string is ignored.
+///
+/// D7 is NOT enforced here on purpose: this layer does no validation, so
+/// there is exactly one gate to audit and it sits next to the git calls it
+/// protects (`git_diff::diff`). What this layer owes is that the value
+/// reaches that gate unchanged and never comes back out — an unresolvable
+/// commit renders the working tree, and the response carries no trace of
+/// what was sent.
+#[derive(serde::Deserialize)]
+struct ChangesQuery {
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+/// The Changes screen: the project's working tree against HEAD (D2), or one
+/// commit against its parent when `?commit=<sha>` names one (D6). Every git
+/// call happens inside `Engine::changes`, on a blocking thread -- the calls
+/// have a 10 s budget of their own, and a request holding a runtime worker
+/// that long would starve every other page.
 ///
 /// git missing, the project not being a repository, and a killed call are
 /// all a 200 carrying the explained empty state (D3), never a 500 and never
-/// a hidden entry point. Only an unknown project id is a 404.
+/// a hidden entry point. So is a `?commit` value that names no commit: it
+/// falls back to the working-tree view (D7). Only an unknown project id is
+/// a 404.
 ///
 /// Highlighting both sides of every section is as CPU-bound as the git calls
 /// are I/O-bound, so the whole page — read, highlight, format — is built on
 /// the same blocking thread and only the finished HTML crosses back.
-async fn changes_screen(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn changes_screen(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ChangesQuery>,
+) -> Response {
     let Ok(Some(project)) = st.engine.get_project(&id) else {
         return not_found("project not found");
+    };
+    let base = match query
+        .commit
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(sha) => DiffBase::Commit(sha.to_string()),
+        None => DiffBase::WorkingTree,
     };
     let engine = st.engine.clone();
     let project_id = id.clone();
     let page = tokio::task::spawn_blocking(move || {
         engine
-            .changes(&project_id)
+            .changes(&project_id, &base)
             .map(|view| views::changes_page(&project, &view, changes_highlighter()))
     })
     .await;
@@ -28791,7 +28823,10 @@ mod bee_route_tests {
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            v["html"].as_str().unwrap().contains("No conversation recorded"),
+            v["html"]
+                .as_str()
+                .unwrap()
+                .contains("No conversation recorded"),
             "{body}"
         );
 
@@ -28824,7 +28859,10 @@ mod bee_route_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["html"].as_str().unwrap().contains("not installed"), "{body}");
+        assert!(
+            v["html"].as_str().unwrap().contains("not installed"),
+            "{body}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -28862,7 +28900,10 @@ mod bee_route_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["html"].as_str().unwrap().contains("not reachable"), "{body}");
+        assert!(
+            v["html"].as_str().unwrap().contains("not reachable"),
+            "{body}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -28908,7 +28949,10 @@ mod bee_route_tests {
             "S6: captured stderr must never reach the page: {body}"
         );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["html"].as_str().unwrap().contains("could not read"), "{body}");
+        assert!(
+            v["html"].as_str().unwrap().contains("could not read"),
+            "{body}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -28952,7 +28996,10 @@ mod bee_route_tests {
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["error"].as_str().unwrap().contains("disabled"), "{body}");
-        assert!(!log.exists(), "the switch being off must never reach the CLI");
+        assert!(
+            !log.exists(),
+            "the switch being off must never reach the CLI"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&store).ok();
@@ -29091,7 +29138,14 @@ mod bee_route_tests {
         let lines: Vec<&str> = argv.lines().collect();
         assert_eq!(
             lines,
-            vec!["send", "agent-1", "--prompt", "hello there", "--no-wait", "--json"],
+            vec![
+                "send",
+                "agent-1",
+                "--prompt",
+                "hello there",
+                "--no-wait",
+                "--json"
+            ],
             "argv must match PaseoCli::send's own shape (S1/S2)"
         );
 
@@ -29182,7 +29236,10 @@ mod bee_route_tests {
             v["error"].as_str().unwrap().contains("32768-byte limit"),
             "the app's own named refusal must name the byte limit, never axum's bare 413: {body}"
         );
-        assert!(!log.exists(), "an oversized message must never reach the CLI");
+        assert!(
+            !log.exists(),
+            "an oversized message must never reach the CLI"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -29257,10 +29314,7 @@ mod bee_route_tests {
             .method("OPTIONS")
             .uri("/paseo/agent-1/send")
             .header(header::ORIGIN, "https://evil.example")
-            .header(
-                header::ACCESS_CONTROL_REQUEST_METHOD,
-                "POST",
-            )
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -29920,7 +29974,10 @@ mod bee_route_tests {
         );
 
         let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
-        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls", "--json"]);
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["permit", "ls", "--json"]
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -29970,7 +30027,10 @@ mod bee_route_tests {
         );
 
         let argv = std::fs::read_to_string(&log).expect("permit_ls must still have been read");
-        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["permit", "ls", "--json"]);
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["permit", "ls", "--json"]
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -30353,7 +30413,10 @@ mod bee_route_tests {
         let html = v["html"].as_str().unwrap();
         assert!(!html.contains("data-paseo-permit"), "{html}");
         assert!(!html.contains("was not recognized"), "{html}");
-        assert!(html.contains("hi"), "the conversation body must still render: {html}");
+        assert!(
+            html.contains("hi"),
+            "the conversation body must still render: {html}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
@@ -33886,6 +33949,118 @@ mod bee_route_tests {
             body.contains("not a git repository") || body.contains("git command line"),
             "the empty state says why there is nothing to show: {body}"
         );
+    }
+
+    /// A fixture git call whose stdout is the answer: the commit-mode route
+    /// tests have to learn the sha they are about to put in a URL.
+    fn git_fixture_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/nonexistent/waggledance-git-global")
+            .env("GIT_CONFIG_SYSTEM", "/nonexistent/waggledance-git-system")
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// cds-5 / D6: `?commit=<sha>` end to end. The parsers have their own
+    /// unit tests; what only the route can prove is that the query value
+    /// reaches the git layer and that the page comes back showing THAT
+    /// commit — the working tree is dirtied first so the two are
+    /// distinguishable in the response body.
+    #[tokio::test]
+    async fn changes_route_in_commit_mode_shows_that_commit_not_the_working_tree() {
+        let dir = fresh_root("changes-commit");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "first"]);
+        write(&dir, "mod.txt", "alpha\nCOMMITTED\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "the second commit"]);
+        let sha = git_fixture_out(&dir, &["rev-parse", "HEAD"]);
+        // Noise the commit view must not pick up: an edit and an untracked
+        // file, both real on disk and both absent from the commit.
+        write(&dir, "mod.txt", "alpha\nDIRTYWORKTREE\n");
+        write(&dir, "loosefile.txt", "untracked\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-commit");
+        let resp = get(
+            router(st),
+            &format!("/p/{}/_changes?commit={sha}", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        assert!(
+            body.contains("COMMITTED"),
+            "the commit's own new side renders: {body}"
+        );
+        assert!(
+            !body.contains("DIRTYWORKTREE"),
+            "a commit base never shows what the working tree holds now: {body}"
+        );
+        assert!(
+            !body.contains("loosefile.txt"),
+            "no untracked call runs in commit mode: {body}"
+        );
+        assert!(
+            body.contains("the second commit") && body.contains(&sha[..7]),
+            "the header names the commit being read: {body}"
+        );
+        assert!(
+            !body.contains("working tree"),
+            "and no longer claims to be the working tree: {body}"
+        );
+    }
+
+    /// D7 through the route: a `?commit` value that is not a commit renders
+    /// the working tree, with a 200 and with no trace of what was sent —
+    /// the daemon is unauthenticated on the LAN, so a reflected value is a
+    /// finding on its own.
+    #[tokio::test]
+    async fn changes_route_with_an_unusable_commit_falls_back_without_echoing_it() {
+        let dir = fresh_root("changes-badcommit");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return;
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nWORKTREEONLY\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-badcommit");
+        let app = router(st);
+        for raw in [
+            "zzz",
+            "--upload-pack=x",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            let resp = get(
+                app.clone(),
+                &format!("/p/{}/_changes?commit={raw}", project.id),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "D7: never a 500 for {raw}");
+            let body = body_string(resp).await;
+            assert!(
+                body.contains("working tree") && body.contains("WORKTREEONLY"),
+                "the fallback is the real working-tree view: {body}"
+            );
+            assert!(
+                !body.contains(raw),
+                "the refused value is never echoed back: {raw}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,13 +1,14 @@
-//! The working-tree diff behind the Changes screen: what `git` reports for
-//! the project's own files, compared against `HEAD` (D2 — staged, unstaged,
-//! and untracked all in one view; no base picker).
+//! The diff behind the Changes screen: what `git` reports for the project's
+//! own files, either as the working tree against `HEAD` (D2 — staged,
+//! unstaged, and untracked all in one view) or as one commit against its
+//! parent (D6, the base picker's other setting).
 //!
 //! Shells out to the system `git` binary rather than linking a git library:
 //! the viewer already depends on a checkout being on disk, and a C-built
 //! crate would cost more than it buys here.
 //!
-//! Four read-only calls per page, all with `-C <project_root>`, a timeout,
-//! and a kill:
+//! Four read-only calls per working-tree page, all with `-C <project_root>`,
+//! a timeout, and a kill:
 //!
 //! 1. `rev-parse --show-toplevel` — is this a repository at all. `git diff`
 //!    cannot answer that: outside a repository it silently falls into
@@ -28,6 +29,28 @@
 //! 4. `ls-files -o --exclude-standard -z` — untracked files (git's own
 //!    exclude rules), each read through [`code_source::read_source`] and
 //!    shown as a full add.
+//!
+//! Commit mode (D6) keeps calls 2 and 3 with `HEAD` replaced by
+//! `<parent> <resolved>`, and drops call 4 entirely: a commit is a closed
+//! set, so nothing from the working tree — untracked files least of all —
+//! belongs in it. `<parent>` is `<resolved>^` where that resolves and git's
+//! own [`EMPTY_TREE_SHA`] for a root commit, which makes every file of a
+//! first commit a plain add rather than an error.
+//!
+//! Ahead of those calls sits D7's gate, and it is the reason this module
+//! resolves the base itself instead of trusting a caller: the value comes
+//! off a URL on a daemon that is unauthenticated on the LAN, so it must be
+//! 4–40 hex characters ([`is_hex_sha`]) AND survive
+//! `git rev-parse --verify --end-of-options <sha>^{commit}` before any other
+//! call sees it, every later call uses the RESOLVED full sha, and every
+//! invocation puts revisions after `--end-of-options`. A value that fails
+//! either half is not an error — it silently becomes the working-tree
+//! comparison, so the screen answers with a diff and never echoes back what
+//! it was sent.
+//!
+//! [`log_entries`] is the picker's own list: one `git log` call, NUL-safe,
+//! newest first. The subjects it carries are user-authored text like any
+//! other — HTML-escaped at render, never trusted.
 //!
 //! D5 holds over every path either list produces: each one goes through
 //! [`code_source::resolve_source_path`] with the project's exclude patterns
@@ -63,6 +86,55 @@ pub const MAX_SECTIONS: usize = 100;
 pub const MAX_STDOUT_BYTES: usize = 48 * 1024 * 1024;
 
 const MAX_STDERR_BYTES: usize = 8 * 1024;
+
+/// Cap on the commit-list call's stdout. Fifty one-line records cannot
+/// approach it; a repository with a pathological subject line still cannot
+/// make the picker cost a page's memory.
+const MAX_LOG_BYTES: usize = 1024 * 1024;
+
+/// How many commits the base picker lists (D6).
+pub const LOG_LIMIT: usize = 50;
+
+/// git's own empty tree — the "before" side a root commit is compared
+/// against, so a repository's first commit renders as a set of plain adds
+/// instead of a failed call. Well-known and stable: it is the SHA-1 of an
+/// empty tree object, which every SHA-1 repository shares.
+pub const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Which comparison the Changes screen was ASKED for (D6). The commit
+/// variant carries the caller's raw, still-unvalidated request — D7's gate
+/// runs inside this module, on the way to an [`ActiveBase`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DiffBase {
+    #[default]
+    WorkingTree,
+    /// A `?commit=` value straight off the URL. Never reaches a git argv
+    /// unvalidated.
+    Commit(String),
+}
+
+/// Which comparison the screen is ACTUALLY showing. Differs from the
+/// requested [`DiffBase`] exactly when D7's gate refused the request: the
+/// page then shows the working tree and says so.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ActiveBase {
+    #[default]
+    WorkingTree,
+    Commit(CommitEntry),
+}
+
+/// One commit as the base picker lists it (D6). `subject` is whatever the
+/// author wrote — untrusted text, escaped wherever it is rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitEntry {
+    /// The full resolved sha; what every git call uses.
+    pub sha: String,
+    /// git's own abbreviation, for display.
+    pub short: String,
+    /// Author date, `YYYY-MM-DD`.
+    pub date: String,
+    pub subject: String,
+}
 
 /// Why the Changes screen has no diff to show. Every variant renders D3's
 /// explained empty state — never a 500, and never a bare stack of git's own
@@ -172,28 +244,78 @@ pub struct WorkingTreeDiff {
     pub stdout_truncated: bool,
     /// More than [`MAX_SECTIONS`] files changed; the rest render as stubs.
     pub sections_capped: bool,
+    /// What this diff actually compared. Working-tree unless a `?commit`
+    /// value passed D7's gate — so a rejected value is visible here as the
+    /// fallback that happened, not as an error nobody can render.
+    pub base: ActiveBase,
 }
 
 /// The working-tree diff for `root`, filtered by the project's `exclude`
 /// patterns. See the module docs for the calls this makes.
 pub fn working_tree_diff(root: &Path, exclude: &[String]) -> Result<WorkingTreeDiff, GitDiffError> {
-    collect(root, exclude, "git", GIT_TIMEOUT)
+    diff(root, exclude, &DiffBase::WorkingTree)
 }
 
-/// The body of [`working_tree_diff`], with the git program and the timeout
-/// injectable so the failure paths (missing binary, a call that never
-/// returns) are testable without a 10-second test or a mutated PATH.
+/// The diff for `root` against `base` — the working tree (D2) or one commit
+/// against its parent (D6) — filtered by the project's `exclude` patterns.
+///
+/// D7's fallback lives here rather than in the caller: a commit value that
+/// is not 4–40 hex characters, or that `git rev-parse --verify` will not
+/// resolve to a commit, silently becomes the working-tree comparison. The
+/// result then reports [`ActiveBase::WorkingTree`], the page says "working
+/// tree", and the refused value is echoed nowhere.
+pub fn diff(
+    root: &Path,
+    exclude: &[String],
+    base: &DiffBase,
+) -> Result<WorkingTreeDiff, GitDiffError> {
+    collect(root, exclude, "git", GIT_TIMEOUT, base)
+}
+
+/// The most recent [`LOG_LIMIT`] commits of `root`'s repository, newest
+/// first — what the base picker lists (D6).
+///
+/// Any failure (no git, no repository, an unborn HEAD, a call that had to be
+/// killed) is an empty list rather than an error: a picker with nothing to
+/// pick still renders, and when git itself is the problem the diff beside it
+/// already carries the explained state (D3).
+pub fn log_entries(root: &Path, limit: usize) -> Vec<CommitEntry> {
+    log_with(root, limit, "git", GIT_TIMEOUT)
+}
+
+/// The body of [`diff`], with the git program and the timeout injectable so
+/// the failure paths (missing binary, a call that never returns) are
+/// testable without a 10-second test or a mutated PATH.
 fn collect(
     root: &Path,
     exclude: &[String],
     git: &str,
     timeout: Duration,
+    base: &DiffBase,
 ) -> Result<WorkingTreeDiff, GitDiffError> {
     let probe = run_git(git, root, &["rev-parse", "--show-toplevel"], timeout, 4096)?;
     if !probe.ok {
         return Err(GitDiffError::NotARepo);
     }
+    match base {
+        DiffBase::WorkingTree => collect_working_tree(root, exclude, git, timeout),
+        DiffBase::Commit(raw) => match resolve_commit(git, root, raw, timeout)? {
+            Some(commit) => collect_commit(root, exclude, git, timeout, commit),
+            // D7: a value that is not a commit here is not an error page and
+            // not a message quoting it back — it is the default view.
+            None => collect_working_tree(root, exclude, git, timeout),
+        },
+    }
+}
 
+/// The working tree against `HEAD` (D2): the three content calls of the
+/// module docs, the untracked list included.
+fn collect_working_tree(
+    root: &Path,
+    exclude: &[String],
+    git: &str,
+    timeout: Duration,
+) -> Result<WorkingTreeDiff, GitDiffError> {
     let mut diff = WorkingTreeDiff::default();
 
     let listing = run_git(
@@ -257,6 +379,142 @@ fn collect(
         sections = parse_patch(&String::from_utf8_lossy(&patch.stdout));
     }
 
+    push_entries(&mut diff, root, exclude, entries, sections);
+
+    let untracked = run_git(
+        git,
+        root,
+        &["ls-files", "-o", "--exclude-standard", "-z"],
+        timeout,
+        MAX_STDOUT_BYTES,
+    )?;
+    if untracked.ok {
+        diff.stdout_truncated |= untracked.truncated;
+        for path in split_nul(&untracked.stdout) {
+            let Ok(abs) = code_source::resolve_source_path(root, &path, exclude) else {
+                diff.hidden += 1;
+                continue;
+            };
+            if abs.is_dir() {
+                continue;
+            }
+            let body = match code_source::read_source(&abs) {
+                Ok(SourceContent::Binary { .. }) => ChangeBody::Binary,
+                Ok(SourceContent::Text { text, truncated }) => full_add(&text, truncated),
+                // Gone between the two calls, or unreadable: it is not a
+                // change anyone can look at, so it is not a row.
+                Err(_) => continue,
+            };
+            let (added, removed) = count_lines(&body);
+            diff.files.push(FileChange {
+                path,
+                old_path: None,
+                status: ChangeStatus::Added,
+                note: Some("untracked".to_string()),
+                added,
+                removed,
+                body,
+            });
+        }
+    }
+
+    cap_sections(&mut diff);
+    Ok(diff)
+}
+
+/// One commit against its parent (D6). The same two content calls the
+/// working tree makes, with the resolved revisions in place of `HEAD` and
+/// after `--end-of-options` (D7) — and no untracked call at all, because a
+/// commit is a closed set that the working tree has no place in.
+fn collect_commit(
+    root: &Path,
+    exclude: &[String],
+    git: &str,
+    timeout: Duration,
+    commit: CommitEntry,
+) -> Result<WorkingTreeDiff, GitDiffError> {
+    // A root commit has no parent; git's own empty tree is the "before"
+    // that makes each of its files a plain add instead of a failed call.
+    let parent = rev_parse(git, root, &format!("{sha}^", sha = commit.sha), timeout)?
+        .unwrap_or_else(|| EMPTY_TREE_SHA.to_string());
+
+    let mut diff = WorkingTreeDiff {
+        base: ActiveBase::Commit(commit.clone()),
+        ..WorkingTreeDiff::default()
+    };
+
+    let listing = run_git(
+        git,
+        root,
+        &[
+            "diff",
+            "-M",
+            "--name-status",
+            "-z",
+            "--relative",
+            "--end-of-options",
+            &parent,
+            &commit.sha,
+            "--",
+            ".",
+        ],
+        timeout,
+        MAX_STDOUT_BYTES,
+    )?;
+    if !listing.ok {
+        return Err(GitDiffError::GitUnavailable(first_line(&listing.stderr)));
+    }
+    diff.stdout_truncated |= listing.truncated;
+    let entries = parse_name_status(&listing.stdout);
+
+    let mut sections: HashMap<String, DiffSection> = HashMap::new();
+    if !entries.is_empty() {
+        let patch = run_git(
+            git,
+            root,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "-M",
+                "--no-color",
+                "--no-ext-diff",
+                "--relative",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "-U100000",
+                "--end-of-options",
+                &parent,
+                &commit.sha,
+                "--",
+                ".",
+            ],
+            timeout,
+            MAX_STDOUT_BYTES,
+        )?;
+        if !patch.ok {
+            return Err(GitDiffError::GitUnavailable(first_line(&patch.stderr)));
+        }
+        diff.stdout_truncated |= patch.truncated;
+        sections = parse_patch(&String::from_utf8_lossy(&patch.stdout));
+    }
+
+    push_entries(&mut diff, root, exclude, entries, sections);
+    cap_sections(&mut diff);
+    Ok(diff)
+}
+
+/// Turn the authoritative `--name-status` list into rows, pairing each with
+/// its reconstructed section. Shared by both bases on purpose: D5's filter
+/// and the body/count rules must not be able to drift apart between the
+/// working tree and a commit.
+fn push_entries(
+    diff: &mut WorkingTreeDiff,
+    root: &Path,
+    exclude: &[String],
+    entries: Vec<Entry>,
+    mut sections: HashMap<String, DiffSection>,
+) {
     for entry in entries {
         // D5: both names of a rename are checked — a file renamed away from
         // a denied name must not surface under its new one either.
@@ -316,44 +574,11 @@ fn collect(
             body,
         });
     }
+}
 
-    let untracked = run_git(
-        git,
-        root,
-        &["ls-files", "-o", "--exclude-standard", "-z"],
-        timeout,
-        MAX_STDOUT_BYTES,
-    )?;
-    if untracked.ok {
-        diff.stdout_truncated |= untracked.truncated;
-        for path in split_nul(&untracked.stdout) {
-            let Ok(abs) = code_source::resolve_source_path(root, &path, exclude) else {
-                diff.hidden += 1;
-                continue;
-            };
-            if abs.is_dir() {
-                continue;
-            }
-            let body = match code_source::read_source(&abs) {
-                Ok(SourceContent::Binary { .. }) => ChangeBody::Binary,
-                Ok(SourceContent::Text { text, truncated }) => full_add(&text, truncated),
-                // Gone between the two calls, or unreadable: it is not a
-                // change anyone can look at, so it is not a row.
-                Err(_) => continue,
-            };
-            let (added, removed) = count_lines(&body);
-            diff.files.push(FileChange {
-                path,
-                old_path: None,
-                status: ChangeStatus::Added,
-                note: Some("untracked".to_string()),
-                added,
-                removed,
-                body,
-            });
-        }
-    }
-
+/// Past [`MAX_SECTIONS`] every file still gets its row; only the contents
+/// stop, behind a stub that points at the Code view.
+fn cap_sections(diff: &mut WorkingTreeDiff) {
     if diff.files.len() > MAX_SECTIONS {
         diff.sections_capped = true;
         for file in diff.files.iter_mut().skip(MAX_SECTIONS) {
@@ -362,8 +587,163 @@ fn collect(
             );
         }
     }
+}
 
-    Ok(diff)
+// ---------------------------------------------------------------------------
+// D7: resolving a requested base, and the commit list beside it
+// ---------------------------------------------------------------------------
+
+/// D7's shape gate: 4–40 hex characters and nothing else. Deliberately run
+/// BEFORE any git call, so a flag-shaped value (`--upload-pack=…`,
+/// `--output=…`) is refused by this crate rather than argued about with
+/// git's own option parser.
+fn is_hex_sha(raw: &str) -> bool {
+    (4..=40).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// D7 in full: the shape gate, then git's own verdict, then the commit's
+/// display fields. `Ok(None)` is "not a commit here" — the caller falls back
+/// to the working tree. Only a git call that could not run is an `Err`.
+fn resolve_commit(
+    git: &str,
+    root: &Path,
+    raw: &str,
+    timeout: Duration,
+) -> Result<Option<CommitEntry>, GitDiffError> {
+    if !is_hex_sha(raw) {
+        return Ok(None);
+    }
+    let peeled = format!("{raw}^{{commit}}");
+    let Some(sha) = rev_parse(git, root, &peeled, timeout)? else {
+        return Ok(None);
+    };
+    Ok(Some(describe_commit(git, root, &sha, timeout)?))
+}
+
+/// `rev-parse --verify` on one revision, the revision after
+/// `--end-of-options` (D7). `--quiet` keeps git's "Needed a single
+/// revision" off stderr — an unresolvable revision is an ordinary answer
+/// here, not a fault. `Ok(None)` is "does not resolve".
+fn rev_parse(
+    git: &str,
+    root: &Path,
+    rev: &str,
+    timeout: Duration,
+) -> Result<Option<String>, GitDiffError> {
+    let out = run_git(
+        git,
+        root,
+        &["rev-parse", "--verify", "--quiet", "--end-of-options", rev],
+        timeout,
+        4096,
+    )?;
+    if !out.ok {
+        return Ok(None);
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // A full object name only; anything shorter would mean git answered
+    // something other than the question asked, and the later calls take the
+    // resolved value on trust.
+    if sha.len() >= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(Some(sha))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The already-resolved commit's display fields. A `git log` that will not
+/// answer still leaves a usable base — the sha is what the diff calls need,
+/// and the header falls back to an abbreviation of it.
+fn describe_commit(
+    git: &str,
+    root: &Path,
+    sha: &str,
+    timeout: Duration,
+) -> Result<CommitEntry, GitDiffError> {
+    let out = run_git(
+        git,
+        root,
+        &[
+            "log",
+            "-n",
+            "1",
+            "--no-color",
+            LOG_FORMAT,
+            "--date=short",
+            "-z",
+            "--end-of-options",
+            sha,
+            "--",
+        ],
+        timeout,
+        MAX_LOG_BYTES,
+    )?;
+    if out.ok {
+        if let Some(entry) = parse_log(&out.stdout).into_iter().next() {
+            return Ok(entry);
+        }
+    }
+    Ok(CommitEntry {
+        sha: sha.to_string(),
+        short: sha.chars().take(12).collect(),
+        date: String::new(),
+        subject: String::new(),
+    })
+}
+
+/// `<sha> US <short> US <date> US <subject>`, records NUL-separated by `-z`.
+/// The subject goes LAST because it is the one field a commit author can put
+/// anything in: parsed with a limit, a separator byte inside it lands in the
+/// subject where it belongs instead of shifting every field after it.
+const LOG_FORMAT: &str = "--format=%H%x1f%h%x1f%ad%x1f%s";
+
+/// The body of [`log_entries`], with the git program and timeout injectable
+/// for the same reason [`collect`]'s is.
+fn log_with(root: &Path, limit: usize, git: &str, timeout: Duration) -> Vec<CommitEntry> {
+    let n = limit.to_string();
+    let Ok(out) = run_git(
+        git,
+        root,
+        &[
+            "log",
+            "-n",
+            &n,
+            "--no-color",
+            LOG_FORMAT,
+            "--date=short",
+            "-z",
+        ],
+        timeout,
+        MAX_LOG_BYTES,
+    ) else {
+        return Vec::new();
+    };
+    if !out.ok {
+        return Vec::new();
+    }
+    parse_log(&out.stdout)
+}
+
+fn parse_log(bytes: &[u8]) -> Vec<CommitEntry> {
+    split_nul(bytes)
+        .into_iter()
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').splitn(4, '\u{1f}');
+            let sha = fields.next()?.to_string();
+            let short = fields.next()?.to_string();
+            let date = fields.next()?.to_string();
+            let subject = fields.next().unwrap_or_default().to_string();
+            if sha.is_empty() {
+                return None;
+            }
+            Some(CommitEntry {
+                sha,
+                short,
+                date,
+                subject,
+            })
+        })
+        .collect()
 }
 
 /// An untracked file: every line an addition, both sides reconstructed the
@@ -1163,6 +1543,7 @@ mod tests {
             &[],
             "/nonexistent/waggledance-git-binary",
             Duration::from_secs(1),
+            &DiffBase::WorkingTree,
         )
         .unwrap_err();
         assert!(matches!(err, GitDiffError::GitUnavailable(_)), "{err:?}");
@@ -1183,6 +1564,7 @@ mod tests {
             &[],
             stub.to_str().unwrap(),
             Duration::from_millis(200),
+            &DiffBase::WorkingTree,
         )
         .unwrap_err();
         assert_eq!(err, GitDiffError::Timeout(0));
@@ -1206,5 +1588,249 @@ mod tests {
         // An unknown letter is a row, never a dropped change.
         assert_eq!(entries[4].path, "odd.txt");
         assert_eq!(entries[4].status, ChangeStatus::Modified);
+    }
+
+    // -----------------------------------------------------------------
+    // D6 / D7: the commit base
+    // -----------------------------------------------------------------
+
+    /// A fixture git call whose stdout is the answer — the commit tests have
+    /// to learn the sha they are about to ask for.
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/nonexistent/waggledance-git-global")
+            .env("GIT_CONFIG_SYSTEM", "/nonexistent/waggledance-git-system")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "fixture git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// D6: a commit shows what IT changed against its parent. The fixture
+    /// dirties the working tree afterwards on purpose — the whole point of
+    /// the mode is that none of that noise reaches the page, untracked files
+    /// least of all (there is no `ls-files` call at all in this path).
+    #[test]
+    fn a_commit_is_compared_against_its_parent_not_the_working_tree() {
+        if !git_present() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let root = &root_of(&tmp);
+        init_repo(root);
+        write(root, "mod.txt", "a\nb\nc\n");
+        write(root, "del.txt", "old\n");
+        commit_all(root, "first");
+        write(root, "mod.txt", "a\nB\nc\n");
+        fs::remove_file(root.join("del.txt")).unwrap();
+        write(root, "added.txt", "new\n");
+        commit_all(root, "the second commit");
+        let sha = git_out(root, &["rev-parse", "HEAD"]);
+
+        write(root, "mod.txt", "a\nWORKTREE\nc\n");
+        write(root, "loose.txt", "untracked\n");
+
+        let changed = diff(root, &[], &DiffBase::Commit(sha.clone())).unwrap();
+        let ActiveBase::Commit(base) = &changed.base else {
+            panic!(
+                "the commit base is what the page reports: {:?}",
+                changed.base
+            );
+        };
+        assert_eq!(base.sha, sha, "later calls use the resolved full sha");
+        assert_eq!(base.subject, "the second commit");
+        assert!(sha.starts_with(&base.short), "{} vs {sha}", base.short);
+        assert_eq!(base.date.len(), 10, "--date=short: {}", base.date);
+
+        assert_eq!(
+            paths(&changed),
+            vec!["added.txt", "del.txt", "mod.txt"],
+            "the commit's own files, and nothing the working tree added since"
+        );
+        let m = find(&changed, "mod.txt");
+        assert_eq!(m.status, ChangeStatus::Modified);
+        assert_eq!(
+            sides(&m.body),
+            ("a\nb\nc\n", "a\nB\nc\n"),
+            "the commit's own new side — not what the file holds on disk now"
+        );
+        assert_eq!((m.added, m.removed), (1, 1));
+        let d = find(&changed, "del.txt");
+        assert_eq!(d.status, ChangeStatus::Deleted);
+        assert_eq!(sides(&d.body), ("old\n", ""));
+        let a = find(&changed, "added.txt");
+        assert_eq!(a.status, ChangeStatus::Added);
+        assert_eq!(sides(&a.body), ("", "new\n"));
+    }
+
+    /// A repository's first commit has no parent to name; git's empty tree
+    /// stands in, so it renders as the set of adds it actually is instead of
+    /// failing the page.
+    #[test]
+    fn a_root_commit_is_compared_against_the_empty_tree() {
+        if !git_present() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let root = &root_of(&tmp);
+        init_repo(root);
+        write(root, "one.txt", "hello\n");
+        write(root, "src/two.txt", "world\n");
+        commit_all(root, "root commit");
+        let sha = git_out(root, &["rev-parse", "HEAD"]);
+
+        let changed = diff(root, &[], &DiffBase::Commit(sha)).unwrap();
+        assert_eq!(paths(&changed), vec!["one.txt", "src/two.txt"]);
+        assert_eq!(find(&changed, "one.txt").status, ChangeStatus::Added);
+        assert_eq!(sides(&find(&changed, "one.txt").body), ("", "hello\n"));
+        assert_eq!(sides(&find(&changed, "src/two.txt").body), ("", "world\n"));
+    }
+
+    /// D7: a value that is not a commit is the default view, not an error
+    /// and not a message quoting it back. Both halves of the gate are
+    /// exercised — a shape git never sees, and a well-shaped sha that names
+    /// nothing in this repository.
+    #[test]
+    fn a_commit_value_that_names_nothing_falls_back_to_the_working_tree() {
+        if !git_present() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let root = &root_of(&tmp);
+        init_repo(root);
+        write(root, "f.txt", "one\n");
+        commit_all(root, "init");
+        write(root, "f.txt", "two\n");
+
+        let refused = vec![
+            "zzz".to_string(),
+            "--upload-pack=x".to_string(),
+            "abc".to_string(),
+            "a".repeat(41),
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+        ];
+        for raw in refused {
+            let changed = diff(root, &[], &DiffBase::Commit(raw.clone())).unwrap();
+            assert_eq!(
+                changed.base,
+                ActiveBase::WorkingTree,
+                "{raw} must never become a base"
+            );
+            assert_eq!(paths(&changed), vec!["f.txt"]);
+            assert_eq!(
+                sides(&find(&changed, "f.txt").body),
+                ("one\n", "two\n"),
+                "the fallback is the real working-tree comparison, not an empty one"
+            );
+        }
+    }
+
+    /// D7's shape gate, on its own. It runs BEFORE any git call precisely so
+    /// that a flag-shaped value is refused by this crate rather than argued
+    /// about with git's option parser — `--upload-pack=…` is the one that
+    /// turns a diff viewer into a command runner.
+    #[test]
+    fn the_commit_shape_gate_takes_bare_hex_and_nothing_else() {
+        assert!(is_hex_sha("abcd"));
+        assert!(is_hex_sha("0123456789abcdefABCDEF0123456789abcdef01"));
+        for bad in [
+            "--upload-pack=x",
+            "-uabc",
+            "--output=/tmp/x",
+            "HEAD",
+            "abc",
+            "",
+            "abcd ",
+            "ab cd",
+            "abcd;id",
+            "../etc",
+            "0123456789abcdef0123456789abcdef012345678",
+        ] {
+            assert!(!is_hex_sha(bad), "{bad:?} must never reach a git argv");
+        }
+    }
+
+    /// D5 does not weaken in commit mode: the excluded path is skipped and
+    /// counted, and its name is nowhere in the result.
+    #[test]
+    fn a_denied_path_is_skipped_and_only_counted_in_commit_mode_too() {
+        if !git_present() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let root = &root_of(&tmp);
+        init_repo(root);
+        write(root, "src/lib.rs", "pub fn a() {}\n");
+        write(root, "id_rsa", "-----BEGIN OPENSSH PRIVATE KEY-----\n");
+        write(root, "node_modules/pkg/index.js", "module.exports = {}\n");
+        commit_all(root, "init");
+        write(root, "src/lib.rs", "pub fn b() {}\n");
+        write(
+            root,
+            "id_rsa",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nrotated\n",
+        );
+        write(root, "node_modules/pkg/index.js", "module.exports = 1\n");
+        commit_all(root, "rotate");
+        let sha = git_out(root, &["rev-parse", "HEAD"]);
+
+        let changed = diff(root, &["node_modules".to_string()], &DiffBase::Commit(sha)).unwrap();
+        assert_eq!(paths(&changed), vec!["src/lib.rs"]);
+        assert_eq!(changed.hidden, 2);
+        let rendered = format!("{changed:?}");
+        for denied in ["id_rsa", "node_modules"] {
+            assert!(
+                !rendered.contains(denied),
+                "a denied path must never reach a commit diff either: {denied}"
+            );
+        }
+    }
+
+    /// The picker's list (D6): newest first, one record per commit, the
+    /// subject carried whole. It arrives RAW — escaping belongs to the
+    /// renderer, and a parser that sanitised here would hide from the view
+    /// layer that it must.
+    #[test]
+    fn the_commit_list_is_newest_first_and_carries_subjects_whole() {
+        if !git_present() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let root = &root_of(&tmp);
+        init_repo(root);
+        write(root, "a.txt", "1\n");
+        commit_all(root, "first commit");
+        write(root, "a.txt", "2\n");
+        commit_all(root, "second <b>commit</b> & more");
+
+        let log = log_entries(root, LOG_LIMIT);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].subject, "second <b>commit</b> & more");
+        assert_eq!(log[1].subject, "first commit");
+        assert!(log[0].sha.len() >= 40 && log[0].sha.starts_with(&log[0].short));
+        assert_eq!(log[0].date.len(), 10, "--date=short: {}", log[0].date);
+        assert_eq!(log_entries(root, 1).len(), 1, "the limit is honoured");
+
+        // The list is where the picker's shas come from, so every one of
+        // them has to survive D7's gate on the way back in.
+        let changed = diff(root, &[], &DiffBase::Commit(log[1].sha.clone())).unwrap();
+        assert_eq!(paths(&changed), vec!["a.txt"]);
+        assert_eq!(sides(&find(&changed, "a.txt").body), ("", "1\n"));
+    }
+
+    /// A project with no repository has no commits to offer — an empty
+    /// picker, never an error the page has to render twice.
+    #[test]
+    fn the_commit_list_of_a_non_repository_is_empty_not_an_error() {
+        if !git_present() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let root = &root_of(&tmp);
+        write(root, "readme.md", "# hi\n");
+        assert!(log_entries(root, LOG_LIMIT).is_empty());
     }
 }

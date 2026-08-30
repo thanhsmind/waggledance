@@ -12,9 +12,10 @@ use waggledance_core::bee::{
 use waggledance_core::code_source::DirListing;
 use waggledance_core::config::Config;
 use waggledance_core::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
-use waggledance_core::engine::ChangesView;
+use waggledance_core::engine::{ChangesContent, ChangesView};
 use waggledance_core::git_diff::{
-    ChangeBody, ChangeStatus, DiffLine, FileChange, GitDiffError, LineKind, WorkingTreeDiff,
+    ActiveBase, ChangeBody, ChangeStatus, DiffLine, FileChange, GitDiffError, LineKind,
+    WorkingTreeDiff,
 };
 use waggledance_core::render::{HighlightedSource, RenderService};
 use waggledance_core::short_link::{path_hash, short_code};
@@ -5051,7 +5052,11 @@ fn bee_live_strip_section(snapshot: &BeeSnapshot) -> String {
                     None => String::new(),
                 };
                 (
-                    format!(" data-work-status=\"{}\"{}", esc(&work.status), acceptance_attr),
+                    format!(
+                        " data-work-status=\"{}\"{}",
+                        esc(&work.status),
+                        acceptance_attr
+                    ),
                     format!(
                         r#"<span class="bee-strip__work">“{}”</span>"#,
                         esc(&work.title)
@@ -9741,16 +9746,20 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
 /// that had to be killed all render an explained empty state here (D3) —
 /// the entry point stays, only its content changes.
 pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderService) -> String {
-    let (tree, main) = match view {
-        ChangesView::Unavailable(reason) => (
+    let scope = base_label(&view.base);
+    let (tree, main) = match &view.content {
+        ChangesContent::Unavailable(reason) => (
             changes_nav_empty("No file list — see the note beside it."),
             changes_unavailable(reason),
         ),
-        ChangesView::Diff(diff) if diff.files.is_empty() => (
+        ChangesContent::Diff(diff) if diff.files.is_empty() => (
             changes_nav_empty("No changed files."),
-            changes_body(project, diff, render),
+            changes_body(project, diff, &scope, render),
         ),
-        ChangesView::Diff(diff) => (changes_nav(diff), changes_body(project, diff, render)),
+        ChangesContent::Diff(diff) => (
+            changes_nav(diff),
+            changes_body(project, diff, &scope, render),
+        ),
     };
     let body_html = format!(
         r#"{topbar}
@@ -9758,7 +9767,7 @@ pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderServic
   <aside id="sidebar" class="sidebar">{tree}</aside>
   <div class="sidebar-backdrop"></div>
   <main class="content content--changes">
-    <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">working tree</span></div></nav>
+    <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">{scope}</span></div></nav>
     <div class="changes" data-project-id="{pid}">{main}</div>
   </main>
 </div>"#,
@@ -9771,9 +9780,26 @@ pub fn changes_page(project: &Project, view: &ChangesView, render: &RenderServic
         tree = tree,
         pid = esc(&project.id),
         name = esc(&project.name),
+        scope = esc(&scope),
         main = main,
     );
     layout_with_drawer("Changes", "", &body_html, false)
+}
+
+/// What the screen says it is comparing (D6). The working tree keeps the
+/// words it has always had, so a page without `?commit` reads exactly as it
+/// did; a commit names itself by git's own abbreviation and its subject.
+///
+/// The subject is whatever a commit author typed — it is escaped by every
+/// caller here, like every other string this module renders.
+fn base_label(base: &ActiveBase) -> String {
+    match base {
+        ActiveBase::WorkingTree => "working tree".to_string(),
+        ActiveBase::Commit(commit) if commit.subject.is_empty() => {
+            format!("commit {}", commit.short)
+        }
+        ActiveBase::Commit(commit) => format!("{} — {}", commit.short, commit.subject),
+    }
 }
 
 /// D3's empty state, in the user's terms: what the screen would show, why it
@@ -9897,13 +9923,19 @@ fn chg_stat(file: &FileChange) -> String {
     )
 }
 
-fn changes_body(project: &Project, diff: &WorkingTreeDiff, render: &RenderService) -> String {
+fn changes_body(
+    project: &Project,
+    diff: &WorkingTreeDiff,
+    scope: &str,
+    render: &RenderService,
+) -> String {
     let mut out = String::new();
     let mut head = format!(
         "<span class=\"changes__count\">{n} {word} changed</span>\
-         <span class=\"changes__scope\">working tree</span>",
+         <span class=\"changes__scope\">{scope}</span>",
         n = diff.files.len(),
         word = plural_files(diff.files.len()),
+        scope = esc(scope),
     );
     if !diff.files.is_empty() {
         // D4's N/M counter. It ships `hidden` and `app.js` unhides it, the
@@ -9932,7 +9964,12 @@ fn changes_body(project: &Project, diff: &WorkingTreeDiff, render: &RenderServic
         out.push_str("<p class=\"changes__note\">Only the first files are shown with their contents; the rest are listed without.</p>");
     }
     if diff.files.is_empty() {
-        out.push_str("<p class=\"changes__empty\">Nothing has changed in the working tree.</p>");
+        out.push_str(match diff.base {
+            ActiveBase::WorkingTree => {
+                "<p class=\"changes__empty\">Nothing has changed in the working tree.</p>"
+            }
+            ActiveBase::Commit(_) => "<p class=\"changes__empty\">This commit changed nothing.</p>",
+        });
         return out;
     }
     for (i, file) in diff.files.iter().enumerate() {
@@ -12058,7 +12095,10 @@ mod tests {
             "a subject inside the budget is rendered whole"
         );
         assert_eq!(
-            bee_rail_wait_clip("Chon muc do tich hop Jarvis vao Super+Space tren Omarchy", 48),
+            bee_rail_wait_clip(
+                "Chon muc do tich hop Jarvis vao Super+Space tren Omarchy",
+                48
+            ),
             "Chon muc do tich hop Jarvis vao Super+Space…",
             "the live subject clips at its last space inside the budget"
         );
@@ -13004,19 +13044,19 @@ mod tests {
     fn every_page_offers_the_guide_from_the_shared_top_bar_menu() {
         let project = sample_project();
         let pages = [
-            ("settings", settings_page(
-                &Config::default(),
-                false,
-                false,
-                NotifyCredentialView::NotConfigured,
-                &[],
-            )),
+            (
+                "settings",
+                settings_page(
+                    &Config::default(),
+                    false,
+                    false,
+                    NotifyCredentialView::NotConfigured,
+                    &[],
+                ),
+            ),
             ("terminal", terminal_page(&project, &[], None, &[])),
             ("guide index", guide_index_page()),
-            (
-                "guide chapter",
-                guide_chapter_page(&guide::CHAPTERS[0]),
-            ),
+            ("guide chapter", guide_chapter_page(&guide::CHAPTERS[0])),
         ];
         for (what, html) in pages {
             let menu_start = html
@@ -15597,7 +15637,10 @@ mod tests {
         let html = bee_live_strip_section(&waggledance_core::bee::read_snapshot(&root));
 
         assert!(!html.contains("<img"), "the tag must not survive: {html}");
-        assert!(!html.contains("<script"), "nor the one in the acceptance: {html}");
+        assert!(
+            !html.contains("<script"),
+            "nor the one in the acceptance: {html}"
+        );
         assert!(html.contains("&lt;img"), "it must arrive escaped: {html}");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -15637,7 +15680,12 @@ mod tests {
             .split('}')
             .next()
             .unwrap();
-        for needed in ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap", "min-width: 0"] {
+        for needed in [
+            "overflow: hidden",
+            "text-overflow: ellipsis",
+            "white-space: nowrap",
+            "min-width: 0",
+        ] {
             assert!(rule.contains(needed), "the work span must {needed}: {rule}");
         }
     }
@@ -17629,12 +17677,10 @@ mod tests {
         );
 
         let card_slot = (1..=10)
-            .find(|n| {
-                html.contains(&format!(
-                    "bee-hub__shell--p{n}\" data-hub-key=\""
-                ))
-            })
-            .unwrap_or_else(|| panic!("proj-a's own In Progress card must carry a colour modifier: {html}"));
+            .find(|n| html.contains(&format!("bee-hub__shell--p{n}\" data-hub-key=\"")))
+            .unwrap_or_else(|| {
+                panic!("proj-a's own In Progress card must carry a colour modifier: {html}")
+            });
         let row_slot = (1..=10)
             .find(|n| html.contains(&format!("bee-hub__row-project--p{n}\">Project A</span>")))
             .unwrap_or_else(|| {
@@ -21880,9 +21926,8 @@ mod tests {
 
     #[test]
     fn agent_output_is_html_escaped() {
-        let html = paseo_conversation_fragment(
-            "[User] <script>alert(1)</script>\n<b>bold reply</b>",
-        );
+        let html =
+            paseo_conversation_fragment("[User] <script>alert(1)</script>\n<b>bold reply</b>");
         assert!(!html.contains("<script>alert(1)</script>"), "{html}");
         assert!(!html.contains("<b>bold reply</b>"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
@@ -21894,7 +21939,8 @@ mod tests {
         let binary = paseo_conversation_error_fragment(PaseoCliError::BinaryNotFound);
         let daemon = paseo_conversation_error_fragment(PaseoCliError::DaemonUnreachable);
         let timeout = paseo_conversation_error_fragment(PaseoCliError::TimedOut);
-        let failed = paseo_conversation_error_fragment(PaseoCliError::Failed { exit_code: Some(1) });
+        let failed =
+            paseo_conversation_error_fragment(PaseoCliError::Failed { exit_code: Some(1) });
         let bodies = [&binary, &daemon, &timeout, &failed];
         for (i, a) in bodies.iter().enumerate() {
             for (j, b) in bodies.iter().enumerate() {
@@ -22182,6 +22228,7 @@ mod tests {
             hidden: 2,
             stdout_truncated: false,
             sections_capped: false,
+            base: ActiveBase::WorkingTree,
         }
     }
 
@@ -22203,10 +22250,21 @@ mod tests {
         out
     }
 
+    /// A page built from one diff and nothing else: the base the view
+    /// reports mirrors the diff's own, exactly as `Engine::changes` builds
+    /// it, so these fixtures cannot drift from the real pairing.
+    fn changes_view(diff: WorkingTreeDiff) -> ChangesView {
+        ChangesView {
+            base: diff.base.clone(),
+            content: ChangesContent::Diff(diff),
+            commits: Vec::new(),
+        }
+    }
+
     fn changes_html(diff: WorkingTreeDiff) -> String {
         changes_page(
             &sample_project(),
-            &ChangesView::Diff(diff),
+            &changes_view(diff),
             &RenderService::new(),
         )
     }
@@ -22344,7 +22402,9 @@ mod tests {
             "marks are scoped per project, so the id is on the screen root: {html}"
         );
         assert!(
-            html.contains("<section class=\"changeset\" id=\"f0\" data-path=\"src/app/main.rs\" data-key=\""),
+            html.contains(
+                "<section class=\"changeset\" id=\"f0\" data-path=\"src/app/main.rs\" data-key=\""
+            ),
             "each section names its file and its content key: {html}"
         );
         assert_eq!(
@@ -22444,9 +22504,13 @@ mod tests {
     fn the_unavailable_state_is_a_page_not_a_stack_trace() {
         let html = changes_page(
             &sample_project(),
-            &ChangesView::Unavailable(GitDiffError::GitUnavailable(
-                "/secret/path/git: No such file".into(),
-            )),
+            &ChangesView {
+                content: ChangesContent::Unavailable(GitDiffError::GitUnavailable(
+                    "/secret/path/git: No such file".into(),
+                )),
+                commits: Vec::new(),
+                base: ActiveBase::WorkingTree,
+            },
             &RenderService::new(),
         );
         assert!(

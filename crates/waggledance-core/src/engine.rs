@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
 use crate::error::{Error, Result};
 use crate::fuzzy::{self, FuzzyHit};
-use crate::git_diff::{self, GitDiffError, WorkingTreeDiff};
+use crate::git_diff::{self, ActiveBase, CommitEntry, DiffBase, GitDiffError, WorkingTreeDiff};
 use crate::indexer::{self, IndexService};
 use crate::render::{self, HighlightedSource, RenderService};
 use crate::repository::SqliteStore;
@@ -532,33 +532,66 @@ impl Engine {
         }
     }
 
-    /// The project's working-tree diff for the Changes screen (D2: staged +
-    /// unstaged + untracked, against HEAD). Mirrors `code_path` above: the
-    /// HTTP layer never touches `git_diff` itself, and the project's own
+    /// The project's diff for the Changes screen — the working tree against
+    /// HEAD (D2: staged + unstaged + untracked) or one commit against its
+    /// parent (D6), whichever `base` asks for. Mirrors `code_path` above:
+    /// the HTTP layer never touches `git_diff` itself, and the project's own
     /// exclude patterns travel with the call so D5's filter runs inside the
     /// git layer rather than after it.
     ///
+    /// `base` carries the caller's raw request, not a checked one: D7's gate
+    /// lives in `git_diff`, so a value that names no commit comes back as
+    /// the working-tree view with `ChangesView::base` saying so — never an
+    /// error, and never quoted back at the reader.
+    ///
     /// Git being missing, the project not being a repository, and a call
-    /// that had to be killed are all `Ok(ChangesView::Unavailable)`, not
-    /// `Err`: they are states the screen explains (D3), not failures of the
-    /// request. Only an unknown project id is an `Err`.
-    pub fn changes(&self, project_id: &str) -> Result<ChangesView> {
+    /// that had to be killed are all `Ok` with a
+    /// `ChangesContent::Unavailable` inside, not `Err`: they are states the
+    /// screen explains (D3), not failures of the request. Only an unknown
+    /// project id is an `Err`.
+    pub fn changes(&self, project_id: &str, base: &DiffBase) -> Result<ChangesView> {
         let project = self
             .store
             .get_project(project_id)?
             .ok_or_else(|| Error::ProjectNotFound(project_id.to_string()))?;
         let exclude = &self.config.indexing.exclude_patterns;
-        Ok(
-            match git_diff::working_tree_diff(&project.root_path, exclude) {
-                Ok(diff) => ChangesView::Diff(diff),
-                Err(reason) => ChangesView::Unavailable(reason),
-            },
-        )
+        let content = match git_diff::diff(&project.root_path, exclude, base) {
+            Ok(diff) => ChangesContent::Diff(diff),
+            Err(reason) => ChangesContent::Unavailable(reason),
+        };
+        // The picker's list costs one more git call, so it is only paid for
+        // when there is a repository to list: an unavailable diff has no
+        // commits to offer either.
+        let (commits, active) = match &content {
+            ChangesContent::Diff(diff) => (
+                git_diff::log_entries(&project.root_path, git_diff::LOG_LIMIT),
+                diff.base.clone(),
+            ),
+            ChangesContent::Unavailable(_) => (Vec::new(), ActiveBase::WorkingTree),
+        };
+        Ok(ChangesView {
+            content,
+            commits,
+            base: active,
+        })
     }
 }
 
 /// What the Changes screen renders — see `Engine::changes`.
-pub enum ChangesView {
+pub struct ChangesView {
+    /// The comparison, or why there is none (D3).
+    pub content: ChangesContent,
+    /// Recent commits for the base picker (D6), newest first. Empty when
+    /// there is no repository to list.
+    pub commits: Vec<CommitEntry>,
+    /// Which base the page is actually showing — a mirror of the diff's own
+    /// `base`, defined even when there is no diff so a caller can label the
+    /// screen without matching on the content first.
+    pub base: ActiveBase,
+}
+
+/// The Changes screen's content: a comparison, or the explained empty state.
+pub enum ChangesContent {
     Diff(WorkingTreeDiff),
     Unavailable(GitDiffError),
 }
@@ -1035,7 +1068,9 @@ mod tests {
         assert_eq!(listed[0].id, "r1");
 
         assert_eq!(engine.run_final_transcript("r1").unwrap(), None);
-        engine.set_run_final_transcript("r1", "final delta").unwrap();
+        engine
+            .set_run_final_transcript("r1", "final delta")
+            .unwrap();
         assert_eq!(
             engine.run_final_transcript("r1").unwrap().as_deref(),
             Some("final delta")
