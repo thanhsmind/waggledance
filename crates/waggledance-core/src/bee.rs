@@ -85,6 +85,14 @@
 //!   later event (an unrecognized future kind included) resolves it — see
 //!   [`BeeDeferredQueue`].
 //!
+//! board-visibility (slice 2) adds the human mailbox: `.bee/human-mailbox/*.md`,
+//! each letter's frozen YAML frontmatter parsed into a typed record by
+//! [`mailbox`], surfaced on [`BeeSnapshot::mailbox`]. A letter that cannot be
+//! read comes back as [`BeeMailboxEntry::Unreadable`] rather than vanishing —
+//! bee's own rule, and the reasoning lives in that module's doc comment. The
+//! letter files are opened for reading only, like every other path here (D4);
+//! read/unread is flipped by calling bee, never by writing the file.
+//!
 //! Every path-shaped value that crosses into a public field is rendered
 //! relative to the project root (or reduced to a bare filename when it
 //! falls outside the root) — no absolute path may survive into a
@@ -96,6 +104,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+mod mailbox;
+
+pub use mailbox::{
+    mailbox_dir, BeeLetter, BeeLetterDeparture, BeeLetterItem, BeeLetterNeedsYou, BeeLetterStatus,
+    BeeMailboxEntry,
+};
 
 /// One live cell, trimmed to what the cockpit board needs. Any path-shaped
 /// field (`files`, `worker`) is relativized against the project root before
@@ -1215,6 +1230,13 @@ pub struct BeeSnapshot {
     /// `.bee/deferred-queue.jsonl` debt (kanban-live-signals D3) — see
     /// [`read_deferred_queue`].
     pub deferred_queue: BeeDeferredQueue,
+    /// `.bee/human-mailbox/*.md` — every letter bee has filed for the human
+    /// in this project, sorted by file name (which is its id, and which
+    /// human-mailbox D11 makes chronological). Empty is the normal shape for
+    /// a checkout whose unattended loop has never run; an unreadable letter
+    /// is present as [`BeeMailboxEntry::Unreadable`], never dropped. See
+    /// [`mailbox`].
+    pub mailbox: Vec<BeeMailboxEntry>,
     /// Human-readable notes naming what could not be read. Every path
     /// mentioned here is relative to the project root.
     pub read_errors: Vec<String>,
@@ -1250,6 +1272,7 @@ impl BeeSnapshot {
             tier_mix: None,
             last_tool_call: None,
             deferred_queue: BeeDeferredQueue::default(),
+            mailbox: Vec::new(),
             read_errors: Vec::new(),
         }
     }
@@ -1422,6 +1445,11 @@ pub fn read_snapshot(root: &Path) -> BeeSnapshot {
     let last_tool_call = read_last_tool_call(&bee_dir);
     let deferred_queue = read_deferred_queue(&bee_dir, root, &mut read_errors);
 
+    // board-visibility: the letters bee filed for the human. Read-only, and
+    // never a `read_errors` entry — a letter that cannot be parsed carries its
+    // own reason to the board instead (see `mailbox`).
+    let mailbox = mailbox::read_mailbox(&bee_dir);
+
     let attention = compute_attention_items(
         &buckets.stuck,
         &read_errors,
@@ -1460,6 +1488,7 @@ pub fn read_snapshot(root: &Path) -> BeeSnapshot {
         tier_mix,
         last_tool_call,
         deferred_queue,
+        mailbox,
         read_errors,
     }
 }
