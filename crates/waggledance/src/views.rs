@@ -530,6 +530,14 @@ const HOME_RAIL_BACKDROP: &str =
 /// reachable from a phone without opening the top bar's menu, and the CSS
 /// grid widened to five columns in the same edit.
 ///
+/// board-visibility bi-2 stopped there: the inbox (`/inbox`) is reached from
+/// the top bar menu on every page ([`topbar_full`]) and is deliberately NOT a
+/// sixth column here. Widening this bar is a layout decision its owner took
+/// once already (dcfbda20, four columns to five, with the stylesheet's grid
+/// changed to match), and a sixth 60px-wide destination on a handset is a
+/// decision to take deliberately rather than inherit from whoever adds the
+/// next page. The menu has no such ceiling, so nothing is unreachable.
+///
 /// Four of the five are real anchors, for the same reason every other
 /// navigation control on this page is: they have to survive the full page
 /// reload and work with scripting off. `Projects` is the exception, and
@@ -4220,6 +4228,17 @@ fn bee_hub_style() -> String {
   --bee-hub-project-10: #E873A9;
 }
 .bee-hub { margin-bottom: var(--space-4); }
+/* board-visibility bi-4: the home board's unread-letter strip
+   (`bee_cross_project_unread_strip`) is the shared `.fg-banner` component
+   wearing an anchor instead of a div, so the whole strip is the click target
+   that reaches `/inbox`. These two lines are the entire difference: undo the
+   link underline the banner was never drawn with, and light the text on hover
+   the way `.bee-hub__row` does, so it still reads as somewhere to go.
+   board-live-morph D2: deliberately NO transition and NO animation here --
+   motion belongs to a card that moved, never to a count that changed, and a
+   rule added here would be exactly that mistake. */
+.bee-hub__inbox { text-decoration: none; }
+.bee-hub__inbox:hover { color: var(--color-action); }
 /* board-liveness-3: the live strip's own dense-row idiom, one row per live
    session or granted worktree — deliberately never `.bee-hub__row`'s
    feature-link styling, since a strip row never links anywhere of its
@@ -6178,6 +6197,64 @@ fn bee_cross_project_read_errors_strip(rollups: &[(&Project, &BeeProjectRollup)]
     )
 }
 
+/// board-visibility D3 on the cross-project home page: ONE number — how many
+/// letters bee has filed and nobody has read yet, summed across every
+/// registered project — and a link to `/inbox`, where the reading happens.
+///
+/// **Why a count and not a list.** D3 refuses a home-page section unless the
+/// owner can act on it AND its number can go down. An unread count passes both
+/// clauses: reading a letter lowers it, and the act of reading is one click
+/// away. A list of letter rows here would pass the first and fail the second
+/// the moment letters accumulate — which is not a hypothetical, it is why a
+/// list-shaped block was deleted from this board once already. So the subject
+/// lines stay on `/inbox` ([`inbox_page`]) and only the number comes home.
+///
+/// **Zero renders nothing at all** — no strip, no placeholder, no "0". That is
+/// the same rule [`bee_cross_project_read_errors_strip`] answers to directly
+/// above, and it does not contradict the stat tiles' "a zero tile still
+/// renders": a tile is a fixed slot in a three-up row whose shape would break
+/// with a hole in it, while this is a strip that either has something to say
+/// or has no reason to exist. On this machine zero is the ordinary state (bee
+/// files a letter only from an unattended run), so a permanent "0 unread"
+/// would be furniture, not information.
+///
+/// **Unread only, never the unreadable ones.** `BeeMailboxEntry::is_unread`
+/// is false for an entry that failed to parse — an unreadable letter is its
+/// own, louder signal and the inbox names it there; folding it into this
+/// number would let a broken store read as "one more thing to read".
+///
+/// **board-live-morph D1/D2.** This strip is a DIRECT child of the
+/// `data-feature-hub` section, sitting outside `.bee-hub__groups` and
+/// `.bee-hub__archive` — which is exactly the set `app.js`'s
+/// `hubPatchWholesale` keeps in place and re-parents around. Every other
+/// direct child is removed and re-inserted from the freshly fetched section
+/// on each patch, so this number is replaced wholesale on every update:
+/// never appended twice, never left showing a stale count. It carries no
+/// `data-hub-key` and neither of the two keyed classes (`.bee-hub__shell`,
+/// `.bee-hub__row`) the patch moves or fades, and `bee_hub_style` gives
+/// `.bee-hub__inbox` no transition of its own — D2 spends motion on the card,
+/// never on a count that changed.
+fn bee_cross_project_unread_strip(rollups: &[(&Project, &BeeProjectRollup)]) -> String {
+    let count: usize = rollups
+        .iter()
+        .map(|(_, rollup)| {
+            rollup
+                .snapshot
+                .mailbox
+                .iter()
+                .filter(|entry| entry.is_unread())
+                .count()
+        })
+        .sum();
+    if count == 0 {
+        return String::new();
+    }
+    format!(
+        r#"<a class="fg-banner fg-banner--info bee-hub__inbox" href="/inbox" data-bee-unread="{count}"><span class="fg-banner__dot"></span><span class="fg-banner__body">{count} lá thư chưa đọc từ các lượt chạy</span><span class="fg-banner__act">Mở hộp thư</span></a>"#,
+        count = count,
+    )
+}
+
 /// board-run-actions D3 hands in `live_runs`, every project's own live board
 /// runs, keyed by project id exactly like the pane map beside it — this page
 /// merges several projects' rows into one column, so a feature name alone
@@ -6436,11 +6513,17 @@ pub fn bee_cross_project_features_section(
     let ready_to_merge_cards = bee_hub_finished_rows(&ready_to_merge_rows);
     let finished_cards = bee_hub_finished_rows(&finished_rows);
     let read_errors_strip = bee_cross_project_read_errors_strip(rollups);
+    // board-visibility bi-4: a direct child of the section, beside the read
+    // errors strip and outside `.bee-hub__groups` -- see
+    // `bee_cross_project_unread_strip` for why that placement is what makes
+    // the in-place board patch replace it rather than duplicate or strand it.
+    let unread_strip = bee_cross_project_unread_strip(rollups);
 
     format!(
         r#"<section class="fg-card bee-hub" data-feature-hub="cross-project">
   <h3 class="bee-panel__head">Features</h3>
   {read_errors_strip}
+  {unread_strip}
   {stat_tiles}
   <div class="bee-hub__groups">
     {todo_group}
@@ -6452,6 +6535,7 @@ pub fn bee_cross_project_features_section(
   {archive_bar}
 </section>"#,
         read_errors_strip = read_errors_strip,
+        unread_strip = unread_strip,
         stat_tiles = bee_hub_stat_tiles(
             in_progress_count,
             in_progress_waiting_count,
@@ -10436,7 +10520,8 @@ fn topbar(center: &str) -> String {
 /// on these pages is "Waggle Dance" by a locked decision (`bee-cockpit.md`),
 /// never the identifier the command line uses.
 ///
-/// The nav slot, the Hướng dẫn link (guide-vi) and the Settings link share
+/// The nav slot, the Hộp thư link (board-visibility bi-2), the Hướng dẫn link
+/// (guide-vi) and the Settings link share
 /// one menu. On a wide screen the
 /// stylesheet hides its control and lays the panel out inline, so the bar
 /// reads exactly as it did before this existed. On a narrow one the control
@@ -10482,6 +10567,7 @@ fn topbar_full(lead: &str, center: &str, actions: &str, nav: &str) -> String {
       <label class="topbar-menu__button" for="topbar-menu-toggle" title="Menu"><span class="menu-label">Menu</span><span aria-hidden="true">☰</span></label>
       <div class="topbar-menu__panel">
         {nav}
+        <a class="nav-link nav-link--icon" href="/inbox" title="Hộp thư"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"></rect><polyline points="3 7 12 13 21 7"></polyline></svg><span class="nav-link__txt">Hộp thư</span></a>
         <a class="nav-link nav-link--icon" href="/guide" title="Hướng dẫn"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg><span class="nav-link__txt">Hướng dẫn</span></a>
         <a class="nav-link nav-link--icon" href="/settings" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg><span class="nav-link__txt">Settings</span></a>
       </div>
@@ -10754,6 +10840,287 @@ pub fn settings_page(
         orchestration_rows = orchestration_rows,
     );
     layout_with_drawer("Settings", "", &body, false)
+}
+
+// ---------------------------------------------------------------------------
+// board-visibility bi-2 — the inbox: every project's filed letters, one list.
+// ---------------------------------------------------------------------------
+
+/// A letter's body, ALREADY through `waggledance-core`'s ordinary sanitizing
+/// markdown pipeline (`render::RenderService::render` — comrak, then the same
+/// ammonia sanitize every document page on this host goes through).
+///
+/// The newtype exists to make that non-negotiable at the type level, because
+/// the other prose surface in this file deliberately goes the opposite way:
+/// [`guide_chapter_page`] embeds `chapter.body` verbatim and UNSANITIZED, and
+/// it may — those fragments are authored by us and compiled into the binary
+/// with `include_str!` (decision d7efc6fe, and [`crate::guide`]'s own module
+/// docs). A letter is not ours. Another program composed it, in another
+/// project's checkout, out of that run's entries, and the file sits in a
+/// git-ignored runtime directory. So it takes the untrusted path, and the
+/// only constructor here takes a `RenderedPage` — a caller cannot hand
+/// [`inbox_letter_page`] a raw string even by accident, and no second
+/// pipeline is written for it.
+pub struct SanitizedLetterBody(String);
+
+impl SanitizedLetterBody {
+    /// The one door in. `RenderedPage::html` is the pipeline's sanitized
+    /// output, and nothing else can produce one.
+    pub fn from_rendered(page: &RenderedPage) -> Self {
+        Self(page.html.clone())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One row of the inbox: a letter bee filed for the human, flattened for the
+/// view. Built in `server.rs` from `BeeSnapshot::mailbox` (bi-1's reader) —
+/// the view never touches disk.
+///
+/// `unreadable` carries the reason a letter could not be parsed, and is the
+/// discriminator: a row with `Some(..)` names its file and why instead of
+/// pretending to be a letter, and has no `href`, because there is no parsed
+/// letter behind it to open. That row is never dropped — bee's own reason,
+/// quoted at `waggledance_core::bee::mailbox`: a silently missing letter reads
+/// to the human as a quiet night rather than as a broken store.
+pub struct InboxRow {
+    /// Where this row leads, or `None` for an unreadable entry.
+    pub href: Option<String>,
+    /// The letter's one-line subject; empty for an unreadable entry.
+    pub subject: String,
+    /// Which project this letter is about. For a letter, the `project` field
+    /// the letter itself carries (bee's own word for it); for an unreadable
+    /// entry — which has no parsed fields at all — the registered name of the
+    /// checkout the file was found in, the only thing we can honestly name.
+    pub project: String,
+    /// The letter's `filed_at`, verbatim; empty for an unreadable entry.
+    pub filed_at: String,
+    /// The file name, which human-mailbox D11 makes the letter's only id.
+    pub file: String,
+    /// True only for a letter that parsed and is still unread.
+    pub unread: bool,
+    /// Why this file could not be read as a letter, when it could not be.
+    pub unreadable: Option<String>,
+}
+
+/// What the inbox says when it holds nothing — and it holds nothing on this
+/// machine today, which is the normal state, not a broken one.
+///
+/// This is written for a reader who does not know bee's internals, because it
+/// is the whole page for them. Every clause behind it is a measured fact: bee
+/// files a letter only from an unattended run (its D9), and its `armed()`
+/// requires BOTH a `herding` block in `.bee/config.json` AND the owner's own
+/// marker file `<main-root>/.bee/tmp/bee-herding.enable`. The block is present
+/// in these checkouts; the marker is not, in any of them. So zero letters
+/// exist, and the honest thing to render is the reason — never a bare "0" and
+/// never an empty list frame, which would read as a store that is broken or as
+/// a page that has not finished loading.
+const INBOX_EMPTY: &str = r#"<div class="fg-card">
+  <div class="fg-card__head"><div class="fg-card__title">Chưa có lá thư nào</div></div>
+  <div class="fg-card__body fg-prose">
+    <p>Thư ở đây không phải do bạn hay tôi ngồi viết: mỗi lượt chạy <strong>không có người ngồi trực</strong> sẽ tự để lại đúng một lá thư khi nó xong việc — kể lại đã làm gì, đi chệch kế hoạch ở đâu, hỏng chỗ nào, và có câu nào chỉ bạn mới trả lời được.</p>
+    <p>Máy này chưa bật chế độ chạy không người trực, nên chưa lượt chạy nào tới lúc phải viết thư. Hộp thư trống vì vậy là <strong>bình thường</strong>, không phải hỏng hóc — khi nào bạn bật nó lên và một lượt chạy kết thúc, lá thư đầu tiên sẽ nằm ở đây.</p>
+  </div>
+</div>"#;
+
+/// `GET /inbox` — one cross-project list of every letter every registered
+/// project has filed, newest first.
+///
+/// **Where it is reached from, and why only there.** From the shared top bar
+/// menu ([`topbar_full`]), on every page, beside Hướng dẫn and Settings — the
+/// same slot and the same shape the guide already uses. Deliberately NOT from
+/// the handset tab bar ([`home_tabbar`]): decision dcfbda20 records that
+/// adding the guide there widened that bar from four columns to five, so
+/// there is no free slot left, and widening it a second time is a layout
+/// decision its owner already took once and would have to take again. The top
+/// bar menu has no such ceiling — it is a list that scrolls — so a phone still
+/// reaches the inbox in two presses, through the same menu it reaches
+/// everything else that leaves the page.
+///
+/// Rows arrive already ordered by the caller and are rendered in that order:
+/// sorting is over the file NAME, since human-mailbox D11 makes the name a UTC
+/// timestamp followed by a run slug precisely so that "a directory listing is
+/// the index" — which also gives an unreadable entry, with no parsed
+/// `filed_at` to sort on, its correct place in the sequence.
+pub fn inbox_page(rows: &[InboxRow]) -> String {
+    let unread = rows.iter().filter(|r| r.unread).count();
+    // A summary of what is on THIS page, not the home page's own number (bi-4
+    // owns that one). It renders only when non-zero, for the same reason the
+    // board does: zero unread needs no pill to say so.
+    let aside = if unread > 0 {
+        format!(
+            r#"<div class="fg-pagehead__aside"><span class="fg-chip fg-chip--accent">{unread} chưa đọc</span></div>"#
+        )
+    } else {
+        String::new()
+    };
+    let list = if rows.is_empty() {
+        INBOX_EMPTY.to_string()
+    } else {
+        rows.iter().map(inbox_row_html).collect::<String>()
+    };
+    let body = format!(
+        r#"{topbar}
+<main class="fg-page">
+  <header class="fg-pagehead">
+    <div class="fg-pagehead__eyebrow">Hộp thư</div>
+    <h1 class="fg-pagehead__title">Thư từ các lượt chạy</h1>
+    {aside}
+  </header>
+  {list}
+</main>"#,
+        topbar = topbar("<span class=\"crumb\">Hộp thư</span>"),
+        aside = aside,
+        list = list,
+    );
+    layout_with_drawer("Hộp thư", "", &body, false)
+}
+
+/// One row: a link to the letter's own body, and the control that flips its
+/// read state ([`inbox_mark_form`]). An unreadable entry is a plain block
+/// naming the file and the reason — louder than an ordinary row on purpose,
+/// never a link, and with no flip control either, because there is no parsed
+/// letter on the other side of one and nothing whose status bee could move.
+///
+/// bi-3: the card is a `<div>` whose TITLE is the anchor, where bi-2 made the
+/// whole card one anchor. A form is interactive content and a browser may not
+/// nest it inside a link at all, so keeping the outer anchor would have meant
+/// keeping the flip control off the list — and the list is exactly where a
+/// human decides a letter is dealt with. The link itself is unchanged in
+/// target; only how much of the card is clickable.
+fn inbox_row_html(row: &InboxRow) -> String {
+    if let Some(reason) = &row.unreadable {
+        return format!(
+            r#"<div class="fg-card fg-card--rule">
+  <div class="fg-card__head"><div class="fg-card__title">{file}</div><span class="fg-chip fg-chip--danger">Không đọc được</span></div>
+  <div class="fg-card__sub">{project}</div>
+  <div class="fg-card__body">{reason}</div>
+</div>"#,
+            file = esc(&row.file),
+            project = esc(&row.project),
+            reason = esc(reason),
+        );
+    }
+    format!(
+        r#"<div class="fg-card">
+  <div class="fg-card__head"><a class="fg-card__title" href="{href}">{subject}</a>{mark}</div>
+  <div class="fg-card__sub">{project} · {filed_at}</div>
+  {flip}
+</div>"#,
+        href = esc(row.href.as_deref().unwrap_or("/inbox")),
+        subject = esc(&row.subject),
+        mark = unread_mark(row.unread),
+        project = esc(&row.project),
+        filed_at = esc(&row.filed_at),
+        flip = inbox_mark_form(row, "/inbox"),
+    )
+}
+
+/// The read/unread marker. A word, never colour alone, so the state survives a
+/// greyscale screen and reaches a screen reader as text.
+fn unread_mark(unread: bool) -> &'static str {
+    if unread {
+        r#"<span class="fg-chip fg-chip--accent">Chưa đọc</span>"#
+    } else {
+        r#"<span class="fg-chip fg-chip--neutral">Đã đọc</span>"#
+    }
+}
+
+/// bi-3: the one control that flips a letter between read and unread.
+///
+/// It is a plain HTML `<form>` posting to `server.rs::inbox_mark_handler`, and
+/// that handler runs `bee mailbox mark` in the letter's own project. Nothing
+/// in this file, and nothing behind that route, opens the letter — human-mailbox
+/// D6 puts the field inside the letter and bee's own command is the only thing
+/// allowed to move it. So the state shown here is never flipped optimistically:
+/// the page that renders after the post is re-read from disk, which means what
+/// the chip says is what bee wrote, and a refused mark leaves the row exactly
+/// as it was.
+///
+/// A form, not `fetch` (the same reasoning `error_page_with_refresh`'s refresh
+/// button already took): the post works with the page's own scripts idle, and
+/// the button carries no state of its own that could disagree with the letter.
+///
+/// One button, whose direction is the letter's current state — an unread letter
+/// offers "read", a read one offers "unread" — because those are the only two
+/// values in bee's closed status set and offering both at once would render one
+/// button that is always a no-op.
+///
+/// `back` is where the reader should land afterwards: the list for a row, the
+/// letter's own page for the letter view. It is a same-site path built here,
+/// never user input, and `server.rs::safe_redirect_path` re-checks it anyway
+/// because the route is unauthenticated like every other route in this server.
+///
+/// An unreadable entry (`href: None`) gets no form: bee refuses a mark naming
+/// no filed letter, and a button whose only outcome is a refusal is not a
+/// control, it is a trap.
+fn inbox_mark_form(row: &InboxRow, back: &str) -> String {
+    let Some(href) = row.href.as_deref() else {
+        return String::new();
+    };
+    let (status, label) = if row.unread {
+        ("read", "Đánh dấu đã đọc")
+    } else {
+        ("unread", "Đánh dấu chưa đọc")
+    };
+    format!(
+        r#"<form class="fg-card__foot" method="post" action="{action}">
+  <input type="hidden" name="status" value="{status}">
+  <input type="hidden" name="back" value="{back}">
+  <button type="submit" class="fg-btn fg-btn--secondary">{label}</button>
+</form>"#,
+        action = esc(&format!("{href}/mark")),
+        status = status,
+        back = esc(back),
+        label = label,
+    )
+}
+
+/// One letter, opened. The header is the typed frontmatter bi-1 parsed; the
+/// prose below it is the letter's own body, rendered through the sanitizing
+/// pipeline — see [`SanitizedLetterBody`] for why it can be nothing else.
+///
+/// bi-3: the header also carries the flip control ([`inbox_mark_form`]), beside
+/// the chip that states the letter's current state — the reader who just
+/// finished the letter is the one most likely to mark it read. The control is a
+/// form posting to a bee command; this page still opens no file, for reading or
+/// for writing, beyond the body it was handed.
+pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
+    // A letter whose run recorded nothing has an empty prose body (bee emits
+    // the frontmatter and stops). Saying so beats an unexplained blank.
+    let prose = if body.as_str().trim().is_empty() {
+        r#"<p class="fg-empty">Lá thư này không có phần nội dung — tất cả những gì nó nói nằm ở dòng tiêu đề bên trên.</p>"#.to_string()
+    } else {
+        body.as_str().to_string()
+    };
+    let body_html = format!(
+        r#"{topbar}
+<main class="fg-page">
+  <header class="fg-pagehead">
+    <div class="fg-pagehead__eyebrow">{project} · {filed_at}</div>
+    <h1 class="fg-pagehead__title">{subject}</h1>
+    <div class="fg-pagehead__aside">{mark}{flip}</div>
+  </header>
+  <article class="fg-prose">{prose}</article>
+  <p class="fg-card__sub">{file}</p>
+</main>"#,
+        topbar = topbar(&format!(
+            "<span class=\"crumb\"><a href=\"/inbox\">Hộp thư</a> · {}</span>",
+            esc(&row.subject)
+        )),
+        project = esc(&row.project),
+        filed_at = esc(&row.filed_at),
+        subject = esc(&row.subject),
+        mark = unread_mark(row.unread),
+        // Back to this letter's own page: a reader who marks it here stays
+        // here, and sees the chip beside the button carry bee's answer.
+        flip = inbox_mark_form(row, row.href.as_deref().unwrap_or("/inbox")),
+        prose = prose,
+        file = esc(&row.file),
+    );
+    layout_with_drawer(&format!("{} · Hộp thư", row.subject), "", &body_html, false)
 }
 
 /// guide-vi: the built-in guide's own chapter rail, on every guide page.
@@ -17044,6 +17411,344 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // -- board-visibility bi-4: the home page's one unread number ----------
+    //
+    // These go through `read_rollup` from a real letter file on disk rather
+    // than hand-building a `BeeSnapshot`, for the reason
+    // `docs/knowledge/patterns/prove-the-whole-path.md` names: the promise is
+    // user-visible ("I can see there is something to read"), and the seam
+    // between bi-1's mailbox reader, the cross-project roll-up and this strip
+    // belongs to no single unit test. The bytes below are bee's own emitter
+    // shape (`verbs/mailbox.rs::render_letter`); there are zero real letters
+    // on this machine, since bee files one only from an unattended run and no
+    // checkout has armed one.
+
+    /// One letter file on disk, in the bytes bee's emitter writes.
+    fn home_letter_file(root: &std::path::Path, name: &str, subject: &str, status: &str) {
+        let p = root.join(".bee/human-mailbox").join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            p,
+            format!(
+                "---\nsubject: {subject:?}\nrun: \"2026-08-30-run\"\nproject: \"demo\"\nfiled_at: \"2026-08-30T09:00:00Z\"\nstatus: {status:?}\nitems: []\nneeds_you: []\n---\n\nBody of the letter.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The one thing bi-4 puts on the home page: how many letters nobody has
+    /// read yet, summed across EVERY registered project, linking to `/inbox`.
+    /// Two projects contribute here and a read letter sits beside an unread
+    /// one, so a per-project count, a count of all letters, or a count taken
+    /// from the first project alone all read as a different number than 3.
+    #[test]
+    fn the_home_board_shows_one_unread_letter_count_summed_across_every_project() {
+        let root_a = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-a-{}",
+            std::process::id()
+        ));
+        let root_b = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-b-{}",
+            std::process::id()
+        ));
+        for r in [&root_a, &root_b] {
+            let _ = std::fs::remove_dir_all(r);
+            std::fs::create_dir_all(r.join(".bee")).unwrap();
+        }
+        home_letter_file(&root_a, "2026-08-30T09-00-00Z-one.md", "Letter one", "unread");
+        home_letter_file(&root_a, "2026-08-30T10-00-00Z-two.md", "Letter two", "unread");
+        home_letter_file(
+            &root_a,
+            "2026-08-30T11-00-00Z-old.md",
+            "Already seen",
+            "read",
+        );
+        home_letter_file(
+            &root_b,
+            "2026-08-30T12-00-00Z-far.md",
+            "Letter from the other project",
+            "unread",
+        );
+
+        let mut project_a = sample_project();
+        project_a.id = "proj-unread-a".into();
+        project_a.root_path = root_a.clone();
+        let mut project_b = sample_project();
+        project_b.id = "proj-unread-b".into();
+        project_b.root_path = root_b.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(&[root_a.clone(), root_b.clone()]);
+        let pairs: Vec<(&Project, &BeeProjectRollup)> =
+            vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            html.contains(r#"data-bee-unread="3""#),
+            "the count must be 3 -- every project's unread letters and only the unread ones: {html}"
+        );
+        assert!(
+            html.contains("3 lá thư chưa đọc"),
+            "the number must be readable as words, not only as an attribute: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/inbox""#),
+            "the count must lead to the inbox, where the reading that lowers it happens: {html}"
+        );
+        // D3's second clause is what forbids the letters themselves here.
+        for subject in [
+            "Letter one",
+            "Letter two",
+            "Already seen",
+            "Letter from the other project",
+        ] {
+            assert!(
+                !html.contains(subject),
+                "no letter subject may reach the home board -- only the number does: {html}"
+            );
+        }
+        assert!(
+            !html.contains("/inbox/p/"),
+            "no per-letter link may reach the home board either: {html}"
+        );
+
+        for r in [&root_a, &root_b] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// The mirror, and the harder half of the rule: at zero unread the home
+    /// board renders NOTHING -- no strip, no placeholder, no "0 chưa đọc".
+    /// Zero is the ordinary state on this machine, so a permanent zero would
+    /// be furniture. A project with letters that have all been read is the
+    /// case that separates "nothing to show" from "no mailbox at all", so
+    /// this one has a read letter on disk rather than an empty directory.
+    #[test]
+    fn the_home_board_shows_nothing_at_all_when_no_letter_is_unread() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-zero-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-seen.md", "Already seen", "read");
+
+        let mut project = sample_project();
+        project.id = "proj-unread-zero".into();
+        project.root_path = root.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            !html.contains("data-bee-unread"),
+            "zero unread renders no strip at all, not an empty one: {html}"
+        );
+        assert!(
+            !html.contains("chưa đọc") && !html.contains("bee-hub__inbox"),
+            "zero unread must not leave a placeholder or a bare 0 behind: {html}"
+        );
+        assert!(
+            !html.contains(r#"href="/inbox""#),
+            "with nothing to read there is nothing on the board to lead to it: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// board-live-morph D1 (decision 5dce3301): the home board does NOT
+    /// full-page reload -- it refetches its own HTML and patches
+    /// `[data-feature-hub]` in place. This asserts the whole path rather
+    /// than assuming it:
+    ///
+    /// 1. the strip is INSIDE the patched section, and a direct child of it,
+    ///    sitting before `.bee-hub__groups`;
+    /// 2. `app.js`'s `hubPatchWholesale` -- the function that actually runs
+    ///    on every patch -- removes every direct child except
+    ///    `.bee-hub__groups`/`.bee-hub__archive` and re-inserts the fetched
+    ///    section's own, which is exactly what makes (1) mean "replaced",
+    ///    never "appended twice";
+    /// 3. a second render with a different number carries the new count and
+    ///    only the new count, and still exactly one strip.
+    #[test]
+    fn the_home_unread_count_rides_the_patched_fragment_and_is_replaced_not_duplicated() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-patch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "unread");
+        home_letter_file(&root, "2026-08-30T10-00-00Z-b.md", "B", "unread");
+
+        let mut project = sample_project();
+        project.id = "proj-unread-patch".into();
+        project.root_path = root.clone();
+
+        let render = |root: &std::path::PathBuf, project: &Project| -> String {
+            let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(root));
+            let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(project, &rollups[0])];
+            bee_cross_project_features_section(
+                &pairs,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            )
+        };
+
+        let html = render(&root, &project);
+
+        // (1) Inside the refetched fragment, and outside the two containers
+        // the patch keeps -- i.e. a direct child of the section.
+        let section_at = html
+            .find(r#"data-feature-hub="cross-project""#)
+            .expect("the cross-project board renders the patched section");
+        let strip_at = html
+            .find(r#"data-bee-unread="2""#)
+            .expect("two unread letters render the strip");
+        let groups_at = html
+            .find(r#"<div class="bee-hub__groups">"#)
+            .expect("the board renders its groups container");
+        assert!(
+            section_at < strip_at && strip_at < groups_at,
+            "the strip must sit inside [data-feature-hub] and before .bee-hub__groups, \
+             so the patch replaces it wholesale: {html}"
+        );
+        assert_eq!(
+            html.matches("data-bee-unread").count(),
+            1,
+            "exactly one strip is rendered, so a patch has exactly one node to replace: {html}"
+        );
+
+        // (2) The patch function itself, pinned: what it spares, and what it
+        // therefore replaces. A future edit that started sparing more, or
+        // stopped re-inserting, would strand this number stale.
+        let js = APP_JS;
+        let start = js
+            .find("function hubPatchWholesale(oldSection, newSection) {")
+            .expect("hubPatchWholesale must exist");
+        let end = js[start..]
+            .find("\n  function ")
+            .map(|i| start + i)
+            .expect("hubPatchWholesale is followed by another function");
+        let block = &js[start..end];
+        assert!(
+            block.contains(
+                "if (child !== oldGroups && child !== oldArchive) oldSection.removeChild(child);"
+            ),
+            "every direct child but the groups and archive containers is removed on a patch: {block}"
+        );
+        assert!(
+            block
+                .contains("oldSection.insertBefore(document.importNode(before[i], true), oldGroups)"),
+            "and the fetched section's own pre-groups children are inserted back: {block}"
+        );
+
+        // (3) One letter read: the number moves, and only one strip survives.
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "read");
+        let next = render(&root, &project);
+        assert!(
+            next.contains(r#"data-bee-unread="1""#) && !next.contains(r#"data-bee-unread="2""#),
+            "the refetched fragment carries the NEW count, never the stale one: {next}"
+        );
+        assert_eq!(
+            next.matches("data-bee-unread").count(),
+            1,
+            "and still exactly one strip, never a second appended beside it: {next}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// board-live-morph D2 (decision 7871e652): motion is spent on the card
+    /// as a whole -- "Text, badges and counts inside a card" do not animate.
+    /// This count is exactly such a number, so it must not animate when it
+    /// changes. Two things make that true and both are pinned here: it is
+    /// none of the elements `app.js` moves or fades (it carries no
+    /// `data-hub-key`, and neither of the two keyed classes the board's own
+    /// transition rule names), and `bee_hub_style` gives `.bee-hub__inbox`
+    /// no transition or animation of its own.
+    #[test]
+    fn the_home_unread_count_does_not_animate_when_it_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-still-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "unread");
+
+        let mut project = sample_project();
+        project.id = "proj-unread-still".into();
+        project.root_path = root.clone();
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        let strip_at = html
+            .find(r#"class="fg-banner fg-banner--info bee-hub__inbox""#)
+            .expect("one unread letter renders the strip");
+        let strip_end = html[strip_at..]
+            .find("</a>")
+            .map(|i| strip_at + i)
+            .expect("the strip closes");
+        let strip = &html[strip_at..strip_end];
+        assert!(
+            !strip.contains("data-hub-key"),
+            "the strip must not be a keyed element -- those are what the patch moves and fades: {strip}"
+        );
+        assert!(
+            !strip.contains("bee-hub__shell") && !strip.contains("bee-hub__row"),
+            "nor may it wear either class the board's own transition rule names: {strip}"
+        );
+
+        // The comments in this stylesheet talk ABOUT motion (including the
+        // one beside this very rule, explaining why it has none), so they are
+        // stripped before the declarations are read -- otherwise the scan
+        // below would be matching prose, not CSS.
+        let style = bee_hub_style();
+        let mut css = String::with_capacity(style.len());
+        let mut rest = style.as_str();
+        while let Some(open) = rest.find("/*") {
+            css.push_str(&rest[..open]);
+            rest = match rest[open..].find("*/") {
+                Some(close) => &rest[open + close + 2..],
+                None => "",
+            };
+        }
+        css.push_str(rest);
+        for rule in css.split('}') {
+            if !rule.contains("bee-hub__inbox") {
+                continue;
+            }
+            assert!(
+                !rule.contains("transition") && !rule.contains("animation"),
+                "D2: a count that changed earns no motion -- {rule}"
+            );
+        }
+        assert!(
+            css.contains(".bee-hub__inbox"),
+            "the scan above must actually have a rule to read: {css}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// inprogress-priority-order-2 (D4/D6/D7): two projects, each
     /// contributing one In Progress feature and one Todo feature. The In
     /// Progress column must merge into ONE list ordered by the shared D7
@@ -22083,6 +22788,254 @@ mod tests {
             "a hostile request id must never open a live script tag: {html}"
         );
         assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    // -- board-visibility bi-2: the inbox ---------------------------------
+
+    fn letter_row(subject: &str, project: &str, filed_at: &str, unread: bool) -> InboxRow {
+        InboxRow {
+            href: Some(format!("/inbox/p/{filed_at}-run.md")),
+            subject: subject.into(),
+            project: project.into(),
+            filed_at: filed_at.into(),
+            file: format!("{filed_at}-run.md"),
+            unread,
+            unreadable: None,
+        }
+    }
+
+    /// A row has to answer four things at a glance, or the list is a list of
+    /// nothing: what the letter says, which project it is about, when it was
+    /// filed, and whether it has been read.
+    #[test]
+    fn an_inbox_row_names_subject_project_filed_at_and_read_state() {
+        let html = inbox_page(&[letter_row("Fixed the rail pill", "waggledance", "2026-08-30T09:00:00Z", true)]);
+        for needle in [
+            "Fixed the rail pill",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            "Chưa đọc",
+            r#"href="/inbox/p/2026-08-30T09:00:00Z-run.md""#,
+        ] {
+            assert!(html.contains(needle), "the row must carry {needle}: {html}");
+        }
+        // Read state is a word, not a colour: the read row says so too.
+        let read = inbox_page(&[letter_row("Already seen", "beehive", "2026-08-29T09:00:00Z", false)]);
+        assert!(read.contains("Đã đọc") && !read.contains("Chưa đọc"), "{read}");
+    }
+
+    /// bee's own rule, quoted at the reader this list reads from: a silently
+    /// missing letter reads to the human as a quiet night rather than as a
+    /// broken store. So a letter that could not be parsed is ON the page, by
+    /// name, with its reason — and it is not a link, because there is no
+    /// parsed letter behind it to open.
+    #[test]
+    fn an_unreadable_letter_is_named_on_the_inbox_and_never_linked() {
+        let html = inbox_page(&[InboxRow {
+            href: None,
+            subject: String::new(),
+            project: "waggledance".into(),
+            filed_at: String::new(),
+            file: "2026-08-30T10-00-00Z-broken.md".into(),
+            unread: false,
+            unreadable: Some("missing required field `filed_at`".into()),
+        }]);
+        assert!(
+            html.contains("2026-08-30T10-00-00Z-broken.md"),
+            "the unreadable letter must name its file: {html}"
+        );
+        assert!(
+            html.contains("missing required field `filed_at`"),
+            "and why it could not be read: {html}"
+        );
+        assert!(
+            html.contains("Không đọc được"),
+            "and say plainly that it could not be: {html}"
+        );
+        assert!(
+            !html.contains(r#"<a class="fg-card" href="/inbox/"#),
+            "an unreadable entry has no letter to open, so it is no link: {html}"
+        );
+        // bi-3: nor anything to flip. bee refuses a mark naming no filed
+        // letter, and a button whose only outcome is a refusal is a trap.
+        assert!(
+            !html.contains("/mark"),
+            "an unreadable entry offers no read/unread control: {html}"
+        );
+    }
+
+    /// bi-3: the flip control, on the row and on the letter's own page. It is
+    /// a form posting to the route that calls `bee mailbox mark` — never a
+    /// link, never a script — and it offers exactly the one direction the
+    /// letter is not already in, because `read|unread` is bee's whole set.
+    #[test]
+    fn the_flip_control_offers_the_one_direction_the_letter_is_not_in() {
+        let unread = inbox_page(&[letter_row(
+            "Đêm qua",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            true,
+        )]);
+        assert!(
+            unread.contains(r#"method="post" action="/inbox/p/2026-08-30T09:00:00Z-run.md/mark""#),
+            "the control posts to that letter's own mark route: {unread}"
+        );
+        assert!(
+            unread.contains(r#"name="status" value="read""#)
+                && unread.contains("Đánh dấu đã đọc")
+                && !unread.contains(r#"name="status" value="unread""#),
+            "an unread letter is offered the flip to read, and only that: {unread}"
+        );
+        assert!(
+            unread.contains(r#"name="back" value="/inbox""#),
+            "and lands the reader back on the list they clicked from: {unread}"
+        );
+
+        let read = inbox_page(&[letter_row(
+            "Đã xem",
+            "waggledance",
+            "2026-08-29T09:00:00Z",
+            false,
+        )]);
+        assert!(
+            read.contains(r#"name="status" value="unread""#)
+                && read.contains("Đánh dấu chưa đọc"),
+            "a read letter is offered the way back: {read}"
+        );
+    }
+
+    /// The letter's own page carries the same control, beside the chip that
+    /// states where the letter stands — and comes back to this letter, not to
+    /// the list, so the reader sees bee's answer on the page they are on.
+    #[test]
+    fn an_opened_letter_carries_the_flip_control_back_to_itself() {
+        let row = letter_row("Đêm qua", "waggledance", "2026-08-30T09:00:00Z", true);
+        let index: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let page = waggledance_core::render::RenderService::new().render(
+            "một việc\n",
+            &std::env::temp_dir().join("waggledance-bi3-letter.md"),
+            "p",
+            std::path::Path::new("/nonexistent"),
+            &index,
+        );
+        let html = inbox_letter_page(&row, &SanitizedLetterBody::from_rendered(&page));
+        assert!(
+            html.contains(r#"action="/inbox/p/2026-08-30T09:00:00Z-run.md/mark""#)
+                && html.contains(r#"name="status" value="read""#),
+            "the opened letter offers the same one flip: {html}"
+        );
+        assert!(
+            html.contains(r#"name="back" value="/inbox/p/2026-08-30T09:00:00Z-run.md""#),
+            "and returns to this letter rather than to the list: {html}"
+        );
+    }
+
+    /// Zero letters is this machine's normal state, not a fault — bee files a
+    /// letter only from an unattended run, and no checkout here has armed one.
+    /// The page has to SAY that. A bare count, or an empty list frame, would
+    /// read as a broken store or as a page that never loaded.
+    #[test]
+    fn an_empty_inbox_explains_the_unattended_run_instead_of_showing_a_zero() {
+        let html = inbox_page(&[]);
+        assert!(
+            html.contains("Chưa có lá thư nào"),
+            "the empty inbox must say it is empty in words: {html}"
+        );
+        assert!(
+            html.contains("không có người ngồi trực"),
+            "and name the one condition that files a letter: {html}"
+        );
+        assert!(
+            html.contains("Máy này chưa bật chế độ chạy không người trực"),
+            "and say that this machine has not armed it: {html}"
+        );
+        assert!(
+            !html.contains("fg-pagehead__aside"),
+            "no unread pill when there is nothing to have read: {html}"
+        );
+    }
+
+    /// Where the inbox is reached from (bi-2's own decision): the shared top
+    /// bar menu, on every page, beside Hướng dẫn and Settings.
+    #[test]
+    fn the_inbox_is_reached_from_the_top_bar_menu_on_every_page() {
+        for (page, html) in [
+            ("error", error_page(404, "nope")),
+            ("guide", guide_index_page()),
+            ("inbox", inbox_page(&[])),
+        ] {
+            let start = html
+                .find(r#"<div class="topbar-menu js-menu">"#)
+                .unwrap_or_else(|| panic!("{page} has no top bar menu"));
+            let end = start + html[start..].find("</header>").expect("unclosed top bar");
+            let menu = &html[start..end];
+            assert!(
+                menu.contains(r#"href="/inbox""#) && menu.contains("Hộp thư"),
+                "the {page} page's menu must reach the inbox beside the guide and Settings: {menu}"
+            );
+        }
+    }
+
+    /// dcfbda20 records that adding the guide widened the handset tab bar from
+    /// four columns to five, stylesheet grid included. bi-2 does not widen it
+    /// again: the inbox is reached from the menu instead, and this test is the
+    /// guard that keeps a later edit from quietly making it six.
+    #[test]
+    fn the_handset_tab_bar_keeps_the_five_destinations_it_was_widened_to() {
+        let bar = home_tabbar(HomeTab::Kanban);
+        let items = bar.matches("home-tabbar__item").count()
+            - bar.matches("home-tabbar__item--on").count();
+        assert_eq!(
+            items, 5,
+            "the tab bar's five columns are a recorded layout decision (dcfbda20): {bar}"
+        );
+        assert!(
+            !bar.contains("/inbox"),
+            "the inbox lives in the top bar menu, not as a sixth column: {bar}"
+        );
+    }
+
+    /// The letter body takes the UNTRUSTED path — `waggledance-core`'s
+    /// ordinary sanitizing markdown pipeline, the same one every document page
+    /// uses — and never the guide's authored-fragment path (d7efc6fe), because
+    /// another program in another checkout composed the file.
+    ///
+    /// The proof runs the real pipeline over hostile markdown and reads the
+    /// finished page: a `<script>` in a letter must not reach the browser as
+    /// one, while the letter's ordinary prose must survive.
+    #[test]
+    fn a_letters_body_is_rendered_through_the_sanitizing_pipeline() {
+        let source = "## Đã làm\n\n- một việc\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n";
+        let path = std::env::temp_dir().join("waggledance-bi2-letter.md");
+        let index: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        let page = waggledance_core::render::RenderService::new().render(
+            source,
+            &path,
+            "p",
+            std::path::Path::new("/nonexistent"),
+            &index,
+        );
+        let html = inbox_letter_page(
+            &letter_row("Một lượt chạy", "waggledance", "2026-08-30T09:00:00Z", true),
+            &SanitizedLetterBody::from_rendered(&page),
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "a letter's script tag must not survive into the page: {html}"
+        );
+        assert!(
+            !html.contains("onerror"),
+            "nor an inline event handler: {html}"
+        );
+        assert!(
+            html.contains("Đã làm") && html.contains("một việc"),
+            "the letter's own prose must still render: {html}"
+        );
+        assert!(
+            html.contains("Một lượt chạy") && html.contains("2026-08-30T09:00:00Z"),
+            "and the header keeps the letter's own frontmatter: {html}"
+        );
     }
 
     #[test]

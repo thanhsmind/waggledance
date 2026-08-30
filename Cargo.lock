@@ -2652,6 +2652,7 @@ dependencies = [
  "time",
  "toml",
  "tracing",
+ "yaml-rust",
 ]
 
 [[package]]

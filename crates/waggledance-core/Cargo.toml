@@ -30,6 +30,16 @@ libc.workspace = true
 # on this crate at the workspace level. Not an async runtime, so it does not
 # touch the `no_web_framework_dependency_declared` guard below.
 rand.workspace = true
+# board-visibility (bi-1): the `.bee/human-mailbox/` letters carry a YAML
+# frontmatter block whose key set bee owns and has frozen. bee JSON-quotes
+# every scalar it emits precisely so "the consuming inbox's real parser" can
+# read it, so this reads with a real parser rather than a hand-rolled one.
+# yaml-rust 0.4.5 was already compiled into this build transitively, so
+# promoting it to a direct dependency adds no new supply-chain surface; the
+# crate being unmaintained is the named trade-off in
+# docs/history/board-visibility/plan-slice-2.md. Not an async runtime, so it
+# does not touch the `no_web_framework_dependency_declared` guard above.
+yaml-rust = "0.4.5"
 
 [dev-dependencies]
 # paths_boundary.rs (agent-terminal-2) tests build temp directories; this
