@@ -20702,6 +20702,15 @@ mod bee_route_tests {
         ) -> herdr::Result<()> {
             unimplemented!("index_page never sends input")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unimplemented!("index_page never prompts an agent")
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unimplemented!("index_page never sends text")
         }
@@ -24648,6 +24657,15 @@ mod bee_route_tests {
         ) -> herdr::Result<()> {
             unreachable!("create routes never send input")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("create routes never prompt an agent")
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("create routes never send text")
         }
@@ -24770,6 +24788,15 @@ mod bee_route_tests {
             _submit: bool,
         ) -> herdr::Result<()> {
             unreachable!("page-selection tests never send input")
+        }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("page-selection tests never prompt an agent")
         }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("page-selection tests never send text")
@@ -32547,6 +32574,15 @@ mod bee_route_tests {
                 .inputs
                 .push((pane_id.to_string(), text.to_string()));
             Ok(())
+        }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("the run actions never prompt an agent")
         }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("the run actions never send raw bytes")

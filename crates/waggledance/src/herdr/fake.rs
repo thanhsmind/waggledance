@@ -600,6 +600,53 @@ impl Herdr for FakeHerdr {
         Ok(())
     }
 
+    /// Mirrors the real daemon's decision points (see `Herdr::agent_prompt`'s
+    /// doc) with no timing model: `FakeHerdr` has no clock to simulate the
+    /// daemon's own "observed a state change within 5000ms" wait, so it
+    /// answers synchronously from whatever status the agent already carries
+    /// at call time -- a test scripts the outcome it wants with `set_status`
+    /// BEFORE calling `agent_prompt`, exactly the same seam `set_status`
+    /// already serves for every other status-driven test in this module.
+    /// `Blocked` refuses before the text is sent, same as production; a
+    /// status already inside `until` (or an empty `until`) accepts and
+    /// delivers the text via `send_input`'s own submit path; anything else
+    /// is a stall. `timeout_ms` has no effect here -- there is nothing to
+    /// time out against without a clock, so this fake never returns
+    /// `HerdrError::Timeout`; only the real socket path can prove that arm.
+    async fn agent_prompt(
+        &self,
+        pane_id: &str,
+        text: &str,
+        until: &[AgentStatus],
+        _timeout_ms: u64,
+    ) -> Result<AgentStatus> {
+        self.ensure_up()?;
+        let status = {
+            let snap = self.inner.snapshot.lock().await;
+            let agent = snap
+                .agents
+                .iter()
+                .find(|a| a.pane_id == pane_id)
+                .ok_or_else(|| HerdrError::NoSuchPane(pane_id.to_string()))?;
+            if agent.status == AgentStatus::Blocked {
+                return Err(HerdrError::AgentBlocked(format!(
+                    "agent on {pane_id} is blocked"
+                )));
+            }
+            agent.status
+        };
+
+        self.send_input(pane_id, text, true).await?;
+
+        if until.is_empty() || until.contains(&status) {
+            Ok(status)
+        } else {
+            Err(HerdrError::AgentPromptStalled(format!(
+                "agent on {pane_id} did not reach {until:?} (observed {status:?})"
+            )))
+        }
+    }
+
     async fn send_keys(&self, pane_id: &str, keys: &[String]) -> Result<()> {
         self.ensure_up()?;
         let mut screens = self.inner.screens.lock().await;
@@ -836,6 +883,54 @@ mod tests {
         let f = FakeHerdr::new();
         assert!(matches!(
             f.send_keys("nope", &["up".into()]).await,
+            Err(HerdrError::NoSuchPane(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_accepted_delivers_text_and_returns_status() {
+        let f = FakeHerdr::new();
+        // w1:p1 seeds Working, which is inside `until` -- an accepted send.
+        let status = f
+            .agent_prompt("w1:p1", "go", &[AgentStatus::Working], 8000)
+            .await
+            .unwrap();
+        assert_eq!(status, AgentStatus::Working);
+        let after = f.read_pane("w1:p1", ReadSource::Visible, 0).await.unwrap();
+        assert!(after.text.contains("go"), "text must still be delivered");
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_blocked_refuses_before_send() {
+        let f = FakeHerdr::new();
+        let before = f.read_pane("w1:p2", ReadSource::Visible, 0).await.unwrap();
+        // w1:p2 seeds Blocked -- refused before any input reaches the pane.
+        let result = f
+            .agent_prompt("w1:p2", "go", &[AgentStatus::Working], 8000)
+            .await;
+        assert!(matches!(result, Err(HerdrError::AgentBlocked(_))));
+        let after = f.read_pane("w1:p2", ReadSource::Visible, 0).await.unwrap();
+        assert_eq!(after.text, before.text, "blocked must send nothing");
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_stalled_when_status_not_in_until() {
+        let f = FakeHerdr::new();
+        // w2:p4 seeds Idle, which is not in `until` -- a stall, distinct
+        // from both AgentBlocked and Timeout.
+        let result = f
+            .agent_prompt("w2:p4", "go", &[AgentStatus::Working], 8000)
+            .await;
+        assert!(matches!(result, Err(HerdrError::AgentPromptStalled(_))));
+        assert!(!matches!(result, Err(HerdrError::AgentBlocked(_))));
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_unknown_pane_errors() {
+        let f = FakeHerdr::new();
+        assert!(matches!(
+            f.agent_prompt("nope", "go", &[AgentStatus::Working], 8000)
+                .await,
             Err(HerdrError::NoSuchPane(_))
         ));
     }

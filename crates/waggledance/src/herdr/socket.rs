@@ -437,6 +437,12 @@ fn parse_response(line: &[u8]) -> Result<Value> {
                 message,
             },
             "invalid_agent_argv" => HerdrError::InvalidAgentArgv(message),
+            // `agent.prompt`'s three refusal codes -- see
+            // `Herdr::agent_prompt`'s doc for why each stays its own typed
+            // variant instead of collapsing into `Remote`.
+            "agent_blocked" => HerdrError::AgentBlocked(message),
+            "agent_prompt_stalled" => HerdrError::AgentPromptStalled(message),
+            "timeout" => HerdrError::Timeout(message),
             _ => HerdrError::Remote { code, message },
         });
     }
@@ -563,6 +569,23 @@ fn agent_start_params(name: &str, pane_id: &str, argv: &[String]) -> Value {
     })
 }
 
+/// Build the `agent.prompt` params -- `target`, `text`, and a `wait` object
+/// carrying `until`/`timeout_ms` verbatim (`AgentPromptParams { target,
+/// text, wait: { until, timeout_ms } }`, confirmed via
+/// `herdr api schema --json`). `target` is the pane id: the same wire slot
+/// herdr's `<TARGET>` CLI argument fills. Pure, same testable seam as
+/// `tab_create_params`/`agent_start_params`.
+fn agent_prompt_params(pane_id: &str, text: &str, until: &[AgentStatus], timeout_ms: u64) -> Value {
+    json!({
+        "target": pane_id,
+        "text": text,
+        "wait": {
+            "until": until,
+            "timeout_ms": timeout_ms,
+        },
+    })
+}
+
 /// `parse_response` cannot know the caller-supplied name or workspace_id, so
 /// it leaves `AgentNameTaken.name` and `WorkspaceNotFound.workspace_id`
 /// empty -- `agent_start_named` (the only caller of `agent.start`) fills
@@ -663,6 +686,32 @@ impl Herdr for SocketHerdr {
             .await?;
         }
         Ok(())
+    }
+
+    async fn agent_prompt(
+        &self,
+        pane_id: &str,
+        text: &str,
+        until: &[AgentStatus],
+        timeout_ms: u64,
+    ) -> Result<AgentStatus> {
+        let result = self
+            .call(
+                "agent.prompt",
+                agent_prompt_params(pane_id, text, until, timeout_ms),
+            )
+            .await?;
+        // result: { "type":"agent_prompted", "agent": AgentInfo } -- the
+        // observed status the caller's `until` matched.
+        let status = result
+            .get("agent")
+            .and_then(|agent| agent.get("agent_status"))
+            .ok_or_else(|| {
+                HerdrError::Malformed("agent_prompted.agent.agent_status missing".into())
+            })?
+            .clone();
+        serde_json::from_value(status)
+            .map_err(|e| HerdrError::Malformed(format!("agent_prompted.agent.agent_status: {e}")))
     }
 
     async fn send_keys(&self, pane_id: &str, keys: &[String]) -> Result<()> {
@@ -1016,6 +1065,38 @@ mod tests {
     }
 
     #[test]
+    fn errcode_agent_blocked_maps_to_typed_variant() {
+        let line = br#"{"error":{"code":"agent_blocked","message":"agent is blocked"}}"#;
+        assert!(matches!(
+            parse_response(line),
+            Err(HerdrError::AgentBlocked(message)) if message == "agent is blocked"
+        ));
+    }
+
+    #[test]
+    fn errcode_agent_prompt_stalled_maps_to_typed_variant() {
+        let line =
+            br#"{"error":{"code":"agent_prompt_stalled","message":"no state change observed"}}"#;
+        assert!(matches!(
+            parse_response(line),
+            Err(HerdrError::AgentPromptStalled(message)) if message == "no state change observed"
+        ));
+    }
+
+    #[test]
+    fn errcode_timeout_maps_to_typed_variant_distinct_from_stalled_and_blocked() {
+        // The caller must be able to match `Timeout` without also catching
+        // `AgentPromptStalled`/`AgentBlocked` -- pinned by asserting all
+        // three land on different enum variants for the same "call
+        // definitely landed / did not land" question.
+        let line = br#"{"error":{"code":"timeout","message":"deadline exceeded"}}"#;
+        assert!(matches!(
+            parse_response(line),
+            Err(HerdrError::Timeout(message)) if message == "deadline exceeded"
+        ));
+    }
+
+    #[test]
     fn errcode_unknown_code_preserved_in_remote() {
         // Every upstream code without a caller that branches on it (e.g.
         // agent_placement_conflict) still reaches the caller with its exact
@@ -1231,6 +1312,180 @@ mod tests {
             stream.flush().await.unwrap();
         }
         requests
+    }
+
+    /// A single-request mock `herdr.sock` server for `agent_prompt` tests:
+    /// `agent_prompt` issues exactly one request per call (no settle-wait
+    /// polling, unlike `send_input`), so this accepts one connection,
+    /// captures its request, and answers with the given raw `result`/
+    /// `error` envelope body (`id` is filled in here so callers only
+    /// script the part that varies). Returns the request it saw.
+    #[cfg(unix)]
+    async fn run_agent_prompt_mock_server(
+        listener: tokio::net::UnixListener,
+        mut reply_body: Value,
+    ) -> Value {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = stream.read(&mut byte).await.unwrap();
+            if n == 0 || byte[0] == b'\n' {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        let request: Value = serde_json::from_slice(&buf).unwrap();
+        reply_body["id"] = json!("gw-0");
+        let mut line = serde_json::to_vec(&reply_body).unwrap();
+        line.push(b'\n');
+        stream.write_all(&line).await.unwrap();
+        stream.flush().await.unwrap();
+        request
+    }
+
+    /// The accepted path: proves the wire request shape
+    /// (`AgentPromptParams { target, text, wait: { until, timeout_ms } }`)
+    /// end to end, and that a matching `agent_prompted.agent.agent_status`
+    /// comes back as the returned `AgentStatus`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agentprompt_accepted_sends_wire_shape_and_returns_observed_status() {
+        let (result, request) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("herdr.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = SocketHerdr::new(path.clone());
+
+            let server = tokio::spawn(run_agent_prompt_mock_server(
+                listener,
+                json!({
+                    "result": {
+                        "type": "agent_prompted",
+                        "agent": {
+                            "terminal_id": "t1",
+                            "agent_status": "working",
+                            "workspace_id": "w1",
+                            "tab_id": "w1:t1",
+                            "pane_id": "w1:p1",
+                            "focused": true,
+                            "revision": 0,
+                        },
+                    },
+                }),
+            ));
+            let result = client
+                .agent_prompt(
+                    "w1:p1",
+                    "hello",
+                    &[AgentStatus::Working, AgentStatus::Idle, AgentStatus::Done],
+                    8000,
+                )
+                .await;
+            let request = server.await.unwrap();
+            (result, request)
+        })
+        .await
+        .expect("agent_prompt must not hang");
+
+        assert_eq!(result.unwrap(), AgentStatus::Working);
+        assert_eq!(request["method"], "agent.prompt");
+        assert_eq!(request["params"]["target"], "w1:p1");
+        assert_eq!(request["params"]["text"], "hello");
+        assert_eq!(
+            request["params"]["wait"]["until"],
+            json!(["working", "idle", "done"])
+        );
+        assert_eq!(request["params"]["wait"]["timeout_ms"], 8000);
+    }
+
+    /// `agent_blocked`: the daemon refuses before anything is sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agentprompt_blocked_maps_to_agentblocked() {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("herdr.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = SocketHerdr::new(path.clone());
+
+            let server = tokio::spawn(run_agent_prompt_mock_server(
+                listener,
+                json!({ "error": { "code": "agent_blocked", "message": "agent is blocked" } }),
+            ));
+            let result = client
+                .agent_prompt("w1:p1", "hello", &[AgentStatus::Working], 8000)
+                .await;
+            server.await.unwrap();
+            result
+        })
+        .await
+        .expect("agent_prompt must not hang");
+
+        assert!(matches!(result, Err(HerdrError::AgentBlocked(_))));
+    }
+
+    /// `agent_prompt_stalled`: text delivered, but no confirmed state
+    /// change -- distinct from both `AgentBlocked` and `Timeout`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agentprompt_stalled_maps_to_agentpromptstalled_not_timeout_or_blocked() {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("herdr.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = SocketHerdr::new(path.clone());
+
+            let server = tokio::spawn(run_agent_prompt_mock_server(
+                listener,
+                json!({
+                    "error": {
+                        "code": "agent_prompt_stalled",
+                        "message": "no state change observed",
+                    },
+                }),
+            ));
+            let result = client
+                .agent_prompt("w1:p1", "hello", &[AgentStatus::Working], 8000)
+                .await;
+            server.await.unwrap();
+            result
+        })
+        .await
+        .expect("agent_prompt must not hang");
+
+        assert!(matches!(result, Err(HerdrError::AgentPromptStalled(_))));
+        assert!(!matches!(result, Err(HerdrError::Timeout(_))));
+        assert!(!matches!(result, Err(HerdrError::AgentBlocked(_))));
+    }
+
+    /// `timeout`-after-change: a state change WAS observed, but `until`
+    /// never matched before `timeout_ms` elapsed -- must land on `Timeout`,
+    /// never get folded into `AgentPromptStalled`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agentprompt_timeout_after_change_maps_to_timeout_not_stalled() {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("herdr.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = SocketHerdr::new(path.clone());
+
+            let server = tokio::spawn(run_agent_prompt_mock_server(
+                listener,
+                json!({ "error": { "code": "timeout", "message": "deadline exceeded" } }),
+            ));
+            let result = client
+                .agent_prompt("w1:p1", "hello", &[AgentStatus::Done], 100)
+                .await;
+            server.await.unwrap();
+            result
+        })
+        .await
+        .expect("agent_prompt must not hang");
+
+        assert!(matches!(result, Err(HerdrError::Timeout(_))));
+        assert!(!matches!(result, Err(HerdrError::AgentPromptStalled(_))));
     }
 
     /// terminal-attach-submit-race: a `pane.read` failure during the

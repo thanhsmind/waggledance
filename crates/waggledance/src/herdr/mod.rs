@@ -69,6 +69,28 @@ pub enum HerdrError {
         tab_id: String,
         workspace_id: String,
     },
+    /// `agent.prompt` refused before sending anything -- the agent was
+    /// already `Blocked` (dispatch-submit-and-reclaim plan, "the decisive
+    /// finding"). Distinct from [`HerdrError::AgentPromptStalled`]: here
+    /// nothing was submitted at all, so there is nothing to worry about
+    /// re-sending.
+    #[error("agent is blocked and refused the prompt: {0}")]
+    AgentBlocked(String),
+    /// `agent.prompt` submitted the text, but the agent never showed even
+    /// one observed state change within the daemon's own ~5000ms window --
+    /// the daemon's `agent_prompt_stalled`. The text already went in
+    /// (dispatch-submit-and-reclaim P2-3: never retry a stall, it would
+    /// re-type into a composer that may already hold it). Kept distinct
+    /// from [`HerdrError::Timeout`] so a caller can branch on "no confirmed
+    /// change" without also catching an ordinary deadline.
+    #[error("agent prompt stalled: no confirmed state change observed ({0})")]
+    AgentPromptStalled(String),
+    /// `agent.prompt`'s own `timeout_ms` elapsed before the agent reached
+    /// any of the requested `until` states. Unlike
+    /// [`HerdrError::AgentPromptStalled`], a state change WAS observed
+    /// first, so the text still went in -- the daemon's `timeout` code.
+    #[error("agent prompt timed out waiting for a matching state: {0}")]
+    Timeout(String),
     #[error("herdr refused the request ({code}): {message}")]
     Remote { code: String, message: String },
 }
@@ -196,6 +218,45 @@ pub trait Herdr: Send + Sync {
     /// `submit: false` and an empty `text` with `submit: true` skip the
     /// settle wait entirely — see `SocketHerdr::wait_for_pane_to_settle`.
     async fn send_input(&self, pane_id: &str, text: &str, submit: bool) -> Result<()>;
+
+    /// Submit text into a pane's REGISTERED agent and confirm the daemon
+    /// itself observed the agent respond, rather than firing a blind Enter
+    /// and hoping (`send_input`'s failure mode --
+    /// dispatch-submit-and-reclaim defect A: a settle-race heuristic cannot
+    /// know whether a keystroke was accepted; only the agent's own observed
+    /// state can answer that). Wraps herdr's `agent.prompt`, whose own
+    /// contract (`herdr agent prompt --help`, confirmed via
+    /// `herdr api schema --json`) is:
+    ///
+    /// - an agent already `Blocked` refuses with [`HerdrError::AgentBlocked`]
+    ///   BEFORE any input is sent -- nothing was submitted, nothing to
+    ///   worry about re-sending;
+    /// - otherwise the text is submitted, then the daemon waits up to
+    ///   `timeout_ms` for the agent to reach one of `until`. Starting from a
+    ///   non-`Working` state it first requires an observed state CHANGE
+    ///   within its own internal ~5000ms window, or refuses with
+    ///   [`HerdrError::AgentPromptStalled`] -- the text already went in, so
+    ///   the caller must never retry a stall, only report it
+    ///   (dispatch-submit-and-reclaim P2-3);
+    /// - a `timeout_ms` shorter than that pending change instead refuses
+    ///   with [`HerdrError::Timeout`] -- kept distinct from a stall because
+    ///   a state change WAS observed, so the text still landed.
+    ///
+    /// `AgentBlocked`, `AgentPromptStalled` and `Timeout` are three
+    /// deliberately distinct variants (never folded into the generic
+    /// `Remote`) so a caller can branch on "definitely nothing sent" versus
+    /// "sent but no confirmed change" without also catching an ordinary
+    /// deadline that still means success.
+    ///
+    /// On success, returns the agent's own observed [`AgentStatus`] --
+    /// whichever member of `until` it matched.
+    async fn agent_prompt(
+        &self,
+        pane_id: &str,
+        text: &str,
+        until: &[AgentStatus],
+        timeout_ms: u64,
+    ) -> Result<AgentStatus>;
 
     /// Send raw bytes into a pane via herdr's `pane.send_text` channel — no
     /// bracketed-paste wrapping, no named-key translation, exactly the bytes
@@ -782,6 +843,15 @@ mod tests {
         async fn send_input(&self, _: &str, text: &str, _: bool) -> Result<()> {
             self.inputs.lock().unwrap().push(text.to_string());
             Ok(())
+        }
+        async fn agent_prompt(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[AgentStatus],
+            _: u64,
+        ) -> Result<AgentStatus> {
+            unreachable!()
         }
         async fn send_text(&self, _: &str, _: &str) -> Result<()> {
             unreachable!()
