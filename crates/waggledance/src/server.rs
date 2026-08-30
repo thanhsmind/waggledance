@@ -7461,14 +7461,21 @@ struct ChangesQuery {
     /// [`page_chrome`], never by anything that touches the repository.
     #[serde(default)]
     embed: Option<String>,
+    /// home-terminal-panel D2's narrowing flag, read only beside `embed` and
+    /// only by [`page_chrome`] — same nothing-but-a-view-selector standing as
+    /// `embed` itself.
+    #[serde(default)]
+    nav: Option<String>,
 }
 
-/// The `embed` flag alone, for the two Code routes — the same field
-/// `ChangesQuery` carries, with nothing else on it.
+/// The two view flags alone, for the two Code routes — the same fields
+/// `ChangesQuery` carries, with nothing else on them.
 #[derive(serde::Deserialize)]
 struct CodeQuery {
     #[serde(default)]
     embed: Option<String>,
+    #[serde(default)]
+    nav: Option<String>,
 }
 
 /// D9: how much chrome a Code or Changes page renders, decided from the
@@ -7480,9 +7487,17 @@ struct CodeQuery {
 /// than the one that route has always served. The value never reaches a
 /// filesystem path, a git argument, or the response body: it selects between
 /// two constants in `views` and stops there.
-fn page_chrome(embed: Option<&str>) -> views::PageChrome {
-    match embed.map(str::trim) {
-        Some("1") => views::PageChrome::Embed,
+///
+/// home-terminal-panel D2 adds `nav`, read the same exact-value way and only
+/// ever together with `embed`: `embed=1&nav=1` is the nav-only rendering,
+/// `embed=1` alone is unchanged, and `nav=1` WITHOUT `embed=1` is the full
+/// page — a narrowing of the embed mode is not something a URL can ask for
+/// on its own, so a stray `nav` in a bookmark can never strip a normal page
+/// down to a sidebar.
+fn page_chrome(embed: Option<&str>, nav: Option<&str>) -> views::PageChrome {
+    match (embed.map(str::trim), nav.map(str::trim)) {
+        (Some("1"), Some("1")) => views::PageChrome::Nav,
+        (Some("1"), _) => views::PageChrome::Embed,
         _ => views::PageChrome::Full,
     }
 }
@@ -7519,7 +7534,7 @@ async fn changes_screen(
         Some(sha) => DiffBase::Commit(sha.to_string()),
         None => DiffBase::WorkingTree,
     };
-    let chrome = page_chrome(query.embed.as_deref());
+    let chrome = page_chrome(query.embed.as_deref(), query.nav.as_deref());
     let engine = st.engine.clone();
     let project_id = id.clone();
     let page = tokio::task::spawn_blocking(move || {
@@ -7552,7 +7567,13 @@ async fn code_root(
     Path(id): Path<String>,
     Query(query): Query<CodeQuery>,
 ) -> Response {
-    code_response(&st, &id, "", page_chrome(query.embed.as_deref())).await
+    code_response(
+        &st,
+        &id,
+        "",
+        page_chrome(query.embed.as_deref(), query.nav.as_deref()),
+    )
+    .await
 }
 
 async fn code_dir_or_file(
@@ -7560,7 +7581,13 @@ async fn code_dir_or_file(
     Path((id, path)): Path<(String, String)>,
     Query(query): Query<CodeQuery>,
 ) -> Response {
-    code_response(&st, &id, &path, page_chrome(query.embed.as_deref())).await
+    code_response(
+        &st,
+        &id,
+        &path,
+        page_chrome(query.embed.as_deref(), query.nav.as_deref()),
+    )
+    .await
 }
 
 /// Shared body for both Code-section routes. Every filesystem access goes
@@ -35316,6 +35343,131 @@ needs_you:
         assert!(
             body.contains("<header class=\"topbar\">") && !body.contains("embed=1"),
             "without the param the Code page is untouched: {body}"
+        );
+    }
+
+    /// htp-1 / D2: `?embed=1&nav=1` on the Changes route serves the
+    /// changed-file list alone, headed by `<base target="wd-term-panel">` so
+    /// every file row opens in the panel above the terminal rather than
+    /// replacing the sidebar it was clicked in. The route is the proof that
+    /// matters here: the view already knows how to render this, and what this
+    /// test pins is that the query reaches it.
+    #[tokio::test]
+    async fn changes_route_with_nav_serves_the_file_list_alone() {
+        let dir = fresh_root("changes-nav");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the view unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-nav");
+        let app = router(st);
+
+        let resp = get(
+            app.clone(),
+            &format!("/p/{}/_changes?embed=1&nav=1", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("<base target=\"wd-term-panel\">"),
+            "the nav names the panel frame its rows load into: {body}"
+        );
+        assert!(
+            body.contains("class=\"nav-only nav-only--changes\"") && body.contains("mod.txt"),
+            "and is the changed-file list: {body}"
+        );
+        assert!(
+            body.contains(&format!("href=\"/p/{}/_changes?embed=1#f0\"", project.id)),
+            "each row deep-links the embedded page at its own section: {body}"
+        );
+        assert!(
+            !body.contains("changeset__head") && !body.contains("class=\"layout"),
+            "with no diff sections and no page shell beside it: {body}"
+        );
+
+        // The narrowing is a narrowing of embed mode, never something a URL
+        // can ask for on its own.
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_changes?nav=1", project.id)).await).await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && !body.contains("nav-only"),
+            "nav=1 without embed=1 is the ordinary page: {body}"
+        );
+    }
+
+    /// htp-1 / D2-D3 on the Code section: nav mode is the tree, and the two
+    /// kinds of link in it go to two different frames — a folder re-renders
+    /// the sidebar, a file fills the panel.
+    #[tokio::test]
+    async fn code_routes_with_nav_serve_the_tree_with_split_link_targets() {
+        let dir = fresh_root("code-nav");
+        write(&dir, "src/main.rs", "fn main() {}\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "code-nav");
+        let app = router(st);
+
+        let resp = get(
+            app.clone(),
+            &format!("/p/{}/_code/?embed=1&nav=1", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("<base target=\"wd-term-panel\">"),
+            "the nav names the panel frame: {body}"
+        );
+        assert!(
+            body.contains("class=\"nav-only nav-only--code\""),
+            "and is the tree alone: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "href=\"/p/{}/_code/src?embed=1&amp;nav=1\" target=\"_self\"",
+                project.id
+            )),
+            "a folder re-renders this frame, keeping nav mode: {body}"
+        );
+        assert!(
+            !body.contains("codelist__"),
+            "the main pane's own listing is not built: {body}"
+        );
+
+        // One level down, where the files live: file rows leave for the panel.
+        let body = body_string(
+            get(
+                app.clone(),
+                &format!("/p/{}/_code/src?embed=1&nav=1", project.id),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            body.contains(&format!(
+                "href=\"/p/{}/_code/src/main.rs?embed=1\"",
+                project.id
+            )),
+            "a file row is an absolute embed link the base target carries away: {body}"
+        );
+        assert!(
+            !body.contains("_code/src/main.rs?embed=1&amp;nav=1"),
+            "and never a nav link, which would put a file page in the sidebar: {body}"
+        );
+
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_code/src?nav=1", project.id)).await)
+                .await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && !body.contains("nav-only"),
+            "nav=1 without embed=1 is the ordinary Code page: {body}"
         );
     }
 }

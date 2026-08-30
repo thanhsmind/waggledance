@@ -9666,6 +9666,24 @@ enum Section {
     Changes,
 }
 
+/// home-terminal-panel D2: the name of the iframe a nav-mode link loads
+/// into — the panel above the terminal on the homepage terminals tab.
+///
+/// One name, two ends: the nav pages below put it in a `<base target>`, and
+/// the terminals tab names its panel iframe with it. They are the same
+/// string on purpose — a typo on either end would silently open a new
+/// browser tab instead of filling the panel, which is why neither end
+/// spells it out.
+pub const PANEL_FRAME_NAME: &str = "wd-term-panel";
+
+/// The head tag that makes every un-targeted link on a nav page load into
+/// the panel frame (D2). `<base>` with no `href` changes nothing about how
+/// URLs resolve — it sets the default target and only that — so the nav's
+/// own absolute links are unaffected in every way except where they land.
+fn panel_base_tag() -> String {
+    format!("<base target=\"{PANEL_FRAME_NAME}\">")
+}
+
 /// D9: how much of the outer chrome a Code or Changes page renders.
 ///
 /// `Embed` is what `?embed=1` asks for: the SAME page, minus the topbar —
@@ -9683,19 +9701,66 @@ enum Section {
 pub enum PageChrome {
     Full,
     Embed,
+    /// home-terminal-panel D2: `embed=1&nav=1` — the page reduced to its
+    /// navigation alone (the changed-file list, or the Code tree), for the
+    /// homepage terminals tab's right sidebar. It is not a third render
+    /// path either: the SAME `changes_nav` / `code_tree` fragments render
+    /// here, minus every pane beside them, with
+    /// `<base target="wd-term-panel">` in the head so a file row loads the
+    /// panel frame above the terminal instead of replacing this narrow
+    /// sidebar with a full diff (D3).
+    Nav,
 }
 
 impl PageChrome {
+    /// True for `Nav` as well: nav mode IS an embed — same dropped topbar,
+    /// same `embed=1` on the links it emits — narrowed to the navigation.
+    /// Nothing that asks this question wants nav mode to answer differently.
     fn is_embed(self) -> bool {
-        self == PageChrome::Embed
+        matches!(self, PageChrome::Embed | PageChrome::Nav)
+    }
+
+    /// D2's nav-only rendering, the one thing `is_embed` deliberately does
+    /// not distinguish.
+    fn is_nav(self) -> bool {
+        self == PageChrome::Nav
     }
 
     /// The query an in-page link must carry to stay inside the frame it was
     /// clicked in. Only ever appended to a URL this module builds with no
     /// query of its own, so `?` is always the right separator.
+    ///
+    /// Nav mode answers `?embed=1`, not `?embed=1&nav=1`, because the links
+    /// this decides are the FILE links (D3): they leave the sidebar for the
+    /// panel frame and must arrive there as the whole embedded page. The
+    /// links that stay in the sidebar — folders and crumbs — ask
+    /// [`PageChrome::self_link_query`] instead.
     fn link_query(self) -> &'static str {
         if self.is_embed() {
             "?embed=1"
+        } else {
+            ""
+        }
+    }
+
+    /// The query a link that re-renders THIS frame must carry (D3): nav mode
+    /// keeps itself, every other mode is unchanged from `link_query`.
+    /// Ampersand-escaped, because it lands in an HTML attribute.
+    fn self_link_query(self) -> &'static str {
+        if self.is_nav() {
+            "?embed=1&amp;nav=1"
+        } else {
+            self.link_query()
+        }
+    }
+
+    /// The attribute a self-navigating link needs to escape the injected
+    /// `<base target>` (D3, and the CONTEXT's named discretion: a per-link
+    /// override, not a second mode). Empty outside nav mode, where there is
+    /// no base target to escape.
+    fn self_link_target(self) -> &'static str {
+        if self.is_nav() {
+            " target=\"_self\""
         } else {
             ""
         }
@@ -9786,6 +9851,13 @@ pub fn code_page(
 ) -> String {
     let active = base_name(rel_path);
     let tree = code_tree(project, sidebar, Some(active), chrome);
+    // D2: nav mode is the tree alone. Returning before the source is
+    // line-numbered and highlighted is the point — a sidebar that renders a
+    // whole file's markup and then throws it away costs the same as the page
+    // it is meant to be cheaper than.
+    if chrome.is_nav() {
+        return code_nav_page(active, &tree);
+    }
 
     let (main, meta) = match body {
         CodeBody::Binary { size } => (
@@ -9857,6 +9929,16 @@ pub fn code_page(
 /// serve different roles, same as a file-explorer's tree-plus-detail split.
 pub fn code_dir_page(project: &Project, listing: &DirListing, chrome: PageChrome) -> String {
     let tree = code_tree(project, listing, None, chrome);
+    // D2: the tree alone, before the main pane's own copy of this listing is
+    // built.
+    if chrome.is_nav() {
+        let title = if listing.rel_path.is_empty() {
+            project.name.as_str()
+        } else {
+            listing.rel_path.as_str()
+        };
+        return code_nav_page(title, &tree);
+    }
     let breadcrumb = breadcrumb(project, "_code/", &listing.rel_path, false, "", chrome);
 
     let mut rows = String::new();
@@ -9921,6 +10003,78 @@ pub fn code_dir_page(project: &Project, listing: &DirListing, chrome: PageChrome
     layout_with_drawer(&title, "", &body_html, false)
 }
 
+/// home-terminal-panel D2: a Code page reduced to its tree, for the homepage
+/// terminals tab's right sidebar.
+///
+/// Not a second renderer: `tree` is `code_tree`'s own output, already built
+/// by the page this replaces, with nav mode's link rules baked in by
+/// [`PageChrome::self_link_query`] — folders and crumbs re-render this frame,
+/// file rows leave it. The `<base target>` in the head is what sends those
+/// file rows to the panel above the terminal (D3), and the body is the tree
+/// with nothing beside it: no topbar, no drawer (`layout`, not
+/// `layout_with_drawer` — a nav frame 240px wide has nowhere to put a drawer
+/// and no reason to carry a second copy of one already open behind it), no
+/// main pane.
+fn code_nav_page(title: &str, tree: &str) -> String {
+    let body = format!("<div class=\"nav-only nav-only--code\">{tree}</div>");
+    layout(title, &panel_base_tag(), &body)
+}
+
+/// home-terminal-panel D2/D3: the Changes screen reduced to its changed-file
+/// list plus the base picker, for the homepage terminals tab's right sidebar.
+///
+/// The list is `changes_nav`'s own grouping, badges and counts — the same
+/// fragment the full screen puts in its sidebar — with one difference the
+/// mode forces: every row is an absolute deep link into the embedded Changes
+/// page at that file's section, because there are no sections in this frame
+/// for a bare `#f<i>` to reach. The picker rides along so the sidebar can
+/// change what it is comparing without the panel having to be open at all;
+/// it navigates this frame, not the panel ([`base_picker`]).
+///
+/// The unavailable and no-changes states are the same two the full screen
+/// shows, with the unavailable one carrying its explanation into the list
+/// itself: the full screen can say "see the note beside it" because a note
+/// is beside it, and here nothing is.
+fn changes_nav_page(project: &Project, view: &ChangesView, picker: &str) -> String {
+    let tree = match &view.content {
+        ChangesContent::Unavailable(reason) => changes_nav_empty(changes_unavailable_text(reason)),
+        ChangesContent::Diff(diff) if diff.files.is_empty() => {
+            changes_nav_empty("No changed files.")
+        }
+        ChangesContent::Diff(diff) => changes_nav(diff, &changes_deep_link_prefix(project, view)),
+    };
+    let body = format!(
+        "<div class=\"nav-only nav-only--changes\" data-project-id=\"{pid}\" data-base=\"{base}\">\
+         <div class=\"nav-only__head\">{picker}</div>{tree}</div>",
+        pid = esc(&project.id),
+        base = esc(active_sha(&view.base)),
+        picker = picker,
+        tree = tree,
+    );
+    layout("Changes", &panel_base_tag(), &body)
+}
+
+/// D3: what a nav row's `href` is, before its own `#f<i>` — the embedded
+/// Changes page for this project, on the base this nav was itself loaded
+/// with, so opening a file from a commit's list lands on that commit's diff
+/// rather than silently on the working tree.
+///
+/// The ampersand is entity-escaped because this string is built straight
+/// into an `href` attribute, and the sha is a value this server read out of
+/// git, escaped here like every other string this module renders.
+fn changes_deep_link_prefix(project: &Project, view: &ChangesView) -> String {
+    let sha = active_sha(&view.base);
+    if sha.is_empty() {
+        format!("/p/{pid}/_changes?embed=1", pid = esc(&project.id))
+    } else {
+        format!(
+            "/p/{pid}/_changes?embed=1&amp;commit={sha}",
+            pid = esc(&project.id),
+            sha = esc(sha),
+        )
+    }
+}
+
 /// The Changes screen: the project's working tree against HEAD (D2), one
 /// stacked section per changed file, each a side-by-side two-column diff,
 /// beside a sidebar listing every changed file grouped by directory.
@@ -9961,6 +10115,13 @@ pub fn changes_page(
 ) -> String {
     let scope = base_label(&view.base);
     let picker = base_picker(project, view, chrome);
+    // D2: nav mode is the changed-file list alone, and it returns before
+    // `changes_body` runs. `render` goes untouched on this path on purpose —
+    // highlighting both sides of every changed file is the whole cost of this
+    // screen, and a frame that shows none of them must not pay it.
+    if chrome.is_nav() {
+        return changes_nav_page(project, view, &picker);
+    }
     let (tree, main) = match &view.content {
         ChangesContent::Unavailable(reason) => (
             changes_nav_empty("No file list — see the note beside it."),
@@ -9971,7 +10132,7 @@ pub fn changes_page(
             changes_body(project, diff, &picker, render),
         ),
         ChangesContent::Diff(diff) => (
-            changes_nav(diff),
+            changes_nav(diff, ""),
             changes_body(project, diff, &picker, render),
         ),
     };
@@ -10061,23 +10222,56 @@ fn base_picker(project: &Project, view: &ChangesView, chrome: PageChrome) -> Str
     // form drops any query already in its `action`, so the flag rides as a
     // field of the form itself; `data-embed` is the same answer for the
     // scripted path, which builds its own URL in `app.js`.
-    let (embed_field, embed_attr) = if chrome.is_embed() {
+    //
+    // home-terminal-panel D2/D3: in nav mode the picker changes the SIDEBAR's
+    // own base, so the form targets itself past the injected base target and
+    // carries `nav=1` beside `embed=1`. It also drops `data-base-url`, which
+    // is what `app.js` selects the scripted `change` handler on: that handler
+    // rebuilds the URL from `data-embed` alone and would drop `nav=1`,
+    // replacing this narrow sidebar with a whole diff page. Without the
+    // attribute the handler never binds here, and the plain GET form — the
+    // scripting-off path this element has always carried — does the
+    // navigating, Show button and all.
+    let (embed_field, embed_attr, hook_attr, form_target) = if chrome.is_nav() {
+        (
+            "<input type=\"hidden\" name=\"embed\" value=\"1\">\
+             <input type=\"hidden\" name=\"nav\" value=\"1\">",
+            "",
+            String::new(),
+            " target=\"_self\"",
+        )
+    } else if chrome.is_embed() {
         (
             "<input type=\"hidden\" name=\"embed\" value=\"1\">",
             " data-embed=\"1\"",
+            format!(
+                "data-base-url=\"/p/{pid}/_changes\"",
+                pid = esc(&project.id)
+            ),
+            "",
         )
     } else {
-        ("", "")
+        (
+            "",
+            "",
+            format!(
+                "data-base-url=\"/p/{pid}/_changes\"",
+                pid = esc(&project.id)
+            ),
+            "",
+        )
     };
     format!(
-        "<form class=\"changes__base\" method=\"get\" action=\"/p/{pid}/_changes\">\
+        "<form class=\"changes__base\" method=\"get\" action=\"/p/{pid}/_changes\"{form_target}>\
          <label class=\"changes__base-label\" for=\"changes-base\">Comparing</label>\
          <select class=\"changes__base-select\" id=\"changes-base\" name=\"commit\" \
-         data-base-url=\"/p/{pid}/_changes\"{embed_attr}>{options}</select>\
+         {hook_attr}{embed_attr}>{options}</select>\
          {embed_field}\
          <button class=\"changes__base-go\" type=\"submit\">Show</button>\
          </form>",
         pid = esc(&project.id),
+        form_target = form_target,
+        hook_attr = hook_attr,
         embed_attr = embed_attr,
         options = options,
         embed_field = embed_field,
@@ -10105,7 +10299,17 @@ fn commit_option(commit: &CommitEntry, selected: bool) -> String {
 /// cannot, and never git's own stderr — a path or a repository name from
 /// inside that message would be the one thing this daemon must not disclose.
 fn changes_unavailable(reason: &GitDiffError) -> String {
-    let text = match reason {
+    format!(
+        "<p class=\"changes__empty\">{}</p>",
+        esc(changes_unavailable_text(reason))
+    )
+}
+
+/// The words alone, without the paragraph around them — [`changes_nav_page`]
+/// puts the same explanation inside the nav list, where a `<p class="changes__empty">`
+/// would be a main-pane element in a sidebar.
+fn changes_unavailable_text(reason: &GitDiffError) -> &'static str {
+    match reason {
         GitDiffError::NotARepo => {
             "This project is not a git repository, so there is no working tree to compare."
         }
@@ -10115,8 +10319,7 @@ fn changes_unavailable(reason: &GitDiffError) -> String {
         GitDiffError::Timeout(_) => {
             "git took too long to answer for this project, so the call was stopped. A very large working tree can do this."
         }
-    };
-    format!("<p class=\"changes__empty\">{}</p>", esc(text))
+    }
 }
 
 fn plural_files(n: usize) -> &'static str {
@@ -10142,7 +10345,14 @@ fn changes_dir(path: &str) -> &str {
 /// file's own `+n −m`. Each row links to its section's anchor, so clicking
 /// scrolls there with no script at all; `app.js` only adds the "which
 /// section am I looking at" highlight on top.
-fn changes_nav(diff: &WorkingTreeDiff) -> String {
+/// `href_prefix` is home-terminal-panel D3, and is `""` for every page that
+/// renders the diff sections beside this list — the bare `#f<i>` anchor
+/// those pages have always emitted, byte for byte. Nav mode (D2) has no
+/// sections beside it, so a bare fragment would scroll a narrow sidebar to
+/// nowhere; it passes the embedded Changes page's own absolute URL instead,
+/// and each row becomes a deep link that fills the panel frame already
+/// scrolled to that file.
+fn changes_nav(diff: &WorkingTreeDiff, href_prefix: &str) -> String {
     // First-seen directory order (git lists paths sorted), so the sidebar
     // reads in the same order as the sections beside it.
     let mut groups: Vec<(&str, Vec<(usize, &FileChange)>)> = Vec::new();
@@ -10170,9 +10380,10 @@ fn changes_nav(diff: &WorkingTreeDiff) -> String {
             // in the markup and hides in CSS, so a page with scripting off
             // shows no tick rather than a control that never moves.
             out.push_str(&format!(
-                "<a class=\"chap-file chg-row\" href=\"#f{i}\" title=\"{title}\">\
+                "<a class=\"chap-file chg-row\" href=\"{prefix}#f{i}\" title=\"{title}\">\
                  {badge}<span class=\"chg-row__name\">{name}</span>{stat}\
                  <span class=\"chg-row__check\" aria-hidden=\"true\">\u{2713}</span></a>",
+                prefix = href_prefix,
                 i = i,
                 title = esc(&label),
                 badge = chg_badge(file),
@@ -10562,10 +10773,17 @@ fn code_tree(
          <nav class=\"chapter\">",
     );
 
+    // D3: a folder or a crumb re-renders THIS frame (the sidebar navigating
+    // itself), so it keeps nav mode and steps out of the injected base
+    // target; only a FILE row carries the base target through to the panel,
+    // and it does that by having no target of its own.
+    let dir_q = chrome.self_link_query();
+    let dir_target = chrome.self_link_target();
     let mut crumbs = format!(
-        "<a class=\"chap-seg\" href=\"/p/{pid}/_code/{q}\">{name}</a>",
+        "<a class=\"chap-seg\" href=\"/p/{pid}/_code/{q}\"{target}>{name}</a>",
         pid = esc(&project.id),
-        q = chrome.link_query(),
+        q = dir_q,
+        target = dir_target,
         name = esc(&project.name),
     );
     let mut acc = String::new();
@@ -10575,10 +10793,11 @@ fn code_tree(
         }
         acc.push_str(seg);
         crumbs.push_str(&format!(
-            "<span class=\"chap-sep\">›</span><a class=\"chap-seg\" href=\"/p/{pid}/_code/{acc}{q}\">{seg}</a>",
+            "<span class=\"chap-sep\">›</span><a class=\"chap-seg\" href=\"/p/{pid}/_code/{acc}{q}\"{target}>{seg}</a>",
             pid = esc(&project.id),
             acc = esc(&acc),
-            q = chrome.link_query(),
+            q = dir_q,
+            target = dir_target,
             seg = esc(seg),
         ));
     }
@@ -10592,10 +10811,11 @@ fn code_tree(
         if entry.is_dir {
             dir_count += 1;
             dirs.push_str(&format!(
-                "<a class=\"chap-subfolder\" href=\"/p/{pid}/_code/{rel}{q}\">{name}</a>",
+                "<a class=\"chap-subfolder\" href=\"/p/{pid}/_code/{rel}{q}\"{target}>{name}</a>",
                 pid = esc(&project.id),
                 rel = esc(&rel),
-                q = chrome.link_query(),
+                q = dir_q,
+                target = dir_target,
                 name = esc(&entry.name),
             ));
         } else {
@@ -24160,6 +24380,233 @@ mod tests {
             assert!(
                 !html.contains("embed=1"),
                 "no link and no field mentions embedding: {html}"
+            );
+        }
+    }
+
+    /// home-terminal-panel D2: a Changes page in nav mode, so the nav tests
+    /// below differ from their embed twins by exactly one argument.
+    fn changes_html_nav(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &changes_view(diff),
+            &RenderService::new(),
+            PageChrome::Nav,
+        )
+    }
+
+    /// D2: `embed=1&nav=1` on the Changes screen is the changed-file list and
+    /// the picker that governs it, and NOTHING else — no topbar (embed
+    /// already took that), no diff sections, no `.layout` columns. A sidebar
+    /// 240px wide that quietly rendered every changed file's two highlighted
+    /// panes would cost the whole screen to show a list.
+    #[test]
+    fn a_nav_changes_page_is_the_file_list_and_nothing_beside_it() {
+        let html = changes_html_nav(changes_fixture());
+
+        assert!(
+            html.contains("<base target=\"wd-term-panel\">"),
+            "the head names the panel frame every file row loads into: {html}"
+        );
+        assert_eq!(
+            PANEL_FRAME_NAME, "wd-term-panel",
+            "and the terminals tab names its iframe from the same constant"
+        );
+        assert!(
+            html.contains("class=\"nav-only nav-only--changes\""),
+            "the body is the nav and its own wrapper: {html}"
+        );
+        assert!(
+            html.contains("changes-nav") && html.contains("chg-badge"),
+            "the list keeps its grouping and status badges: {html}"
+        );
+        assert!(
+            html.contains("changes__base-select"),
+            "the base picker rides along so the nav can switch base: {html}"
+        );
+
+        assert!(
+            !html.contains("<header class=\"topbar\">"),
+            "no topbar: {html}"
+        );
+        assert!(
+            !html.contains("changeset__head"),
+            "and not one diff section beside the list: {html}"
+        );
+        assert!(
+            !html.contains("class=\"layout"),
+            "the two-column page shell is gone with them: {html}"
+        );
+        assert!(
+            !html.contains("agent-drawer"),
+            "and a 240px frame carries no agent drawer: {html}"
+        );
+    }
+
+    /// D3: a row in the Diff nav opens the file's diff in the PANEL, so its
+    /// href cannot be the bare `#f<i>` the full screen uses — there is no
+    /// section in this frame for that fragment to reach. It is the embedded
+    /// Changes page's own absolute URL with the anchor on the end.
+    #[test]
+    fn nav_changes_rows_deep_link_into_the_embedded_page() {
+        let html = changes_html_nav(changes_fixture());
+        assert!(
+            html.contains("href=\"/p/proj-1/_changes?embed=1#f0\""),
+            "the first row deep-links the embedded page at its section: {html}"
+        );
+        assert!(
+            !html.contains("href=\"#f0\""),
+            "and no row is left as a fragment that scrolls this frame to nowhere: {html}"
+        );
+    }
+
+    /// D3, second half: a nav loaded against a commit hands that commit on to
+    /// every row it renders. Opening a file from a commit's list must show
+    /// that commit's diff, not silently the working tree's.
+    #[test]
+    fn a_nav_changes_page_carries_its_commit_into_every_row() {
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(CommitEntry {
+            sha: "abc123def456".into(),
+            short: "abc123d".into(),
+            date: "2026-08-30".into(),
+            subject: "Name the wait".into(),
+        });
+        let html = changes_html_nav(diff);
+        assert!(
+            html.contains("href=\"/p/proj-1/_changes?embed=1&amp;commit=abc123def456#f0\""),
+            "the row carries the nav's own base: {html}"
+        );
+    }
+
+    /// D2/D3: the picker changes what the SIDEBAR is comparing, so it
+    /// navigates this frame — past the injected base target — and keeps nav
+    /// mode on the way. It also gives up `data-base-url`, the hook `app.js`
+    /// binds its scripted `change` handler to: that handler rebuilds the URL
+    /// from `data-embed` alone and would drop `nav=1`, swapping the sidebar
+    /// for a full diff page. Without the hook the plain GET form navigates.
+    #[test]
+    fn the_nav_base_picker_navigates_the_nav_itself() {
+        let html = changes_html_nav(changes_fixture());
+        assert!(
+            html.contains("action=\"/p/proj-1/_changes\" target=\"_self\""),
+            "the picker's form targets this frame, not the panel: {html}"
+        );
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"embed\" value=\"1\">")
+                && html.contains("<input type=\"hidden\" name=\"nav\" value=\"1\">"),
+            "and submits both flags, so the nav comes back as a nav: {html}"
+        );
+        assert!(
+            !html.contains("data-base-url="),
+            "the scripted handler, which cannot carry nav=1, never binds: {html}"
+        );
+        assert!(
+            html.contains("changes__base-go"),
+            "so the form's own Show button stays the way it navigates: {html}"
+        );
+    }
+
+    /// The empty case: a project with nothing changed still renders a nav —
+    /// the frame says so in the reader's words instead of coming back blank.
+    #[test]
+    fn a_nav_changes_page_with_no_changes_says_so() {
+        let mut diff = changes_fixture();
+        diff.files.clear();
+        let html = changes_html_nav(diff);
+        assert!(
+            html.contains("<base target=\"wd-term-panel\">"),
+            "the base target is there either way: {html}"
+        );
+        assert!(
+            html.contains("changes-nav__empty") && html.contains("No changed files."),
+            "and the list states its own emptiness: {html}"
+        );
+    }
+
+    /// D2 on the Code section: nav mode is the tree, in a document that is
+    /// nothing but the tree.
+    #[test]
+    fn a_nav_code_page_is_the_tree_and_nothing_beside_it() {
+        for html in [
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Nav),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Nav,
+            ),
+        ] {
+            assert!(
+                html.contains("<base target=\"wd-term-panel\">"),
+                "the head names the panel frame: {html}"
+            );
+            assert!(
+                html.contains("class=\"nav-only nav-only--code\"") && html.contains("chap-crumbs"),
+                "the body is the tree and its wrapper: {html}"
+            );
+            assert!(
+                !html.contains("<header class=\"topbar\">") && !html.contains("class=\"layout"),
+                "no bar and no page shell: {html}"
+            );
+            assert!(
+                !html.contains("codeview__") && !html.contains("codelist__"),
+                "and neither of the main panes this page would otherwise build: {html}"
+            );
+        }
+    }
+
+    /// D3: inside the Files nav, a folder or a crumb re-renders the NAV — it
+    /// keeps nav mode and steps out of the injected base target with its own
+    /// `target="_self"`. A file row does the opposite: it carries the panel's
+    /// embed URL and no target at all, so the base sends it to the panel.
+    #[test]
+    fn nav_code_folders_navigate_themselves_and_files_fill_the_panel() {
+        let html = code_dir_page(&sample_project(), &code_listing(), PageChrome::Nav);
+
+        assert!(
+            html.contains(
+                "<a class=\"chap-seg\" href=\"/p/proj-1/_code/?embed=1&amp;nav=1\" target=\"_self\">"
+            ),
+            "the root crumb re-renders the nav: {html}"
+        );
+        assert!(
+            html.contains(
+                "<a class=\"chap-subfolder\" href=\"/p/proj-1/_code/src/app?embed=1&amp;nav=1\" target=\"_self\">"
+            ),
+            "and so does a subfolder: {html}"
+        );
+        assert!(
+            html.contains("<a class=\"chap-file\" href=\"/p/proj-1/_code/src/main.rs?embed=1\">"),
+            "a file row is an absolute embed link with no nav and no target: {html}"
+        );
+        assert!(
+            !html.contains("/p/proj-1/_code/src/main.rs?embed=1&amp;nav=1"),
+            "a file must never re-render the sidebar as the whole file page: {html}"
+        );
+    }
+
+    /// The pages nav mode does not touch. `PageChrome::Embed` still renders
+    /// the whole embedded page, base-target-free and self-target-free — nav
+    /// mode is a narrowing of embed, never a change to it.
+    #[test]
+    fn embed_mode_is_untouched_by_nav_mode() {
+        for html in [
+            changes_html_embedded(changes_fixture()),
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Embed),
+        ] {
+            assert!(
+                !html.contains("<base target=") && !html.contains("target=\"_self\""),
+                "an embedded page names no frame and overrides no base: {html}"
+            );
+            assert!(
+                !html.contains("nav=1") && !html.contains("nav-only"),
+                "and carries nothing of nav mode: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout layout--embed\""),
+                "it is the same embedded page it was: {html}"
             );
         }
     }

@@ -3726,3 +3726,59 @@ html:has(.layout--embed) {
     inset: 0;
   }
 }
+
+/* ============================================================
+   NAV-ONLY MODE (home-terminal-panel, D2)
+   `?embed=1&nav=1` serves a Code or Changes page as its NAVIGATION alone —
+   the tree, or the changed-file list — for the two narrow iframes in the
+   homepage terminals tab's right sidebar. The rows themselves are the
+   sidebar rows the full pages already ship (`.chapter`, `.chap-file`,
+   `.chg-row`), unchanged and unduplicated; what this block does is put them
+   in a document that is nothing but them, at roughly a third of the width
+   `.sidebar` was drawn for. Placed after the embed rules for the same
+   reason those were placed last: source order decides between rules of
+   equal specificity.
+   ============================================================ */
+.nav-only {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: var(--space-3) var(--space-2);
+  background: var(--color-surface);
+}
+/* No topbar above this document, so an anchored jump has nothing to clear —
+   the reserve `html` keeps for the 53px bar would just be a gap here. */
+html:has(.nav-only) {
+  scroll-padding-top: var(--space-3);
+}
+/* The Diff nav's header strip: the base picker, ruled off from the list it
+   governs so a long file list scrolling past it stays legible. */
+.nav-only__head {
+  margin-bottom: var(--space-2);
+  padding-bottom: var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+}
+/* The picker at sidebar width: the label sits above its control rather than
+   beside it, and the select gives up the 26rem it holds on the full screen —
+   at this width that cap is wider than the frame. */
+.nav-only .changes__base {
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.nav-only .changes__base-select {
+  flex: 1 1 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.nav-only .changes__base-go {
+  flex: none;
+}
+/* The Files nav's own search box is inert on these pages (the Code tree
+   ships it disabled); it keeps its place but not the full sidebar's gap. */
+.nav-only .fg-sidebar-search {
+  margin-bottom: var(--space-2);
+}
+/* A file's `+n −m` must not push its name out of the row: the name is the
+   part that ellipses, the counts hold their width. */
+.nav-only .chg-stat {
+  flex: none;
+}
