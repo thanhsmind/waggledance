@@ -1,9 +1,12 @@
 # Board Visibility — slice 1 proof against the three real projects
 
-**Cell:** `bv-5` · **Run:** 2026-08-30, 15:27–15:41 (+07) · **Worker:** `w-bv-5`
-**Status: INCOMPLETE — leg (d) could not be produced.** Legs (a), (b), (c) are proven
-below with their actual commands and actual output. Leg (d) is recorded as a
-measured negative with its diagnosis, not as a narrative; see "Leg (d)".
+**Cell:** `bv-5` · **Run 1:** 2026-08-30, 15:27–15:41 (+07) · **Worker:** `w-bv-5`
+**Run 2:** 2026-08-30, 15:55–16:01 (+07) · **Worker:** `w-bv-5b` · after `bv-6` (`385fa87`)
+**Status: COMPLETE as of run 2.** Legs (a), (b), (c) are run 1's, proven below with
+their actual commands and actual output, and untouched by run 2. Run 1's leg (d) was a
+measured negative against the *card's* sentence and is kept verbatim as
+"Leg (d) — NOT PRODUCED"; `bv-6` then moved the subject onto the surface that actually
+renders, and run 2's "Leg (d) — PRODUCED" below is the measurement of that surface.
 
 Everything here is measured against the LIVE machine: the real registry
 (`~/.waggledance/registry.db`) and the real `.bee` stores of the three registered
@@ -305,6 +308,231 @@ That is a measurement, not a defect verdict: whether a live `question` mark with
 non-review gate pending *should* produce a waiting sentence is a product question the
 `review`-exclusion comment at `views.rs` already flags as deliberate.
 
+## Leg (d) — PRODUCED (run 2, after bv-6). The rail pill names what the project waits for.
+
+Run 1 measured the *card's* sentence and found zero instances of it on this store; that
+section stands as written. `bv-6` (`385fa87`) moved the judgment onto the rail pill —
+the element run 1 had just measured as rendering exactly once — calling `bv-3`'s
+`bee_hub_subject_beats_derived` with the pill's own bare label as the derived side. This
+leg measures that pill against the live registry.
+
+### The probe binary — resolved from cargo, then proved to be the bv-6 one
+
+```
+$ cargo build --profile fast -p waggledance --message-format=json > .bee/tmp/bv5-legd/build.json
+   Compiling waggledance v0.5.2 (/home/thanhsmind/Projects/goglbe/waggledance--wt--board-visibility/crates/waggledance)
+    Finished `fast` profile [optimized] target(s) in 4.60s
+$ jq -r 'select(.reason=="compiler-artifact" and .executable!=null and .target.name=="waggledance") | .executable' .bee/tmp/bv5-legd/build.json
+/home/thanhsmind/.cache/cargo-target/fast/waggledance
+$ stat -c '%n mtime=%y size=%s' /home/thanhsmind/.cache/cargo-target/fast/waggledance
+/home/thanhsmind/.cache/cargo-target/fast/waggledance mtime=2026-08-30 15:55:35.814777374 +0700 size=22707272
+$ sha256sum /home/thanhsmind/.cache/cargo-target/fast/waggledance
+f2726fd9c8faefcf141151c0f8bc952aa2fb42895329f7c1b4d716b8e3a99d89  /home/thanhsmind/.cache/cargo-target/fast/waggledance
+```
+
+Trap 1's second half, restated because it applies here too: the uplift path
+`fast/waggledance` is shared by every tree that uses this `CARGO_TARGET_DIR`, so neither
+the path nor the sha says *which source* produced it. The decisive check is a string that
+exists only after `bv-6` — the pill's own format literal — so the binary was copied out of
+the target dir immediately after the build and grepped:
+
+```
+$ cp /home/thanhsmind/.cache/cargo-target/fast/waggledance .bee/tmp/bv5-legd/wd-head
+$ sha256sum .bee/tmp/bv5-legd/wd-head
+f2726fd9c8faefcf141151c0f8bc952aa2fb42895329f7c1b4d716b8e3a99d89  .bee/tmp/bv5-legd/wd-head
+$ strings -n 8 .bee/tmp/bv5-legd/wd-head | grep -c 'proj-row__badge--bee-wait" title='
+1
+$ strings -n 8 /home/thanhsmind/.cargo/bin/waggledance | grep -c 'proj-row__badge--bee-wait" title='
+0
+```
+
+| binary | sha256 | carries bv-6's pill literal |
+| --- | --- | --- |
+| probe (`.bee/tmp/bv5-legd/wd-head`) | `f2726fd9c8faefcf…` | yes — `1` |
+| the user's running daemon `~/.cargo/bin/waggledance` | `ae770d4182587f7f…` | no — `0` |
+| in-repo `target/fast/waggledance` (stale, unused) | `420d8646b4cea0fd…` | not used |
+
+Three different shas, and the one binary that renders below is the only one carrying the
+code under test. The user's daemon (pid 2110441, port 7700) was left running and
+untouched; nothing was installed over `~/.cargo/bin/waggledance`.
+
+### How the page was rendered
+
+`.bee/spikes/board-visibility/bv5_legd.rs` — a std-only probe compiled with plain `rustc`,
+no repo test file added. It sets `HOME` on the **child** process (the idiom
+`crates/waggledance/tests/e2e_open.rs` already uses), spawns `serve --port 0`, polls that
+daemon's own `daemon.lock` for the real bound port, then does a raw `GET /`. The scratch
+`HOME` holds a `sqlite3 .backup` snapshot of the **live** registry, so the project rows and
+their absolute roots are the real ones while every write lands on the copy:
+
+```
+$ sqlite3 file:/home/thanhsmind/.waggledance/registry.db?mode=ro ".backup '.../bv5-legd/home/.waggledance/registry.db'"
+exit=0
+$ sqlite3 .bee/tmp/bv5-legd/home/.waggledance/registry.db "select id,name,root_path from projects;"
+waggledance|waggledance|/home/thanhsmind/Projects/goglbe/waggledance
+jarvis|jarvis|/home/thanhsmind/Projects/goglbe/jarvis
+beehive|beehive|/home/thanhsmind/Projects/goglbe/beehive
+```
+
+The three real stores were fingerprinted before the first render and again after the last,
+and did not move across this whole leg:
+
+```
+$ md5sum .../waggledance/.bee/state.json .../beehive/.bee/state.json .../jarvis/.bee/state.json   # before
+df9f7f2d861b5d14ea07d881f7bcd3d0  /home/thanhsmind/Projects/goglbe/waggledance/.bee/state.json
+89be4fb942c13bd4645142aeaaca0872  /home/thanhsmind/Projects/goglbe/beehive/.bee/state.json
+211eb85cd23dc2560a4e6fec11eb64fa  /home/thanhsmind/Projects/goglbe/jarvis/.bee/state.json
+$ md5sum <same three>                                                                             # after
+df9f7f2d861b5d14ea07d881f7bcd3d0  /home/thanhsmind/Projects/goglbe/waggledance/.bee/state.json
+89be4fb942c13bd4645142aeaaca0872  /home/thanhsmind/Projects/goglbe/beehive/.bee/state.json
+211eb85cd23dc2560a4e6fec11eb64fa  /home/thanhsmind/Projects/goglbe/jarvis/.bee/state.json
+```
+
+The store as this leg read it — note beehive's subject differs from run 1's, which is the
+store moving between the two runs, not a transcription:
+
+```
+$ jq -c '{feature, phase, waiting_on}' /home/thanhsmind/Projects/goglbe/waggledance/.bee/state.json
+{"feature":"todo-column-collapse","phase":"compounding","waiting_on":{"kind":"turn-end","subject":"Giờ đo chi phí thật mỗi vòng poll và viết vào báo cáo.","asked_at":"2026-08-30T08:33:31.324Z","session":"9b03b358-41a6-4720-a2d9-2e2bef89adb6"}}
+$ jq -c '{feature, phase, waiting_on}' /home/thanhsmind/Projects/goglbe/beehive/.bee/state.json
+{"feature":"slp-dissent-stop-and-ask","phase":"compounding","waiting_on":{"kind":"turn-end","subject":"All six surfaces are quiet again — nothing new that rises to a signal. Writing the silence record.","asked_at":"2026-08-30T08:45:03.060Z","session":"660592ec-adc9-4a17-93b2-c79e8fd280e5"}}
+$ jq -c '{feature, phase, waiting_on}' /home/thanhsmind/Projects/goglbe/jarvis/.bee/state.json
+{"feature":"harness-install-landing","phase":"exploring","waiting_on":{"kind":"question","subject":"Chon muc do tich hop Jarvis vao Super+Space tren Omarchy","asked_at":"2026-08-28T14:13:13.080Z","session":"d9842a15-bc20-4afe-bc40-e9cd7b2f4ced"}}
+```
+
+### Render 1 of this leg — the three live projects
+
+```
+$ .bee/tmp/bv5-legd/bv5_legd .bee/tmp/bv5-legd/wd-head <scratch-home> .bee/tmp/bv5-legd/home-live.html
+BV5D binary=.bee/tmp/bv5-legd/wd-head port=41071 status=HTTP/1.1 200 OK bytes=211940 out=.bee/tmp/bv5-legd/home-live.html
+```
+
+Every wait pill on that page, verbatim:
+
+```
+$ grep -o '<span class="proj-row__badge proj-row__badge--bee-wait"[^§]\{0,220\}' .bee/tmp/bv5-legd/home-live.html
+<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Chon muc do tich hop Jarvis vao Super+Space tren Omarchy">Waiting on you<span class="proj-row__badge-title">— Chon muc do tich hop Jarvis vao Super+Space…</span></span></div>
+$ grep -o 'proj-row__badge--bee-wait' .bee/tmp/bv5-legd/home-live.html | wc -l
+1
+$ grep -o 'proj-row__badges--bee' .bee/tmp/bv5-legd/home-live.html | wc -l
+3
+```
+
+Three rail rows, one wait pill — and that pill now says what it wants.
+
+Each rail row, extracted by its project's own `/p/<slug>/` link:
+
+```
+rail waggledance => <div class="proj-row__badges proj-row__badges--bee"><span class="proj-row__badge proj-row__badge--bee">todo-column-collapse · compounding</span></div>
+rail beehive     => <div class="proj-row__badges proj-row__badges--bee"><span class="proj-row__badge proj-row__badge--bee">slp-dissent-stop-and-ask · compounding</span></div>
+rail jarvis      => <div class="proj-row__badges proj-row__badges--bee"><span class="proj-row__badge proj-row__badge--bee">harness-install-landing · exploring</span><span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Chon muc do tich hop Jarvis vao Super+Space tren Omarchy">Waiting on you<span class="proj-row__badge-title">— Chon muc do tich hop Jarvis vao Super+Space…</span></span></div>
+```
+
+**The winner, live: `jarvis`.** Its `state.json` records
+`kind="question"`, `subject="Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"`;
+the pill's hover title carries that subject whole
+(`title="Waiting on you — Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"`) and
+the visible text carries it clipped on a word boundary:
+
+```
+$ python3 -c "print(len('Chon muc do tich hop Jarvis vao Super+Space tren Omarchy'), len('Chon muc do tich hop Jarvis vao Super+Space'))"
+56 43
+```
+
+56 characters recorded, budget 48, cut back to the last word boundary at 43 plus `…`, with
+`tren Omarchy` recoverable from the title. Before `bv-6` this same row read `Waiting on
+you` and nothing else.
+
+### The loser: **no live project supplies one**, said plainly
+
+`waggledance` and `beehive` both record `kind: "turn-end"`, which `bv-1` classifies as not
+live, so their rows carry **no wait pill at all** — not a plain-label one. On this store, at
+this moment, **there is no live project whose rail pill falls back to the bare label**, and
+this proof claims none.
+
+The subjects that *would* lose are real and they are in this store — they simply sit where
+the site cannot read them (`.bee/lanes/*.json`, never `state.json`), which is run 1's
+finding 1, unchanged:
+
+```
+$ grep -l 'AskUserQuestion' /home/thanhsmind/Projects/goglbe/waggledance/.bee/lanes/*.json
+/home/thanhsmind/Projects/goglbe/waggledance/.bee/lanes/herdr-protocol-20.json
+/home/thanhsmind/Projects/goglbe/waggledance/.bee/lanes/dispatch-submit-and-reclaim.json
+/home/thanhsmind/Projects/goglbe/waggledance/.bee/lanes/paseo-control.json
+$ jq -c '.waiting_on' /home/thanhsmind/Projects/goglbe/waggledance/.bee/lanes/paseo-control.json
+{"kind":"gate","subject":"AskUserQuestion","asked_at":"2026-08-30T00:40:18.888Z","session":"4fca0305-e2f3-45e2-bf83-ade1a1e08ad8"}
+```
+
+So the losing branch is demonstrated the honest way instead of claimed: **that exact
+recorded object**, copied verbatim, is placed where the site *does* read — a project's own
+`state.json` — on a **synthetic project that is not a real project of this machine**
+(`.bee/tmp/bv5-legd/losing-demo`, whose README says so), and rendered by the same binary,
+in the same page, beside the live winner.
+
+### Render 2 of this leg — the same page with the synthetic project registered
+
+```
+$ .bee/tmp/bv5-legd/bv5_legd .bee/tmp/bv5-legd/wd-head <scratch-home> .bee/tmp/bv5-legd/home-with-demo.html ".../bv5-legd/losing-demo=bv5-losing-demo"
+BV5D register bv5-losing-demo status=exit status: 0 out=Registered 'bv5-losing-demo' (losing-demo) — 1 markdown files
+  /home/thanhsmind/Projects/goglbe/waggledance--wt--board-visibility/.bee/tmp/bv5-legd/losing-demo
+BV5D binary=.bee/tmp/bv5-legd/wd-head port=43631 status=HTTP/1.1 200 OK bytes=214687 out=.bee/tmp/bv5-legd/home-with-demo.html
+```
+
+Every rail row on that page, verbatim:
+
+```
+rail losing-demo =>
+  <div class="proj-row__badges proj-row__badges--bee"><span class="proj-row__badge proj-row__badge--bee">losing-subject-demo · executing</span><span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span></div>
+
+rail waggledance =>
+  <div class="proj-row__badges proj-row__badges--bee"><span class="proj-row__badge proj-row__badge--bee">todo-column-collapse · compounding</span></div>
+
+rail beehive =>
+  <div class="proj-row__badges proj-row__badges--bee"><span class="proj-row__badge proj-row__badge--bee">slp-dissent-stop-and-ask · compounding</span></div>
+
+rail jarvis =>
+  <div class="proj-row__badges proj-row__badges--bee"><span class="proj-row__badge proj-row__badge--bee">harness-install-landing · exploring</span><span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Chon muc do tich hop Jarvis vao Super+Space tren Omarchy">Waiting on you<span class="proj-row__badge-title">— Chon muc do tich hop Jarvis vao Super+Space…</span></span></div>
+
+wait pills = 2
+bee blocks = 4
+```
+
+Both branches, one render, one binary:
+
+| project | live? | recorded `waiting_on` | rendered wait pill | branch |
+| --- | --- | --- | --- | --- |
+| `jarvis` | **live** | `question` · `"Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"` | `Waiting on you — Chon muc do tich hop Jarvis vao Super+Space…` (full text in `title`) | subject **wins** |
+| `bv5-losing-demo` | **synthetic, not a real project** | `gate` · `"AskUserQuestion"` (copied verbatim from waggledance's `lanes/paseo-control.json`) | `Waiting on you` — plain label, no `title`, no subject span | subject **refused** |
+| `waggledance` | live | `turn-end` · `"Giờ đo chi phí thật mỗi vòng poll…"` | *(no pill at all)* | not live (`bv-1`) |
+| `beehive` | live | `turn-end` · `"All six surfaces are quiet again…"` | *(no pill at all)* | not live (`bv-1`) |
+
+The two pills differ in exactly the way the rule says they should: a sentence a human wrote
+is named, a bare tool name is not, and neither is a finished turn.
+
+### The same rule at the fixture level
+
+```
+$ cargo test -p waggledance a_rail_wait_pill_names_the_subject_only_when_it_beats_the_bare_label -- --nocapture
+test views::tests::a_rail_wait_pill_names_the_subject_only_when_it_beats_the_bare_label ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1043 filtered out; finished in 0.00s
+```
+
+### The workspace scope, green at the end of this leg
+
+```
+$ cargo test -p waggledance -p waggledance-core
+     Running unittests src/main.rs
+test result: ok. 1043 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.90s
+     Running tests/e2e_open.rs
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+     Running tests/e2e_stop_stale_lock.rs
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+     Running unittests src/lib.rs (waggledance_core)
+test result: ok. 463 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+   Doc-tests waggledance_core
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
 ## What this proof does and does not establish
 
 - Established: bv-1 lowers the count of projects reading as "waiting on you" from 3 to 1
@@ -314,3 +542,18 @@ non-review gate pending *should* produce a waiting sentence is a product questio
 - Not established: any behaviour of bv-3, which produced no rendered output on this store.
 - Not covered: bv-2's field is exercised only through bv-3's site, so it is likewise
   unproven at the render layer here (its reader-level tests are green in the suite above).
+
+**Amended by run 2** — the two "not established" lines above were true of run 1's tree and
+are superseded, not deleted:
+
+- Now established: bv-3's rule renders. Called from bv-6's rail pill, it names jarvis's
+  recorded question on the live home page and refuses waggledance's real
+  `"AskUserQuestion"` subject, both in one render from one binary.
+- Now established: bv-2's `waiting_on` field reaches the render layer — the pill's text and
+  hover title are read from it.
+- Still not established: bv-3's *original* call site, the card's waiting sentence, which
+  still renders zero times on this store for the `gate_stop` reason run 1 diagnosed. That
+  condition is untouched by bv-6 and remains the owner's question.
+- Still synthetic: the losing branch has no live instance on this store. Its demonstration
+  uses a real recorded subject on a project that is not real, and is labelled as such
+  everywhere it appears.
