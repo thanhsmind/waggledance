@@ -119,6 +119,224 @@
     });
   }
 
+  // csl-2 (D1 `a4d73a4f`, D2 `ae531e75`, D3 `4da60387`): slash-command and
+  // skill suggestions for a reply composer. Shared by all three composer
+  // wiring sites below (project panes, the Unassigned page, the paseo agent
+  // page) so the trigger rule and the key handling live in exactly one
+  // place, the way `wireTermKeysGrid` above holds the latch rule.
+  //
+  // The menu opens ONLY while `/` is the FIRST character of the box (D3):
+  // a mid-text slash is a path or a date, never a command, and popping a
+  // menu over one would fight the typist. The token between that `/` and
+  // the caret filters `name` by case-insensitive prefix; no match closes
+  // the menu rather than showing an empty box.
+  //
+  // Entries come from `fetchUrl` (D2's `{name, kind, description}` list),
+  // fetched at most once per page and cached — a failed fetch caches the
+  // empty list rather than retrying on every keystroke.
+  //
+  // Enter/Tab insert `/name ` and close. The keydown is bound in the
+  // CAPTURE phase so it runs before each site's own bubble-phase Ctrl+Enter
+  // send handler; a bare Enter with the menu open is swallowed
+  // (`preventDefault`, so no newline and no submit), while any keystroke
+  // carrying Ctrl/Cmd/Alt is left entirely to that send handler — Ctrl+Enter
+  // still sends, menu open or closed.
+  //
+  // Rows are built with `textContent` only: names and descriptions come
+  // from files on disk (`.claude/commands/*.md`, `SKILL.md` frontmatter),
+  // which are content, never markup.
+  function wireSlashSuggest(input, fetchUrl) {
+    if (!input || !fetchUrl) return;
+
+    var menu = null;
+    var entries = null; // null until the one fetch resolves; then an array
+    var fetching = false;
+    var shown = [];
+    var sel = 0;
+
+    function ensureMenu() {
+      if (menu) return menu;
+      menu = document.createElement("div");
+      menu.className = "slash-menu";
+      menu.setAttribute("role", "listbox");
+      menu.setAttribute("hidden", "");
+      // Anchored to the composer form (or the textarea's own parent when a
+      // site has no form), which the CSS positions the menu above. A static
+      // host gets `position: relative` so the absolute menu hangs off it and
+      // not off some far-away ancestor.
+      var host = (input.closest && input.closest("form")) || input.parentNode;
+      if (!host) return null;
+      try {
+        if (window.getComputedStyle(host).position === "static") host.style.position = "relative";
+      } catch (e) {}
+      host.appendChild(menu);
+      return menu;
+    }
+
+    function isOpen() {
+      return !!menu && !menu.hasAttribute("hidden");
+    }
+
+    function close() {
+      if (menu) menu.setAttribute("hidden", "");
+      shown = [];
+      sel = 0;
+    }
+
+    // The leading `/token` the caret sits inside, or null when the box is not
+    // in slash-suggest shape at all. `end` is where the token stops — the
+    // first whitespace, or the end of the text — so an insert replaces the
+    // whole token even when the caret was moved back into its middle.
+    function leadingToken() {
+      var value = input.value || "";
+      if (value.charAt(0) !== "/") return null;
+      var caret = typeof input.selectionStart === "number" ? input.selectionStart : value.length;
+      if (caret < 1) return null;
+      var match = /\s/.exec(value);
+      var end = match ? match.index : value.length;
+      if (caret > end) return null; // caret has left the leading token
+      return { query: value.slice(1, caret), end: end };
+    }
+
+    function load() {
+      if (entries !== null || fetching) return;
+      fetching = true;
+      fetch(fetchUrl, { credentials: "same-origin" })
+        .then(function (res) {
+          return res.ok ? res.json() : [];
+        })
+        .then(function (data) {
+          entries = Array.isArray(data) ? data : [];
+          fetching = false;
+          refresh();
+        })
+        .catch(function () {
+          entries = [];
+          fetching = false;
+        });
+    }
+
+    function refresh() {
+      var token = leadingToken();
+      if (!token) {
+        close();
+        return;
+      }
+      if (entries === null) {
+        load();
+        return;
+      }
+      var q = token.query.toLowerCase();
+      shown = entries.filter(function (e) {
+        return e && typeof e.name === "string" && e.name.toLowerCase().indexOf(q) === 0;
+      });
+      if (!shown.length) {
+        close();
+        return;
+      }
+      if (sel >= shown.length) sel = 0;
+      render();
+    }
+
+    function render() {
+      var el = ensureMenu();
+      if (!el) return;
+      el.textContent = "";
+      shown.forEach(function (entry, i) {
+        var row = document.createElement("div");
+        row.className = "slash-item" + (i === sel ? " active" : "");
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", i === sel ? "true" : "false");
+
+        var name = document.createElement("span");
+        name.className = "slash-item__name";
+        name.textContent = "/" + entry.name;
+        row.appendChild(name);
+
+        if (entry.kind) {
+          var kind = document.createElement("span");
+          kind.className = "slash-item__kind";
+          kind.textContent = entry.kind;
+          row.appendChild(kind);
+        }
+
+        if (entry.description) {
+          var desc = document.createElement("span");
+          desc.className = "slash-item__desc";
+          desc.textContent = entry.description;
+          row.appendChild(desc);
+        }
+
+        // mousedown, not click, and defaulted away: the same trick the jump
+        // palette uses — the textarea never loses focus, so the blur that
+        // would otherwise close the menu out from under the click never fires.
+        row.addEventListener("mousedown", function (ev) {
+          ev.preventDefault();
+          choose(i);
+        });
+        el.appendChild(row);
+      });
+      el.removeAttribute("hidden");
+      var active = el.children[sel];
+      if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest" });
+    }
+
+    function move(delta) {
+      if (!shown.length) return;
+      sel = (sel + delta + shown.length) % shown.length;
+      render();
+    }
+
+    function choose(i) {
+      var entry = shown[i];
+      var token = leadingToken();
+      if (!entry || !token) {
+        close();
+        return;
+      }
+      var insert = "/" + entry.name + " ";
+      input.value = insert + (input.value || "").slice(token.end);
+      var caret = insert.length;
+      input.focus();
+      if (input.setSelectionRange) input.setSelectionRange(caret, caret);
+      close();
+    }
+
+    input.addEventListener(
+      "keydown",
+      function (ev) {
+        if (!isOpen()) return;
+        // Ctrl+Enter (Cmd+Enter) is the send chord and stays untouched, as
+        // does anything else a modifier claims.
+        if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+        if (ev.key === "ArrowDown") {
+          ev.preventDefault();
+          move(1);
+        } else if (ev.key === "ArrowUp") {
+          ev.preventDefault();
+          move(-1);
+        } else if (ev.key === "Enter" || ev.key === "Tab") {
+          ev.preventDefault();
+          choose(sel);
+        } else if (ev.key === "Escape") {
+          ev.preventDefault();
+          close();
+        }
+      },
+      true
+    );
+
+    input.addEventListener("input", refresh);
+    input.addEventListener("click", refresh);
+    // Arrow/Home/End move the caret without firing `input`, and the caret is
+    // half of what decides whether the menu belongs open at all.
+    input.addEventListener("keyup", function (ev) {
+      if (ev.key && ev.key.indexOf("Arrow") === 0) refresh();
+      else if (ev.key === "Home" || ev.key === "End") refresh();
+    });
+    input.addEventListener("blur", close);
+  }
+
   // One-shot storage-key migration (D5 of the waggledance rename): the old
   // "mdview-theme" / "mdview-folders-open" key is read exactly once, copied
   // to its new "waggledance-*" key, then deleted — so neither the user's
@@ -3506,6 +3724,19 @@
       var card = form.closest(".term-pane");
       var stageBtn = card && card.querySelector(".term-reply__stage");
       var approveBtn = card && card.querySelector(".term-reply__approve");
+      // csl-2 (D1): every reply composer gets slash suggestions. Wired
+      // BEFORE the send keydown below so its capture-phase handler is also
+      // first in registration order. The project page carries a
+      // `data-project-id`, so its panes ask that project's scan endpoint;
+      // the home page's Terminals tab reaches these same forms with no
+      // project id at all (see this IIFE's own doc above), and asks the
+      // user-level endpoint rather than building a `/p/null/...` URL.
+      if (input) {
+        wireSlashSuggest(
+          input,
+          projectId ? "/p/" + encodeURIComponent(projectId) + "/_slash" : "/_slash"
+        );
+      }
       var attachBox = form.querySelector(".term-attach[data-pane-id]");
       var fileInput = attachBox && attachBox.querySelector(".term-attach__input");
       var attachBtn = attachBox && attachBox.querySelector(".term-attach__btn");
@@ -3721,6 +3952,9 @@
         var card = form.closest(".term-pane");
         var stageBtn = card && card.querySelector(".term-reply__stage");
         var approveBtn = card && card.querySelector(".term-reply__approve");
+        // csl-2 (D1): this page has no project of its own, so the
+        // suggestions are the user-level scan only.
+        if (input) wireSlashSuggest(input, "/_slash");
         form.addEventListener("submit", function (ev) {
           ev.preventDefault();
           sendReply(paneId, input.value, true, input);
@@ -4203,6 +4437,11 @@
     var input = form.querySelector(".term-reply__text");
     var sendBtn = form.querySelector(".term-reply__send");
     var errorEl = form.querySelector("[data-paseo-send-error]");
+
+    // csl-2 (D1): the paseo composer feeds a live agent session too. This
+    // page is not a project page (`data-paseo-base`, not `data-project-id`),
+    // so it asks the user-level endpoint.
+    if (input) wireSlashSuggest(input, "/_slash");
 
     function showSendError(message) {
       if (!errorEl) return;

@@ -23917,6 +23917,91 @@ mod tests {
         );
     }
 
+    /// csl-2 (D1 `a4d73a4f`, D2 `ae531e75`): the slash-suggest menu is
+    /// created entirely by `assets/app.js`, so nothing in the served markup
+    /// mentions it — the only handshake left to pin is the pair the JS
+    /// reaches for: the textarea class it binds to, and the endpoint it
+    /// fetches its entries from. Same two-sided idiom as
+    /// `agent_page_composer_class_matches_what_app_js_finds_it_by` above:
+    /// one side is `APP_JS`, the other is the rendered composer, and a
+    /// rename on either side goes red. Needles are single tokens, never
+    /// spans of adjacent statements — the pitfall in
+    /// `docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`.
+    #[test]
+    fn slash_suggest_binds_to_the_composer_class_the_pages_actually_render() {
+        assert!(
+            APP_JS.contains("wireSlashSuggest"),
+            "app.js must still carry the shared slash-suggest wiring"
+        );
+        assert!(
+            APP_JS.contains(".term-reply__text"),
+            "app.js must still find the composer textarea by .term-reply__text"
+        );
+        assert!(
+            APP_JS.contains("/_slash"),
+            "app.js must still fetch its suggestions from the _slash endpoint"
+        );
+
+        // The markup side of the same handshake, for both composer families
+        // D1 names: the pane reply box and the paseo agent composer.
+        let project = sample_project();
+        let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
+            pane_id: "w1:p1".into(),
+            kind: "claude".into(),
+            name: "one".into(),
+            status: "working".into(),
+            cwd: String::new(),
+            workspace: "w1".into(),
+            tab: "t1".into(),
+            title: String::new(),
+        }];
+        let pane_html = terminal_page(&project, &panes, Some("w1:p1"), &[]);
+        assert!(
+            pane_html.contains("term-reply__text"),
+            "the pane composer must still carry the class app.js binds to: {pane_html}"
+        );
+
+        let agent = waggledance_core::paseo::PaseoAgent {
+            id: "agent-7".to_string(),
+            provider: "claude".to_string(),
+            cwd: std::path::PathBuf::from("/x"),
+            title: "compose something".to_string(),
+            last_status: "running".to_string(),
+            last_activity_at: "2026-08-29T12:00:00Z".to_string(),
+            model: None,
+        };
+        let agent_html = paseo_agent_page(&agent);
+        assert!(
+            agent_html.contains("term-reply__text"),
+            "the paseo composer must still carry the class app.js binds to: {agent_html}"
+        );
+    }
+
+    /// csl-2: the menu app.js builds is invisible without its rules — the
+    /// class name is the seam between the two files, so it is asserted from
+    /// both ends, the way the test above pins the JS↔markup seam. `APP_CSS`
+    /// is the concatenated stylesheet the page actually serves (the same
+    /// constant `served_html_and_js_never_mention_mdview_outside_the_storage_fallback`
+    /// reads), so this also proves the rules survive that concat.
+    #[test]
+    fn slash_menu_class_is_styled_in_the_stylesheet_that_ships() {
+        assert!(
+            APP_JS.contains("slash-menu"),
+            "app.js must still build the menu with the .slash-menu class"
+        );
+        assert!(
+            APP_CSS.contains(".slash-menu"),
+            "the served stylesheet must still style .slash-menu"
+        );
+        assert!(
+            APP_CSS.contains(".slash-item"),
+            "the served stylesheet must still style .slash-item rows"
+        );
+    }
+
     /// pc-4 second revision (semantic-judge finding `brittle-assertions`):
     /// the prior revision's needles spanned embedded newlines with exact
     /// leading indentation, pinning literal adjacency rather than behaviour —

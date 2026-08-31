@@ -503,9 +503,17 @@ fn router(state: AppState) -> Router {
         .route("/highlight.css", get(highlight_asset))
         .route("/ws", get(ws_handler))
         .route("/s/:code", get(short_link_redirect))
+        // composer-slash-suggest (D2): the projectless half of `_slash` — the
+        // user-level list, for composers on a page that has no project.
+        .route("/_slash", get(slash_suggest_user))
         .route("/p/:id/", get(project_home))
         .route("/p/:id/_search", get(search_page))
         .route("/p/:id/_jump", get(jump_search))
+        // composer-slash-suggest (D2): what the composer's `/` popup may
+        // offer — the project's own slash commands and skills merged over the
+        // user-level ones. `/_slash` below is the same list for a page with
+        // no project. Read-only, like `_jump` beside it.
+        .route("/p/:id/_slash", get(slash_suggest))
         .route("/p/:id/_bee", get(bee_board))
         // board-approve-actions (D1/D3/D4): the board's one write path —
         // a card's Approve/Reject relayed into the project's own bee CLI
@@ -7483,6 +7491,38 @@ async fn jump_search(
     Json(hits).into_response()
 }
 
+/// composer-slash-suggest (D2): the slash commands and skills offerable in a
+/// composer on this project's pages — the project root's own set shadowing the
+/// user-level one, as JSON for the `/` popup. Shaped after `jump_search`
+/// above: project lookup, 404 when absent, `Json(...)` otherwise.
+///
+/// Read-only by construction. Nothing here runs or interprets a slash command;
+/// the browser inserts the name it picks into a reply box, and the agent CLI
+/// behind the pane stays the only thing that ever executes one.
+async fn slash_suggest(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let Ok(Some(project)) = st.engine.get_project(&id) else {
+        return not_found("project not found");
+    };
+    Json(crate::slash::slash_entries(
+        Some(&project.root_path),
+        &slash_home(),
+    ))
+    .into_response()
+}
+
+/// `slash_suggest`'s projectless half (D2): pages with no project — the
+/// unassigned-pane and paseo composers — get the user-level list alone.
+async fn slash_suggest_user() -> Response {
+    Json(crate::slash::slash_entries(None, &slash_home())).into_response()
+}
+
+/// Where the user-level `.claude/` tree lives. Falls back to the current
+/// directory the same way every other home lookup in this file does — an
+/// unresolvable home then simply finds nothing to suggest.
+fn slash_home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// The base the Changes screen was asked for (D6). `?commit=<sha>` is the
 /// only value; anything else about the query string is ignored.
 ///
@@ -10190,6 +10230,71 @@ mod bee_route_tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// composer-slash-suggest (D2): the whole path, not just the scanner —
+    /// the route is registered, the handler resolves the project, and the
+    /// body is the JSON array the popup parses. The user-level half of the
+    /// merge is the developer's real home here (the handler resolves it
+    /// through `slash_home`), so this asserts only that the project's own
+    /// entries are present; the merge and shadow rules are proven
+    /// hermetically in `crate::slash`'s own fixture tests.
+    #[tokio::test]
+    async fn slash_route_serves_the_projects_commands_and_skills_as_json() {
+        let root = fresh_root("slash-route");
+        write(
+            &root,
+            ".claude/commands/x.md",
+            "---\ndescription: run x\n---\n",
+        );
+        write(
+            &root,
+            ".claude/skills/y/SKILL.md",
+            "---\ndescription: do y\n---\n",
+        );
+
+        let st = build_state();
+        let project = register(&st, &root, "slash-route");
+        let app = router(st);
+
+        let resp = get(app, &format!("/p/{}/_slash", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let x = entries
+            .iter()
+            .find(|e| e["name"] == "x")
+            .unwrap_or_else(|| panic!("no x entry in {body}"));
+        assert_eq!(x["kind"], "command");
+        assert_eq!(x["description"], "run x");
+        let y = entries
+            .iter()
+            .find(|e| e["name"] == "y")
+            .unwrap_or_else(|| panic!("no y entry in {body}"));
+        assert_eq!(y["kind"], "skill");
+        assert_eq!(y["description"], "do y");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The projectless half and the missing-project refusal — `/_slash`
+    /// answers a JSON array with no project at all, and an unknown id on the
+    /// project route is the same 404 `_jump` gives.
+    #[tokio::test]
+    async fn bare_slash_route_answers_json_and_an_unknown_project_is_not_found() {
+        let st = build_state();
+        let app = router(st);
+
+        let resp = get(app.clone(), "/_slash").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&body).is_ok(),
+            "bare _slash must answer a JSON array: {body}"
+        );
+
+        let missing = get(app, "/p/no-such-project/_slash").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
