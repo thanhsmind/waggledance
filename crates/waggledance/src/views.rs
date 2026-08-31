@@ -10087,6 +10087,13 @@ fn changes_body(
             "<span class=\"changes__reviewed\" hidden>0/{n} reviewed</span>",
             n = diff.files.len(),
         ));
+        // diff-file-collapse D3: ONE control for the whole screen, its label
+        // and `aria-expanded` flipped by app.js as the sections open and
+        // close — Collapse all while any is open, Expand all once every one
+        // is folded. Hidden until app.js takes it, for the reason above.
+        head.push_str(
+            "<button type=\"button\" class=\"changes__fold-all\" hidden>Collapse all</button>",
+        );
     }
     if diff.hidden > 0 {
         // D5: the count, never the names — naming them would disclose
@@ -10171,14 +10178,25 @@ fn changes_section(
             link = code_view_link(project, &file.path, open_q),
         ),
     };
+    // diff-file-collapse D1: the two-way fold sits FIRST in the sticky
+    // header, so every file's chevron lines up down the left edge and the
+    // path still starts where it always did. It ships `hidden` and app.js
+    // unhides it — the same contract `.changeset__review` follows, because a
+    // control that remembers nothing must not appear with scripting off.
+    // `aria-controls` names the body it folds, which is why the body div now
+    // carries an id of its own.
     format!(
         "<section class=\"changeset\" id=\"f{index}\" data-path=\"{path}\" data-key=\"{key}\">\
-         <h2 class=\"changeset__head\">{badge}\
+         <h2 class=\"changeset__head\">\
+         <button type=\"button\" class=\"changeset__fold\" aria-expanded=\"true\" \
+         aria-controls=\"f{index}-body\" aria-label=\"Fold {name}\" hidden>\
+         <span class=\"changeset__fold-chev\" aria-hidden=\"true\">›</span></button>\
+         {badge}\
          <span class=\"changeset__path\">{name}</span>{note}{stat}\
          <label class=\"changeset__review\" hidden>\
          <input type=\"checkbox\" class=\"changeset__review-box\">\
          <span class=\"changeset__review-text\">Reviewed</span></label></h2>\
-         <div class=\"changeset__body\">{body}</div></section>",
+         <div class=\"changeset__body\" id=\"f{index}-body\">{body}</div></section>",
         index = index,
         path = esc(&file.path),
         key = changeset_key(file),
@@ -24375,6 +24393,81 @@ mod tests {
         );
         assert!(!html.contains("changes__reviewed"), "{html}");
         assert!(!html.contains("changeset__review"), "{html}");
+    }
+
+    /// diff-file-collapse D1: the ground the two-way fold stands on. Every
+    /// section ships its own button, first in the sticky header, wired by
+    /// `aria-controls` to the body it folds and starting out expanded — and
+    /// `hidden`, because it remembers nothing and app.js is what makes it
+    /// real (the contract `.changeset__review` beside it already follows).
+    #[test]
+    fn every_section_ships_a_hidden_fold_button_over_its_own_body() {
+        let html = changes_html(changes_fixture());
+
+        assert!(
+            html.contains(
+                "<h2 class=\"changeset__head\"><button type=\"button\" \
+                 class=\"changeset__fold\" aria-expanded=\"true\" \
+                 aria-controls=\"f0-body\" aria-label=\"Fold src/app/main.rs\" hidden>"
+            ),
+            "the fold button is the header's first child, expanded, named for its file: {html}"
+        );
+        assert!(
+            html.contains("<div class=\"changeset__body\" id=\"f0-body\">"),
+            "and `aria-controls` points at a body that actually carries that id: {html}"
+        );
+        assert_eq!(
+            html.matches("class=\"changeset__fold\"").count(),
+            2,
+            "one fold button per changed file: {html}"
+        );
+        assert_eq!(
+            html.matches("id=\"f1-body\"").count(),
+            1,
+            "every section's body id is its own: {html}"
+        );
+    }
+
+    /// diff-file-collapse D3: ONE whole-screen control, in the head beside
+    /// the reviewed counter. It ships saying "Collapse all" — the state
+    /// every screen opens in — and `hidden`, for the same reason as above.
+    #[test]
+    fn the_head_carries_one_hidden_collapse_all_button() {
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains(
+                "<button type=\"button\" class=\"changes__fold-all\" hidden>Collapse all</button>"
+            ),
+            "the head offers Collapse all, hidden until app.js takes it: {html}"
+        );
+        assert_eq!(
+            html.matches("changes__fold-all").count(),
+            1,
+            "one control, not one per file: {html}"
+        );
+        // Scoped to the CHANGES head — the page's own topbar closes a
+        // `</header>` long before this one does.
+        let head_start = html
+            .find("<header class=\"changes__head\">")
+            .expect("the changes head is rendered");
+        let head_end = head_start
+            + html[head_start..]
+                .find("</header>")
+                .expect("the changes head is closed");
+        assert!(
+            html[head_start..head_end].contains("changes__fold-all"),
+            "and it sits inside the head, beside the counter: {html}"
+        );
+    }
+
+    /// Nothing changed: nothing to fold. Neither control is rendered, the
+    /// same rule the reviewed counter follows one test up — a Collapse all
+    /// over an empty screen is a button about nothing.
+    #[test]
+    fn an_empty_diff_offers_no_fold_controls() {
+        let html = changes_html(WorkingTreeDiff::default());
+        assert!(!html.contains("changes__fold-all"), "{html}");
+        assert!(!html.contains("changeset__fold"), "{html}");
     }
 
     /// A binary file says so instead of rendering bytes; a truncated one
