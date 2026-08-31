@@ -9,7 +9,7 @@ bee:
   areas: [workflow-state]
   sources: [docs/knowledge/index.md]
   polarity: practice
-  signature: area bullet(s), 0 pattern candidate(s)
+  signature: "area bullet(s), 0 pattern candidate(s)"
 ---
 
 # A promote-proposal backlog triages itself before anything is read closely

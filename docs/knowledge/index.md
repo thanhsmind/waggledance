@@ -13,11 +13,12 @@ never a generation timestamp or any other wall-clock value.
 
 ## Sections
 
-- [patterns/](patterns/index.md) — 14 concept(s)
-- [work/](work/index.md) — 106 concept(s)
+- [patterns/](patterns/index.md) — 28 concept(s)
+- [work/](work/index.md) — 112 concept(s)
 
 ## Critical patterns
 
+- [A private-index commit leaves the shared index lying](patterns/a-private-index-commit-leaves-the-shared-one-lying.md) — Pitfall: the private-index route around the concurrent-worker git guard does not refresh the shared index, so the next worker's commit silently reverts the previous one — and the working tree, which every green is read from, still looks correct.
 - [Assertions that pin literal adjacency decide where new code is allowed to go](patterns/assertions-that-pin-literal-adjacency.md) — Pitfall: tests that locate markup or style by literal substring, whole-string equality, or first-versus-second match turn the ordering of a rendered file into a contract — so the natural place to insert a new attribute or rule is the one place that breaks a dozen tests for no behavioural reason.
 - [A cell that promises a user-visible outcome owes one proof of the whole path](patterns/prove-the-whole-path.md) — Pitfall: slicing a user-visible outcome into per-unit cells lets every slice go green while the feature stays inert, because no proof ever crosses the seams between them.
 - [The binary you ran is not the one you built](patterns/the-binary-you-ran-is-not-the-one-you-built.md) — Pitfall: every cheap way to identify a built artifact — its version string, its in-repo path, even cargo's own reported executable path — can name a stale binary, so a green proof run certifies code that was never executed.

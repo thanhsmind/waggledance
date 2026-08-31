@@ -91,3 +91,23 @@ Two things this recurrence changed:
   than built, because the discriminator between "pins ordering" and "pins behaviour"
   is not mechanical enough yet to fail a build on. Prose plus a measured signature
   stands until a recurrence count justifies the false-positive budget.
+
+## The trap reaches prose, not just code (2026-08-31)
+
+`term-keys-nav-tint` cost two red runs to a shape the entries above do not
+cover: **a comment is page content**.
+
+The first red came from a CSS rule selecting the arrow keys by per-key
+attribute literals. That put those literals into the stylesheet *ahead of* the
+markup they describe, and the grid-order test — which locates a key by its bare
+attribute and compares positions — found the CSS occurrence first. Rewriting
+the rule to select by class fixed it.
+
+The second red came from the explanatory **comment** written to record that
+fix, because the comment quoted the selector it was explaining. The literal was
+back in the block, ahead of the markup, and the same test went red again.
+
+The rule this adds: in a file that ships its stylesheet inside the page it
+asserts on, anything a test greps for must not be spelled out anywhere in that
+block — prose included. A position-based assertion cannot tell a rule from a
+comment, and neither can it tell either from the markup.
