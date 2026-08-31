@@ -47,6 +47,13 @@ struct Inner {
     /// closing -- the seam for "a close that errors still reports the run
     /// as Done".
     close_error: Mutex<Option<String>>,
+    /// Every `read_pane` call, in order, as `(pane_id, source)`. Same
+    /// reason `closed_panes` exists: the assertion that matters is often
+    /// the EMPTY one -- board-run-reaper D2 says a run whose pane vanished
+    /// is capped from the ledger alone, with no pane read attempted, and
+    /// only a recorded call log can tell "did not read" from "read and
+    /// got an error".
+    read_panes: Mutex<Vec<(String, ReadSource)>>,
 }
 
 /// One pane's fake screen state -- history-aware so a test can construct all
@@ -275,6 +282,7 @@ impl FakeHerdr {
                 sent_text: Mutex::new(Vec::new()),
                 closed_panes: Mutex::new(Vec::new()),
                 close_error: Mutex::new(None),
+                read_panes: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -381,6 +389,14 @@ impl FakeHerdr {
     /// an inferred completion is a killed working agent.
     pub async fn closed_panes(&self) -> Vec<String> {
         self.inner.closed_panes.lock().await.clone()
+    }
+
+    /// Every `read_pane` call, in order, as `(pane_id, source)` -- recorded
+    /// even for a pane this fake does not know, so a read aimed at a
+    /// vanished pane shows up as a recorded call rather than disappearing
+    /// into its own error.
+    pub async fn read_pane_log(&self) -> Vec<(String, ReadSource)> {
+        self.inner.read_panes.lock().await.clone()
     }
 
     /// Test-only: make every subsequent `close_pane` refuse with `message`.
@@ -568,6 +584,11 @@ impl Herdr for FakeHerdr {
         source: ReadSource,
         lines: usize,
     ) -> Result<ScreenRead> {
+        self.inner
+            .read_panes
+            .lock()
+            .await
+            .push((pane_id.to_string(), source));
         self.ensure_up()?;
         let mut screens = self.inner.screens.lock().await;
         match screens.get_mut(pane_id) {

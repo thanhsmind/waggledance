@@ -36,7 +36,7 @@ use crate::notify;
 /// Herdr's own hard cap on a `recent` read (mirrors `pane_scroller.rs`'s own
 /// local copy of the same constant, `pane_scroller.rs:52`) — baseline/delta
 /// reads use `Recent`, capped the same way.
-const RECENT_LINES_CAP: usize = 1000;
+pub(crate) const RECENT_LINES_CAP: usize = 1000;
 
 /// Hard cap on `await_run`'s wait (D4) — a caller-requested longer timeout
 /// is silently clamped, never honored, never an error.
@@ -449,6 +449,29 @@ fn delta_from_baseline(baseline: &str, current: &str) -> String {
     }
 }
 
+/// Whether `current` shows `marker` as a marker the agent printed for THIS
+/// run — the one completion signal that may retire a pane (D5), and the
+/// single home of that rule.
+///
+/// Two halves, both required:
+///
+/// 1. `baseline` — the run's own pre-send capture — must NOT already carry
+///    the joined marker. A marker minted for this run but already sitting in
+///    its own baseline can only mean the string reached the pane some other
+///    way (a leaked instruction, an unrelated echo); it can never be
+///    evidence of completion, so staleness is decided against the run's own
+///    fixed baseline, never re-derived from a later read.
+/// 2. `current` — a fresh `Recent` read — must carry it.
+///
+/// [`await_run`] and the reaper's pre-check
+/// (`crates/waggledance/src/reaper.rs`) both ask this question, and a second
+/// copy of the rule is exactly how the two would drift into disagreeing
+/// about which runs are finished — so there is one function and both call
+/// it.
+pub(crate) fn marker_is_fresh(baseline: &str, current: &str, marker: &str) -> bool {
+    !baseline.contains(marker) && current.contains(marker)
+}
+
 /// Resolve the herdr workspace/cwd destination for spawning a fresh agent
 /// pane (D3's preset-spawn path): the first workspace in `snapshot` whose D2
 /// anchor (`Snapshot::anchor_cwd_for_workspace`) validates against
@@ -680,13 +703,6 @@ async fn await_run_with_poll_interval(
     }
 
     let deadline = tokio::time::Instant::now() + clamp_timeout(timeout);
-    // A marker string minted for THIS run but already sitting in ITS OWN
-    // baseline can only mean the joined string reached the pane some other
-    // way (e.g. a leaked instruction, or an unrelated echo) -- it can never
-    // be evidence of completion, so staleness is decided once, up front,
-    // from the run's own fixed baseline/marker pair, never re-derived from
-    // a later read.
-    let marker_is_stale_from_start = run.baseline.contains(run.marker.as_str());
     let mut stable_reads: u32 = 0;
     let mut last_revision: Option<u64> = None;
 
@@ -715,7 +731,7 @@ async fn await_run_with_poll_interval(
             .await;
         }
 
-        if !marker_is_stale_from_start && read.text.contains(run.marker.as_str()) {
+        if marker_is_fresh(&run.baseline, &read.text, run.marker.as_str()) {
             // The one declared completion in this loop: the agent's own
             // marker, freshly printed by the agent itself.
             return finish(
