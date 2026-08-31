@@ -61,10 +61,11 @@ pub struct SearchConfig {
 }
 
 /// The D7 opt-in switches for the agent terminal surface, all off until the
-/// user turns them on from the settings page. `#[derive(Default)]` gives
-/// every switch `false`, matching a config that has never seen this
-/// section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// user turns them on from the settings page — matching a config that has
+/// never seen this section. [`TerminalConfig::default`] is hand-written
+/// rather than derived for exactly one reason: `reaper_enabled` is the one
+/// switch here that defaults **on**, and its own doc says why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
     /// The terminal surface itself (D2/D3) — panes and screens are reachable
@@ -76,6 +77,24 @@ pub struct TerminalConfig {
     /// D7: Telegram notification on agent status change. waggledance makes no
     /// outbound call while this is off.
     pub notify_enabled: bool,
+    /// board-run-reaper: the in-daemon reaper that awaits every
+    /// waggledance-spawned `working` run nobody else is awaiting, so a run
+    /// that printed its own completion marker gets capped and its pane
+    /// closed with no human in the loop, and a run whose pane has vanished
+    /// stops reading `working` forever (D1 `eecfefeb`, D2 `4047ca75`).
+    ///
+    /// The one switch in this section that defaults **on**, and
+    /// deliberately: unlike the supervisor (which spawns a process) and
+    /// notifications (which make an outbound call), the reaper only tidies
+    /// up runs waggledance itself dispatched — it touches nothing the user
+    /// owns, `preset_label IS NOT NULL` being the same guard `finish`
+    /// reads. It is still mastered by [`enabled`](Self::enabled) above like
+    /// every other background task, so a terminal family switched off runs
+    /// no reaper at all; this switch is the narrow off-ramp for someone who
+    /// wants the terminal without the sweep. Because the default is `true`,
+    /// this struct's `Default` is written out by hand — a derived one would
+    /// silently ship it off.
+    pub reaper_enabled: bool,
     /// toa-4 (D9): the Unassigned group — panes that live outside every
     /// registered project's root. This group has no containment check of
     /// its own; before terminal-open-access removed the terminal's session,
@@ -84,10 +103,10 @@ pub struct TerminalConfig {
     /// this switch is a second, deliberate gate on top of `enabled` above —
     /// both must be on for the group's routes to answer, so turning off
     /// `enabled` alone still closes this group, and turning this switch on
-    /// while `enabled` is off opens nothing. `#[derive(Default)]` on this
-    /// struct gives it `false`, matching a config that has never mentioned
-    /// it — the same "off unless the owner made a deliberate act" rule
-    /// every other switch in this section follows.
+    /// while `enabled` is off opens nothing. This struct's `Default` gives
+    /// it `false`, matching a config that has never mentioned it — the same
+    /// "off unless the owner made a deliberate act" rule every other
+    /// user-facing switch in this section follows.
     pub unassigned_enabled: bool,
     /// D8/P4: operator-authored agent-create presets, keyed by label — the
     /// terminal page's creation controls
@@ -125,6 +144,25 @@ pub struct AgentPreset {
     pub argv: Vec<String>,
 }
 
+/// Hand-written so `reaper_enabled` can ship **on** while every
+/// user-facing switch in the section stays off (see the field's own doc).
+/// The container-level `#[serde(default)]` routes every absent key in a
+/// `[terminal]` section through here, so an existing install's config.toml
+/// — written before the reaper existed — loads with the reaper on and its
+/// other switches exactly as the owner left them.
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            supervisor_enabled: false,
+            notify_enabled: false,
+            reaper_enabled: true,
+            unassigned_enabled: false,
+            agent_presets: Vec::new(),
+            notify_chat_id: None,
+        }
+    }
+}
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -694,7 +732,9 @@ mod tests {
     fn terminal_switches_default_off_and_carry_no_token_field() {
         // A config that has never seen the terminal section — the shape a
         // pre-existing install's config.toml has today — must still resolve
-        // every switch to off, never on by an absent-field accident.
+        // every user-facing switch to off, never on by an absent-field
+        // accident. `reaper_enabled` is the deliberate exception and has its
+        // own test (`reaper_switch_defaults_on_and_survives_an_explicit_off`).
         let c = Config::default();
         assert!(!c.terminal.enabled);
         assert!(!c.terminal.supervisor_enabled);
@@ -714,6 +754,45 @@ mod tests {
         assert!(!loaded.terminal.supervisor_enabled);
         assert!(!loaded.terminal.notify_enabled);
         assert!(!loaded.terminal.unassigned_enabled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// board-run-reaper: the one switch in `[terminal]` that ships on. Both
+    /// halves matter — a fresh `Config` has it on, and an *existing*
+    /// install's config.toml, written by a build that never heard of the
+    /// key, still loads with it on rather than falling to `bool`'s `false`.
+    /// The explicit `false` round-trip is the other half of the same
+    /// contract: default-on must not mean unturnoffable.
+    #[test]
+    fn reaper_switch_defaults_on_and_survives_an_explicit_off() {
+        assert!(
+            Config::default().terminal.reaper_enabled,
+            "the reaper ships on — it only tidies runs waggledance dispatched"
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-cfg-reaper-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+
+        // A config file that predates the switch entirely.
+        std::fs::write(&p, "[terminal]\nenabled = true\n").unwrap();
+        let loaded = Config::load_from(&p);
+        assert!(loaded.terminal.enabled);
+        assert!(
+            loaded.terminal.reaper_enabled,
+            "an absent key must read as the shipped default, not as false"
+        );
+
+        // And the owner's explicit off is honored, through the file.
+        std::fs::write(&p, "[terminal]\nenabled = true\nreaper_enabled = false\n").unwrap();
+        let loaded = Config::load_from(&p);
+        assert!(!loaded.terminal.reaper_enabled);
+
+        let mut c = Config::default();
+        c.terminal.reaper_enabled = false;
+        c.save_to(&p).unwrap();
+        assert!(!Config::load_from(&p).terminal.reaper_enabled);
         std::fs::remove_dir_all(&dir).ok();
     }
 

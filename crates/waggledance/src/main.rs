@@ -8,6 +8,7 @@ mod mcp;
 mod notify;
 mod orchestrate;
 mod paseo_cli;
+mod reaper;
 mod runtime;
 mod server;
 mod supervisor;
@@ -64,8 +65,11 @@ fn main() {
 /// red/green mutation that tells them apart).
 #[derive(Default)]
 pub struct TerminalBackground {
-    supervisor: Mutex<Option<SupervisorTask>>,
+    supervisor: Mutex<Option<CancellableTask>>,
     notify: Mutex<Option<JoinHandle<()>>>,
+    /// board-run-reaper: the third background task, same shape as the other
+    /// two — a slot, a cancel flag, and a tick counter.
+    reaper: Mutex<Option<CancellableTask>>,
     /// The notification store handed down to the dispatch path while
     /// notifications are enabled (D6/dbn-3). `None` when notifications
     /// are disabled.
@@ -74,18 +78,24 @@ pub struct TerminalBackground {
     /// switch-on has waited for it to finish.
     supervisor_stopping: Mutex<Option<JoinHandle<()>>>,
     notify_stopping: Mutex<Option<JoinHandle<()>>>,
+    reaper_stopping: Mutex<Option<JoinHandle<()>>>,
     /// Incremented once per completed health check while the supervisor
     /// task is actually running — a real side effect, not bookkeeping.
     supervisor_ticks: Arc<AtomicU64>,
     /// Incremented once per completed poll cycle while the notify task is
     /// actually running.
     notify_ticks: Arc<AtomicU64>,
+    /// Incremented once per completed sweep while the reaper task is
+    /// actually running.
+    reaper_ticks: Arc<AtomicU64>,
 }
 
-/// The supervisor's live task plus the flag that lets its owner cancel the
-/// next spawn immediately, without waiting for `abort()` to land at the
-/// task's next `.await` point.
-struct SupervisorTask {
+/// A live background task plus the flag that lets its owner cancel the next
+/// side-effecting step immediately, without waiting for `abort()` to land at
+/// the task's next `.await` point. Shared by the supervisor (whose
+/// side effect is spawning herdr) and the reaper (whose side effect is
+/// closing a finished run's pane).
+struct CancellableTask {
     handle: JoinHandle<()>,
     cancel: Arc<AtomicBool>,
 }
@@ -105,6 +115,11 @@ impl TerminalBackground {
     /// True while the notify (watcher + drain) task is live.
     pub fn notify_running(&self) -> bool {
         self.notify.lock().unwrap().is_some()
+    }
+
+    /// True while the board run reaper's sweep task is live.
+    pub fn reaper_running(&self) -> bool {
+        self.reaper.lock().unwrap().is_some()
     }
 
     /// The notification store available to the dispatch path while the notify
@@ -130,6 +145,13 @@ impl TerminalBackground {
         self.notify_ticks.load(Ordering::SeqCst)
     }
 
+    /// How many sweeps the reaper task has actually completed — the same
+    /// "real side effect, not bookkeeping" counter as the two above.
+    #[cfg(test)]
+    fn reaper_ticks(&self) -> u64 {
+        self.reaper_ticks.load(Ordering::SeqCst)
+    }
+
     /// Start what `cfg` says should be running and isn't; stop (abort) what
     /// is running and shouldn't be. A switch already in the state `cfg`
     /// wants is left untouched — flipping the *other* switch never disturbs
@@ -150,7 +172,85 @@ impl TerminalBackground {
         engine: Option<Arc<waggledance_core::Engine>>,
     ) {
         self.reconcile_supervisor(cfg.supervisor_enabled, herdr.clone());
+        // board-run-reaper: mastered by the terminal family switch on top of
+        // its own, unlike the two above — the reaper's own switch defaults
+        // ON, so `enabled` is what keeps a terminal-family-off install from
+        // sweeping anything at all.
+        self.reconcile_reaper(
+            cfg.enabled && cfg.reaper_enabled,
+            herdr.clone(),
+            engine.clone(),
+        );
         self.reconcile_notify(cfg.notify_enabled, herdr, notify_store, telegram, engine);
+    }
+
+    fn reconcile_reaper(
+        &self,
+        enabled: bool,
+        control: Arc<dyn herdr::Herdr>,
+        engine: Option<Arc<waggledance_core::Engine>>,
+    ) {
+        self.reconcile_reaper_with_timings(
+            enabled,
+            control,
+            engine,
+            reaper::SWEEP_INTERVAL,
+            reaper::GRACE_WINDOW,
+        );
+    }
+
+    /// `interval`/`grace` are parameterized only so a test can drive the
+    /// sweep fast enough to observe real ticks; every production call goes
+    /// through [`reconcile_reaper`](Self::reconcile_reaper)'s fixed values.
+    ///
+    /// A `None` engine switches the reaper off no matter what the config
+    /// says: the sweep reads and writes the run ledger, and there is no
+    /// ledger to sweep without one.
+    fn reconcile_reaper_with_timings(
+        &self,
+        enabled: bool,
+        control: Arc<dyn herdr::Herdr>,
+        engine: Option<Arc<waggledance_core::Engine>>,
+        interval: Duration,
+        grace: Duration,
+    ) {
+        let enabled = enabled && engine.is_some();
+        let mut slot = self.reaper.lock().unwrap();
+        match (enabled, slot.take()) {
+            (true, Some(existing)) => *slot = Some(existing), // already running
+            (true, None) => {
+                let Some(engine) = engine else { return };
+                let previous = self.reaper_stopping.lock().unwrap().take();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let sweep = reaper::Reaper::with_cancel_flag(
+                    control,
+                    engine,
+                    interval,
+                    grace,
+                    cancelled.clone(),
+                );
+                let ticks = self.reaper_ticks.clone();
+                let handle = tokio::spawn(async move {
+                    if let Some(prev) = previous {
+                        let _ = prev.await;
+                    }
+                    sweep.run(ticks).await;
+                });
+                *slot = Some(CancellableTask {
+                    handle,
+                    cancel: cancelled,
+                });
+            }
+            (false, Some(existing)) => {
+                // Cancel first — checked by the sweep immediately before the
+                // one call that can close a pane — then abort, keeping the
+                // handle so the next switch-on waits for this one to be gone.
+                existing.cancel.store(true, Ordering::SeqCst);
+                existing.handle.abort();
+                *self.reaper_stopping.lock().unwrap() = Some(existing.handle);
+            }
+            (false, None) => {}
+        }
     }
 
     fn reconcile_supervisor(&self, enabled: bool, control: Arc<dyn herdr::Herdr>) {
@@ -219,7 +319,7 @@ impl TerminalBackground {
                     )
                     .await;
                 });
-                *slot = Some(SupervisorTask {
+                *slot = Some(CancellableTask {
                     handle,
                     cancel: cancelled,
                 });
@@ -414,10 +514,17 @@ impl Drop for TerminalBackground {
         if let Some(h) = self.notify.lock().unwrap().take() {
             h.abort();
         }
+        if let Some(t) = self.reaper.lock().unwrap().take() {
+            t.cancel.store(true, Ordering::SeqCst);
+            t.handle.abort();
+        }
         if let Some(h) = self.supervisor_stopping.lock().unwrap().take() {
             h.abort();
         }
         if let Some(h) = self.notify_stopping.lock().unwrap().take() {
+            h.abort();
+        }
+        if let Some(h) = self.reaper_stopping.lock().unwrap().take() {
             h.abort();
         }
         *self.notify_store.lock().unwrap() = None;
@@ -722,9 +829,92 @@ mod terminal_background_tests {
     #[test]
     fn main_declares_the_background_modules() {
         let src = include_str!("main.rs");
-        for m in ["mod notify;", "mod watcher;", "mod supervisor;"] {
+        for m in [
+            "mod notify;",
+            "mod watcher;",
+            "mod supervisor;",
+            "mod reaper;",
+        ] {
             assert!(src.contains(m), "main.rs must declare `{m}`");
         }
+    }
+
+    fn engine() -> Arc<waggledance_core::Engine> {
+        Arc::new(waggledance_core::Engine::new(
+            waggledance_core::SqliteStore::open_in_memory().unwrap(),
+            waggledance_core::Config::default(),
+        ))
+    }
+
+    /// board-run-reaper: the sweep is mastered by BOTH the terminal family
+    /// switch and its own `reaper_enabled` (which, unlike its two siblings,
+    /// defaults on) — either one off runs no reaper at all.
+    #[tokio::test]
+    async fn reaper_runs_only_with_the_family_switch_and_its_own_switch_on() {
+        let bg = TerminalBackground::new();
+        let fake = Arc::new(FakeHerdr::new());
+
+        // Family off (the default), reaper switch on by default: nothing runs.
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake.clone(),
+            store(),
+            None,
+            Some(engine()),
+        );
+        assert!(
+            !bg.reaper_running(),
+            "a terminal family switched off runs no reaper"
+        );
+
+        let mut cfg = TerminalConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(cfg.reaper_enabled, "the reaper's own switch defaults on");
+        bg.reconcile(&cfg, fake.clone(), store(), None, Some(engine()));
+        assert!(
+            bg.reaper_running(),
+            "the terminal family on is enough to start the sweep"
+        );
+
+        cfg.reaper_enabled = false;
+        bg.reconcile(&cfg, fake.clone(), store(), None, Some(engine()));
+        assert!(
+            !bg.reaper_running(),
+            "the narrow off-ramp must stop the sweep"
+        );
+
+        // And with no engine there is no ledger to sweep, switches or not.
+        cfg.reaper_enabled = true;
+        bg.reconcile(&cfg, fake, store(), None, None);
+        assert!(!bg.reaper_running(), "no engine, no reaper");
+    }
+
+    /// The reaper's own teeth: `reaper_ticks` counts completed sweeps, so a
+    /// switch-off that only emptied the slot would leave this advancing.
+    #[tokio::test]
+    async fn reaper_off_actually_stops_the_sweep() {
+        let bg = TerminalBackground::new();
+        let fake: Arc<dyn crate::herdr::Herdr> = Arc::new(FakeHerdr::new());
+        let fast = Duration::from_millis(15);
+
+        bg.reconcile_reaper_with_timings(true, fake.clone(), Some(engine()), fast, fast);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        let ticks_while_on = bg.reaper_ticks();
+        assert!(
+            ticks_while_on >= 2,
+            "the reaper must actually sweep while switched on (ticks={ticks_while_on})"
+        );
+
+        bg.reconcile_reaper_with_timings(false, fake, Some(engine()), fast, fast);
+        let ticks_at_off = bg.reaper_ticks();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            ticks_at_off,
+            bg.reaper_ticks(),
+            "switching off must stop the sweep from ticking again"
+        );
     }
 
     /// Defect (1), the test with teeth: `supervisor_ticks` is a real side
