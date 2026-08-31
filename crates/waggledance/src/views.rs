@@ -2371,16 +2371,21 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    child of `.term-controls`". */
 .term-keys { display: grid; grid-template-columns: repeat(6, minmax(44px, 1fr)); gap: var(--space-1); }
 .term-keys button { padding: var(--space-1) var(--space-2); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; font-size: var(--type-caption-size); }
-/* term-keys-nav-tint D1 (`334b8353`): the four arrows are NAVIGATION, a
-   different class of control from the keys around them — Esc/Tab/⇧Tab/
-   Ctrl+C/Enter send a key to the program, Approve/Stage/Paste act on the
-   session — so they read as their own cluster instead of four more action
-   buttons. The tint is the INFO accent on purpose, never `--color-action`:
-   the action colour is what Send and a latched modifier wear, and it would
-   say "act" over a control that only moves the cursor. `color-mix` over the
+/* term-keys-nav-tint D1b (`816f4993`, superseding `334b8353`): the four
+   arrows are NAVIGATION, a different class of control from the keys around
+   them — Esc/Tab/⇧Tab/Ctrl+C/Enter send a key to the program,
+   Approve/Stage/Paste act on the session — so they read as their own cluster
+   instead of four more action buttons. The tint is `--color-info`, never
+   `--color-action` (what Send and a latched modifier wear, and it would say
+   "act" over a control that only moves the cursor) and never an
+   `accent-alt` slot: those look like a neutral accent ramp in
+   `contract.css`, but `console.css` — the theme actually live — redefines
+   the whole set as BOARD LANE IDENTITY, so alt-2 is the orange that means
+   "needs you". A cursor key must not wear a status colour. `color-mix` over the
    same surface token every other key uses keeps both themes correct with no
    literal colour (the idiom `.fg-callout` and `.bee-hub__group-waiting`
-   already use). */
+   already use).
+
    The cluster is selected by its own class, never by per-arrow attribute
    selectors: any such literal in this stylesheet sits BEFORE the markup and
    is what every assertion locating a key by its bare attribute would find
@@ -2389,7 +2394,7 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    quoting the selector it was warning about
    (`docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`).
    Nothing in this block may spell one out, prose included. */
-.term-keys button.term-keys__nav { background: color-mix(in srgb, var(--color-accent-alt-2) 14%, var(--color-surface-raised)); border-color: color-mix(in srgb, var(--color-accent-alt-2) 40%, var(--color-border)); color: var(--color-accent-alt-2); }
+.term-keys button.term-keys__nav { background: color-mix(in srgb, var(--color-info) 22%, var(--color-surface-raised)); border-color: color-mix(in srgb, var(--color-info) 60%, var(--color-border)); color: var(--color-info); }
 /* D2: a latched modifier (Ctrl/Shift/Alt) reads the same way Send already
    does — filled with the action colour — so the one lit key is obvious
    before the next tap combines with it and clears the latch. The arrow
@@ -14921,12 +14926,21 @@ mod tests {
             "the navigation tint must select the arrows by that class: {css}"
         );
         assert!(
-            css.contains("color: var(--color-accent-alt-2); }"),
-            "the arrows must take the info accent as their glyph colour: {css}"
+            css.contains("color: var(--color-info); }"),
+            "the arrows must take the info token as their glyph colour: {css}"
         );
         assert!(
-            css.contains("color-mix(in srgb, var(--color-accent-alt-2) 14%, var(--color-surface-raised))"),
-            "the arrow ground must be the info accent mixed over the shared surface token: {css}"
+            css.contains(
+                "color-mix(in srgb, var(--color-info) 22%, var(--color-surface-raised))"
+            ),
+            "the arrow ground must be the info token mixed over the shared surface token: {css}"
+        );
+        // D1b (`816f4993`): the accent-alt slots are BOARD LANE IDENTITY in
+        // the live console theme (alt-2 is the orange for "needs you"), so a
+        // key must never wear one — the mistake D1 shipped.
+        assert!(
+            !css.contains(".term-keys button.term-keys__nav { background: color-mix(in srgb, var(--color-accent-alt"),
+            "the arrows must not borrow a board lane-identity colour: {css}"
         );
         // The action colour stays what it was: Send's and a latched
         // modifier's, never the arrows'.
@@ -23597,6 +23611,50 @@ mod tests {
             open, close,
             "APP_CSS braces are unbalanced ({open} open vs {close} close) — an unclosed block disables every rule after it"
         );
+    }
+
+    /// The sibling check for the stylesheets this FILE ships inline, which
+    /// the `APP_CSS` test above never sees. Same failure, one layer over:
+    /// a `*/` typed one line early ends the comment there, and the prose
+    /// after it becomes CSS the parser chokes on — swallowing the rules that
+    /// follow while every `contains(...)` assertion still passes, because
+    /// the literal it greps for is present, just no longer inside a comment.
+    /// That shipped here once (term-keys-nav-tint), and the arrow tint below
+    /// it is what went missing on the live page.
+    #[test]
+    fn inline_style_blocks_have_balanced_comments_and_braces() {
+        let project = sample_project();
+        let pages: [(&str, String); 2] = [
+            ("terminal page", terminal_page(&project, &[], None, &[])),
+            ("project tab style", PROJECT_TAB_STYLE.to_string()),
+        ];
+        for (name, html) in pages {
+            let mut rest = html.as_str();
+            let mut blocks = 0;
+            while let Some(start) = rest.find("<style>") {
+                let after = &rest[start + "<style>".len()..];
+                let end = after
+                    .find("</style>")
+                    .unwrap_or_else(|| panic!("{name}: a <style> block is never closed"));
+                let css = &after[..end];
+                blocks += 1;
+                let opened = css.matches("/*").count();
+                let closed = css.matches("*/").count();
+                assert_eq!(
+                    opened, closed,
+                    "{name}: comment delimiters are unbalanced ({opened} `/*` vs {closed} `*/`) — \
+                     prose left outside a comment is parsed as CSS and takes the rules after it down"
+                );
+                let open = css.matches('{').count();
+                let close = css.matches('}').count();
+                assert_eq!(
+                    open, close,
+                    "{name}: braces are unbalanced ({open} open vs {close} close)"
+                );
+                rest = &after[end..];
+            }
+            assert!(blocks > 0, "{name}: expected at least one <style> block");
+        }
     }
 
     /// waggledance-rename W5: `mdview:mermaid-done` was renamed on both the
