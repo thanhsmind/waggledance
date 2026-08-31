@@ -39,9 +39,36 @@ These are fixed. Planning must implement them exactly — cited, never reinterpr
 | D7 | **Per-project dispatch consent is still required.** The trigger only dispatches into a project whose own `orchestration_enabled` is on. A transition in a project that has not opted in produces no tick — same per-project gate `orchestrator-dispatch` D6 / `dispatch-project-presets` D5 already require for every other dispatch path. | Keeps this feature from being a second, ungated door into a project that declined orchestration through the front one. |
 | D8 | **Per-project cooldown between dispatched ticks.** The trigger enforces a minimum spacing between two ticks it dispatches into the SAME project (exact window: planning's call), so a burst of transitions (a flapping run) fires at most one tick per cooldown window, not one per transition. Still event-driven — only the *rate*, not the presence of a timer, is bounded. Cooldown suppresses the DISPATCH only, never the detection: every detector's own cursor/seen-set still advances past a transition it observed, whether or not the cooldown let a tick actually fire — a suppressed transition is dropped, never queued or retried, matching D8's own "not one per transition" wording. | The source xia doc names its own risk if this seat is stood up now: §8.11 ceremony capture / §8.14 attention dilution. A per-transition dispatch with no floor turns one flapping run into an unbounded burst of spawned agents; this decision is the structural answer, not a config knob left to the operator to discover the hard way. |
 | D9 | **The trigger never re-observes its own dispatched runs.** Every tick the trigger dispatches carries a fixed, distinguishing `feature` marker on `dispatch_run` (e.g. `"observer-tick-trigger"`); every detector (D4a–D4d) filters out a run/row that already carries this marker before treating it as a transition. | Found during the plan-step hat wave (`hat-user-impact`, 2026-08-31): without this, a dispatched tick's own eventual completion (or stall) is itself a "run capped"/"run overrun" transition in the exact same project, which would wake ANOTHER tick pointed at the first tick's own run — a self-sustaining loop bounded only by D8's cooldown, never terminating. D5 (no local store) means this would be invisible even to an operator looking, since no record exists distinguishing a trigger-dispatched run from any other. |
-| D10 | **`terminal.trigger_dry_run` (default `false`).** When true, every detector runs exactly as normal and logs (via `tracing::info!`, not a store — D5 is unaffected) the transition it would have acted on and the dispatch it would have made, but `dispatch_run` is never actually called. Independent of `trigger_enabled` — an operator can dry-run before ever arming real dispatch. | Found during the plan-step hat wave (`hat-alternatives`, 2026-08-31): D1's exception is self-authored and cannot yet be proven safe by anything but production fleet behavior; a dry-run mode lets an operator measure real transition volume (directly answering the risk map's "dispatch storm" row) before arming autonomous LLM dispatch, at near-zero implementation cost, and independently narrows the `hat-user-impact` finding that a fired tick is otherwise invisible outside the target project's own run ledger (D5 still holds — this is a log line, never a store). |
+| D10 | **`terminal.trigger_dry_run` (default `false`).** When true, every detector runs exactly as normal and logs (via `tracing::info!`, not a store — D5 is unaffected) every transition it would have acted on and the dispatch it would have made — not gated by D8's cooldown, so the log genuinely reflects real transition volume — but `dispatch_run` is never actually called. **As shipped, `trigger_dry_run` still requires `trigger_enabled: true` to run at all** (the daemon task is gated on `terminal.enabled && terminal.trigger_enabled`; `trigger_dry_run` only controls the one branch inside it) — corrected 2026-08-31 from this row's original wording ("independent of `trigger_enabled` — an operator can dry-run before ever arming real dispatch"), which the shipped code does not do. The practical path is: turn both switches on together to preview, then flip `trigger_dry_run` off once satisfied. A genuinely independent preview (dry-run with `trigger_enabled: false`) is real but separate follow-up work, not blocking. | Found during the plan-step hat wave (`hat-alternatives`, 2026-08-31): D1's exception is self-authored and cannot yet be proven safe by anything but production fleet behavior; a dry-run mode lets an operator measure real transition volume (directly answering the risk map's "dispatch storm" row) before arming autonomous LLM dispatch, at near-zero implementation cost, and independently narrows the `hat-user-impact` finding that a fired tick is otherwise invisible outside the target project's own run ledger (D5 still holds — this is a log line, never a store). Wording correction found by ott-5's own review judge (2026-08-31): the "independent of `trigger_enabled`" claim was aspirational, not implemented. |
 
-### Accepted risks (found during the hat wave, not blocking)
+### Accepted risks (found during the hat wave and the slice review, not blocking)
+
+- **D9 cannot close the loop through the D4d escalation mailbox.** Found by the per-slice
+  review judge (2026-08-31, ott-1..ott-4). The fixed task template tells the woken agent
+  to record what it finds through `bee supervisor`'s own verbs; if it records
+  `kind: escalation`/`urgent`, that row is itself a new D4d transition the trigger will
+  see on its next poll. D9's marker lives on the *run* row (`Run.feature`), but a
+  mailbox row carries no run pointer, so the D9 filter at the escalation detector is
+  presently a no-op for this specific path (its own code comment says so). The letter
+  of D9 is honored in all four detectors (verified by the review judge, code-level, not
+  just by test); this is the one path its *intent* does not fully reach. Bounded, not
+  unbounded: `TRIGGER_DISPATCH_COOLDOWN` (D8) still caps it at one dispatch per project
+  per window, forever, if a loop forms — not the unterminating burst an unbounded design
+  would risk. Real fix (matching a mailbox row back to the tick that plausibly caused
+  it, e.g. by `target_session`/`point_key` pattern or a time-correlation with this
+  project's own last dispatched tick) is real, separate follow-up work, tracked as a
+  backlog item.
+- **D4b can silently lose a transition when an MCP-awaited run reaches `blocked` before
+  the trigger's own poll sees it.** Found by the review judge. `scan_blocked` resolves a
+  blocked pane back to its run via `list_unattended_working_runs`, which filters
+  `status='working'` — a run an active MCP awaiter has already marked `blocked` has
+  already left that set, so the pane is unresolvable and the poll's `StatusCursor`
+  advances past the transition anyway (D8's own "cursor always advances" rule). D4a
+  deliberately excludes `Awaited(Blocked)` too (correct per D4), so this narrow case (a
+  run someone is actively, interactively awaiting via MCP, that then blocks) can fire
+  neither D4a nor D4b. Reaper-swept runs (no live awaiter) are unaffected — the 30s poll
+  interval beats reaper's 60s grace window in practice. Untested; low real-world
+  exposure (an actively-awaited run already has a human's attention).
 
 - **No cross-project push signal.** D5 forbids a local observation store, and this
   feature adds no board/UI surface (out of scope). An operator watching project A gets
