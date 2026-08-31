@@ -974,11 +974,26 @@ mod agent_instruction_tests {
     fn supervisor_skill_template_is_a_valid_skill_file() {
         assert!(SUPERVISOR_SKILL_TEMPLATE.starts_with("---"));
         assert!(SUPERVISOR_SKILL_TEMPLATE.contains("name: waggledance-supervisor"));
+        // The frontmatter description is what the router matches on to pick
+        // this skill — it must name both modes, not just relay, or a request
+        // that mixes a completion verb with a routing verb mis-selects
+        // relay-only again (the mode-selection trap this skill guards against).
+        assert!(SUPERVISOR_SKILL_TEMPLATE.contains(
+            "relay mode files it as a proposed PBI and stops; execute mode has the lead run its own full chain to a finished result"
+        ));
+        // The mode gate sits before any procedure — the agent must state
+        // relay vs execute, and why, before dispatching anything.
+        assert!(SUPERVISOR_SKILL_TEMPLATE.contains("## Mode gate — decide before anything else"));
+        assert!(SUPERVISOR_SKILL_TEMPLATE.contains("the completion verb decides the SCOPE"));
         // The spec-drop provenance line format — what lets a target repo
         // recognize where a drop came from and de-duplicate a re-send.
         assert!(SUPERVISOR_SKILL_TEMPLATE.contains("spec-drop <corr-id> from waggledance@<sha>"));
-        // The no-merge rule — merging to the target repo's main is human-only.
+        // The no-merge rule — merging to the target repo's main is human-only,
+        // in both relay mode and execute mode.
         assert!(SUPERVISOR_SKILL_TEMPLATE.contains("Never merge, and never ask for a merge"));
+        assert!(
+            SUPERVISOR_SKILL_TEMPLATE.contains("Never merge, and never approve that repo's gates")
+        );
         // The duplicate-id line — a duplicate `--id` means the drop already
         // landed, not that anything failed.
         assert!(SUPERVISOR_SKILL_TEMPLATE
