@@ -1518,6 +1518,8 @@
         supervisor_enabled: form.supervisor_enabled.checked,
         notify_enabled: form.notify_enabled.checked,
         unassigned_enabled: form.unassigned_enabled.checked,
+        trigger_enabled: form.trigger_enabled.checked,
+        trigger_dry_run: form.trigger_dry_run.checked,
         notify_chat_id: form.notify_chat_id.value,
         notify_telegram_token: form.notify_telegram_token.value,
       };
