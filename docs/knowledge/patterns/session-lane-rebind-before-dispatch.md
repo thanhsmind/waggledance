@@ -14,7 +14,7 @@ bee:
 
 ## The trap
 
-A session that already did work on one feature (e.g. `paseo-support`) is
+A session that already did work on one feature (e.g. `board-visibility`) is
 reused to pick up a different feature (e.g. `term-keys-grid`). The session's
 own lane binding does not follow the new work automatically — it stays
 pointed at the old feature. The write guard resolves every gate check through
