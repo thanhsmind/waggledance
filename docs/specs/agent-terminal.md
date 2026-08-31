@@ -327,11 +327,16 @@ implementation. Code entry points are listed in `reading-map.md`.
   declares but that carries no runnable command is refused as that, and never
   as an unknown name: the name exists, so calling it unknown sends the reader
   looking for a spelling mistake that is not there.
-- **Where each control appears:** the project terminal page offers both the
-  presets and the plain shell; the homepage's Terminals tab offers the
-  presets only — no plain-shell control there. When a surface would show no
-  creation control at all (no presets configured and no plain shell offered),
-  the creation box is omitted entirely rather than shipped empty.
+- **Where each control appears:** both surfaces offer the same controls — the
+  configured presets and the plain shell. The homepage's Terminals tab withheld
+  the plain-shell control for a time, on the reasoning that a page not scoped to
+  one project could only guess where a new shell belonged; that stopped being
+  true once the tab's switcher and its creation controls both took the selected
+  pane's own project, so "new shell here" now names the same project on either
+  page. The creation box is therefore never empty, and never omitted for want of
+  something to put in it. The one surface that shows no creation control is a
+  selected pane belonging to no registered project: creation is addressed per
+  project, so a pane outside every project has no address to create into.
 
 ### The pane's header
 
