@@ -204,6 +204,39 @@ impl SqliteStore {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Every still-`working` run waggledance itself spawned, across all
+    /// projects — the reaper's sweep list (board-run-reaper D1,
+    /// `eecfefeb`). Newest first.
+    ///
+    /// Two filters, both load-bearing:
+    ///
+    /// - `status='working'`: a run that already reached any terminal status
+    ///   (`done`, `blocked`, `timeout`, `lost`) is finished business, and
+    ///   re-awaiting it would re-read a pane that may belong to someone
+    ///   else by now.
+    /// - `preset_label IS NOT NULL`: waggledance spawned this pane. A
+    ///   `DispatchTarget::Pane` run borrows a pane the user already owned
+    ///   and leaves the column NULL exactly there — the same guard
+    ///   `orchestrate::finish` reads before closing anything — so the
+    ///   reaper never so much as looks at a human's own pane.
+    ///
+    /// Deliberately project-blind, unlike
+    /// [`list_live_runs_for_feature`](Self::list_live_runs_for_feature):
+    /// the leak D1 names is who-calls-await, not which project or which
+    /// button dispatched, so the sweep covers board runs and abandoned MCP
+    /// dispatches alike. Age is not filtered here — the caller's grace
+    /// window is a policy the store has no business holding.
+    pub fn list_unattended_working_runs(&self) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE status='working' AND preset_label IS NOT NULL
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// The `feature` column of one run row, for the round-trip proof and for
     /// any caller that holds a [`Run`] and needs the column the struct does
     /// not carry. `Ok(None)` for both an unknown id and a NULL column.
@@ -1168,6 +1201,69 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the lock is per project as well as per feature"
+        );
+    }
+
+    /// board-run-reaper D1: the reaper's sweep list is every `working` run
+    /// waggledance itself spawned, in every project. The four rows this test
+    /// keeps out are the whole contract — a finished run, a reaped (`lost`)
+    /// run, and a run in a pane the user already owned (NULL
+    /// `preset_label`, the same guard `finish` reads before closing
+    /// anything) must never reach a sweep, while a second project's working
+    /// run must.
+    #[test]
+    fn the_sweep_list_is_every_waggledance_spawned_working_run_in_every_project() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+
+        let mut working = sample_run();
+        working.id = "r-working".into();
+        working.status = "working".into();
+        working.created_at = "2026-08-16T00:00:00Z".into();
+        s.insert_run(&working, Some("board-run-reaper")).unwrap();
+
+        // Another project entirely, and newer — the sweep is project-blind
+        // and newest-first.
+        let mut other_project = sample_run();
+        other_project.id = "r-other-project".into();
+        other_project.project_id = "p2".into();
+        other_project.status = "working".into();
+        other_project.created_at = "2026-08-17T00:00:00Z".into();
+        s.insert_run(&other_project, None).unwrap();
+
+        let mut done = sample_run();
+        done.id = "r-done".into();
+        done.status = "done".into();
+        s.insert_run(&done, Some("board-run-reaper")).unwrap();
+
+        let mut lost = sample_run();
+        lost.id = "r-lost".into();
+        lost.status = "lost".into();
+        s.insert_run(&lost, Some("board-run-reaper")).unwrap();
+
+        // Dispatched into a pane the user already owned: no preset label,
+        // so nothing waggledance spawned, so not the reaper's business.
+        let mut borrowed = sample_run();
+        borrowed.id = "r-borrowed-pane".into();
+        borrowed.status = "working".into();
+        borrowed.preset_label = None;
+        s.insert_run(&borrowed, Some("board-run-reaper")).unwrap();
+
+        let sweep = s.list_unattended_working_runs().unwrap();
+        assert_eq!(
+            sweep.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-other-project", "r-working"],
+            "only preset-labeled working rows, newest first: {sweep:?}"
+        );
+
+        // And a run the reaper caps leaves the list on the next sweep.
+        s.update_run_status("r-working", "lost", "2026-08-18T00:00:00Z", None, None)
+            .unwrap();
+        let sweep = s.list_unattended_working_runs().unwrap();
+        assert_eq!(
+            sweep.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-other-project"],
+            "a reaped run is not swept twice: {sweep:?}"
         );
     }
 

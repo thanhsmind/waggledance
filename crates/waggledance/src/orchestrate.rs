@@ -560,6 +560,15 @@ pub enum RunStatus {
     /// trustworthy signal to fall back on at all, not even "known still
     /// working".
     Timeout,
+    /// board-run-reaper D2 (`4047ca75`): the run's pane is gone from the
+    /// herdr snapshot entirely, so there is nothing left to poll and
+    /// nothing left to read. Terminal, and deliberately **row-only** — a
+    /// vanished pane has no process to protect and no screen to store, so
+    /// this status is written by `Engine::update_run_status` alone and
+    /// never travels through [`finish`], which would try to close a pane
+    /// that no longer exists. `await_run` never returns it either: it is
+    /// the reaper's verdict about a pane's absence, not a wait's outcome.
+    Lost,
 }
 
 impl RunStatus {
@@ -569,6 +578,7 @@ impl RunStatus {
             RunStatus::Done => "done",
             RunStatus::Blocked => "blocked",
             RunStatus::Timeout => "timeout",
+            RunStatus::Lost => "lost",
         }
     }
 
@@ -591,9 +601,14 @@ impl RunStatus {
     /// value costs one poll of a live pane, never a wrong answer from the
     /// ledger.
     pub fn terminal_from_stored(status: &str) -> Option<RunStatus> {
-        [RunStatus::Done, RunStatus::Blocked, RunStatus::Timeout]
-            .into_iter()
-            .find(|s| s.as_str() == status)
+        [
+            RunStatus::Done,
+            RunStatus::Blocked,
+            RunStatus::Timeout,
+            RunStatus::Lost,
+        ]
+        .into_iter()
+        .find(|s| s.as_str() == status)
     }
 }
 
@@ -1484,9 +1499,12 @@ mod tests {
         assert_eq!(outcome.delta, "all the work\nHERDR_DONE_x");
     }
 
-    /// The short-circuit reads the three terminal spellings and nothing
+    /// The short-circuit reads the four terminal spellings and nothing
     /// else: `working` is open by name, and so is any status this build does
     /// not know -- an unrecognized value costs a poll, never a wrong answer.
+    /// `lost` (board-run-reaper D2) is the fourth: a reaped run whose pane
+    /// vanished answers from the store like any other finished run, so a
+    /// later await never goes looking for the pane again.
     #[test]
     fn only_the_terminal_statuses_answer_from_the_store() {
         assert_eq!(
@@ -1501,11 +1519,22 @@ mod tests {
             RunStatus::terminal_from_stored("timeout"),
             Some(RunStatus::Timeout)
         );
+        assert_eq!(
+            RunStatus::terminal_from_stored("lost"),
+            Some(RunStatus::Lost),
+            "board-run-reaper D2: a reaped row reads terminal from the store"
+        );
         assert_eq!(RunStatus::terminal_from_stored("working"), None);
         assert_eq!(RunStatus::terminal_from_stored("pending"), None);
         assert_eq!(RunStatus::terminal_from_stored("Done"), None);
+        assert_eq!(RunStatus::Lost.as_str(), "lost");
         assert!(!RunStatus::Working.is_terminal());
-        for status in [RunStatus::Done, RunStatus::Blocked, RunStatus::Timeout] {
+        for status in [
+            RunStatus::Done,
+            RunStatus::Blocked,
+            RunStatus::Timeout,
+            RunStatus::Lost,
+        ] {
             assert!(status.is_terminal(), "{status:?} ends the run");
         }
     }
