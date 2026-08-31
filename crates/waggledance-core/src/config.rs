@@ -95,6 +95,40 @@ pub struct TerminalConfig {
     /// this struct's `Default` is written out by hand — a derived one would
     /// silently ship it off.
     pub reaper_enabled: bool,
+    /// observer-tick-trigger (D6): the in-daemon trigger that wakes exactly
+    /// one cold `bee supervisor` observation tick in a project whose fleet
+    /// just made a transition waggledance itself detected — a run capped, a
+    /// run blocked, a run overrun, a new escalation row — and stays silent
+    /// otherwise (`crates/waggledance/src/trigger.rs`).
+    ///
+    /// Defaults **off**, for exactly the reason
+    /// [`reaper_enabled`](Self::reaper_enabled) above defaults on, read the
+    /// other way round. The reaper only tidies up runs waggledance itself
+    /// dispatched, so it touches nothing the user owns; this task *spawns an
+    /// LLM agent* into a project's own repository with no human in the loop,
+    /// which is the largest external side effect anything in this section
+    /// has. So it joins `supervisor_enabled`/`notify_enabled`'s off-by-default
+    /// class — nothing here fires until the owner made a deliberate act — and
+    /// is mastered by [`enabled`](Self::enabled) on top of its own switch,
+    /// like the reaper.
+    ///
+    /// Two further gates stand behind this one and are never widened by it:
+    /// the target project's own `orchestration_enabled` (D7), and the
+    /// per-project cooldown that bounds how often one project can be woken
+    /// (D8).
+    pub trigger_enabled: bool,
+    /// observer-tick-trigger (D10): measure before arming. With this on,
+    /// every trigger detector runs exactly as it would in production and
+    /// logs the transition it saw and the tick it would have dispatched —
+    /// and `dispatch_run` is never called. Independent of
+    /// [`trigger_enabled`](Self::trigger_enabled) above in meaning (it
+    /// changes what an armed trigger *does*, not whether it runs), so an
+    /// operator can watch real fleet transition volume for a week before
+    /// ever letting a tick actually spawn.
+    ///
+    /// A log line, never a store: D5 forbids waggledance keeping any copy of
+    /// what it observed, and this mode does not create one.
+    pub trigger_dry_run: bool,
     /// toa-4 (D9): the Unassigned group — panes that live outside every
     /// registered project's root. This group has no containment check of
     /// its own; before terminal-open-access removed the terminal's session,
@@ -157,6 +191,8 @@ impl Default for TerminalConfig {
             supervisor_enabled: false,
             notify_enabled: false,
             reaper_enabled: true,
+            trigger_enabled: false,
+            trigger_dry_run: false,
             unassigned_enabled: false,
             agent_presets: Vec::new(),
             notify_chat_id: None,

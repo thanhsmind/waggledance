@@ -299,9 +299,30 @@ impl Reaper {
     /// what proves a switch-off actually stopped the task rather than merely
     /// emptying its owner's slot (same contract as the supervisor's own
     /// tick counter).
-    pub async fn run(self, ticks: Arc<AtomicU64>) {
+    ///
+    /// `verdicts`, when `Some`, receives every `(run_id, verdict)` pair each
+    /// sweep decided — the same `Vec` [`sweep_once`](Self::sweep_once)
+    /// already returns and this loop used to drop on the floor. It is the
+    /// observer-tick-trigger's D4a source (`crates/waggledance/src/trigger.rs`),
+    /// and it exists because the reaper is the only thing in the process that
+    /// can tell an ordinary healthy completion apart from a run it capped:
+    /// from outside, the ledger's status column reads the same for both.
+    /// `None` (every configuration with the trigger off) restores the old
+    /// behaviour exactly — nothing is sent, nothing is allocated, and no
+    /// sweep decision changes either way. A send that fails means the
+    /// receiver is gone; the sweep neither retries nor stops.
+    pub async fn run(
+        self,
+        ticks: Arc<AtomicU64>,
+        verdicts: Option<tokio::sync::mpsc::UnboundedSender<(String, Verdict)>>,
+    ) {
         loop {
-            let _ = self.sweep_once().await;
+            let swept = self.sweep_once().await;
+            if let Some(tx) = verdicts.as_ref() {
+                for pair in swept {
+                    let _ = tx.send(pair);
+                }
+            }
             ticks.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(self.interval).await;
         }
