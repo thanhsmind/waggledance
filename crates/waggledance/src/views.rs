@@ -3239,10 +3239,13 @@ fn pane_controls(
     };
     // trc-2: row 1 of the key grid is Esc, Tab, Approve, ↑, Stage, Ctrl+C —
     // Approve and Stage take the slots Ctrl and Shift used to hold, which
-    // are removed outright (Alt is the only latching modifier left,
-    // `data-mod="alt"`; `assets/app.js`'s `wireTermKeysGrid` already reads
-    // `button[data-mod]` generically, so dropping two of the three needs no
-    // JS change). Approve/Stage keep their `.term-reply__approve`/
+    // are removed outright. tks-1 (D1 `c6c086a0`) retires the last latching
+    // modifier too: Alt's slot now opens row 2 as a plain `shift+tab` key —
+    // the back-tab herdr delivers as ESC[Z, the key Claude Code reads to
+    // cycle its permission modes — leaving zero `data-mod` buttons in the
+    // grid (`assets/app.js`'s `wireTermKeysGrid` reads `button[data-mod]`
+    // generically, so an empty modifier set needs no JS change).
+    // Approve/Stage keep their `.term-reply__approve`/
     // `.term-reply__stage` classes and A4's disabled/title gating — they
     // just render here, inside `.term-keys`, instead of inside the
     // `.term-reply` form; `assets/app.js`'s handlers find them via the
@@ -3257,7 +3260,7 @@ fn pane_controls(
       <button type="button" data-key="up">↑</button>
       <button type="button" class="term-reply__stage" data-pane-id="{pane_id}">Stage</button>
       <button type="button" data-key="ctrl+c">Ctrl+C</button>
-      <button type="button" data-mod="alt" aria-pressed="false">Alt</button>
+      <button type="button" data-key="shift+tab">⇧Tab</button>
       <button type="button" class="term-keys__paste" aria-label="Paste into the reply to {name}">Paste</button>
       <button type="button" data-key="left">←</button>
       <button type="button" data-key="down">↓</button>

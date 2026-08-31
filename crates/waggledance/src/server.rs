@@ -19225,18 +19225,20 @@ mod bee_route_tests {
             body.contains("class=\"term-controls\"") && !body.contains("term-controls__row"),
             "the controls must sit in one single-row block: {body}"
         );
-        // tkg-1/D1, amended by trc-2 (UAT round): the grid renders in one
-        // fixed order — row 1 Esc, Tab, Approve, ↑, Stage, Ctrl+C; row 2
-        // Alt, Paste, ←, ↓, →, Enter. Ctrl and Shift are gone outright,
-        // their slots taken by Approve and Stage — so a script that walks
-        // `.term-keys` children in DOM order tags each one correctly.
+        // tkg-1/D1, amended by trc-2 (UAT round) and tks-1: the grid renders
+        // in one fixed order — row 1 Esc, Tab, Approve, ↑, Stage, Ctrl+C;
+        // row 2 ⇧Tab, Paste, ←, ↓, →, Enter. Ctrl and Shift are gone
+        // outright, their slots taken by Approve and Stage, and tks-1
+        // replaced the Alt latch with the plain `shift+tab` key — so a
+        // script that walks `.term-keys` children in DOM order tags each
+        // one correctly.
         let esc_pos = at("data-key=\"escape\"");
         let tab_pos = at("data-key=\"tab\"");
         let approve_pos = at("class=\"term-reply__approve\"");
         let up_pos = at("data-key=\"up\"");
         let stage_pos = at("class=\"term-reply__stage\"");
         let ctrlc_pos = at("data-key=\"ctrl+c\"");
-        let alt_pos = at("data-mod=\"alt\"");
+        let shifttab_pos = at("data-key=\"shift+tab\"");
         let paste_pos = at("class=\"term-keys__paste\"");
         let left_pos = at("data-key=\"left\"");
         let down_pos = at("data-key=\"down\"");
@@ -19248,30 +19250,21 @@ mod bee_route_tests {
                 && approve_pos < up_pos
                 && up_pos < stage_pos
                 && stage_pos < ctrlc_pos
-                && ctrlc_pos < alt_pos
-                && alt_pos < paste_pos
+                && ctrlc_pos < shifttab_pos
+                && shifttab_pos < paste_pos
                 && paste_pos < left_pos
                 && left_pos < down_pos
                 && down_pos < right_pos
                 && right_pos < enter_pos,
-            "the 2x6 grid must render Esc,Tab,Approve,↑,Stage,Ctrl+C / Alt,Paste,←,↓,→,Enter in that order: {body}"
+            "the 2x6 grid must render Esc,Tab,Approve,↑,Stage,Ctrl+C / ⇧Tab,Paste,←,↓,→,Enter in that order: {body}"
         );
-        // Ctrl and Shift are removed outright — Alt is the grid's only
-        // latching modifier now, and it still carries no data-key.
+        // tks-1: every latching modifier is gone — Ctrl and Shift were
+        // replaced by Approve/Stage, and Alt's slot is the plain `shift+tab`
+        // key now. `data-mod` must not appear at all: a stray latch button
+        // would re-arm `wireTermKeysGrid`'s modifier path nothing else uses.
         assert!(
-            !body.contains("data-mod=\"ctrl\"") && !body.contains("data-mod=\"shift\""),
-            "the Ctrl/Shift soft keys must be gone, replaced by Approve/Stage: {body}"
-        );
-        let start = body
-            .find("data-mod=\"alt\"")
-            .unwrap_or_else(|| panic!("missing the alt modifier button: {body}"));
-        let end = body[start..]
-            .find("</button>")
-            .map(|i| start + i)
-            .unwrap_or_else(|| panic!("the alt modifier button must close: {body}"));
-        assert!(
-            !body[start..end].contains("data-key"),
-            "the alt modifier button must carry no data-key: {body}"
+            !body.contains("data-mod="),
+            "no latching modifier button may remain in the grid: {body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -19283,7 +19276,8 @@ mod bee_route_tests {
     /// runaway command reaches for — closing row 1 (Esc, Tab, Approve, ↑,
     /// Stage, Ctrl+C, amended by trc-2's UAT round: Approve/Stage took
     /// Ctrl/Shift's slots) right after Tab and right before row 2 opens
-    /// with Alt. It carries the wire name herdr's key channel accepts
+    /// with ⇧Tab (tks-1: the Alt latch's old slot). It carries the wire
+    /// name herdr's key channel accepts
     /// for an interrupt — `ctrl+c`, never tmux's `C-c`. No separate wiring
     /// is asserted because none exists: `assets/app.js` binds every
     /// `button[data-key]` in the grid, so the markup IS the feature.
@@ -19319,19 +19313,19 @@ mod bee_route_tests {
             "the wire name is ctrl+c; tmux spelling would be sent verbatim and ignored: {body}"
         );
         // Same grid as every other key: Ctrl+C is the sixth button — row 1's
-        // last — sitting right after Tab and right before row 2's Alt opens.
+        // last — sitting right after Tab and right before row 2's ⇧Tab opens.
         let keys = body
             .find("class=\"term-keys\"")
             .unwrap_or_else(|| panic!("no key grid: {body}"));
         let tab = body
             .find("data-key=\"tab\"")
             .unwrap_or_else(|| panic!("no Tab key: {body}"));
-        let alt = body
-            .find("data-mod=\"alt\"")
-            .unwrap_or_else(|| panic!("no Alt modifier: {body}"));
+        let shift_tab = body
+            .find("data-key=\"shift+tab\"")
+            .unwrap_or_else(|| panic!("no Shift+Tab key: {body}"));
         assert!(
-            keys < tab && tab < interrupt && interrupt < alt,
-            "Ctrl+C must close row 1, right after Tab and before Alt opens row 2 (grid {keys}, tab {tab}, interrupt {interrupt}, alt {alt}): {body}"
+            keys < tab && tab < interrupt && interrupt < shift_tab,
+            "Ctrl+C must close row 1, right after Tab and before ⇧Tab opens row 2 (grid {keys}, tab {tab}, interrupt {interrupt}, shift_tab {shift_tab}): {body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
