@@ -3726,16 +3726,20 @@
       var approveBtn = card && card.querySelector(".term-reply__approve");
       // csl-2 (D1): every reply composer gets slash suggestions. Wired
       // BEFORE the send keydown below so its capture-phase handler is also
-      // first in registration order. The project page carries a
-      // `data-project-id`, so its panes ask that project's scan endpoint;
-      // the home page's Terminals tab reaches these same forms with no
-      // project id at all (see this IIFE's own doc above), and asks the
-      // user-level endpoint rather than building a `/p/null/...` URL.
+      // first in registration order. csl-3: the form's own `data-term-base`
+      // (`/p/<id>/_terminal/<pane>`, shape pinned by `validTermBase`) names
+      // the pane's project even where the page-level `data-project-id` is
+      // absent — the home page's Terminals tab (see this IIFE's own doc
+      // above) — so the project id is read from `base` first and the
+      // page-level id is only the fallback; with neither, the user-level
+      // endpoint, never a `/p/null/...` URL.
       if (input) {
-        wireSlashSuggest(
-          input,
-          projectId ? "/p/" + encodeURIComponent(projectId) + "/_slash" : "/_slash"
-        );
+        var slashUrl = base
+          ? "/p/" + base.split("/")[2] + "/_slash"
+          : projectId
+            ? "/p/" + encodeURIComponent(projectId) + "/_slash"
+            : "/_slash";
+        wireSlashSuggest(input, slashUrl);
       }
       var attachBox = form.querySelector(".term-attach[data-pane-id]");
       var fileInput = attachBox && attachBox.querySelector(".term-attach__input");
