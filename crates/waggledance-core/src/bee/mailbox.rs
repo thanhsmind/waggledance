@@ -226,7 +226,10 @@ pub enum BeeMailboxEntry {
     /// A period's fold, shown in the same section as the letters and counted
     /// as none of them (mailbox-inbox D1).
     Digest(BeeDigest),
-    Unreadable { file: String, reason: String },
+    Unreadable {
+        file: String,
+        reason: String,
+    },
 }
 
 impl BeeMailboxEntry {
@@ -407,7 +410,9 @@ fn parse_letter_map(id: &str, map: &Hash) -> Result<BeeLetter, String> {
     let filed_at = required_str(map, "", "filed_at")?;
     let status_raw = required_str(map, "", "status")?;
     let status = BeeLetterStatus::parse(&status_raw).ok_or_else(|| {
-        format!("`status` is {status_raw:?}, and a letter's status is exactly \"unread\" or \"read\"")
+        format!(
+            "`status` is {status_raw:?}, and a letter's status is exactly \"unread\" or \"read\""
+        )
     })?;
 
     let items = match get(map, "items") {
@@ -837,7 +842,10 @@ unreadable:
 
     #[test]
     fn a_half_written_departure_is_unreadable() {
-        let text = WELL_FORMED.replace("      why: \"the entry line is free to grow keys; the letter is frozen\"\n", "");
+        let text = WELL_FORMED.replace(
+            "      why: \"the entry line is free to grow keys; the letter is frozen\"\n",
+            "",
+        );
         let err = parse(&text).expect_err("a departure is null or all three keys");
         assert!(err.contains("departure.why"), "{err}");
     }

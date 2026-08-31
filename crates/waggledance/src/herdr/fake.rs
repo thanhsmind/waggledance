@@ -1144,7 +1144,6 @@ mod tests {
     #[tokio::test]
     async fn agentstart_fake_appends_named_agent_and_readable_pane() {
         let f = FakeHerdr::new();
-        let before = f.snapshot().await.unwrap();
 
         // Protocol 20 starts an agent INTO an existing pane, so make the
         // pane first — the same two steps production takes.

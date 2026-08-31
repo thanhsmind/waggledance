@@ -165,11 +165,7 @@ pub fn neighbours(slug: &str) -> (Option<&'static Chapter>, Option<&'static Chap
     let Some(at) = CHAPTERS.iter().position(|c| c.slug == slug) else {
         return (None, None);
     };
-    let prev = if at == 0 {
-        None
-    } else {
-        CHAPTERS.get(at - 1)
-    };
+    let prev = if at == 0 { None } else { CHAPTERS.get(at - 1) };
     (prev, CHAPTERS.get(at + 1))
 }
 
@@ -293,7 +289,13 @@ mod tests {
             // A literal colour or an inline style in a diagram is a diagram
             // that goes blind on the other side of the theme toggle. The
             // `fig-*` classes are the whole palette (see app.css).
-            for banned in ["fill=\"#", "stroke=\"#", "style=\"", "fill=\"rgb", "stroke=\"rgb"] {
+            for banned in [
+                "fill=\"#",
+                "stroke=\"#",
+                "style=\"",
+                "fill=\"rgb",
+                "stroke=\"rgb",
+            ] {
                 assert!(
                     !c.body.contains(banned),
                     "chapter {} hard-codes {banned} — use the fig-* classes so both themes work",
@@ -329,7 +331,10 @@ mod tests {
 
         let (prev, next) = neighbours(last.slug);
         assert!(next.is_none(), "the last chapter has nothing after it");
-        assert_eq!(prev.map(|c| c.slug), Some(CHAPTERS[CHAPTERS.len() - 2].slug));
+        assert_eq!(
+            prev.map(|c| c.slug),
+            Some(CHAPTERS[CHAPTERS.len() - 2].slug)
+        );
 
         let (prev, next) = neighbours("khong-co-chuong-nay");
         assert!(
