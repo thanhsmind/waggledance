@@ -2024,6 +2024,7 @@
       root.getAttribute("data-project-id") +
       (base ? ":" + base : "");
     var counter = root.querySelector(".changes__reviewed");
+    var foldAll = root.querySelector(".changes__fold-all");
     var nav = document.querySelector(".changes-nav");
     var total = sections.length;
 
@@ -2073,6 +2074,11 @@
         key: section.getAttribute("data-key") || "",
         label: label,
         box: label && label.querySelector(".changeset__review-box"),
+        // diff-file-collapse D1: the section's own fold button. Folding is
+        // view state and nothing else (D4) - this handle never reads or
+        // writes a mark, and nothing writes it down (D5): a reload derives
+        // the fold from the reviewed marks alone, exactly as before.
+        fold: section.querySelector(".changeset__fold"),
         row: nav && nav.querySelector("a[href='#" + section.id + "']"),
       };
     });
@@ -2098,6 +2104,46 @@
       }
     }
 
+    // The fold half of the screen (diff-file-collapse). `changeset--collapsed`
+    // is the one class that says "folded" - the reviewed tick has always
+    // toggled it and still does; these only give the reader a way to say it
+    // directly, in both directions.
+    function isOpen(s) {
+      return !s.section.classList.contains("changeset--collapsed");
+    }
+
+    function paintFold(s) {
+      if (!s.fold) return;
+      var open = isOpen(s);
+      var what = s.path || "this file";
+      s.fold.setAttribute("aria-expanded", open ? "true" : "false");
+      // The label flips with the state rather than naming a fixed direction:
+      // read aloud, the button says what pressing it will do.
+      s.fold.setAttribute("aria-label", (open ? "Fold " : "Unfold ") + what);
+      s.fold.title = (open ? "Fold " : "Unfold ") + what;
+    }
+
+    // D3: one control, its label the ANSWER to "what would pressing this
+    // do?" - Collapse all while anything is still open, Expand all once
+    // every section is folded.
+    function anySectionOpen() {
+      var open = false;
+      state.forEach(function (s) { if (isOpen(s)) open = true; });
+      return open;
+    }
+
+    function paintFoldAll() {
+      if (!foldAll) return;
+      var anyOpen = anySectionOpen();
+      foldAll.textContent = anyOpen ? "Collapse all" : "Expand all";
+      foldAll.setAttribute("aria-expanded", anyOpen ? "true" : "false");
+    }
+
+    function setFolded(s, folded) {
+      s.section.classList.toggle("changeset--collapsed", folded);
+      paintFold(s);
+    }
+
     var marks = load();
     state.forEach(function (s) {
       if (!s.box) return;
@@ -2111,12 +2157,29 @@
       paintOne(s);
       if (s.label) s.label.hidden = false;
 
+      paintFold(s);
+      if (s.fold) s.fold.hidden = false;
+
       s.box.addEventListener("change", function () {
-        s.section.classList.toggle("changeset--collapsed", s.box.checked);
+        // D4 the other way round: ticking still folds, as it always has.
+        setFolded(s, s.box.checked);
         paintOne(s);
         paintCounter();
+        paintFoldAll();
         save();
       });
+
+      // The explicit gesture: this one button folds AND unfolds its own
+      // section, and touches no mark either way (D4).
+      if (s.fold) {
+        s.fold.addEventListener("click", function (e) {
+          // The header's own handler is expand-only (below). A click that
+          // reached it from here would undo the fold in the same gesture.
+          e.stopPropagation();
+          setFolded(s, isOpen(s));
+          paintFoldAll();
+        });
+      }
 
       // Clicking the sticky header brings a folded section back. One way on
       // purpose: a stray click on a header must never hide content the reader
@@ -2126,13 +2189,26 @@
       if (s.head) {
         s.head.addEventListener("click", function (e) {
           if (s.label && s.label.contains(e.target)) return;
-          s.section.classList.remove("changeset--collapsed");
+          if (s.fold && s.fold.contains(e.target)) return;
+          setFolded(s, false);
+          paintFoldAll();
         });
       }
     });
 
     paintCounter();
     if (counter) counter.hidden = false;
+    paintFoldAll();
+    if (foldAll) {
+      foldAll.hidden = false;
+      foldAll.addEventListener("click", function () {
+        // Read the state once, then move every section to the same place -
+        // deciding per section would flip the answer halfway through.
+        var folded = anySectionOpen();
+        state.forEach(function (s) { setFolded(s, folded); });
+        paintFoldAll();
+      });
+    }
     // Write once on load so the marks dropped just above (edited files, files
     // no longer in the diff) leave storage instead of growing there forever.
     save();

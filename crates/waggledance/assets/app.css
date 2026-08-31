@@ -3458,6 +3458,33 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   background: var(--color-success-tint);
   color: var(--color-success);
 }
+/* diff-file-collapse D3: Collapse all / Expand all, one control whose label
+   app.js flips by state. It borrows the base picker's pill so the head reads
+   as one line of chips, and it is scripting-only like everything else here:
+   shipped `hidden`, with its own `[hidden]` guard so the `display` implied
+   below cannot outrank the UA sheet's rule. */
+.changes__fold-all {
+  display: inline-block;
+  padding: var(--space-0) var(--space-2);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+.changes__fold-all[hidden] {
+  display: none;
+}
+.changes__fold-all:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+.changes__fold-all:focus-visible {
+  outline: var(--border-width-strong) solid var(--focus-color);
+  outline-offset: 2px;
+}
 /* D5: an aggregate count, never a name. */
 .changes__hidden,
 .changes__note,
@@ -3579,6 +3606,49 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   font-family: var(--type-body-sm-font);
   font-size: var(--type-body-sm-size);
   font-weight: var(--weight-regular);
+}
+/* diff-file-collapse D1: the per-file fold, first in the sticky header so
+   the chevrons line up down the page. Scripting-only like the checkbox at
+   the other end of the header, so it ships `hidden` and carries its own
+   `[hidden]` guard - the `display` here would otherwise outrank the UA
+   sheet's `[hidden] { display: none }` (the trap `.proj-row[hidden]`
+   documents). */
+.changeset__fold {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-5);
+  height: var(--space-5);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-text-subtle);
+  font-size: var(--type-body-sm-size);
+  line-height: 1;
+  cursor: pointer;
+}
+.changeset__fold[hidden] {
+  display: none;
+}
+.changeset__fold:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+.changeset__fold:focus-visible {
+  outline: var(--border-width-strong) solid var(--focus-color);
+  outline-offset: 2px;
+}
+/* Open points down at the diff, folded points along the header - the same
+   glyph and the same quarter turn the Docs subfolder disclosure uses. */
+.changeset__fold-chev {
+  display: block;
+  transform: rotate(90deg);
+  transition: transform var(--motion-fast) var(--ease-standard);
+}
+.changeset--collapsed .changeset__fold-chev {
+  transform: none;
 }
 .changeset__path {
   flex: 1;
