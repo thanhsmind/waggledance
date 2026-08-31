@@ -298,7 +298,12 @@ content itself.
   unstaged, and untracked files (untracked as A). A base dropdown in the
   header lists "Working tree" plus the ~50 most recent commits; picking a
   commit shows that commit against its parent (`?commit=<sha>`; a root commit
-  diffs against the empty tree). The sidebar lists changed files grouped by
+  diffs against the empty tree). Each commit's label there, and the header's
+  own naming of the active base, condense bee's own machine-commit subjects to
+  one canonical form — `<slug> · <action>` (worktree merge / pre-merge
+  bookkeeping / lane bookkeeping) — since one feature's bee commits otherwise
+  appear under three different spellings; a subject bee did not generate
+  renders verbatim (decision `4d620c33`). The sidebar lists changed files grouped by
   directory with M/A/D/R letter badges and per-file `+n −m` counts; clicking
   a file scrolls to its section and a scrollspy tracks the section in view.
 - **Reviewed marks:** each file section's sticky header carries a checkbox,

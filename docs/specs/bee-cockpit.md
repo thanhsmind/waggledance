@@ -122,7 +122,10 @@ now, then what there is to work on:
   **…** disclosure menu offering **Docs** (the project's reading pages) and
   **Remove** (unregister, with the usual confirmation) — the menu, not a bare
   remove control, and it stays reachable while the group is closed. A worktree
-  branch row keeps only its dot, never a glyph.
+  branch row keeps only its dot, never a glyph. A project row additionally
+  names its own active feature, that feature's phase, and the project's own
+  live wait — the same subject-aware wording the Feature Hub's In Progress
+  card uses; an idle project's row renders none of that.
   Everything a collapsed group should fold away sits in the body — the markdown
   count and last-seen line, the badges, and the worktree branches. Groups open
   by default; the set a reader leaves closed is remembered for that browser
@@ -332,6 +335,11 @@ full rather than truncating, so nothing a row says is ever hidden behind an elli
   say, and naming an earlier one would claim a decision is owed that nobody is
   waiting on. A feature whose interview genuinely stopped for an answer — nothing
   approved after it — still carries the line, which is the case it exists to catch.
+  The line renders the wait's own recorded subject when it beats the derived
+  wording (a bare "gate"/"question" label), and keeps the derived wording
+  otherwise; a turn-end wait — the harness's own end-of-turn mark, set on every
+  ordinary turn end — is never live and never raises this line, only a gate, a
+  question, or an unrecognised kind is.
 - **Review** — a feature with no live work that still holds an unsettled review
   candidate.
 - **Compound** — a feature whose own phase is exactly the compounding step.
