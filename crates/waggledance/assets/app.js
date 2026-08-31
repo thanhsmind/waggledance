@@ -43,6 +43,60 @@
     return base != null || projectId != null;
   }
 
+  // pane-kick-refresh D1 (`ac627264`) / D2 (`5f697a7c`): a key or reply that
+  // lands is invisible until the next fixed 1500 ms screen tick, so a tap
+  // that herdr answers in ~14 ms (and that is visible in `/screen` at ~28 ms)
+  // still reads as 0–1500 ms of dead air — 750 ms on average, plus a tunnel's
+  // ~365 ms per leg. Nothing here polls harder: `POLL_MS` is untouched
+  // everywhere. The sender simply says "this pane just changed" and the
+  // screen pollers refetch that one pane at once instead of waiting out the
+  // rest of the tick.
+  //
+  // The senders and the screen pollers are separate IIFEs by design, and a
+  // window event is already this file's way of talking across that boundary
+  // (`window.dispatchEvent(new Event("resize"))` further down) — so the
+  // bridge is a window CustomEvent carrying the pane id, and each poller
+  // ignores a pane id it does not own (the project page and the Unassigned
+  // page must never poll each other's panes).
+  //
+  // The two follow-ups exist because the first kick can be swallowed: that
+  // pane's poll may already be in flight (`inFlightScreen` skips it, by
+  // design — never stack a second fetch on a held pane lock), or herdr may
+  // not have repainted the frame yet. Both are bounded one-shot timers; no
+  // new interval is introduced.
+  var PANE_DIRTY_FOLLOW_UP_MS = [250, 700];
+
+  function markPaneDirty(paneId) {
+    if (!paneId) return;
+    // Same try/catch the `resize` dispatches below carry: a browser without
+    // the `CustomEvent` constructor loses the kick (and falls back to the
+    // ordinary tick), never the send that triggered it.
+    try {
+      window.dispatchEvent(new CustomEvent("waggledance:pane-dirty", { detail: { paneId: paneId } }));
+    } catch (e) {}
+  }
+
+  // The listening half of that bridge, shared by both screen pollers so the
+  // ownership check and the follow-up schedule live in one place. `ownedEl`
+  // answers "is this pane mine?" for the calling poller — returning `null`
+  // for a pane belonging to the other page — and `poll` is that poller's own
+  // `pollOne`, whose existing refusals (`viewingHistory`, `inFlightScreen`)
+  // are deliberately left to do their job on every one of these calls.
+  function onPaneDirty(ownedEl, poll) {
+    window.addEventListener("waggledance:pane-dirty", function (ev) {
+      var paneId = ev && ev.detail ? ev.detail.paneId : null;
+      if (!paneId) return;
+      var el = ownedEl(paneId);
+      if (!el) return;
+      poll(el);
+      PANE_DIRTY_FOLLOW_UP_MS.forEach(function (ms) {
+        setTimeout(function () {
+          poll(el);
+        }, ms);
+      });
+    });
+  }
+
   // tkg-1 (D1/D2): the 2×6 key grid's modifier buttons latch one at a
   // time — aria-pressed marks which one, if any, is lit — and the next
   // data-key tap combines with it as "<mod>+<key>" before the latch clears,
@@ -3130,6 +3184,20 @@
     pollAll();
     setInterval(pollAll, POLL_MS);
 
+    // pane-kick-refresh D1/D2: a send into one of THIS poller's panes just
+    // landed — repaint it now rather than on the next `POLL_MS` tick. Panes
+    // this poller does not own resolve to `null` here and are ignored; on the
+    // Unassigned page (whose panes match this selector but have no resolvable
+    // target) `pollOne`'s own `hasTarget` bail is the second gate, so the two
+    // pages still never poll each other's panes.
+    onPaneDirty(function (paneId) {
+      var found = null;
+      screens.forEach(function (el) {
+        if (el.getAttribute("data-pane-id") === paneId) found = el;
+      });
+      return found;
+    }, pollOne);
+
     // Scroll-history buttons (terminal-scroll-2, `herdr/pane_scroller.rs`;
     // made stateful by scroll-keep-position): "Load older" raises this
     // pane's own running depth by one and sends that ABSOLUTE depth — the
@@ -3533,7 +3601,11 @@
       if (!text) return;
       postJson(inputUrl(paneId, base), { text: text, submit: submit })
         .then(function (res) {
-          if (res.ok && input) input.value = "";
+          // pane-kick-refresh D1: only a send that actually landed kicks a
+          // repaint — a rejected post leaves the pane alone.
+          if (!res.ok) return;
+          if (input) input.value = "";
+          markPaneDirty(paneId);
         })
         .catch(function () {});
     }
@@ -3700,6 +3772,7 @@
           if (res.ok) {
             if (input) input.value = "";
             clearChips(paneId, chipList);
+            markPaneDirty(paneId); // pane-kick-refresh D1
           }
         })
         .catch(function () {});
@@ -3802,7 +3875,11 @@
           // guard is here so a stale card, a keyboard path or a script click
           // can never one-tap "Approve" into a pane that never asked.
           if (approveBtn.disabled) return;
-          postJson(inputUrl(paneId, base), { text: "Approve", submit: true }).catch(function () {});
+          postJson(inputUrl(paneId, base), { text: "Approve", submit: true })
+            .then(function (res) {
+              if (res.ok) markPaneDirty(paneId); // pane-kick-refresh D1
+            })
+            .catch(function () {});
         });
       }
 
@@ -3843,7 +3920,11 @@
       // no target, no key posts wired for this group.
       if (!hasTarget(base, projectId)) return;
       wireTermKeysGrid(group, function (wire) {
-        postJson(keysUrl(paneId, base), { keys: [wire] }).catch(function () {});
+        postJson(keysUrl(paneId, base), { keys: [wire] })
+          .then(function (res) {
+            if (res.ok) markPaneDirty(paneId); // pane-kick-refresh D1
+          })
+          .catch(function () {});
       });
     });
   })();
@@ -3927,13 +4008,28 @@
         });
     }
 
+    function ownPanes() {
+      return Array.prototype.slice.call(
+        document.querySelectorAll(".unassigned-panes .term-screen[data-pane-id]"),
+      );
+    }
+
     function pollAll() {
-      Array.prototype.slice
-        .call(document.querySelectorAll(".unassigned-panes .term-screen[data-pane-id]"))
-        .forEach(pollOne);
+      ownPanes().forEach(pollOne);
     }
     pollAll();
     setInterval(pollAll, POLL_MS);
+
+    // pane-kick-refresh D1/D2: same immediate repaint as the shared poller
+    // above, scoped to `.unassigned-panes` — the same scope `pollAll` uses —
+    // so a project page's pane id finds nothing here and is ignored.
+    onPaneDirty(function (paneId) {
+      var found = null;
+      ownPanes().forEach(function (el) {
+        if (el.getAttribute("data-pane-id") === paneId) found = el;
+      });
+      return found;
+    }, pollOne);
 
     function postJson(url, body) {
       return fetch(url, {
@@ -3947,7 +4043,13 @@
     function sendReply(paneId, text, submit, input) {
       if (!text) return;
       postJson(inputUrl(paneId), { text: text, submit: submit })
-        .then(function (res) { if (res.ok && input) input.value = ""; })
+        .then(function (res) {
+          // pane-kick-refresh D1, same rule as the shared sender above: a
+          // send that did not land kicks nothing.
+          if (!res.ok) return;
+          if (input) input.value = "";
+          markPaneDirty(paneId);
+        })
         .catch(function () {});
     }
 
@@ -3994,7 +4096,11 @@
             // A4, same guard as the shared wiring above: a disabled Approve
             // never posts, whatever produced the click.
             if (approveBtn.disabled) return;
-            postJson(inputUrl(paneId), { text: "Approve", submit: true }).catch(function () {});
+            postJson(inputUrl(paneId), { text: "Approve", submit: true })
+              .then(function (res) {
+                if (res.ok) markPaneDirty(paneId); // pane-kick-refresh D1
+              })
+              .catch(function () {});
           });
         }
       });
@@ -4005,7 +4111,11 @@
         var paneId = group.getAttribute("data-pane-id");
         wireTermKeysPaste(group);
         wireTermKeysGrid(group, function (wire) {
-          postJson(keysUrl(paneId), { keys: [wire] }).catch(function () {});
+          postJson(keysUrl(paneId), { keys: [wire] })
+            .then(function (res) {
+              if (res.ok) markPaneDirty(paneId); // pane-kick-refresh D1
+            })
+            .catch(function () {});
         });
       });
   })();
