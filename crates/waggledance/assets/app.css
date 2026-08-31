@@ -3721,95 +3721,77 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
 }
 
 /* ============================================================
-   TERMINAL FILES | DIFF PANEL (changes-diff-screen, D8)
-   Two toggle buttons above the terminal and the panel they open: an
-   `embed=1` iframe onto this project's Code or Changes page. Closed is the
-   default and costs nothing — the panel carries the `hidden` attribute, no
-   rule here sets `display` on it, and the page below it is laid out exactly
-   as it was before this feature existed.
+   TERMINAL WORKSPACE — FILES | DIFF SIDEBAR + PANEL
+   (changes-diff-screen D8 · terminal panel D1/D2 · unified by
+   term-workspace-unify)
+   ONE layout, rendered the same way by the homepage terminals tab and by a
+   project's terminal page: the terminal in the left column, a sidebar on the
+   right carrying the Files | Diff tabs over one lazy nav frame, and the panel
+   those frames open into sitting above the terminal, splitting the area in
+   half.
+   Closed costs nothing: `.term-work__panel` and the nav frames carry the
+   `hidden` attribute and NO rule here sets `display` on them unconditionally
+   (`:not([hidden])` is what turns the panel into a column), so a page where
+   nobody opens a file is the page it has always been, plus the sidebar.
    ============================================================ */
-.term-embed { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; max-width: 100%; }
-.term-embed__tabs { display: flex; gap: var(--space-1); min-width: 0; }
-.term-embed__tab { padding: var(--space-1) var(--space-3); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); letter-spacing: .04em; cursor: pointer; }
-.term-embed__tab:hover { border-color: var(--color-border-strong); color: var(--color-text); }
-.term-embed__tab--on { border-color: var(--color-action); color: var(--color-text); font-weight: var(--weight-semibold); }
-.term-embed__panel { min-height: 0; min-width: 0; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); overflow: hidden; }
-.term-embed__frame { display: block; width: 100%; height: 100%; border: 0; }
-/* The split itself, applied by `assets/app.js` to `<main>` while a tab is
+.term-work { display: flex; align-items: stretch; gap: var(--space-3); min-width: 0; }
+.term-work__col { display: flex; flex-direction: column; gap: var(--space-2); flex: 1 1 auto; min-width: 0; min-height: 0; }
+/* Judged against the nav pages it holds: the Code tree's own sidebar is
+   240px wide and the changed-file list's rows carry a badge and ± counts
+   beside the name, so 280px is the width where a middling path stops
+   wrapping — and it is taken from a `<main>` that already stretches to fill
+   whatever room is left beside it (the homepage's 320px rail is the
+   narrowest case). */
+.term-work__side { display: flex; flex-direction: column; gap: var(--space-2); flex: 0 0 280px; min-width: 0; min-height: 0; }
+.term-work__tabs { display: flex; gap: var(--space-1); min-width: 0; }
+/* Halved across the sidebar's width, so the pair reads as one control rather
+   than two loose buttons. */
+.term-work__tab { flex: 1 1 0; padding: var(--space-1) var(--space-3); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); letter-spacing: .04em; cursor: pointer; }
+.term-work__tab:hover { border-color: var(--color-border-strong); color: var(--color-text); }
+.term-work__tab--on { border-color: var(--color-action); color: var(--color-text); font-weight: var(--weight-semibold); }
+/* The hint is what the sidebar says before either tab is opened; once one
+   is, the frame below says it better. */
+.term-work__side--open .term-work__hint { display: none; }
+.term-work__navs { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; }
+.term-work__nav { flex: 1 1 auto; width: 100%; min-height: 360px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); }
+.term-work__panel { min-height: 0; min-width: 0; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); overflow: hidden; }
+.term-work__panel:not([hidden]) { display: flex; flex-direction: column; }
+.term-work__panel-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: var(--space-1) var(--space-2); border-bottom: var(--border-width-hairline) solid var(--color-border); }
+.term-work__panel-name { font-size: var(--type-tag-size); letter-spacing: .04em; color: var(--color-text-muted); }
+.term-work__close { padding: var(--space-1) var(--space-2); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); cursor: pointer; }
+.term-work__close:hover { border-color: var(--color-border-strong); color: var(--color-text); }
+.term-work__frame { display: block; flex: 1 1 auto; width: 100%; min-height: 0; border: 0; }
+/* The split itself, applied by `assets/app.js` to `<main>` while a panel is
    open: the page stops scrolling as one column and becomes a fixed frame
    divided in half — panel on top, terminal below. 53px is the topbar's own
    pinned height (see `.topbar` above), the one thing between the viewport
    top and this element. The terminal half scrolls inside itself, which is
    what lets `.term-screen` keep the `height: auto` full-frame rendering the
    page has always given it; its WIDTH is untouched, so the screen poller's
-   font fit reads exactly what it read before. */
+   font fit reads exactly what it read before. Both pages put the same class
+   on the same element, so there is ONE definition of what "split" means. */
 main.fg-page.term-split { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }
-main.fg-page.term-split .term-embed { flex: 1 1 50%; min-height: 0; }
-main.fg-page.term-split .term-embed__panel { flex: 1 1 auto; }
+main.fg-page.term-split .term-work { height: 100%; min-height: 0; }
+main.fg-page.term-split .term-work__panel { flex: 1 1 50%; }
 /* The slim rule between the two halves — one hairline, so the boundary reads
    as a boundary without spending a band on it. */
-main.fg-page.term-split .term-panes { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top: var(--border-width-hairline) solid var(--color-border); padding-top: var(--space-2); }
-
-/* ============================================================
-   HOMEPAGE TERMINALS TAB — FILES | DIFF SIDEBAR + PANEL
-   (home-terminal-panel, D1/D2)
-   The same two halves the block above gives a project's terminal page, laid
-   out for a tab that has a rail on its left already: the sidebar is a third
-   column on the right (tabs over one lazy nav frame), and the panel those
-   frames open into sits above the terminal, splitting the area in half
-   exactly as `.term-embed` does — the split class on `<main>` is literally
-   the same one, so there is one definition of what "split" means.
-   Closed costs nothing: `.home-term__panel` and the nav frames carry the
-   `hidden` attribute and NO rule here sets `display` on them unconditionally
-   (`:not([hidden])` is what turns the panel into a column), so a tab nobody
-   opens is the tab it has always been, plus the sidebar.
-   ============================================================ */
-.home-term { display: flex; align-items: stretch; gap: var(--space-3); min-width: 0; }
-.home-term__col { display: flex; flex-direction: column; gap: var(--space-2); flex: 1 1 auto; min-width: 0; min-height: 0; }
-/* Judged against the nav pages it holds: the Code tree's own sidebar is
-   240px wide and the changed-file list's rows carry a badge and ± counts
-   beside the name, so 280px is the width where a middling path stops
-   wrapping — and it is taken from a `<main>` that already stretches to fill
-   whatever the 320px rail leaves. */
-.home-term__side { display: flex; flex-direction: column; gap: var(--space-2); flex: 0 0 280px; min-width: 0; min-height: 0; }
-.home-term__tabs { display: flex; gap: var(--space-1); min-width: 0; }
-/* The project page's `.term-embed__tab`, halved across the sidebar's width
-   so the pair reads as one control rather than two loose buttons. */
-.home-term__tab { flex: 1 1 0; padding: var(--space-1) var(--space-3); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); letter-spacing: .04em; cursor: pointer; }
-.home-term__tab:hover { border-color: var(--color-border-strong); color: var(--color-text); }
-.home-term__tab--on { border-color: var(--color-action); color: var(--color-text); font-weight: var(--weight-semibold); }
-/* The hint is what the sidebar says before either tab is opened; once one
-   is, the frame below says it better. */
-.home-term__side--open .home-term__hint { display: none; }
-.home-term__navs { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; }
-.home-term__nav { flex: 1 1 auto; width: 100%; min-height: 360px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); }
-.home-term__panel { min-height: 0; min-width: 0; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); overflow: hidden; }
-.home-term__panel:not([hidden]) { display: flex; flex-direction: column; }
-.home-term__panel-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: var(--space-1) var(--space-2); border-bottom: var(--border-width-hairline) solid var(--color-border); }
-.home-term__panel-name { font-size: var(--type-tag-size); letter-spacing: .04em; color: var(--color-text-muted); }
-.home-term__close { padding: var(--space-1) var(--space-2); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); cursor: pointer; }
-.home-term__close:hover { border-color: var(--color-border-strong); color: var(--color-text); }
-.home-term__frame { display: block; flex: 1 1 auto; width: 100%; min-height: 0; border: 0; }
-/* The split, applied by `assets/app.js` to `<main>` — the same class and the
-   same height rule the project page's panel uses (above); only the children
-   it divides are this tab's. */
-main.fg-page.term-split .home-term { height: 100%; min-height: 0; }
-main.fg-page.term-split .home-term__panel { flex: 1 1 50%; }
-main.fg-page.term-split .home-term__screen { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top: var(--border-width-hairline) solid var(--color-border); padding-top: var(--space-2); }
+main.fg-page.term-split .term-work__screen { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top: var(--border-width-hairline) solid var(--color-border); padding-top: var(--space-2); }
 /* Narrow: the sidebar goes UNDER the terminal rather than squeezing it —
    the same answer the rail already gives at this width (it becomes a
    drawer), for the same reason. A fixed-height split has nothing to divide
    on a handset either, so the page goes back to scrolling as one column
-   with the panel taking a readable slice of the viewport. 700px is the one
-   breakpoint this layout uses. */
+   with the panel taking a readable slice of the viewport. The rules below
+   are unscoped on purpose: both pages carry `main.fg-page.term-split`, and
+   only one of them sits inside `.home-shell`. 700px is the one breakpoint
+   this layout uses. */
 @media (max-width: 700px) {
-  .home-term { flex-direction: column; }
-  .home-term__side { flex: none; width: auto; }
-  .home-term__nav { min-height: 60vh; }
-  .home-shell > main.fg-page.term-split { height: auto; overflow: visible; }
-  .home-shell > main.fg-page.term-split .home-term { height: auto; }
-  .home-shell > main.fg-page.term-split .home-term__panel { flex: none; height: 60vh; }
-  .home-shell > main.fg-page.term-split .home-term__screen { flex: none; overflow: visible; }
+  .term-work { flex-direction: column; }
+  .term-work__side { flex: none; width: auto; }
+  .term-work__nav { min-height: 60vh; }
+  main.fg-page.term-split { height: auto; overflow: visible; }
+  main.fg-page.term-split .term-work { height: auto; }
+  main.fg-page.term-split .term-work__panel { flex: none; height: 60vh; }
+  main.fg-page.term-split .term-work__screen { flex: none; overflow: visible; }
 }
 
 /* ============================================================
