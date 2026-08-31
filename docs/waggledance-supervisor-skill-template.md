@@ -1,16 +1,51 @@
 ---
 name: waggledance-supervisor
-description: Relay a spec from the human into a target project's own backlog as a proposed PBI, via a lead agent opened through waggledance's dispatch door. Use when the user asks to hand off, drop, or route a spec/request into another repo for that repo's own team to triage — never to drive that repo's work directly.
+description: Hand a spec into a target project's own team via a lead agent opened through waggledance's dispatch door — relay mode files it as a proposed PBI and stops; execute mode has the lead run its own full chain to a finished result. Use whenever a request routes work into another repo, whether to file it (hand off, drop, route) or to get it fully built/done there (làm hoàn chỉnh, do it completely, build it, finish it) — the skill states which mode first, always. Never drives that repo's work directly from this session in either mode.
 ---
 
 # waggledance-supervisor
 
-The cockpit-supervisor seat: a human hands this skill a spec, it opens one lead agent
-in the target repo carrying that spec through waggledance's existing dispatch door, and
-the run is visible afterwards. The lead runs its own working flow — the seat never
-routes for it, never triages on its behalf, and never merges. Everything mechanical this
-skill uses already exists in waggledance: `waggledance_ask_state`, `waggledance_dispatch`,
-`waggledance_await`, `waggledance_runs`. This skill adds no new tool and no control loop.
+The cockpit-supervisor seat: a human hands this skill a spec, the mode gate below picks
+relay or execute, and the seat opens one lead agent in the target repo carrying that spec
+through waggledance's existing dispatch door — the run is visible afterwards. In relay
+mode the lead files the spec and stops; in execute mode the lead runs its own full
+working chain through to a finished result. Either way the lead runs its own working
+flow — the seat never routes for it, never triages on its behalf, and never merges.
+Everything mechanical this skill uses already exists in waggledance:
+`waggledance_ask_state`, `waggledance_dispatch`, `waggledance_await`, `waggledance_runs`.
+This skill adds no new tool and no control loop.
+
+## Mode gate — decide before anything else
+
+State explicitly, before dispatching anything, which mode this run is in and why.
+
+- **Relay mode** — file the spec as a proposed PBI in the target repo's own backlog,
+  then stop. The target repo's own triage decides what happens to it next, on its own
+  schedule. This is the default: cheap, safe, and reversible.
+
+- **Execute mode** — dispatch a lead into the target repo and have it run its own full
+  working chain (explore → gate → plan → execute → scribe) through to a finished,
+  proven result, in its own feature worktree, merging per that repo's own `uat_stop`
+  configuration. This seat only dispatches and monitors that run — it never merges on
+  the target repo's behalf and never approves that repo's gates itself, exactly as in
+  relay mode.
+
+**Phrases that push toward execute mode** — read intent, this list is not exhaustive:
+"làm hoàn chỉnh", "thực hiện hoàn chỉnh", "làm tới nơi", "làm cho xong", "do it
+completely", "build it", "implement it", "finish it", "get it done", "ship it".
+
+**The governing principle:** when a single request mixes a completion verb ("làm hoàn
+chỉnh", "build", "implement", "finish") with a routing verb ("gửi sang", "route to",
+"hand off to", "drop into"), the completion verb decides the SCOPE — finished, proven
+work, not just a filed spec — and the routing verb only decides WHO does the work: the
+target repo's own lead, dispatched through this door, rather than this session. A
+routing phrase's keyword match is not by itself grounds for relay mode when a completion
+verb is also present in the same request — that silent match is exactly the trap this
+gate exists to catch. A routing phrase with no completion verb anywhere in the request
+means relay mode.
+
+If the request is ambiguous — no completion verb, and no clear "just file this" language
+either — ask the human which mode, rather than guessing.
 
 ## Input
 
@@ -18,7 +53,7 @@ skill uses already exists in waggledance: `waggledance_ask_state`, `waggledance_
 - The **spec** — the request text to hand off, in the human's own words or a pasted
   document. If either is missing, ask.
 
-## Procedure
+## Relay mode procedure
 
 1. **Mint the correlation id.** Before dispatching anything, generate one short id that
    will name both this run and the PBI it creates in the target repo (e.g.
@@ -71,10 +106,56 @@ skill uses already exists in waggledance: `waggledance_ask_state`, `waggledance_
    merge tool and reports the drop as complete once the lead has filed the spec and
    registered the PBI — it does not wait for or request any merge, ever.
 
+## Execute mode procedure
+
+1. **Mint the correlation id.** Same as relay mode, step 1 — one short id (e.g.
+   `sup-<yyyymmdd>-<4-char hex>`) naming this run, minted before dispatching anything.
+
+2. **Check for a live lead first.** Same as relay mode, step 2 — reuse-before-spawn
+   applies to execute mode exactly as it does to relay mode. A live lead already working
+   that repo means: report it and wait, never dispatch a competing one.
+
+3. **Dispatch through the door.** Call `waggledance_dispatch` with `{project, task,
+   preset}` — a **preset label** only, never raw argv, an environment variable, or a
+   working directory. The `task` again has three parts, in this order:
+
+   - **Line 1 — the same provenance line format** as relay mode
+     (`spec-drop <corr-id> from waggledance@<sha>`), so the drop is traceable and a
+     re-send after a timeout is recognizable the same way.
+
+   - **The spec body** — the request text itself, unmodified.
+
+   - **The execute-to-completion contract**, spelled out explicitly so the lead runs its
+     own full chain rather than stopping at a filed spec:
+
+     > Treat this spec as your own feature work in this repo. Run this repo's full
+     > working chain end to end — explore, gate, plan, execute, scribe — starting in
+     > this repo's own feature worktree from the outset. Prove each step the way this
+     > repo's own proof rules require; a claim of "done" needs this repo's own fresh
+     > command output beside it. Merge only through this repo's own `uat_stop`
+     > configuration and this repo's own gate approvals — being dispatched from
+     > elsewhere is never grounds to merge or self-approve a gate here. Report progress
+     > as the chain moves, and report the finished result — or the blocker — when done.
+
+   `waggledance_dispatch` returns `{run_id, warnings}` — keep the `run_id`.
+
+4. **Track the run.** Report the `run_id` to the human immediately. This is a
+   longer-running chain than relay mode's file-and-stop — expect multiple checkpoints,
+   not one. Check progress with `waggledance_runs` or `waggledance_await` (poll one run,
+   up to 60s per call), polling in a loop rather than blocking on a single call, and
+   relay the lead's own progress reports as they arrive.
+
+5. **Never merge, and never approve that repo's gates.** Even though execute mode asks
+   the lead to carry the work all the way to a finished, merged result, the merge itself
+   and every gate approval along the way remain that repo's own gesture, on that repo's
+   own terms — dispatching the lead from here is not standing authorization to make
+   either call on its behalf. This seat dispatches and monitors; it does not merge, and
+   it does not answer that repo's gate questions.
+
 ## Refusals
 
-These are the shapes an operator or a lead actually meets running this skill. Recognize
-each one for what it is — most are not failures.
+These are the shapes an operator or a lead actually meets running this skill, in either
+mode unless noted. Recognize each one for what it is — most are not failures.
 
 - **Project not opted in.** `waggledance_dispatch` refuses with:
 
@@ -96,20 +177,28 @@ each one for what it is — most are not failures.
   something this skill can route around by picking a different project.
 
 - **A lead is already working that repo.** Not an MCP error — this is what step 2's
-  `waggledance_ask_state` check is for. Seeing a live lead means: do not dispatch a
-  second one. Report the existing run to the human instead of spawning a competing one.
+  `waggledance_ask_state` check is for, in both modes. Seeing a live lead means: do not
+  dispatch a second one. Report the existing run to the human instead of spawning a
+  competing one.
 
-- **Duplicate PBI id.** When the lead runs `bee backlog pbi add --id <corr-id>`, a
-  duplicate `--id` **refuses** rather than overwriting — `--id` is a migration-only
-  override and first-add wins. **This means the drop already landed under that
-  correlation id, not that anything failed.** On a re-send after a timeout, this is the
-  expected and correct outcome: do not re-mint a new correlation id and try again: check
-  `waggledance_runs` / the target's backlog for the existing PBI instead of treating the
-  refusal as an error to route around.
+- **Duplicate PBI id (relay mode).** When the lead runs `bee backlog pbi add --id
+  <corr-id>`, a duplicate `--id` **refuses** rather than overwriting — `--id` is a
+  migration-only override and first-add wins. **This means the drop already landed under
+  that correlation id, not that anything failed.** On a re-send after a timeout, this is
+  the expected and correct outcome: do not re-mint a new correlation id and try again:
+  check `waggledance_runs` / the target's backlog for the existing PBI instead of
+  treating the refusal as an error to route around. Execute mode's lead is not required
+  to register a PBI at all — its own chain may create backlog/decision state as a normal
+  part of shaping and planning, on its own repo's terms.
 
 ## Reporting
 
-Tell the human, in one short summary: the correlation id, the `run_id`, and once the
-lead reports back — where it wrote the spec and the PBI id it registered (which is the
-same as the correlation id). Then stop. There is no next step for this skill to take;
-the target repo's own triage takes it from here.
+**Relay mode:** tell the human, in one short summary, the correlation id, the `run_id`,
+and once the lead reports back — where it wrote the spec and the PBI id it registered
+(which is the same as the correlation id). Then stop. There is no next step for this
+skill to take; the target repo's own triage takes it from here.
+
+**Execute mode:** tell the human the correlation id and `run_id` immediately, then relay
+the lead's own checkpoints as they arrive, and its finished result (or blocker) when the
+chain ends. Then stop. There is no next step for this skill to take beyond monitoring and
+reporting; the target repo's own gates and merge decide what happens next.
