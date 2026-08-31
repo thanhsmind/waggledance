@@ -832,7 +832,8 @@ impl Herdr for SocketHerdr {
         // arrives as `Remote { code: "pane_not_found" }` -- deliberately
         // left generic, because the only caller treats every close failure
         // the same way: log it, change nothing.
-        self.call("pane.close", json!({ "pane_id": pane_id })).await?;
+        self.call("pane.close", json!({ "pane_id": pane_id }))
+            .await?;
         Ok(())
     }
 

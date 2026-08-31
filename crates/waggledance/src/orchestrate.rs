@@ -894,7 +894,11 @@ async fn finish(
             // The run is over either way -- a pane that outlives it costs
             // machine performance, and reporting the run as anything but
             // finished would cost the result the agent already produced.
-            tracing::warn!("failed to close pane {} for run {}: {e}", run.pane_id, run.id);
+            tracing::warn!(
+                "failed to close pane {} for run {}: {e}",
+                run.pane_id,
+                run.id
+            );
         }
     }
     Ok(AwaitOutcome { status, delta })
@@ -1028,8 +1032,7 @@ mod tests {
                 .unwrap()
                 .push((pane_id.to_string(), text.to_string()));
             assert_eq!(
-                until,
-                SUBMIT_UNTIL,
+                until, SUBMIT_UNTIL,
                 "the dispatch send must wait on every state that proves the text landed"
             );
             assert_eq!(

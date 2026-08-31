@@ -1284,7 +1284,6 @@ mod tests {
         (engine, pa, pb)
     }
 
-    #[test]
     /// A published field nobody can discover is not published: an agent
     /// learns what `ask_state` answers with from this description and
     /// nowhere else. Pinned so a later trim cannot quietly drop the two

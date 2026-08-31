@@ -1,5 +1,13 @@
 //! waggledance — multi-project markdown viewer for AI agent workflows.
 
+// This crate's request helpers return `Result<T, axum::response::Response>`:
+// the Err arm is not an error value the caller inspects, it IS the complete
+// HTTP refusal the caller returns verbatim. Boxing it to shrink the variant
+// would buy a lint's approval with an allocation and an unwrap at every call
+// site — the lint has misread the idiom, so it is silenced once here rather
+// than five times per function (lint-gates-green D1, 89c6098c).
+#![allow(clippy::result_large_err)]
+
 mod cli;
 mod doctor;
 mod guide;

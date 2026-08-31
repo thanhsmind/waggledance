@@ -31506,7 +31506,15 @@ mod bee_route_tests {
     // own emitter shape (`verbs/mailbox.rs::render_letter`).
 
     /// One letter on disk, in the bytes bee's emitter writes.
-    fn letter_file(dir: &Path, name: &str, subject: &str, project: &str, filed_at: &str, status: &str, body: &str) {
+    fn letter_file(
+        dir: &Path,
+        name: &str,
+        subject: &str,
+        project: &str,
+        filed_at: &str,
+        status: &str,
+        body: &str,
+    ) {
         write(
             dir,
             &format!(".bee/human-mailbox/{name}"),
@@ -31525,9 +31533,33 @@ mod bee_route_tests {
     async fn the_inbox_lists_every_projects_letters_newest_first() {
         let alpha = fresh_root("inbox-alpha");
         let beta = fresh_root("inbox-beta-two");
-        letter_file(&alpha, "2026-08-30T04-12-07Z-late.md", "Alpha's newest night", "alpha", "2026-08-30T04:12:07Z", "unread", "## Đã làm\n\n- alpha work\n");
-        letter_file(&alpha, "2026-08-28T01-00-00Z-early.md", "Alpha's oldest night", "alpha", "2026-08-28T01:00:00Z", "read", "nothing much\n");
-        letter_file(&beta, "2026-08-29T02-00-00Z-mid.md", "Beta's one night", "beta", "2026-08-29T02:00:00Z", "unread", "beta work\n");
+        letter_file(
+            &alpha,
+            "2026-08-30T04-12-07Z-late.md",
+            "Alpha's newest night",
+            "alpha",
+            "2026-08-30T04:12:07Z",
+            "unread",
+            "## Đã làm\n\n- alpha work\n",
+        );
+        letter_file(
+            &alpha,
+            "2026-08-28T01-00-00Z-early.md",
+            "Alpha's oldest night",
+            "alpha",
+            "2026-08-28T01:00:00Z",
+            "read",
+            "nothing much\n",
+        );
+        letter_file(
+            &beta,
+            "2026-08-29T02-00-00Z-mid.md",
+            "Beta's one night",
+            "beta",
+            "2026-08-29T02:00:00Z",
+            "unread",
+            "beta work\n",
+        );
         let st = build_state();
         register(&st, &alpha, "Alpha");
         register(&st, &beta, "Beta");
@@ -31558,7 +31590,15 @@ mod bee_route_tests {
     #[tokio::test]
     async fn an_unreadable_letter_reaches_the_inbox_naming_its_file() {
         let root = fresh_root("inbox-unreadable");
-        letter_file(&root, "2026-08-30T05-00-00Z-fine.md", "A readable one", "gamma", "2026-08-30T05:00:00Z", "read", "ok\n");
+        letter_file(
+            &root,
+            "2026-08-30T05-00-00Z-fine.md",
+            "A readable one",
+            "gamma",
+            "2026-08-30T05:00:00Z",
+            "read",
+            "ok\n",
+        );
         // `filed_at` is one of the five human-mailbox D3 requires at read.
         write(
             &root,
@@ -31639,7 +31679,15 @@ mod bee_route_tests {
     #[tokio::test]
     async fn a_letter_url_that_names_nothing_answers_not_found() {
         let root = fresh_root("inbox-unknown-letter");
-        letter_file(&root, "2026-08-30T08-00-00Z-real.md", "Real", "eps", "2026-08-30T08:00:00Z", "read", "ok\n");
+        letter_file(
+            &root,
+            "2026-08-30T08-00-00Z-real.md",
+            "Real",
+            "eps",
+            "2026-08-30T08:00:00Z",
+            "read",
+            "ok\n",
+        );
         let st = build_state();
         let project = register(&st, &root, "Eps");
         let app = router(st);
@@ -31672,7 +31720,14 @@ mod bee_route_tests {
     /// One digest on disk. `type: "digest"` is what makes it one
     /// (mailbox-inbox D1) — the `digest-` file name is bee's convention and
     /// nothing here reads it.
-    fn digest_file(dir: &Path, name: &str, subject: &str, period: &str, period_id: &str, body: &str) {
+    fn digest_file(
+        dir: &Path,
+        name: &str,
+        subject: &str,
+        period: &str,
+        period_id: &str,
+        body: &str,
+    ) {
         write(
             dir,
             &format!(".bee/human-mailbox/{name}"),
@@ -31688,8 +31743,23 @@ mod bee_route_tests {
     #[tokio::test]
     async fn a_digest_rides_the_same_inbox_list_and_opens_through_the_same_route() {
         let root = fresh_root("inbox-digest");
-        letter_file(&root, "2026-08-30T04-12-07Z-late.md", "Đêm qua ở alpha", "alpha", "2026-08-30T04:12:07Z", "unread", "alpha work\n");
-        digest_file(&root, "digest-2026-08-30.md", "What happened on 2026-08-30.", "day", "2026-08-30", "## alpha\n\n- Run finished: 3 cells capped\n\n<script>alert(1)</script>\n");
+        letter_file(
+            &root,
+            "2026-08-30T04-12-07Z-late.md",
+            "Đêm qua ở alpha",
+            "alpha",
+            "2026-08-30T04:12:07Z",
+            "unread",
+            "alpha work\n",
+        );
+        digest_file(
+            &root,
+            "digest-2026-08-30.md",
+            "What happened on 2026-08-30.",
+            "day",
+            "2026-08-30",
+            "## alpha\n\n- Run finished: 3 cells capped\n\n<script>alert(1)</script>\n",
+        );
         let st = build_state();
         let project = register(&st, &root, "Alpha");
         let app = router(st);
@@ -31740,8 +31810,24 @@ mod bee_route_tests {
     #[tokio::test]
     async fn an_unfinished_letter_reaches_the_inbox_badged_and_subject_intact() {
         let root = fresh_root("inbox-unfinished");
-        letter_file(&root, "2026-08-30T04-12-07Z-silent.md", "Unfinished run: nightly on alpha", "alpha", "2026-08-30T04:12:07Z", "unread", "nothing came back\n");
-        letter_file(&root, "2026-08-29T04-12-07Z-fine.md", "Đêm yên ả", "alpha", "2026-08-29T04:12:07Z", "unread", "ok\n");
+        letter_file(
+            &root,
+            "2026-08-30T04-12-07Z-silent.md",
+            "Unfinished run: nightly on alpha",
+            "alpha",
+            "2026-08-30T04:12:07Z",
+            "unread",
+            "nothing came back\n",
+        );
+        letter_file(
+            &root,
+            "2026-08-29T04-12-07Z-fine.md",
+            "Đêm yên ả",
+            "alpha",
+            "2026-08-29T04:12:07Z",
+            "unread",
+            "ok\n",
+        );
         let st = build_state();
         register(&st, &root, "Alpha");
 
@@ -31774,7 +31860,14 @@ mod bee_route_tests {
     async fn marking_a_digest_read_is_refused_rather_than_reaching_bee() {
         let root = fresh_root("inbox-digest-mark");
         let log = fresh_root("inbox-digest-mark-log").join("argv");
-        digest_file(&root, "digest-2026-08-30.md", "What happened on 2026-08-30.", "day", "2026-08-30", "## alpha\n\n- ok\n");
+        digest_file(
+            &root,
+            "digest-2026-08-30.md",
+            "What happened on 2026-08-30.",
+            "day",
+            "2026-08-30",
+            "## alpha\n\n- ok\n",
+        );
         fake_bee(&root, &log, "{}", "", 0);
         let st = build_state();
         let project = register(&st, &root, "Alpha");
@@ -31864,10 +31957,8 @@ mod bee_route_tests {
         // The control the list actually renders, with the action it carries.
         let list = body_string(get(app.clone(), "/inbox").await).await;
         assert!(
-            list.contains(&format!(
-                r#"action="/inbox/{}/{name}/mark""#,
-                project.id
-            )) && list.contains(r#"name="status" value="read""#),
+            list.contains(&format!(r#"action="/inbox/{}/{name}/mark""#, project.id))
+                && list.contains(r#"name="status" value="read""#),
             "an unread row must offer the flip to read: {list}"
         );
 

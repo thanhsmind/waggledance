@@ -1197,6 +1197,15 @@ fn project_sidebar(
                 // name (see the grouping above), so it is never indented
                 // under a row that is not there.
                 let label = branch.unwrap_or(bp.name.as_str());
+                let badges = format!(
+                    "{}{}",
+                    // board-visibility bv-4: a worktree branch is its own
+                    // registered project with its own `.bee/`, so it reads
+                    // its own row's line here rather than borrowing its
+                    // parent's.
+                    proj_row_bee(bee_by_project.get(&bp.id).copied()),
+                    project_badges(&bp.id, bpanes),
+                );
                 // D1/D1a/D2/D3/D5: a sibling of `proj-row__link`, never
                 // nested inside it -- an anchor inside an anchor is invalid
                 // HTML and browsers unnest it, which would break the row
@@ -1213,15 +1222,7 @@ fn project_sidebar(
                     id = esc(&bp.id),
                     label = esc(label),
                     meta = proj_row_meta(*bcount, &bp.last_seen_at),
-                    badges = format!(
-                        "{}{}",
-                        // board-visibility bv-4: a worktree branch is its own
-                        // registered project with its own `.bee/`, so it reads
-                        // its own row's line here rather than borrowing its
-                        // parent's.
-                        proj_row_bee(bee_by_project.get(&bp.id).copied()),
-                        project_badges(&bp.id, bpanes),
-                    ),
+                    badges = badges,
                     row_menu = proj_row_menu(&bp.id, &bp.name),
                 ));
             }
@@ -1237,6 +1238,15 @@ fn project_sidebar(
                     branches = branches,
                 )
             };
+            let badges = format!(
+                "{}{}",
+                // board-visibility bv-4: the bee line leads the row's
+                // badge block — what the project is DOING is what the
+                // reader came to this rail for; the agents running there
+                // annotate it.
+                proj_row_bee(bee_by_project.get(&p.id).copied()),
+                project_badges(&p.id, panes),
+            );
             // The summary is the name line and nothing else: the dot, the
             // name, and the actions menu. Everything a collapsed group is
             // meant to fold away -- the meta line, the badges, the branches
@@ -1268,15 +1278,7 @@ fn project_sidebar(
                 folder = RAIL_ICON_FOLDER,
                 row_menu = proj_row_menu(&p.id, &p.name),
                 meta = proj_row_meta(*count, &p.last_seen_at),
-                badges = format!(
-                    "{}{}",
-                    // board-visibility bv-4: the bee line leads the row's
-                    // badge block — what the project is DOING is what the
-                    // reader came to this rail for; the agents running there
-                    // annotate it.
-                    proj_row_bee(bee_by_project.get(&p.id).copied()),
-                    project_badges(&p.id, panes),
-                ),
+                badges = badges,
                 branch_list = branch_list,
             ));
         }
@@ -11307,9 +11309,7 @@ pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
             inbox_mark_form(row, row.href.as_deref().unwrap_or("/inbox")),
             unfinished_badge(*unfinished).to_string(),
         ),
-        InboxRowKind::Digest { period } => {
-            (String::new(), String::new(), digest_badge(period))
-        }
+        InboxRowKind::Digest { period } => (String::new(), String::new(), digest_badge(period)),
         // The list never links one and the route answers 404 for it, so this
         // arm is unreachable in production — it renders the bare header rather
         // than claiming a read state no parsed entry stands behind.
@@ -14236,9 +14236,7 @@ mod tests {
             "the arrows must take the info token as their glyph colour: {css}"
         );
         assert!(
-            css.contains(
-                "color-mix(in srgb, var(--color-info) 22%, var(--color-surface-raised))"
-            ),
+            css.contains("color-mix(in srgb, var(--color-info) 22%, var(--color-surface-raised))"),
             "the arrow ground must be the info token mixed over the shared surface token: {css}"
         );
         // D1b (`816f4993`): the accent-alt slots are BOARD LANE IDENTITY in
@@ -17995,20 +17993,26 @@ mod tests {
     /// from the first project alone all read as a different number than 3.
     #[test]
     fn the_home_board_shows_one_unread_letter_count_summed_across_every_project() {
-        let root_a = std::env::temp_dir().join(format!(
-            "waggledance-views-unread-a-{}",
-            std::process::id()
-        ));
-        let root_b = std::env::temp_dir().join(format!(
-            "waggledance-views-unread-b-{}",
-            std::process::id()
-        ));
+        let root_a =
+            std::env::temp_dir().join(format!("waggledance-views-unread-a-{}", std::process::id()));
+        let root_b =
+            std::env::temp_dir().join(format!("waggledance-views-unread-b-{}", std::process::id()));
         for r in [&root_a, &root_b] {
             let _ = std::fs::remove_dir_all(r);
             std::fs::create_dir_all(r.join(".bee")).unwrap();
         }
-        home_letter_file(&root_a, "2026-08-30T09-00-00Z-one.md", "Letter one", "unread");
-        home_letter_file(&root_a, "2026-08-30T10-00-00Z-two.md", "Letter two", "unread");
+        home_letter_file(
+            &root_a,
+            "2026-08-30T09-00-00Z-one.md",
+            "Letter one",
+            "unread",
+        );
+        home_letter_file(
+            &root_a,
+            "2026-08-30T10-00-00Z-two.md",
+            "Letter two",
+            "unread",
+        );
         home_letter_file(
             &root_a,
             "2026-08-30T11-00-00Z-old.md",
@@ -18087,7 +18091,12 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".bee")).unwrap();
-        home_letter_file(&root, "2026-08-30T09-00-00Z-seen.md", "Already seen", "read");
+        home_letter_file(
+            &root,
+            "2026-08-30T09-00-00Z-seen.md",
+            "Already seen",
+            "read",
+        );
 
         let mut project = sample_project();
         project.id = "proj-unread-zero".into();
@@ -18261,8 +18270,9 @@ mod tests {
             "every direct child but the groups and archive containers is removed on a patch: {block}"
         );
         assert!(
-            block
-                .contains("oldSection.insertBefore(document.importNode(before[i], true), oldGroups)"),
+            block.contains(
+                "oldSection.insertBefore(document.importNode(before[i], true), oldGroups)"
+            ),
             "and the fetched section's own pre-groups children are inserted back: {block}"
         );
 
@@ -23207,7 +23217,12 @@ mod tests {
     /// filed, and whether it has been read.
     #[test]
     fn an_inbox_row_names_subject_project_filed_at_and_read_state() {
-        let html = inbox_page(&[letter_row("Fixed the rail pill", "waggledance", "2026-08-30T09:00:00Z", true)]);
+        let html = inbox_page(&[letter_row(
+            "Fixed the rail pill",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            true,
+        )]);
         for needle in [
             "Fixed the rail pill",
             "waggledance",
@@ -23218,8 +23233,16 @@ mod tests {
             assert!(html.contains(needle), "the row must carry {needle}: {html}");
         }
         // Read state is a word, not a colour: the read row says so too.
-        let read = inbox_page(&[letter_row("Already seen", "beehive", "2026-08-29T09:00:00Z", false)]);
-        assert!(read.contains("Đã đọc") && !read.contains("Chưa đọc"), "{read}");
+        let read = inbox_page(&[letter_row(
+            "Already seen",
+            "beehive",
+            "2026-08-29T09:00:00Z",
+            false,
+        )]);
+        assert!(
+            read.contains("Đã đọc") && !read.contains("Chưa đọc"),
+            "{read}"
+        );
     }
 
     /// bee's own rule, quoted at the reader this list reads from: a silently
@@ -23298,8 +23321,7 @@ mod tests {
             false,
         )]);
         assert!(
-            read.contains(r#"name="status" value="unread""#)
-                && read.contains("Đánh dấu chưa đọc"),
+            read.contains(r#"name="status" value="unread""#) && read.contains("Đánh dấu chưa đọc"),
             "a read letter is offered the way back: {read}"
         );
     }
@@ -23310,8 +23332,7 @@ mod tests {
     #[test]
     fn an_opened_letter_carries_the_flip_control_back_to_itself() {
         let row = letter_row("Đêm qua", "waggledance", "2026-08-30T09:00:00Z", true);
-        let index: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
+        let index: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
         let page = waggledance_core::render::RenderService::new().render(
             "một việc\n",
             &std::env::temp_dir().join("waggledance-bi3-letter.md"),
@@ -23384,8 +23405,8 @@ mod tests {
     #[test]
     fn the_handset_tab_bar_keeps_the_five_destinations_it_was_widened_to() {
         let bar = home_tabbar(HomeTab::Kanban);
-        let items = bar.matches("home-tabbar__item").count()
-            - bar.matches("home-tabbar__item--on").count();
+        let items =
+            bar.matches("home-tabbar__item").count() - bar.matches("home-tabbar__item--on").count();
         assert_eq!(
             items, 5,
             "the tab bar's five columns are a recorded layout decision (dcfbda20): {bar}"
@@ -23533,7 +23554,11 @@ mod tests {
     fn letters_and_digests_render_as_one_interleaved_list_and_only_letters_are_counted() {
         let html = inbox_page(&[
             letter_row("Đêm qua", "waggledance", "2026-08-31T09:00:00Z", true),
-            digest_row("What happened on 2026-08-30.", "2026-08-31T00:04:00Z", "day"),
+            digest_row(
+                "What happened on 2026-08-30.",
+                "2026-08-31T00:04:00Z",
+                "day",
+            ),
             letter_row("Hôm kia", "beehive", "2026-08-29T09:00:00Z", false),
         ]);
         let at = |needle: &str| {
@@ -23541,7 +23566,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("the inbox must carry {needle}: {html}"))
         };
         assert!(
-            at("Đêm qua") < at("What happened on 2026-08-30.") && at("What happened on 2026-08-30.") < at("Hôm kia"),
+            at("Đêm qua") < at("What happened on 2026-08-30.")
+                && at("What happened on 2026-08-30.") < at("Hôm kia"),
             "the digest sits where the caller's ordering put it, between the letters: {html}"
         );
         assert_eq!(
@@ -23565,8 +23591,7 @@ mod tests {
     /// badge instead of a read chip, and there is nothing on the page to flip.
     #[test]
     fn an_opened_digest_renders_its_body_and_offers_nothing_to_flip() {
-        let index: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
+        let index: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
         let page = waggledance_core::render::RenderService::new().render(
             "## waggledance\n\n- Run finished: 3 cells capped\n\n<script>alert(1)</script>\n",
             &std::env::temp_dir().join("waggledance-mi2-digest.md"),
@@ -23575,7 +23600,11 @@ mod tests {
             &index,
         );
         let html = inbox_letter_page(
-            &digest_row("What happened on 2026-08-30.", "2026-08-31T00:04:00Z", "day"),
+            &digest_row(
+                "What happened on 2026-08-30.",
+                "2026-08-31T00:04:00Z",
+                "day",
+            ),
             &SanitizedLetterBody::from_rendered(&page),
         );
         assert!(
@@ -23984,10 +24013,8 @@ mod tests {
             "Merge worktree cleanup notes",
         );
 
-        let html = changes_html_with_commits(
-            changes_fixture(),
-            vec![merge.clone(), auto, lane, human],
-        );
+        let html =
+            changes_html_with_commits(changes_fixture(), vec![merge.clone(), auto, lane, human]);
         assert!(
             html.contains("1111111 — letter-digest · worktree merge · 2026-08-30"),
             "the merge subject condenses to the slug form: {html}"
