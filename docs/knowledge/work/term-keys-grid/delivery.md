@@ -16,7 +16,7 @@ bee:
 ## What shipped
 
 The terminal page used to offer two separate soft-key clusters — an arrow pad
-and a named-key row. They are now one 2×6 grid modeled on paseo's mobile key
+and a named-key row. They are now one 2×6 grid modeled on a mobile agent key
 bar (term-keys-grid D1): Esc, Tab, Ctrl, ↑, Shift, Ctrl+C across the top;
 Alt, Paste, ←, ↓, →, Enter along the bottom. There is no keyboard-toggle
 button; the freed slot keeps Ctrl+C as a dedicated interrupt, and the grid

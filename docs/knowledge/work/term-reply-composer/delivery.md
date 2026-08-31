@@ -1,7 +1,7 @@
 ---
 type: bee.delivery
 title: term-reply-composer — delivery
-description: "Delivery record for work item term-reply-composer: the terminal reply widget is one paseo-style composer card — borderless textarea on top, a small round + attach and a round action-colored ↑ Send (39px each) inside the card; Approve and Stage moved up into the soft-key grid."
+description: "Delivery record for work item term-reply-composer: the terminal reply widget is one chat-style composer card — borderless textarea on top, a small round + attach and a round action-colored ↑ Send (39px each) inside the card; Approve and Stage moved up into the soft-key grid."
 timestamp: 2026-08-29
 bee:
   id: term-reply-composer-delivery
@@ -17,7 +17,7 @@ bee:
 
 The reply widget under a terminal pane used to be two separate blocks — a
 bordered textarea box and a loose row of Approve/Stage/Send buttons below it.
-It is now one bordered, rounded composer card modeled on the paseo composer
+It is now one bordered, rounded composer card modeled on a chat composer
 (term-reply-composer D1): the borderless textarea sits on top, and the controls
 row lives inside the card at the bottom. Every class name survived the
 restructure, so the posting wiring in `assets/app.js` kept working against the

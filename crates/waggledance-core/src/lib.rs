@@ -18,7 +18,6 @@ pub mod git_diff;
 pub mod indexer;
 pub mod link_resolver;
 pub mod notify_store;
-pub mod paseo;
 pub mod paths_boundary;
 pub mod process;
 pub mod render;
