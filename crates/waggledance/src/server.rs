@@ -7499,21 +7499,61 @@ async fn jump_search(
 /// Read-only by construction. Nothing here runs or interprets a slash command;
 /// the browser inserts the name it picks into a reply box, and the agent CLI
 /// behind the pane stays the only thing that ever executes one.
-async fn slash_suggest(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+///
+/// slash-builtin-commands D2 `fe5b9256`: the optional `?pane=<pane_id>` names
+/// the composer's pane, whose agent kind decides which vendor's built-ins join
+/// the list. Absent, unresolvable, or a plain shell pane → the file-based
+/// entries alone, exactly as before this feature.
+async fn slash_suggest(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<SlashQuery>,
+) -> Response {
     let Ok(Some(project)) = st.engine.get_project(&id) else {
         return not_found("project not found");
     };
+    let vendor = slash_vendor_for_pane(&st, query.pane.as_deref()).await;
     Json(crate::slash::slash_entries(
         Some(&project.root_path),
         &slash_home(),
+        vendor,
     ))
     .into_response()
 }
 
 /// `slash_suggest`'s projectless half (D2): pages with no project — the
-/// unassigned-pane and paseo composers — get the user-level list alone.
-async fn slash_suggest_user() -> Response {
-    Json(crate::slash::slash_entries(None, &slash_home())).into_response()
+/// unassigned-pane and paseo composers — get the user-level list alone, plus
+/// the same pane-resolved built-ins.
+async fn slash_suggest_user(
+    State(st): State<AppState>,
+    Query(query): Query<SlashQuery>,
+) -> Response {
+    let vendor = slash_vendor_for_pane(&st, query.pane.as_deref()).await;
+    Json(crate::slash::slash_entries(None, &slash_home(), vendor)).into_response()
+}
+
+/// Which composer is asking (slash-builtin-commands D2). `pane` is the herdr
+/// pane id behind the composer; the paseo composer has none and omits it.
+#[derive(serde::Deserialize)]
+struct SlashQuery {
+    #[serde(default)]
+    pane: Option<String>,
+}
+
+/// The built-in vendor for the agent running in `pane_id`, or `None`.
+///
+/// The join goes through the snapshot's `agents[]` because that is the only
+/// place a pane's kind exists (`herdr::wire::Agent`; `Pane` carries none) —
+/// and a plain shell pane is simply absent from it, which is precisely how a
+/// shell composer ends up offered no `/model`. Every failure is that same
+/// `None`: no pane parameter, an unknown pane, an unrecognised kind, or a
+/// herdr that is down. Suggestions are a convenience, never a reason to fail
+/// the request.
+async fn slash_vendor_for_pane(st: &AppState, pane_id: Option<&str>) -> Option<&'static str> {
+    let pane_id = pane_id?;
+    let snapshot = st.herdr.snapshot().await.ok()?;
+    let agent = snapshot.agents.iter().find(|a| a.pane_id == pane_id)?;
+    crate::slash::vendor_for_kind(&agent.kind)
 }
 
 /// Where the user-level `.claude/` tree lives. Falls back to the current
@@ -10295,6 +10335,105 @@ mod bee_route_tests {
 
         let missing = get(app, "/p/no-such-project/_slash").await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// slash-builtin-commands D2 `fe5b9256`: the whole path for the built-ins
+    /// — `?pane=` on a claude agent's pane joins the snapshot's `agents[]`,
+    /// resolves the vendor, and the body carries the agent's own commands
+    /// beside the project's. The seeded fake runs claude in `w1:p1` and keeps
+    /// `w2:p5` as a plain shell (never in `agents[]`), so both halves of the
+    /// join are real rather than mocked.
+    #[tokio::test]
+    async fn slash_route_adds_the_pane_agents_builtins_and_a_shell_pane_gets_none() {
+        let root = fresh_root("slash-builtins");
+        write(
+            &root,
+            ".claude/commands/x.md",
+            "---\ndescription: run x\n---\n",
+        );
+
+        let st = build_state();
+        let project = register(&st, &root, "slash-builtins");
+        let app = router(st);
+
+        let names = |body: &str| -> Vec<(String, String)> {
+            serde_json::from_str::<Vec<serde_json::Value>>(body)
+                .unwrap()
+                .into_iter()
+                .map(|e| {
+                    (
+                        e["name"].as_str().unwrap().to_string(),
+                        e["kind"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        let resp = get(app.clone(), &format!("/p/{}/_slash?pane=w1:p1", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let with = names(&body);
+        assert!(
+            with.contains(&("model".to_string(), "builtin".to_string())),
+            "a claude pane must be offered /model as a builtin: {body}"
+        );
+        assert!(
+            with.contains(&("usage".to_string(), "builtin".to_string())),
+            "and /usage: {body}"
+        );
+        assert!(
+            with.contains(&("x".to_string(), "command".to_string())),
+            "beside the project's own commands: {body}"
+        );
+
+        // w2:p5 is a shell pane: in `panes[]`, never in `agents[]`.
+        let shell = get(app.clone(), &format!("/p/{}/_slash?pane=w2:p5", project.id)).await;
+        assert_eq!(shell.status(), StatusCode::OK);
+        let shell_body = body_string(shell).await;
+        let shell_names = names(&shell_body);
+        assert!(
+            !shell_names.iter().any(|(_, kind)| kind == "builtin"),
+            "a shell pane answers no builtin at all: {shell_body}"
+        );
+        assert!(
+            shell_names.contains(&("x".to_string(), "command".to_string())),
+            "but still gets the file-based entries: {shell_body}"
+        );
+
+        // An unknown pane id degrades the same way — never a 500.
+        let unknown = get(
+            app.clone(),
+            &format!("/p/{}/_slash?pane=no-such-pane", project.id),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::OK);
+        assert!(
+            !names(&body_string(unknown).await)
+                .iter()
+                .any(|(_, kind)| kind == "builtin"),
+            "an unresolvable pane is not a builtin list"
+        );
+
+        // No pane parameter at all: exactly the pre-feature behaviour.
+        let bare = get(app.clone(), &format!("/p/{}/_slash", project.id)).await;
+        assert_eq!(bare.status(), StatusCode::OK);
+        assert!(
+            !names(&body_string(bare).await)
+                .iter()
+                .any(|(_, kind)| kind == "builtin"),
+            "no pane means no builtin"
+        );
+
+        // The projectless half carries the same join.
+        let unassigned = get(app, "/_slash?pane=w1:p1").await;
+        assert_eq!(unassigned.status(), StatusCode::OK);
+        let unassigned_body = body_string(unassigned).await;
+        assert!(
+            names(&unassigned_body).contains(&("model".to_string(), "builtin".to_string())),
+            "an unassigned pane's composer gets its agent's builtins too: {unassigned_body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

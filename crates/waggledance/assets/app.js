@@ -3733,12 +3733,18 @@
       // above) — so the project id is read from `base` first and the
       // page-level id is only the fallback; with neither, the user-level
       // endpoint, never a `/p/null/...` URL.
+      // sbc-1 (D2): `?pane=` names the pane whose agent the daemon joins in
+      // the herdr snapshot, so the menu can offer that agent's own built-in
+      // commands (`/model`, `/usage`). A pane with no agent behind it — a
+      // plain shell — is simply absent from `agents[]` there and is offered
+      // none of them, which is why the id is sent rather than guessed at.
       if (input) {
         var slashUrl = base
           ? "/p/" + base.split("/")[2] + "/_slash"
           : projectId
             ? "/p/" + encodeURIComponent(projectId) + "/_slash"
             : "/_slash";
+        if (paneId) slashUrl += "?pane=" + encodeURIComponent(paneId);
         wireSlashSuggest(input, slashUrl);
       }
       var attachBox = form.querySelector(".term-attach[data-pane-id]");
@@ -3957,8 +3963,15 @@
         var stageBtn = card && card.querySelector(".term-reply__stage");
         var approveBtn = card && card.querySelector(".term-reply__approve");
         // csl-2 (D1): this page has no project of its own, so the
-        // suggestions are the user-level scan only.
-        if (input) wireSlashSuggest(input, "/_slash");
+        // suggestions are the user-level scan only. sbc-1 (D2): the pane id
+        // still rides along, so an agent pane here is offered its own
+        // built-in commands beside that scan.
+        if (input) {
+          wireSlashSuggest(
+            input,
+            paneId ? "/_slash?pane=" + encodeURIComponent(paneId) : "/_slash",
+          );
+        }
         form.addEventListener("submit", function (ev) {
           ev.preventDefault();
           sendReply(paneId, input.value, true, input);
