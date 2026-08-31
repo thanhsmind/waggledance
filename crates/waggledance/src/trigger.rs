@@ -23,7 +23,7 @@
 //! "event-driven, never a timer" lives in what reaches that gate: a
 //! transition, edge-detected by its own source, never "it is time again".
 //!
-//! Three detectors are wired. D4a, a run capped, is PUSHED: its source is the
+//! All four detectors are wired. D4a, a run capped, is PUSHED: its source is the
 //! reaper's own sweep verdict, arriving over the channel `Reaper::run` was
 //! given, because the reaper is the only thing in the process that can tell a
 //! run it capped apart from an ordinary healthy completion — from outside,
@@ -37,8 +37,10 @@
 //! way, off this task's own herdr snapshot and its own
 //! [`watcher::StatusCursor`](crate::watcher::StatusCursor) — the cursor is
 //! its edge, so a pane that stays blocked is silent after the first poll.
-//! The remaining D4 detector (escalation row) hangs off the same loop and
-//! reuses the same gate.
+//! D4d, a new escalation row, is PULLED as well, off each consenting
+//! project's own `.bee/supervisor/interventions.jsonl` — the one and only
+//! read this repo makes against that store (D5), never a write — with a
+//! per-project row-count cursor as its edge.
 //!
 //! Wired in behind the terminal family switch AND `terminal.trigger_enabled`
 //! by `crate::TerminalBackground` (`crates/waggledance/src/main.rs`), the same
@@ -60,7 +62,7 @@ use waggledance_core::Engine;
 use crate::herdr::{AgentStatus, Herdr};
 use crate::orchestrate::{self, DispatchTarget, RunStatus};
 use crate::reaper::Verdict;
-use crate::watcher::{statuses_from, StatusCursor};
+use crate::watcher::{statuses_from, BeeRoots, StatusCursor};
 
 /// D9's marker: the `feature` every tick this task dispatches is stamped
 /// with, and the one thing that keeps the trigger from observing itself.
@@ -150,6 +152,13 @@ pub const TRANSITION_OVERRUN: &str = "a run overran";
 /// it is substituted into [`TRIGGER_TASK_TEMPLATE`] and contributes no
 /// wording of its own to the template.
 pub const TRANSITION_BLOCKED: &str = "a run's pane entered blocked";
+
+/// D4d's transition kind, and the last of the four. A value on exactly the
+/// same terms as the three above it: substituted into
+/// [`TRIGGER_TASK_TEMPLATE`], contributing no wording of its own to it, and
+/// saying nothing about what the escalation row actually said — this task
+/// reads that a row appeared and nothing more (D5).
+pub const TRANSITION_ESCALATION: &str = "a new escalation row appeared";
 
 /// The whole task text, once, for every transition kind there is (D1).
 ///
@@ -247,6 +256,40 @@ pub struct Trigger {
     /// Not a record of anything observed (D5): last-status per pane, in
     /// memory, and a restart legitimately starts over.
     blocked_cursor: Mutex<StatusCursor>,
+    /// D4d's source of project roots to read escalation mailboxes from.
+    ///
+    /// [`watcher::BeeRoots`](crate::watcher::BeeRoots) itself, not a second
+    /// port speaking the same sentence: it already means exactly "the roots
+    /// to read `.bee/` from", it is already re-asked on every tick (so a
+    /// project registered while the daemon runs is picked up with no
+    /// restart), and a parallel `TriggerRoots` would be a fork of that
+    /// meaning rather than a new one.
+    ///
+    /// Built from the engine here rather than passed in, so this task's
+    /// owner keeps the constructor it already calls; the port stays the port
+    /// because what it answers is a policy question ("which roots?") that a
+    /// test or a later caller can answer differently.
+    roots: Arc<dyn BeeRoots>,
+    /// D4d's edge: how many escalation rows this task has already accounted
+    /// for in each project's mailbox, keyed by project id.
+    ///
+    /// A count works because the mailbox is append-only and
+    /// [`read_escalations`](waggledance_core::bee::read_escalations) answers
+    /// in file order: qualifying rows only ever arrive at the end, so
+    /// everything past the mark is new and everything before it is history.
+    ///
+    /// The first read of a project PRIMES this mark and dispatches nothing —
+    /// the one place this detector deliberately differs from
+    /// [`Trigger::scan_blocked`], whose first sight of an already-blocked
+    /// pane IS an entry. The difference is what the two sources are: a herdr
+    /// snapshot is current state, so a pane blocked right now is blocked
+    /// right now; a mailbox is history, and a project with fifty escalations
+    /// filed last month has had no transition at all — waking an observer
+    /// for them on daemon start would be a restart storm dressed as an event.
+    ///
+    /// Not a record of anything observed (D5): a count per project, in
+    /// memory, and a restart legitimately starts over.
+    seen_escalations: Mutex<HashMap<String, usize>>,
     /// Flipped by the owner (`TerminalBackground`) the moment either switch
     /// is turned off. Checked immediately before the one call with an
     /// irreversible external side effect (`dispatch_run`, which spawns an
@@ -265,6 +308,16 @@ impl Trigger {
         dry_run: bool,
         cancelled: Arc<AtomicBool>,
     ) -> Self {
+        // The same closure `main.rs` already hands the notify watcher, for
+        // the same reason: the registry IS the list of roots, and asking it
+        // per tick is what keeps a mid-run registration visible.
+        let registry = engine.clone();
+        let roots: Arc<dyn BeeRoots> = Arc::new(move || -> Vec<std::path::PathBuf> {
+            registry
+                .list_projects()
+                .map(|ps| ps.into_iter().map(|p| p.root_path).collect())
+                .unwrap_or_default()
+        });
         Trigger {
             herdr,
             engine,
@@ -274,6 +327,8 @@ impl Trigger {
             last_dispatch: Mutex::new(HashMap::new()),
             seen_overrun: Mutex::new(HashSet::new()),
             blocked_cursor: Mutex::new(StatusCursor::new()),
+            roots,
+            seen_escalations: Mutex::new(HashMap::new()),
             cancelled,
         }
     }
@@ -646,6 +701,127 @@ impl Trigger {
         outcomes
     }
 
+    /// D4d: one escalation scan, over every registered, consenting project's
+    /// own `.bee/supervisor/interventions.jsonl` mailbox. Returns the outcome
+    /// for each row it actually took to the gate, keyed by row id, in the
+    /// order decided.
+    ///
+    /// This is the only place in waggledance that touches a project's
+    /// `.bee/supervisor/` store at all, and it only ever reads it (D5):
+    /// [`read_escalations`](waggledance_core::bee::read_escalations) opens
+    /// one file, and this task calls no `bee supervisor` write verb —
+    /// `record`, `mark-delivered`, `away`, `back` or any other — from
+    /// anywhere. Every write after a tick fires belongs to the woken agent,
+    /// inside the target repo.
+    ///
+    /// Nothing a row SAYS is read, kept or forwarded. The gate is told a row
+    /// appeared and where; the row's own question never enters the task text
+    /// (that would be this module choosing what to say, which is exactly what
+    /// the D1 exception does not cover), and nothing about it is stored
+    /// beyond [`Trigger::seen_escalations`]'s per-project count.
+    ///
+    /// Four steps, in this order:
+    ///
+    /// 1. Roots, from the port ([`Trigger::roots`]), re-asked this tick.
+    /// 2. The project behind each root, and D7's consent — checked HERE,
+    ///    before the file is opened, not only at the gate: a project that
+    ///    declined orchestration should not have its supervisor mailbox read
+    ///    at all, and the cheapest way to honour that is to never open it.
+    /// 3. The read itself, off the async worker
+    ///    ([`tokio::task::spawn_blocking`]) — synchronous file I/O, the same
+    ///    rule `watcher::PollWatcher::poll_activity_once` already follows for
+    ///    this crate's other `.bee/` reads.
+    /// 4. The cursor, then D9, then the gate. A row this task's own tick
+    ///    could have filed is dropped before the gate, because the gate's own
+    ///    D9 check can only answer for a transition that names a run and this
+    ///    one names none. It is a no-op filter today — per D5 this task never
+    ///    calls `bee supervisor record`, so no row in any mailbox can be its
+    ///    own — and it is here so that stays true if that ever changes.
+    pub async fn scan_escalations(&self) -> Vec<(String, GateOutcome)> {
+        // (1) + (2) — the roots, narrowed to the projects that consented.
+        let projects: Vec<Project> = {
+            let roots = self.roots.roots();
+            if roots.is_empty() {
+                return Vec::new();
+            }
+            let registered = match self.engine.list_projects() {
+                Ok(projects) => projects,
+                Err(e) => {
+                    tracing::warn!("observer tick could not list projects: {e}");
+                    return Vec::new();
+                }
+            };
+            roots
+                .into_iter()
+                .filter_map(|root| registered.iter().find(|p| p.root_path == root).cloned())
+                .filter(|p| self.engine.orchestration_allowed(p))
+                .collect()
+        };
+        if projects.is_empty() {
+            return Vec::new();
+        }
+
+        // (3) The reads, all of them, off the async worker.
+        let to_read: Vec<(String, std::path::PathBuf)> = projects
+            .iter()
+            .map(|p| (p.id.clone(), p.root_path.clone()))
+            .collect();
+        let mailboxes = tokio::task::spawn_blocking(move || {
+            to_read
+                .into_iter()
+                .map(|(id, root)| (id, waggledance_core::bee::read_escalations(&root)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        // A join failure yields nothing — never a spurious transition, and
+        // never a cursor advanced past rows that were not read.
+        .unwrap_or_default();
+
+        let mut outcomes: Vec<(String, GateOutcome)> = Vec::new();
+        for (project_id, rows) in mailboxes {
+            let Some(project) = projects.iter().find(|p| p.id == project_id) else {
+                continue;
+            };
+            // (4) The cursor. Everything past the mark is new; the mark moves
+            // to the end of the file whatever the gate then decides about the
+            // rows in between, which is the gate's own contract.
+            let fresh: Vec<waggledance_core::bee::BeeEscalation> = {
+                let mut seen = self.seen_escalations.lock().unwrap();
+                match seen.insert(project_id.clone(), rows.len()) {
+                    // First read of this project: prime and say nothing. A
+                    // mailbox is history, not current state — see
+                    // `seen_escalations` for why this differs from
+                    // `scan_blocked`'s first-sight-is-an-entry.
+                    None => continue,
+                    // The file shrank (rotated, truncated, replaced). Nothing
+                    // was appended, so nothing transitioned; re-baseline
+                    // rather than re-fire everything that is left.
+                    Some(mark) if mark > rows.len() => continue,
+                    Some(mark) => rows[mark..].to_vec(),
+                }
+            };
+            for row in fresh {
+                // D9, this detector's own — the gate cannot do it for a
+                // transition that names no run.
+                if row.point_key.contains(TRIGGER_FEATURE_MARKER)
+                    || row.target_session.contains(TRIGGER_FEATURE_MARKER)
+                {
+                    tracing::debug!(
+                        row = %row.id,
+                        project = %project.id,
+                        "observer tick skipped: the escalation row is about this task's own tick"
+                    );
+                    continue;
+                }
+                let outcome = self
+                    .maybe_dispatch(project, TRANSITION_ESCALATION, None)
+                    .await;
+                outcomes.push((row.id, outcome));
+            }
+        }
+        outcomes
+    }
+
     /// Run the trigger loop. `ticks` counts every completed poll — a real,
     /// externally observable side effect of the loop still running, which is
     /// what proves a switch-off actually stopped the task rather than merely
@@ -661,10 +837,11 @@ impl Trigger {
     /// receiver.
     ///
     /// The poll branch is where the pulling detectors live: D4c's overrun
-    /// scan and D4b's blocked scan both run there, in that order, and the
-    /// counter advances after both — so a tick means a poll that completed
-    /// every scan it owns, never a poll that merely started. D4a takes the
-    /// other arm — its source pushes, so it needs no polling at all.
+    /// scan, D4b's blocked scan and D4d's escalation scan all run there, in
+    /// that order, and the counter advances after all three — so a tick means
+    /// a poll that completed every scan it owns, never a poll that merely
+    /// started. D4a takes the other arm — its source pushes, so it needs no
+    /// polling at all.
     pub async fn run(
         self,
         ticks: Arc<AtomicU64>,
@@ -679,6 +856,7 @@ impl Trigger {
                 _ = poll.tick() => {
                     self.scan_overruns().await;
                     self.scan_blocked().await;
+                    self.scan_escalations().await;
                     ticks.fetch_add(1, Ordering::Relaxed);
                 }
                 received = next_verdict(&mut verdicts) => {
@@ -1385,6 +1563,224 @@ mod tests {
         };
         let warning = lifecycle_warning(&leaky).expect("this pair must never be silent");
         assert!(warning.contains("reaper_enabled"), "{warning}");
+    }
+
+    // --- D4d: the escalation mailbox ---
+
+    /// One mailbox row in the bytes `bee supervisor record` actually writes
+    /// (generated against a scratch store on 2026-08-31 and locked in
+    /// `waggledance_core::bee`'s own tests — this is the same shape, kept
+    /// here so a trigger test reads like the file it is standing in for).
+    fn mailbox_row(id: &str, kind: &str, point_key: &str, session: &str) -> String {
+        format!(
+            r#"{{"ts":"2026-08-31T10:17:47.459Z","event":"record","id":"{id}","kind":"{kind}","signal":"none","point_key":"{point_key}","question":"Is the row shape stable?","target_session":"{session}","tick":null,"queued":false}}"#
+        )
+    }
+
+    /// Replace a project's whole mailbox with `lines`. Append-only in
+    /// production; a test writes the file it wants to have been appended to.
+    fn write_mailbox(root: &std::path::Path, lines: &[String]) {
+        let dir = root.join(".bee").join("supervisor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut body = lines.join("\n");
+        body.push('\n');
+        std::fs::write(dir.join("interventions.jsonl"), body).unwrap();
+    }
+
+    /// The whole D4d path: a row appended to a consenting project's mailbox
+    /// since the last poll wakes exactly one tick, and only one.
+    #[tokio::test]
+    async fn a_new_escalation_row_dispatches_exactly_one_tick() {
+        let root = temp_root("escalation-new");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        let (trigger, _cancel) =
+            trigger_for(herdr, engine.clone(), false, TRIGGER_DISPATCH_COOLDOWN);
+
+        // The first poll baselines the mailbox (empty here) and says nothing.
+        assert!(trigger.scan_escalations().await.is_empty());
+
+        write_mailbox(&root, &[mailbox_row("esc-1", "escalation", "p-one", "s1")]);
+        let outcomes = trigger.scan_escalations().await;
+
+        assert_eq!(
+            outcomes,
+            vec![("esc-1".to_string(), GateOutcome::Dispatched)],
+            "the one appended row is the one transition"
+        );
+        assert_eq!(dispatched_ticks(&engine).len(), 1);
+
+        // And it never fires again while it sits there.
+        assert!(
+            trigger.scan_escalations().await.is_empty(),
+            "a row already accounted for is not a transition on the next poll"
+        );
+        assert_eq!(dispatched_ticks(&engine).len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D4d's closed kind set: `urgent` is a transition too, and
+    /// `intervention` — the third mailbox kind — is not.
+    #[tokio::test]
+    async fn only_escalation_and_urgent_rows_are_transitions() {
+        let root = temp_root("escalation-kinds");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        // Dry run with no cooldown: this test is about which kinds pass the
+        // detector, not about spawning or about D8.
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), true, Duration::ZERO);
+        assert!(trigger.scan_escalations().await.is_empty());
+
+        write_mailbox(
+            &root,
+            &[mailbox_row("int-1", "intervention", "p-one", "s1")],
+        );
+        assert!(
+            trigger.scan_escalations().await.is_empty(),
+            "an ordinary intervention row is not a D4d transition"
+        );
+
+        write_mailbox(
+            &root,
+            &[
+                mailbox_row("int-1", "intervention", "p-one", "s1"),
+                mailbox_row("urg-1", "urgent", "p-two", "s2"),
+            ],
+        );
+        assert_eq!(
+            trigger.scan_escalations().await,
+            vec![("urg-1".to_string(), GateOutcome::DryRun)],
+            "urgent is the danger class and fires like an escalation"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A project that has never run a supervisor tick has no store at all.
+    /// That is a normal, expected shape — not an error, and not a transition.
+    #[tokio::test]
+    async fn a_missing_supervisor_store_reads_as_empty() {
+        let root = temp_root("escalation-absent");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), false, Duration::ZERO);
+
+        assert!(trigger.scan_escalations().await.is_empty());
+        assert!(trigger.scan_escalations().await.is_empty());
+
+        assert_eq!(dispatched_ticks(&engine).len(), 0);
+        assert!(
+            !root.join(".bee").join("supervisor").exists(),
+            "D5: reading an absent supervisor store must never create one"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A mailbox already full of history is not a burst of transitions the
+    /// moment the daemon starts — the first read baselines it.
+    #[tokio::test]
+    async fn the_first_read_of_a_mailbox_primes_the_cursor_and_dispatches_nothing() {
+        let root = temp_root("escalation-prime");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        write_mailbox(
+            &root,
+            &[
+                mailbox_row("old-1", "escalation", "p-one", "s1"),
+                mailbox_row("old-2", "urgent", "p-two", "s2"),
+                mailbox_row("old-3", "escalation", "p-three", "s3"),
+            ],
+        );
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), false, Duration::ZERO);
+
+        assert!(
+            trigger.scan_escalations().await.is_empty(),
+            "history is not news: a restart must not wake a tick per filed row"
+        );
+        assert_eq!(dispatched_ticks(&engine).len(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D5/D7: a project that declined orchestration has its mailbox left
+    /// alone entirely — the transition never reaches the gate at all.
+    #[tokio::test]
+    async fn a_non_consenting_projects_mailbox_dispatches_nothing() {
+        let root = temp_root("escalation-unconsented");
+        let engine = test_engine(false, &root);
+        let herdr = spawnable_herdr(&root).await;
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), false, Duration::ZERO);
+
+        assert!(trigger.scan_escalations().await.is_empty());
+        write_mailbox(&root, &[mailbox_row("esc-1", "escalation", "p-one", "s1")]);
+        assert!(trigger.scan_escalations().await.is_empty());
+
+        assert_eq!(dispatched_ticks(&engine).len(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D9, on the one detector whose transitions name no run: a row this
+    /// task's own tick could have filed is dropped before the gate. A no-op
+    /// filter today (D5 means this task files no rows at all) and here so it
+    /// stays a no-op if that ever changes.
+    #[tokio::test]
+    async fn a_row_this_tasks_own_tick_could_have_filed_is_never_a_transition() {
+        let root = temp_root("escalation-self");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), true, Duration::ZERO);
+        assert!(trigger.scan_escalations().await.is_empty());
+
+        write_mailbox(
+            &root,
+            &[
+                mailbox_row("mine-1", "escalation", TRIGGER_FEATURE_MARKER, "s1"),
+                mailbox_row("mine-2", "urgent", "p-two", TRIGGER_FEATURE_MARKER),
+                mailbox_row("theirs", "escalation", "p-three", "s3"),
+            ],
+        );
+
+        assert_eq!(
+            trigger.scan_escalations().await,
+            vec![("theirs".to_string(), GateOutcome::DryRun)],
+            "only the row that is not this task's own is a transition"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The reader's one deliberate departure from `bee.rs`'s silent
+    /// precedent: a malformed line is named by its 1-indexed line number
+    /// before it is skipped, and the rows around it still read. Asserted
+    /// against the reader directly — `scan_escalations` runs it on a blocking
+    /// worker thread, which a thread-local test subscriber cannot see.
+    #[test]
+    fn a_malformed_mailbox_line_warns_by_line_number_and_is_skipped() {
+        let root = temp_root("escalation-malformed");
+        write_mailbox(
+            &root,
+            &[
+                mailbox_row("first", "escalation", "p-one", "s1"),
+                "{not json at all".to_string(),
+                mailbox_row("third", "urgent", "p-three", "s3"),
+            ],
+        );
+
+        let logs = CapturedLogs::new();
+        let rows = {
+            let _guard = logs.attach();
+            waggledance_core::bee::read_escalations(&root)
+        };
+
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["first", "third"],
+            "a bad line never aborts the rows around it"
+        );
+        let text = logs.text();
+        assert!(text.contains("WARN"), "the skip is never silent: {text}");
+        assert!(
+            text.contains("line=2"),
+            "the warning names the line it skipped: {text}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A `tracing` subscriber that writes into a buffer this test can read —
