@@ -13408,11 +13408,15 @@ mod tests {
             !html[bar_end..].contains("class=\"proj-tabs\""),
             "the section nav must not also open a band under the bar: {html}"
         );
+        // term-workspace-unify: the slice ends at the workspace's panel, the
+        // pane row's own next sibling. `.term-panes` is two elements deeper
+        // now (inside `.term-work__screen`), so slicing to it would let a
+        // "New shell" rendered INSIDE the panel pass as "on the row".
         let row_start = html.find("class=\"pane-bar\"").expect("no pane row");
         let row_end = html[row_start..]
-            .find("<div class=\"term-panes\">")
+            .find("<div class=\"term-work__panel\"")
             .map(|i| row_start + i)
-            .expect("no pane list after the pane row");
+            .expect("no panel after the pane row");
         assert!(
             html[row_start..row_end].contains("class=\"term-create__pane\""),
             "New shell must share the pane strip's row: {html}"
@@ -13446,123 +13450,74 @@ mod tests {
         );
     }
 
-    /// changes-diff-screen D8/D9: the terminal page offers FILES and DIFF,
-    /// and offers them CLOSED. Both buttons carry the exact `embed=1`
-    /// addresses the script is allowed to load — built here, never assembled
-    /// from a project id in `assets/app.js` — the panel ships hidden, and the
-    /// frame ships with no `src` at all, so a terminal page nobody touches
-    /// fetches neither page.
+    /// changes-diff-screen D8/D9, re-pointed by term-workspace-unify: the
+    /// project terminal page offers Files and Diff, and offers them CLOSED.
+    /// Both buttons carry the exact nav-mode addresses the script is allowed
+    /// to load — built in [`term_work_sidebar`], never assembled from a
+    /// project id in `assets/app.js` — the panel ships hidden, and not one of
+    /// the three frames ships with a `src`, so a terminal page nobody touches
+    /// fetches nothing. The controls used to be two buttons of this page's
+    /// own above the terminal; they are the shared workspace's sidebar now,
+    /// which is the point of the feature — but what they PROMISE is
+    /// unchanged, so it stays pinned here, on this page, and not only on the
+    /// homepage tab.
     #[test]
-    fn terminal_page_offers_files_and_diff_tabs_closed_with_no_frame_loaded() {
+    fn terminal_page_offers_files_and_diff_closed_with_no_frame_loaded() {
         let project = sample_project();
         let html = terminal_page(&project, &[], None, &[]);
         assert!(
             html.contains(
-                r#"<button type="button" class="term-embed__tab" data-embed-tab="files" data-embed-src="/p/proj-1/_code/?embed=1" aria-pressed="false">FILES</button>"#
+                r#"<button type="button" class="term-work__tab" data-nav-tab="files" data-nav-src="/p/proj-1/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>"#
             ),
-            "FILES must carry the Code page's own embed URL: {html}"
+            "Files must carry the Code page's own nav-mode URL: {html}"
         );
         assert!(
             html.contains(
-                r#"<button type="button" class="term-embed__tab" data-embed-tab="diff" data-embed-src="/p/proj-1/_changes?embed=1" aria-pressed="false">DIFF</button>"#
+                r#"<button type="button" class="term-work__tab" data-nav-tab="diff" data-nav-src="/p/proj-1/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>"#
             ),
-            "DIFF must carry the Changes page's own embed URL: {html}"
+            "Diff must carry the Changes page's own nav-mode URL: {html}"
         );
         assert!(
-            html.contains(r#"<div class="term-embed__panel" hidden>"#),
+            html.contains(r#"<div class="term-work__panel" hidden>"#),
             "the panel must exist and ship hidden: {html}"
         );
-        let frame_start = html
-            .find("<iframe class=\"term-embed__frame\"")
-            .expect("no panel frame");
-        let frame_end = html[frame_start..]
-            .find('>')
-            .map(|i| frame_start + i)
-            .expect("unclosed iframe tag");
-        assert!(
-            !html[frame_start..frame_end].contains("src="),
-            "an untouched terminal page must load no frame: {html}"
+        assert_eq!(
+            html.matches("<iframe").count(),
+            3,
+            "the page must render exactly the two nav frames and the panel frame: {html}"
         );
+        for (start, _) in html.match_indices("<iframe") {
+            let end = start + html[start..].find('>').expect("unclosed iframe tag");
+            assert!(
+                !html[start..end].contains("src="),
+                "an untouched terminal page must load no frame: {}",
+                &html[start..end]
+            );
+        }
     }
 
     /// The panel is the TOP half: it renders above the terminal, inside the
     /// same content column, so opening it compresses the screen downward
-    /// rather than covering it.
+    /// rather than covering it. term-workspace-unify: that column is
+    /// `.term-work__col`, shared with the homepage tab — the order it puts
+    /// the panel and the screen in is what this pins, on the page that used
+    /// to compose the order itself.
     #[test]
     fn the_terminal_panel_renders_above_the_terminal() {
         let project = sample_project();
         let html = terminal_page(&project, &[], None, &[]);
+        let col = html
+            .find(r#"<div class="term-work__col">"#)
+            .expect("no workspace column");
         let panel = html
-            .find(r#"<div class="term-embed" data-project-id="proj-1">"#)
+            .find(r#"<div class="term-work__panel" hidden>"#)
             .expect("no panel");
-        let panes = html
-            .find("<div class=\"term-panes\">")
-            .expect("no terminal pane list");
+        let screen = html
+            .find(r#"<div class="term-work__screen">"#)
+            .expect("no terminal screen");
         assert!(
-            panel < panes,
-            "the panel must render above the terminal: {html}"
-        );
-    }
-
-    /// D8's JS half. Three things are pinned because three things could go
-    /// quietly wrong: the frame's URL is only ever the button's own
-    /// server-rendered attribute (never a string built here from a project
-    /// id, and never a value read out of storage); the open tab is remembered
-    /// per project in `sessionStorage` under this feature's own key; and
-    /// every storage touch is wrapped, so a disabled or quota-blocked store
-    /// degrades to closed instead of taking the terminal page down.
-    #[test]
-    fn app_js_opens_the_terminal_panel_from_the_servers_own_urls() {
-        let script = include_str!("../assets/app.js");
-        assert!(
-            script.contains(r#"var src = btn.getAttribute("data-embed-src") || "";"#)
-                && script.contains(
-                    r#"if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);"#
-                ),
-            "the frame's src must be copied from the button's own attribute: {script}"
-        );
-        assert!(
-            script.contains(
-                r#"var KEY = "waggledance-term-panel:" + root.getAttribute("data-project-id");"#
-            ),
-            "the open tab must be remembered per project under the D8 key: {script}"
-        );
-        assert!(
-            script.contains(
-                r#"try { stored = sessionStorage.getItem(KEY); } catch (e) { stored = null; }"#
-            ),
-            "a throwing sessionStorage must read as closed: {script}"
-        );
-        assert!(
-            script.contains(r#"if (main) main.classList.toggle("term-split", !!openTab);"#),
-            "the split class must be driven by the open tab: {script}"
-        );
-    }
-
-    /// D8's CSS half: half and half, and only while a tab is open. The rule
-    /// hangs off `main.fg-page.term-split`, so with the panel closed nothing
-    /// in it applies and the terminal page keeps the page-scrolled,
-    /// full-height screen it has always had.
-    #[test]
-    fn the_terminal_panel_splits_the_content_area_in_half_only_while_open() {
-        let css = include_str!("../assets/app.css");
-        assert!(
-            css.contains(
-                "main.fg-page.term-split { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }"
-            ),
-            "the split must give the content area one fixed frame: {css}"
-        );
-        assert!(
-            css.contains("main.fg-page.term-split .term-embed { flex: 1 1 50%; min-height: 0; }"),
-            "the panel must take half the frame: {css}"
-        );
-        assert!(
-            css.contains("main.fg-page.term-split .term-panes { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top:"),
-            "the terminal must take the other half and scroll inside it: {css}"
-        );
-        assert!(
-            !css.contains(".term-embed__panel { display:"),
-            "the panel must take no display rule, or `hidden` would stop hiding it: {css}"
+            col < panel && panel < screen,
+            "the panel must render above the terminal, inside the column: {html}"
         );
     }
 
@@ -14999,13 +14954,13 @@ mod tests {
         let html = terminals_tab(&panes, Some("w1:p1"), true, &[]);
         assert!(
             html.contains(
-                r#"<button type="button" class="home-term__tab" data-nav-tab="files" data-nav-src="/p/proj-1/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>"#
+                r#"<button type="button" class="term-work__tab" data-nav-tab="files" data-nav-src="/p/proj-1/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>"#
             ),
             "Files must carry the Code page's own nav-mode URL: {html}"
         );
         assert!(
             html.contains(
-                r#"<button type="button" class="home-term__tab" data-nav-tab="diff" data-nav-src="/p/proj-1/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>"#
+                r#"<button type="button" class="term-work__tab" data-nav-tab="diff" data-nav-src="/p/proj-1/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>"#
             ),
             "Diff must carry the Changes page's own nav-mode URL: {html}"
         );
@@ -15014,7 +14969,7 @@ mod tests {
             "the sidebar must carry the embedded Changes page the Diff tab drops into the panel (D1), sidebar-less because this sidebar is it: {html}"
         );
         assert!(
-            html.contains(r#"<div class="home-term__panel" hidden>"#),
+            html.contains(r#"<div class="term-work__panel" hidden>"#),
             "the panel must exist and ship hidden: {html}"
         );
         assert!(
@@ -15049,7 +15004,7 @@ mod tests {
         let panes = vec![menu_pane("w1:u1", None, "Unassigned")];
         let html = terminals_tab(&panes, Some("w1:u1"), true, &[]);
         assert!(
-            html.contains(r#"class="home-term__side home-term__side--empty""#)
+            html.contains(r#"class="term-work__side term-work__side--empty""#)
                 && html.contains("not inside a registered project"),
             "the sidebar must explain why it is empty: {html}"
         );
@@ -15058,7 +15013,7 @@ mod tests {
             "a pane with no project must render no frames at all: {html}"
         );
         assert!(
-            !html.contains("home-term__tab") && !html.contains("home-term__panel"),
+            !html.contains("term-work__tab") && !html.contains("term-work__panel"),
             "a pane with no project must render neither tab buttons nor a panel: {html}"
         );
     }
@@ -15070,7 +15025,7 @@ mod tests {
     /// neither end spells the name out, and this test asserts through the
     /// constant rather than the literal it happens to hold.
     #[test]
-    fn the_home_panel_frame_and_the_nav_base_target_share_one_name() {
+    fn the_workspace_panel_frame_and_the_nav_base_target_share_one_name() {
         let panes = vec![menu_pane("w1:p1", Some("proj-1"), "Proj One")];
         let html = terminals_tab(&panes, Some("w1:p1"), true, &[]);
         assert!(
@@ -15084,15 +15039,28 @@ mod tests {
         );
     }
 
-    /// D1/D2's JS half. What is pinned is what could go quietly wrong: a
-    /// frame's URL is only ever the server's own attribute; choosing Diff
-    /// fills the panel as well as the sidebar; the open tab is remembered
-    /// per project under this feature's own key; every storage touch is
-    /// wrapped; and the split is one class on `<main>`, the same one the
-    /// project page's panel drives.
+    /// The workspace's JS half, for BOTH pages. term-workspace-unify folded
+    /// two tests into this one — the homepage's sidebar block and the project
+    /// page's panel block — because it folded two script blocks into one:
+    /// `assets/app.js` roots at `.term-work` and serves whichever page
+    /// rendered it, so asserting the same block twice would pay two
+    /// maintenance bills for one behavior.
+    ///
+    /// What is pinned is what could go quietly wrong: a frame's URL is only
+    /// ever the server's own attribute (never a string built here from a
+    /// project id, never a value read out of storage); a nav frame is loaded
+    /// once and left loaded, while the panel frame is re-pointed only when
+    /// the address actually changed; choosing Diff fills the panel as well as
+    /// the sidebar; the open tab is remembered per PROJECT under one key that
+    /// both pages share; every storage touch is wrapped; and the split is one
+    /// class on `<main>`, the same one on either page.
     #[test]
-    fn app_js_wires_the_home_sidebar_and_panel_from_the_servers_own_urls() {
+    fn app_js_wires_the_one_terminal_workspace_from_the_servers_own_urls() {
         let script = include_str!("../assets/app.js");
+        assert!(
+            script.contains(r#"var root = document.querySelector(".term-work");"#),
+            "one block must root at the shared workspace, whichever page rendered it: {script}"
+        );
         assert!(
             script.contains(r#"var src = btn.getAttribute("data-nav-src") || "";"#),
             "a nav frame's src must be copied from its own tab button's attribute: {script}"
@@ -15107,10 +15075,18 @@ mod tests {
             "choosing Diff must also fill the panel, from the sidebar's own attribute (D1): {script}"
         );
         assert!(
+            script.contains(r#"if (panelFrame.getAttribute("src") !== src) {"#),
+            "the panel frame must be re-pointed only when the address changed: {script}"
+        );
+        assert!(
             script.contains(
-                r#""waggledance-home-panel:" + (root.getAttribute("data-panel-project") || "");"#
+                r#""waggledance-term-panel:" + (root.getAttribute("data-panel-project") || "");"#
             ),
-            "the open sidebar tab must be remembered per project under this feature's key: {script}"
+            "the open tab must be remembered per project under the one shared key: {script}"
+        );
+        assert!(
+            !script.contains("waggledance-home-panel:"),
+            "the homepage's own key is retired — one key means the choice follows the project across both pages: {script}"
         );
         assert!(
             script.contains(
@@ -15123,32 +15099,229 @@ mod tests {
                 && script.contains(r#"if (main) main.classList.toggle("term-split", split);"#),
             "the close control and the split must drive the one split class: {script}"
         );
+        assert!(
+            !script.contains("term-embed"),
+            "the project page's deleted variant must have no wiring left: {script}"
+        );
     }
 
-    /// D1/D2's CSS half: half and half, and only while the panel is open.
-    /// The rules hang off the same `main.fg-page.term-split` the project
-    /// page's panel uses, and the panel's own `display` is set only when it
-    /// is not `hidden` — so a closed panel is laid out exactly as the tab
-    /// was before this feature existed.
+    /// The workspace's CSS half, for BOTH pages — half and half, and only
+    /// while the panel is open. term-workspace-unify folded the project
+    /// page's own copy of this test into this one: there is a single set of
+    /// rules now, hanging off the same `main.fg-page.term-split` both pages
+    /// put on their `<main>`, so there is ONE definition of what "split"
+    /// means and one test of it. The panel's `display` is set only when it is
+    /// not `hidden`, so a closed panel leaves either page laid out exactly as
+    /// it was before this feature existed.
     #[test]
-    fn the_home_panel_splits_the_terminals_tab_only_while_open() {
+    fn the_workspace_panel_splits_the_content_area_in_half_only_while_open() {
         let css = include_str!("../assets/app.css");
+        assert!(
+            css.contains(
+                "main.fg-page.term-split { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }"
+            ),
+            "the split must give the content area one fixed frame: {css}"
+        );
         let closed_costs_nothing =
-            ".home-term__panel:not([hidden]) { display: flex; flex-direction: column; }";
+            ".term-work__panel:not([hidden]) { display: flex; flex-direction: column; }";
         assert!(
             css.contains(closed_costs_nothing),
             "the panel must take its display only when it is not hidden: {css}"
         );
         assert!(
-            css.contains("main.fg-page.term-split .home-term__panel { flex: 1 1 50%; }"),
+            !css.contains(".term-work__panel { display:"),
+            "the panel must take no unconditional display rule, or `hidden` would stop hiding it: {css}"
+        );
+        assert!(
+            css.contains("main.fg-page.term-split .term-work__panel { flex: 1 1 50%; }"),
             "the open panel must take the top half: {css}"
         );
         assert!(
             css.contains(
-                "main.fg-page.term-split .home-term__screen { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top:"
+                "main.fg-page.term-split .term-work__screen { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top:"
             ),
-            "the terminal must take the bottom half and scroll inside itself: {css}"
+            "the terminal must take the other half and scroll inside itself: {css}"
         );
+        assert!(
+            !css.contains("term-embed"),
+            "the project page's deleted variant must have no rules left: {css}"
+        );
+    }
+
+    /// term-workspace-unify: the unification itself, pinned from both ends.
+    /// The project terminal page and the homepage Terminals tab render ONE
+    /// workspace — the same frame, column, screen wrapper, panel and
+    /// Files | Diff sidebar — and each names its OWN project in every address
+    /// it hands the script. A page growing a variant of its own again fails
+    /// here first, which is what makes the shared layout stay shared.
+    #[test]
+    fn both_terminal_surfaces_render_the_one_shared_workspace() {
+        let project = sample_project();
+        let panes = vec![menu_pane("w1:p1", Some("proj-2"), "Proj Two")];
+        for (page, html, pid) in [
+            (
+                "the project terminal page",
+                terminal_page(&project, &[], None, &[]),
+                "proj-1",
+            ),
+            (
+                "the homepage Terminals tab",
+                terminals_tab(&panes, Some("w1:p1"), true, &[]),
+                "proj-2",
+            ),
+        ] {
+            for part in [
+                r#"<div class="term-work""#,
+                r#"<div class="term-work__col">"#,
+                r#"<div class="term-work__screen">"#,
+                r#"<aside class="term-work__side""#,
+                r#"<div class="term-work__panel" hidden>"#,
+                r#"<div class="term-work__tabs""#,
+            ] {
+                assert!(
+                    html.contains(part),
+                    "{page} must render `{part}` of the shared workspace: {html}"
+                );
+            }
+            assert!(
+                html.contains(&format!(
+                    r#"data-nav-tab="files" data-nav-src="/p/{pid}/_code/?embed=1&amp;nav=1""#
+                )) && html.contains(&format!(
+                    r#"data-nav-tab="diff" data-nav-src="/p/{pid}/_changes?embed=1&amp;nav=1""#
+                )),
+                "{page}'s sidebar must offer Files and Diff over {pid}'s own nav pages: {html}"
+            );
+            assert!(
+                html.contains(&format!(
+                    r#"data-panel-src="/p/{pid}/_changes?embed=1&amp;panel=1""#
+                )) && html.contains(&format!(r#"data-panel-project="{pid}""#)),
+                "{page}'s panel address and storage key must name {pid}: {html}"
+            );
+            assert!(
+                !html.contains("term-embed"),
+                "{page} must render nothing of the deleted per-page variant: {html}"
+            );
+        }
+    }
+
+    /// The workspace's rules belong to BOTH pages, so not one of them may be
+    /// scoped to `.home-shell` — that wrapper exists only on the homepage.
+    /// The rule this matters most for is the 700px breakpoint that undoes the
+    /// fixed-height split: left homepage-scoped (which is how it was written),
+    /// a handset on the project page keeps a `100dvh`, `overflow: hidden`
+    /// frame while the columns stack inside it — a terminal you cannot scroll
+    /// to. Comments are stripped first: the block above these rules explains
+    /// the scoping in prose that names both selectors.
+    #[test]
+    fn no_terminal_workspace_rule_is_scoped_to_the_homepage_shell() {
+        let css = css_without_comments(include_str!("../assets/app.css"));
+        for rule in css.lines() {
+            if !(rule.contains(".term-work") || rule.contains("main.fg-page.term-split")) {
+                continue;
+            }
+            assert!(
+                !rule.contains(".home-shell"),
+                "a shared workspace rule must not be scoped to the homepage shell: {rule}"
+            );
+        }
+        assert!(
+            css.contains("main.fg-page.term-split { height: auto; overflow: visible; }"),
+            "the narrow breakpoint must undo the split — for both pages: {css}"
+        );
+    }
+
+    /// CSS with every `/* … */` comment removed, so a rule test reads rules
+    /// and a comment that quotes a selector cannot fail it.
+    fn css_without_comments(css: &str) -> String {
+        let mut out = String::new();
+        let mut rest = css;
+        while let Some(open) = rest.find("/*") {
+            out.push_str(&rest[..open]);
+            match rest[open..].find("*/") {
+                Some(close) => rest = &rest[open + close + 2..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Every occurrence of the retired workspace class in `text`, with the
+    /// 40 characters that follow it for the failure message.
+    ///
+    /// The needle is assembled at runtime, for two reasons. This file is one
+    /// of the three the guard reads, so a literal would trip the guard on its
+    /// own source — and, the trap that makes a bare `rg` count a FALSE red,
+    /// the locked decision ids `home-terminal-panel`,
+    /// `home-terminal-parity-2` and `home-terminal-header-2` are cited in
+    /// comments in all three files and must STAY. So what is matched is the
+    /// class token alone: the old prefix with the word ending right there —
+    /// a `_`, a `-`, a quote, a dot, a space — never a letter or a digit
+    /// carrying it on into one of those ids.
+    fn retired_workspace_class_hits(text: &str) -> Vec<String> {
+        let needle = concat!("home", "-term");
+        let mut hits = Vec::new();
+        for (at, _) in text.match_indices(needle) {
+            let rest = &text[at + needle.len()..];
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            hits.push(text[at..].chars().take(40).collect::<String>());
+        }
+        hits
+    }
+
+    /// term-workspace-unify's whole point, guarded across all three files
+    /// that rendered the old name: a page that is not the homepage must not
+    /// render a homepage-named class. Every one of those names is a rename
+    /// with a mechanical counterpart in another file, and a missed one shows
+    /// up as an unstyled or dead control rather than a crash — silent, unless
+    /// something fails here.
+    #[test]
+    fn no_file_renders_the_retired_homepage_named_workspace_class() {
+        for (file, text) in [
+            ("src/views.rs", include_str!("views.rs")),
+            ("assets/app.css", include_str!("../assets/app.css")),
+            ("assets/app.js", include_str!("../assets/app.js")),
+        ] {
+            let hits = retired_workspace_class_hits(text);
+            assert!(
+                hits.is_empty(),
+                "{file} still carries the retired homepage-named class: {hits:?}"
+            );
+        }
+    }
+
+    /// The guard above, proved in both directions — a guard that cannot fail
+    /// is not a guard, and this one has to walk past three locked decision
+    /// ids that begin with the very letters it hunts.
+    #[test]
+    fn the_class_guard_walks_past_the_decision_ids_and_still_catches_a_class() {
+        let ids = "home-terminal-panel D1/D2, home-terminal-parity-2, home-terminal-header-2";
+        assert!(
+            retired_workspace_class_hits(ids).is_empty(),
+            "a cited decision id must not read as a class: {ids}"
+        );
+        let old = concat!("home", "-term");
+        for reintroduced in [
+            format!(r#"<div class="{old}__col">"#),
+            format!(r#"<div class="{old}">"#),
+            format!(".{old}__panel {{ display: flex; }}"),
+            format!(r#"root.classList.toggle("{old}--split", split);"#),
+        ] {
+            assert_eq!(
+                retired_workspace_class_hits(&reintroduced).len(),
+                1,
+                "a reintroduced class must fail the guard: {reintroduced}"
+            );
+        }
     }
 
     /// The Older/Newer/Live column is bounded by the screen it moves: the
@@ -24875,22 +25048,41 @@ mod tests {
         }
     }
 
-    /// cds-8's panel, pinned as the thing this change must NOT touch: the
-    /// project terminal page embeds the same two pages, and there the
-    /// embedded sidebar is the only navigation in the frame. Its URLs stay
-    /// plain `?embed=1`.
+    /// cds-8's panel, re-pointed by term-workspace-unify. This slot held
+    /// `the_project_terminal_panel_stays_on_plain_embed_urls`: the project
+    /// page had a panel of its own that dropped a WHOLE embedded page into
+    /// the frame, sidebar included, so it asked for plain `?embed=1` and
+    /// never for the sidebar-less `panel=1` — that embedded sidebar was the
+    /// only navigation the panel had. The variant is deleted. Both pages now
+    /// render the shared workspace, which carries a sidebar of its OWN beside
+    /// the terminal, so the narrowed rendering is right on both: the old
+    /// assertion would today pin a duplicated sidebar as correct, which is
+    /// why it is stated as retired here rather than quietly dropped. What
+    /// survives is the claim that still means something — the two pages
+    /// agree on what the panel holds, and neither carries a control of the
+    /// deleted variant's own.
     #[test]
-    fn the_project_terminal_panel_stays_on_plain_embed_urls() {
-        let html = terminal_embed_panel("proj-1");
-        assert!(
-            html.contains(r#"data-embed-src="/p/proj-1/_code/?embed=1""#)
-                && html.contains(r#"data-embed-src="/p/proj-1/_changes?embed=1""#),
-            "the project page's panel embeds whole pages, sidebars included: {html}"
-        );
-        assert!(
-            !html.contains("panel=1"),
-            "it must never ask for the sidebar-less rendering — that sidebar is \
-             all the navigation this panel has: {html}"
-        );
+    fn both_terminal_workspaces_ask_for_the_sidebar_less_panel() {
+        let project = sample_project();
+        let panes = vec![menu_pane("w1:p1", Some("proj-2"), "Proj Two")];
+        for (page, html) in [
+            (
+                "the project terminal page",
+                terminal_page(&project, &[], None, &[]),
+            ),
+            (
+                "the homepage Terminals tab",
+                terminals_tab(&panes, Some("w1:p1"), true, &[]),
+            ),
+        ] {
+            assert!(
+                html.contains("?embed=1&amp;panel=1"),
+                "{page} must drop the narrowed Changes page into the panel: {html}"
+            );
+            assert!(
+                !html.contains("data-embed-src"),
+                "{page} must carry none of the deleted variant's own controls: {html}"
+            );
+        }
     }
 }
