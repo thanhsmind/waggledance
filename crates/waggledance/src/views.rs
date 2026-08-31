@@ -2767,85 +2767,110 @@ fn terminals_tab(
         format!("/?tab=terminals&pane={}", pane_id)
     });
 
-    // home-terminal-panel D1/D2: the tab's own two-column frame. Left: the
-    // switcher, the panel above the screen, and the screen itself. Right:
-    // the Files | Diff sidebar, scoped to the *effective* pane's project —
-    // the same pane the body is showing, resolved once above, so the files
-    // beside a terminal always belong to the terminal being watched.
+    // home-terminal-panel D1/D2, term-workspace-unify: the frame around the
+    // switcher, the panel and the screen is [`term_workspace`]'s, shared with
+    // the project terminal page — this tab composes none of it inline any
+    // more. The sidebar it renders is scoped to the *effective* pane's
+    // project, the same pane the body is showing, resolved once above, so the
+    // files beside a terminal always belong to the terminal being watched.
     //
     // A pane outside every registered project (`project_id: None`, the
-    // `unassigned_panes` shape) renders the sidebar's explained empty state
-    // and no panel at all: there is no `:id` for `/p/:id/_code` or
+    // `unassigned_panes` shape) gets the sidebar's explained empty state and
+    // no panel at all: there is no `:id` for `/p/:id/_code` or
     // `/p/:id/_changes` to embed, exactly as `create` above has no create
     // route for it.
-    let project_id = effective.and_then(|pane| pane.project_id.as_deref());
-    // Deliberately NOT `data-project-id`: homepage-terminal-full D5 forbids
-    // a page-root project id on this tab — every pane control reads its own
-    // `data-term-base` instead, and a test pins that the page's only
-    // `data-project-id` is `.term-create`'s own (the create route's target),
-    // so no later widget can quietly reintroduce the fallback beside it.
-    // This attribute scopes ONE
-    // widget, the sidebar's sessionStorage key, and is named for that widget
-    // so the two can never be read as the same thing.
-    let panel_project = project_id
-        .map(|id| format!(" data-panel-project=\"{}\"", esc(id)))
-        .unwrap_or_default();
+    //
     // agents-drawer-global: this used to splice its own
     // `agent_switch_drawer(true)` in here — now [`home_page`] (the only
     // caller of this tab) renders the drawer once, through
     // `layout_with_drawer`, wrapping every home tab alike. A second drawer
     // here would duplicate `#agent-drawer-toggle`.
+    let project_id = effective.and_then(|pane| pane.project_id.as_deref());
+    term_workspace(&bar, &body, project_id)
+}
+
+/// home-terminal-panel D1/D2, term-workspace-unify: the terminal workspace
+/// itself — the two-column frame BOTH terminal surfaces render, the homepage
+/// Terminals tab ([`terminals_tab`]) and a project's own terminal page
+/// ([`terminal_page`]). Left column: the switcher `bar`, the panel above the
+/// screen, and `screen_html` (the selected pane's card on the tab, the
+/// `.term-panes` list on the project page). Right: the Files | Diff sidebar.
+/// One function so the two pages cannot drift into two shapes again.
+///
+/// `project_id` is the project whose files sit beside the terminal — the
+/// *effective* pane's project on the homepage tab, the page's own project on
+/// the project page. `None` (the tab's `unassigned_panes` shape) renders the
+/// sidebar's explained empty state and no panel at all: there is no `:id` for
+/// `/p/:id/_code` or `/p/:id/_changes` to embed.
+///
+/// `data-panel-project` is deliberately NOT `data-project-id`:
+/// homepage-terminal-full D5 forbids a page-root project id on the Terminals
+/// tab — every pane control reads its own `data-term-base` instead, and a
+/// test pins that the tab's only `data-project-id` is `.term-create`'s own
+/// (the create route's target), so no later widget can quietly reintroduce
+/// the fallback beside it. This attribute scopes ONE widget, the sidebar's
+/// sessionStorage key, and is named for that widget so the two can never be
+/// read as the same thing. The project page does carry `data-project-id`, on
+/// its own `<main>` for the screen poller ([`terminal_page`]); this attribute
+/// sits inside it still naming only the sidebar's key.
+///
+/// Laziness lives in the markup, not in script: the panel frame and the two
+/// nav frames ship with no `src` at all, so a workspace nobody opens a file
+/// from fetches nothing. See [`term_work_panel`] and [`term_work_sidebar`].
+fn term_workspace(bar: &str, screen_html: &str, project_id: Option<&str>) -> String {
+    let panel_project = project_id
+        .map(|id| format!(" data-panel-project=\"{}\"", esc(id)))
+        .unwrap_or_default();
     format!(
-        r#"<div class="home-term"{panel_project}>
-  <div class="home-term__col">
+        r#"<div class="term-work"{panel_project}>
+  <div class="term-work__col">
     {bar}
     {panel}
-    <div class="home-term__screen">{body}</div>
+    <div class="term-work__screen">{screen_html}</div>
   </div>
   {side}
 </div>"#,
         panel_project = panel_project,
         bar = bar,
-        panel = home_term_panel(project_id),
-        body = body,
-        side = home_term_sidebar(project_id),
+        panel = term_work_panel(project_id),
+        screen_html = screen_html,
+        side = term_work_sidebar(project_id),
     )
 }
 
-/// home-terminal-panel D2: the panel frame above the terminal on the
-/// homepage terminals tab — the counterpart to [`terminal_embed_panel`],
-/// with the one difference that is the whole feature: nothing HERE picks
-/// what it shows. The frame is NAMED with [`PANEL_FRAME_NAME`], and every
-/// nav page in the sidebar beside it carries `<base target>` with that same
-/// name, so a file row clicked over there lands in this frame with no script
-/// in between and no `postMessage`.
+/// home-terminal-panel D2: the panel frame above the terminal, in the
+/// [`term_workspace`] both terminal pages render — with the one difference
+/// that is the whole feature: nothing HERE picks what it shows. The frame is
+/// NAMED with [`PANEL_FRAME_NAME`], and every nav page in the sidebar beside
+/// it carries `<base target>` with that same name, so a file row clicked over
+/// there lands in this frame with no script in between and no `postMessage`.
 ///
-/// It ships with no `src` at all — the laziness is in the markup, exactly as
-/// the project page's panel does it: a tab nobody opens a file from fetches
-/// nothing. `assets/app.js` opens the split the first time this frame
-/// actually loads a page, and the close control folds the split away without
-/// tearing the frame down, so reopening shows a page already there.
+/// It ships with no `src` at all — the laziness is in the markup: a workspace
+/// nobody opens a file from fetches nothing. `assets/app.js` opens the split
+/// the first time this frame actually loads a page, and the close control
+/// folds the split away without tearing the frame down, so reopening shows a
+/// page already there.
 ///
 /// Empty for a pane with no project: there is no project to embed, and the
 /// sidebar beside it says so rather than leaving a dead control here.
-fn home_term_panel(project_id: Option<&str>) -> String {
+fn term_work_panel(project_id: Option<&str>) -> String {
     if project_id.is_none() {
         return String::new();
     }
     format!(
-        r#"<div class="home-term__panel" hidden>
-  <div class="home-term__panel-head">
-    <span class="home-term__panel-name">Files &amp; diff</span>
-    <button type="button" class="home-term__close" data-panel-close aria-label="Close the panel above the terminal">Close</button>
+        r#"<div class="term-work__panel" hidden>
+  <div class="term-work__panel-head">
+    <span class="term-work__panel-name">Files &amp; diff</span>
+    <button type="button" class="term-work__close" data-panel-close aria-label="Close the panel above the terminal">Close</button>
   </div>
-  <iframe class="home-term__frame" name="{name}" title="Project files and diff"></iframe>
+  <iframe class="term-work__frame" name="{name}" title="Project files and diff"></iframe>
 </div>"#,
         name = PANEL_FRAME_NAME,
     )
 }
 
-/// home-terminal-panel D1/D2: the terminals tab's right sidebar — Files and
-/// Diff over two lazy nav frames.
+/// home-terminal-panel D1/D2: the right-hand column of every
+/// [`term_workspace`] — Files and Diff over two lazy nav frames.
 ///
 /// D2's addresses are all built HERE, escaped here: the two `nav=1` pages
 /// the sidebar itself shows, and (on the sidebar element) the embedded
@@ -2860,23 +2885,23 @@ fn home_term_panel(project_id: Option<&str>) -> String {
 ///
 /// `project_id: None` renders the sidebar and nothing else — an explanation
 /// in place of controls with no project to point at, and zero iframes.
-fn home_term_sidebar(project_id: Option<&str>) -> String {
+fn term_work_sidebar(project_id: Option<&str>) -> String {
     let Some(project_id) = project_id else {
-        return r#"<aside class="home-term__side home-term__side--empty" aria-label="Files and diff">
+        return r#"<aside class="term-work__side term-work__side--empty" aria-label="Files and diff">
   <p class="fg-empty">This terminal is not inside a registered project, so there are no files or diff to show here.</p>
 </aside>"#
             .to_string();
     };
     format!(
-        r#"<aside class="home-term__side" aria-label="Files and diff" data-panel-src="/p/{pid}/_changes?embed=1&amp;panel=1">
-  <div class="home-term__tabs" role="group" aria-label="Show this project's files or diff">
-    <button type="button" class="home-term__tab" data-nav-tab="files" data-nav-src="/p/{pid}/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>
-    <button type="button" class="home-term__tab" data-nav-tab="diff" data-nav-src="/p/{pid}/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>
+        r#"<aside class="term-work__side" aria-label="Files and diff" data-panel-src="/p/{pid}/_changes?embed=1&amp;panel=1">
+  <div class="term-work__tabs" role="group" aria-label="Show this project's files or diff">
+    <button type="button" class="term-work__tab" data-nav-tab="files" data-nav-src="/p/{pid}/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>
+    <button type="button" class="term-work__tab" data-nav-tab="diff" data-nav-src="/p/{pid}/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>
   </div>
-  <p class="home-term__hint fg-empty">Pick Files or Diff to browse this project beside the terminal.</p>
-  <div class="home-term__navs">
-    <iframe class="home-term__nav" data-nav-for="files" title="Files in this project" hidden></iframe>
-    <iframe class="home-term__nav" data-nav-for="diff" title="Changed files in this project" hidden></iframe>
+  <p class="term-work__hint fg-empty">Pick Files or Diff to browse this project beside the terminal.</p>
+  <div class="term-work__navs">
+    <iframe class="term-work__nav" data-nav-for="files" title="Files in this project" hidden></iframe>
+    <iframe class="term-work__nav" data-nav-for="diff" title="Changed files in this project" hidden></iframe>
   </div>
 </aside>"#,
         pid = esc(project_id),
@@ -3293,42 +3318,6 @@ fn agent_switch_drawer(homepage: bool) -> String {
     )
 }
 
-/// changes-diff-screen D8: the terminal page's own FILES | DIFF panel —
-/// two toggle buttons above the screen and the container the panel opens
-/// into. Open, the panel takes the TOP HALF of the content area and the
-/// terminal compresses into the bottom half; closed (the default this
-/// renders) the page is byte-for-byte the terminal page it has always been
-/// apart from the two buttons themselves — no panel, no frame, no request.
-///
-/// D9 lives entirely in the two `data-embed-src` attributes: the panel is a
-/// same-origin iframe onto the Code and Changes pages this project already
-/// serves, in their `embed=1` chrome (topbar off, in-page sidebars intact —
-/// [`PageChrome::Embed`]). There is no fragment endpoint and no second
-/// render path, and `assets/app.js` never assembles a project id into a URL:
-/// the two addresses are built HERE, escaped here, and the script only ever
-/// copies the attribute it is handed onto the frame.
-///
-/// The `<iframe>` ships with no `src` at all — that is the laziness, in
-/// markup rather than in script: a terminal page nobody opens the panel on
-/// fetches neither page. `assets/app.js` sets it the first time a tab is
-/// opened and leaves it set, so reopening a tab shows a frame already
-/// loaded.
-fn terminal_embed_panel(project_id: &str) -> String {
-    let pid = esc(project_id);
-    format!(
-        r#"<div class="term-embed" data-project-id="{pid}">
-  <div class="term-embed__tabs" role="group" aria-label="Show this project's files or diff above the terminal">
-    <button type="button" class="term-embed__tab" data-embed-tab="files" data-embed-src="/p/{pid}/_code/?embed=1" aria-pressed="false">FILES</button>
-    <button type="button" class="term-embed__tab" data-embed-tab="diff" data-embed-src="/p/{pid}/_changes?embed=1" aria-pressed="false">DIFF</button>
-  </div>
-  <div class="term-embed__panel" hidden>
-    <iframe class="term-embed__frame" title="Project files and diff"></iframe>
-  </div>
-</div>"#,
-        pid = pid,
-    )
-}
-
 /// `GET /p/:id/_terminal` and `/p/:id/_terminal/pane/:pane_id` up state
 /// (D2/D4/D6): one pane's own page, chosen by `selected` from the pane strip
 /// (D4) rendered above it. `selected` is `None` only when `panes` is empty
@@ -3360,7 +3349,13 @@ pub fn terminal_page(
     );
     // `data-project-id` lets `assets/app.js`'s screen poller build each
     // pane's `/p/:id/_terminal/:pane_id/screen` URL without threading the id
-    // through every `.term-screen` element individually.
+    // through every `.term-screen` element individually — [`pane_cards`]
+    // above passes `base: None` precisely because this page-root id is here.
+    // term-workspace-unify: everything inside the `<main>` is
+    // [`term_workspace`]'s now, the same frame the homepage Terminals tab
+    // renders — this page composes no panel of its own. What stays its own is
+    // page navigation, not terminal presentation: the topbar, the
+    // `name · terminal` crumb and the Overview/Terminal/Transcript nav.
     // agents-drawer-global: this used to splice its own
     // `agent_switch_drawer(false)` in here — `layout_with_drawer` below now
     // renders it once for every page. A second drawer here would duplicate
@@ -3369,9 +3364,7 @@ pub fn terminal_page(
         r#"{topbar}
 {tab_style}
 <main class="fg-page fg-page--tight" data-project-id="{pid}">
-  {bar}
-  {embed}
-  <div class="term-panes">{rows}</div>
+  {workspace}
 </main>"#,
         topbar = topbar_full(
             "",
@@ -3384,9 +3377,11 @@ pub fn terminal_page(
         ),
         tab_style = PROJECT_TAB_STYLE,
         pid = esc(&project.id),
-        bar = bar,
-        embed = terminal_embed_panel(&project.id),
-        rows = rows,
+        workspace = term_workspace(
+            &bar,
+            &format!(r#"<div class="term-panes">{rows}</div>"#, rows = rows),
+            Some(&project.id),
+        ),
     );
     layout_with_drawer(&format!("{} · terminal", project.name), "", &body, false)
 }
@@ -9155,10 +9150,11 @@ enum Section {
 }
 
 /// home-terminal-panel D2: the name of the iframe a nav-mode link loads
-/// into — the panel above the terminal on the homepage terminals tab.
+/// into — the panel above the terminal, on both pages [`term_workspace`]
+/// frames.
 ///
 /// One name, two ends: the nav pages below put it in a `<base target>`, and
-/// the terminals tab names its panel iframe with it. They are the same
+/// [`term_work_panel`] names its panel iframe with it. They are the same
 /// string on purpose — a typo on either end would silently open a new
 /// browser tab instead of filling the panel, which is why neither end
 /// spells it out.
@@ -9175,7 +9171,7 @@ fn panel_base_tag() -> String {
 /// D9: how much of the outer chrome a Code or Changes page renders.
 ///
 /// `Embed` is what `?embed=1` asks for: the SAME page, minus the topbar —
-/// so a same-origin iframe (the terminal screen's FILES | DIFF panel, D8)
+/// so a same-origin iframe (the panel above the terminal, D8)
 /// shows the file list, the base picker and the reviewed marks without a
 /// second application bar stacked inside the frame. Everything inside the
 /// `.layout` is untouched; only the bar above it, and the sticky offsets
@@ -9191,7 +9187,7 @@ pub enum PageChrome {
     Embed,
     /// home-terminal-panel D2: `embed=1&nav=1` — the page reduced to its
     /// navigation alone (the changed-file list, or the Code tree), for the
-    /// homepage terminals tab's right sidebar. It is not a third render
+    /// terminal workspace's right sidebar. It is not a third render
     /// path either: the SAME `changes_nav` / `code_tree` fragments render
     /// here, minus every pane beside them, with
     /// `<base target="wd-term-panel">` in the head so a file row loads the
@@ -9200,7 +9196,7 @@ pub enum PageChrome {
     Nav,
     /// home-terminal-panel (UAT): `embed=1&panel=1` — the whole page as
     /// `Embed` renders it, minus the one thing the frame it lands in already
-    /// has beside it. The panel above the homepage terminal sits next to the
+    /// has beside it. The panel above the terminal sits next to the
     /// sidebar that IS this page's changed-file list (or its file tree), so
     /// an in-page `#sidebar` inside the frame is the same list twice, at half
     /// the width each. Only that column goes: the header — file count, base
@@ -9551,8 +9547,8 @@ fn code_side(
     sidebar_column(&code_tree(project, listing, active_file, chrome))
 }
 
-/// home-terminal-panel D2: a Code page reduced to its tree, for the homepage
-/// terminals tab's right sidebar.
+/// home-terminal-panel D2: a Code page reduced to its tree, for the terminal
+/// workspace's right sidebar.
 ///
 /// Not a second renderer: `tree` is `code_tree`'s own output, already built
 /// by the page this replaces, with nav mode's link rules baked in by
@@ -9569,7 +9565,7 @@ fn code_nav_page(title: &str, tree: &str) -> String {
 }
 
 /// home-terminal-panel D2/D3: the Changes screen reduced to its changed-file
-/// list plus the base picker, for the homepage terminals tab's right sidebar.
+/// list plus the base picker, for the terminal workspace's right sidebar.
 ///
 /// The list is `changes_nav`'s own grouping, badges and counts — the same
 /// fragment the full screen puts in its sidebar — with one difference the
