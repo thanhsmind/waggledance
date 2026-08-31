@@ -227,8 +227,10 @@ pub struct Trigger {
     engine: Arc<Engine>,
     interval: Duration,
     cooldown: Duration,
-    /// D10. Every gate above it still runs; only the one external call is
-    /// replaced by the log line describing it.
+    /// D10. Every gate that decides whether a transition is real (D9, D7/D6)
+    /// still runs above it; the one external call is replaced by the log line
+    /// describing it, and D8's rate limit — which exists only to bound that
+    /// call — is not applied to a run that makes no call.
     dry_run: bool,
     /// D8's state, and the only state this task keeps: when each project was
     /// last dispatched into. Not a record of what was observed (D5) —
@@ -334,15 +336,18 @@ impl Trigger {
     }
 
     /// The one gate every detector funnels a transition through, in this
-    /// order and deliberately: D9 self-exclusion, D7/D6 consent, D8
-    /// cooldown, D10 dry-run, the cancel flag, then the dispatch.
+    /// order and deliberately: D9 self-exclusion, D7/D6 consent, D10
+    /// dry-run, D8 cooldown, the cancel flag, then the dispatch.
     ///
     /// The order is the point. Self-exclusion runs first so a tick's own
     /// run can never even consume a cooldown slot; consent runs before
-    /// anything is spent on a project that declined orchestration; and the
-    /// cancel flag is last, immediately before the one call that spawns an
-    /// agent, which is the same placement `reaper.rs` and `supervisor.rs`
-    /// give theirs.
+    /// anything is spent on a project that declined orchestration; D10's
+    /// dry run sits ahead of D8 so the log reports EVERY real transition
+    /// rather than one per cooldown window — measuring volume is the whole
+    /// reason D10 exists, and a dry run consumes no window because it spawns
+    /// nothing; and the cancel flag is last, immediately before the one call
+    /// that spawns an agent, which is the same placement `reaper.rs` and
+    /// `supervisor.rs` give theirs.
     ///
     /// `kind` names the transition ([`TRANSITION_CAPPED`] and its siblings);
     /// `run` is the evidence pointer, `None` for a transition that is not
@@ -388,7 +393,29 @@ impl Trigger {
             return GateOutcome::NotConsented;
         }
 
-        // (3) D8 — the stamp is taken HERE, the moment the decision to act is
+        // (3) D10 — ahead of the cooldown, deliberately. D10 exists so an
+        // operator can MEASURE real transition volume before arming
+        // autonomous dispatch; behind D8 it would report at most one line per
+        // cooldown window per project, which is the measurement filtered
+        // through the very rate limit the operator is trying to size. A dry
+        // run also spends nothing — no spawn, no cooldown slot — so there is
+        // nothing for the window to protect here. Everything that decides
+        // whether a transition is REAL (D9's self-exclusion, D7/D6's consent)
+        // still runs above, so a tick's own run or a project that declined
+        // orchestration stays silent in dry run too.
+        if self.dry_run {
+            tracing::info!(
+                project = %project.id,
+                transition = kind,
+                run = run.unwrap_or("-"),
+                preset = TRIGGER_PRESET_LABEL,
+                feature = TRIGGER_FEATURE_MARKER,
+                "observer tick DRY RUN: would dispatch one tick for this transition and did not"
+            );
+            return GateOutcome::DryRun;
+        }
+
+        // (4) D8 — the stamp is taken HERE, the moment the decision to act is
         // made, not after a successful dispatch: a refusal that left the
         // window open would let a flapping run retry a failing spawn every
         // few seconds, which is the storm this window exists to bound.
@@ -410,20 +437,6 @@ impl Trigger {
         }
 
         let task = task_text(kind, project, run);
-
-        // (4) D10 — everything above ran exactly as it would in production;
-        // only the spawn is replaced by the description of it.
-        if self.dry_run {
-            tracing::info!(
-                project = %project.id,
-                transition = kind,
-                run = run.unwrap_or("-"),
-                preset = TRIGGER_PRESET_LABEL,
-                feature = TRIGGER_FEATURE_MARKER,
-                "observer tick DRY RUN: would dispatch one tick for this transition and did not"
-            );
-            return GateOutcome::DryRun;
-        }
 
         // (5) The cancel flag, last possible moment before the one call that
         // spawns an agent (`reaper.rs` and `supervisor.rs` take the same
@@ -1241,6 +1254,105 @@ mod tests {
             "the dry run must log the transition and the dispatch it withheld: {text}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D10 ahead of D8: a dry run measures VOLUME, so every transition inside
+    /// what would be one cooldown window gets its own line. Behind the
+    /// cooldown, the operator sizing the window would see exactly one line per
+    /// window — the measurement filtered through the limit being measured.
+    #[tokio::test]
+    async fn a_dry_run_logs_every_transition_inside_one_cooldown_window() {
+        let root = temp_root("dryrun-burst");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        seed_run(&engine, "run-a", None);
+        seed_run(&engine, "run-b", None);
+        seed_run(&engine, "run-c", None);
+        // The real window, so the second and third verdicts land well inside
+        // it — under the old order they would have come back `CooledDown`.
+        let (trigger, _cancel) =
+            trigger_for(herdr, engine.clone(), true, TRIGGER_DISPATCH_COOLDOWN);
+
+        let logs = CapturedLogs::new();
+        {
+            let _guard = logs.attach();
+            for run in ["run-a", "run-b", "run-c"] {
+                assert_eq!(
+                    trigger.on_verdict(run, Verdict::Lost).await,
+                    Some(GateOutcome::DryRun),
+                    "{run} is a real transition and a dry run reports every one of them"
+                );
+            }
+        }
+
+        let text = logs.text();
+        assert_eq!(
+            text.matches("DRY RUN").count(),
+            3,
+            "three transitions, three dry-run lines -- volume is what D10 measures: {text}"
+        );
+        for run in ["run-a", "run-b", "run-c"] {
+            assert!(text.contains(run), "the dry run names {run}: {text}");
+        }
+        assert!(
+            dispatched_ticks(&engine).is_empty(),
+            "a dry run still calls dispatch_run zero times, burst or not"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The gates D10 still sits BEHIND: a transition about this task's own
+    /// tick (D9), or one in a project that declined orchestration (D7), is
+    /// silent in dry run too. A dry run reports real transitions, not noise.
+    #[tokio::test]
+    async fn a_dry_run_stays_silent_for_self_excluded_and_non_consenting_transitions() {
+        let root = temp_root("dryrun-silent");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        seed_run(&engine, "run-own-tick", Some(TRIGGER_FEATURE_MARKER));
+        let (trigger, _cancel) = trigger_for(
+            herdr.clone(),
+            engine.clone(),
+            true,
+            TRIGGER_DISPATCH_COOLDOWN,
+        );
+
+        let logs = CapturedLogs::new();
+        let own = {
+            let _guard = logs.attach();
+            trigger.on_verdict("run-own-tick", Verdict::Lost).await
+        };
+        assert_eq!(own, Some(GateOutcome::SelfExcluded));
+        assert!(
+            !logs.text().contains("DRY RUN"),
+            "D9 runs before D10: a tick's own run is not a transition to report: {}",
+            logs.text()
+        );
+
+        let quiet_root = temp_root("dryrun-silent-unconsented");
+        let quiet_engine = test_engine(false, &quiet_root);
+        let quiet_herdr = spawnable_herdr(&quiet_root).await;
+        seed_run(&quiet_engine, "run-capped", None);
+        let (quiet_trigger, _quiet_cancel) = trigger_for(
+            quiet_herdr,
+            quiet_engine.clone(),
+            true,
+            TRIGGER_DISPATCH_COOLDOWN,
+        );
+
+        let quiet_logs = CapturedLogs::new();
+        let declined = {
+            let _guard = quiet_logs.attach();
+            quiet_trigger.on_verdict("run-capped", Verdict::Lost).await
+        };
+        assert_eq!(declined, Some(GateOutcome::NotConsented));
+        assert!(
+            !quiet_logs.text().contains("DRY RUN"),
+            "D7 runs before D10: a project that declined orchestration is not observed at all: {}",
+            quiet_logs.text()
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&quiet_root).ok();
     }
 
     /// The cancel flag is checked after every other gate and immediately
