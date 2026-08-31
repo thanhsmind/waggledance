@@ -23992,6 +23992,69 @@ mod tests {
         );
     }
 
+    /// pane-kick-refresh (D1 `ac627264`, D2 `5f697a7c`): a key or reply that
+    /// lands used to stay invisible until the next fixed 1500 ms screen tick.
+    /// The fix is entirely inside `assets/app.js` — a successful send
+    /// dispatches a window event carrying its pane id, and each screen poller
+    /// listens for it and refetches that one pane at once. The event name is
+    /// the whole seam: it is written twice, once on each side of a boundary
+    /// no compiler checks, so renaming one side alone silently restores the
+    /// old lag. Same two-sided idiom as
+    /// `slash_suggest_binds_to_the_composer_class_the_pages_actually_render`
+    /// above, and the same needle discipline — each assertion names one thing
+    /// the behaviour promises, never the statements it sits between
+    /// (`docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`).
+    #[test]
+    fn a_landed_send_kicks_the_screen_poller_through_the_event_both_sides_name() {
+        assert!(
+            APP_JS.contains(r#"new CustomEvent("waggledance:pane-dirty""#),
+            "app.js must still DISPATCH the pane-dirty event when a send lands"
+        );
+        assert!(
+            APP_JS.contains(r#"addEventListener("waggledance:pane-dirty""#),
+            "app.js must still LISTEN for the pane-dirty event in its screen pollers"
+        );
+        assert!(
+            APP_JS.contains("markPaneDirty"),
+            "app.js must still route every sender through the markPaneDirty helper"
+        );
+
+        // D1 leaves the steady-state poll rate alone: the kick removes the
+        // wait, it does not poll harder. The follow-ups that cover a kick
+        // landing mid-flight are bounded one-shot timers, never a new
+        // interval.
+        assert!(
+            APP_JS.contains("var POLL_MS = 1500;"),
+            "the screen pollers must still tick at 1500 ms — the kick is additive"
+        );
+        assert!(
+            APP_JS.contains("PANE_DIRTY_FOLLOW_UP_MS"),
+            "app.js must still schedule the pane-dirty follow-ups from one place"
+        );
+
+        // The markup side of the same handshake: the listener finds its pane
+        // by the `data-pane-id` the screen frame actually renders.
+        let project = sample_project();
+        let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
+            pane_id: "w1:p1".into(),
+            kind: "claude".into(),
+            name: "one".into(),
+            status: "working".into(),
+            cwd: String::new(),
+            workspace: "w1".into(),
+            tab: "t1".into(),
+            title: String::new(),
+        }];
+        let pane_html = terminal_page(&project, &panes, Some("w1:p1"), &[]);
+        assert!(
+            pane_html.contains(r#"data-pane-id="w1:p1""#),
+            "the rendered screen must still carry the data-pane-id the kick matches on: {pane_html}"
+        );
+    }
+
     /// csl-2: the menu app.js builds is invisible without its rules — the
     /// class name is the seam between the two files, so it is asserted from
     /// both ends, the way the test above pins the JS↔markup seam. `APP_CSS`
