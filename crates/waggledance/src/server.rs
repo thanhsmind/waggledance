@@ -1366,7 +1366,14 @@ async fn api_agents(State(st): State<AppState>) -> Response {
             .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r, &herdr_sessions)))
             .collect()
     };
-    Json(json!(agent_pane_rows(&snapshot, &projects, &bee))).into_response()
+    let live_waggledance_panes = live_waggledance_dispatched_panes(&st.engine);
+    Json(json!(agent_pane_rows(
+        &snapshot,
+        &projects,
+        &bee,
+        &live_waggledance_panes
+    )))
+    .into_response()
 }
 
 async fn api_config(State(st): State<AppState>) -> impl IntoResponse {
@@ -3641,10 +3648,14 @@ async fn terminal_page_inner(
             // A boundary that fails to construct (e.g. a project registered
             // on top of the hard-deny list) can never accept any pane —
             // fail closed to zero panes, not a crash and not a laxer check.
-            let panes =
+            let mut panes =
                 waggledance_core::paths_boundary::Boundary::new(vec![project.root_path.clone()])
                     .map(|boundary| project_panes(&snapshot, &boundary))
                     .unwrap_or_default();
+            overlay_waggledance_dispatched_panes(
+                &mut panes,
+                &live_waggledance_dispatched_panes(&st.engine),
+            );
             let selected = match requested_pane_id {
                 Some(pane_id) => {
                     if !panes.iter().any(|p| p.pane_id == pane_id) {
@@ -5032,6 +5043,56 @@ pub(crate) fn project_panes(
         .collect()
 }
 
+/// board-run-reaper's own guard (`SqliteStore::list_unattended_working_runs`:
+/// `status='working' AND preset_label IS NOT NULL`), read a second time here
+/// for the opposite reason it exists there — the reaper uses it to find a
+/// pane waggledance dispatched into and has since gone quiet; this uses it to
+/// find a pane waggledance dispatched into that is STILL live, keyed by pane
+/// id to the preset that spawned it. herdr classifies a pane by watching what
+/// it prints, which has nothing to do with who dispatched into it, so a
+/// freshly spawned pane can read as a plain shell to herdr right up until the
+/// dispatched program paints its first frame — this is the second witness
+/// [`overlay_waggledance_dispatched_panes`] joins against so that gap never
+/// reaches a reader. A store read failure answers the same as "no live runs"
+/// rather than fail the page: herdr's own classification is still the
+/// primary source of truth, so this join degrades to a no-op, never a 5xx.
+fn live_waggledance_dispatched_panes(engine: &Engine) -> std::collections::HashMap<String, String> {
+    engine
+        .store
+        .list_unattended_working_runs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|run| run.preset_label.map(|label| (run.pane_id, label)))
+        .collect()
+}
+
+/// Fills the one gap herdr's own pane/agent join leaves open: a pane
+/// waggledance itself dispatched a run into, still `working`, that herdr's
+/// snapshot has not (yet, or ever) classified as an agent. Only a pane
+/// [`project_panes`] already fell back to `"shell"` on is touched — a pane
+/// herdr DOES recognize as an agent keeps herdr's own kind/status untouched,
+/// exactly as before, so this never overrides a real classification with a
+/// guess. It reverts on its own the moment the run leaves `working` (done,
+/// blocked, failed, timeout): `live` is re-derived from the store on every
+/// request, so a finished run is simply absent from it next time and the
+/// pane reads as a plain shell again, with no separate cleanup step.
+fn overlay_waggledance_dispatched_panes(
+    panes: &mut [views::TerminalPaneView],
+    live: &std::collections::HashMap<String, String>,
+) {
+    for pane in panes.iter_mut() {
+        if pane.kind != "shell" {
+            continue;
+        }
+        let Some(preset_label) = live.get(&pane.pane_id) else {
+            continue;
+        };
+        pane.kind = preset_label.clone();
+        pane.name = preset_label.clone();
+        pane.status = "working".to_string();
+    }
+}
+
 /// A2's two joins for one project, built once from that project's own
 /// `.bee/sessions/*.json` and handed to every surface that needs either.
 pub(crate) struct ProjectBeeActivity {
@@ -5772,7 +5833,11 @@ fn agent_title_for(snapshot: &herdr::Snapshot, pane_id: &str) -> String {
 /// membership complement, so no pane is ever listed under two rows. A
 /// `project_panes` row whose `status` reads `"shell"` (`project_panes`'s own
 /// doc comment: no agent behind it) is dropped here — a shell holds no
-/// agent to switch to. The panes no registered project's boundary claims
+/// agent to switch to, UNLESS [`overlay_waggledance_dispatched_panes`] has
+/// already turned it into a live one (`live_waggledance_panes`, run first)
+/// — a pane waggledance itself dispatched into and is still `working` is
+/// an agent pane by waggledance's own definition, whatever herdr currently
+/// calls it. The panes no registered project's boundary claims
 /// are appended last, straight from `unassigned_panes` — already
 /// agent-only by construction (its own doc comment: sourced from
 /// `snapshot.agents`, never `snapshot.panes`), so no separate shell filter
@@ -5785,6 +5850,7 @@ fn agent_pane_rows(
     snapshot: &herdr::Snapshot,
     projects: &[waggledance_core::domain::Project],
     bee: &std::collections::HashMap<String, ProjectBeeActivity>,
+    live_waggledance_panes: &std::collections::HashMap<String, String>,
 ) -> Vec<AgentPaneRow> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rows = Vec::new();
@@ -5796,6 +5862,7 @@ fn agent_pane_rows(
             continue;
         };
         let mut project_panes = project_panes(snapshot, &boundary);
+        overlay_waggledance_dispatched_panes(&mut project_panes, live_waggledance_panes);
         if let Some(activity) = bee.get(&project.id) {
             apply_bee_activity(&mut project_panes, &activity.pane);
         }
@@ -23150,6 +23217,65 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&scratch).ok();
     }
 
+    /// dispatched-pane-agent-visibility: the terminal page's own pane strip
+    /// is built through the same `project_panes` + overlay join the
+    /// `/api/agents` feed uses (`terminal_page_inner`), so a pane herdr
+    /// still calls a shell but waggledance has a live dispatched run on
+    /// reads its mark as the dispatching preset (`claude`), never the
+    /// generic shell prompt — and goes back to reading `title="shell"` the
+    /// moment that run leaves `working`.
+    #[tokio::test]
+    async fn terminal_page_labels_a_dispatched_pane_as_its_agent_while_the_run_is_live() {
+        let dir = fresh_root("dispatched-pane-label-data");
+        enable_terminal(&dir);
+        let root = fresh_root("dispatched-pane-label-project");
+
+        let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        let pane = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "dispatched-label");
+        let run = waggledance_core::domain::Run {
+            id: "run-dispatched-label-1".into(),
+            project_id: project.id.clone(),
+            pane_id: pane.pane_id.clone(),
+            preset_label: Some("claude".into()),
+            task: "do the thing".into(),
+            baseline: String::new(),
+            marker: "HERDR_DONE_ghi789".into(),
+            status: "working".into(),
+            created_at: "2026-08-31T00:00:00Z".into(),
+            updated_at: "2026-08-31T00:00:00Z".into(),
+        };
+        st.engine.insert_run(&run, None).unwrap();
+        let app = router(st.clone());
+
+        let body = body_string(get(app, &format!("/p/{}/_terminal", project.id)).await).await;
+        assert!(
+            body.contains(r#"title="claude""#),
+            "a pane with a live dispatched run must show the dispatching agent's mark, not a bare shell: {body}"
+        );
+        assert!(
+            !body.contains(r#"title="shell""#),
+            "a live dispatched pane must never still read as a plain shell: {body}"
+        );
+
+        st.engine
+            .update_run_status(&run.id, "done", "2026-08-31T00:05:00Z", None, None)
+            .unwrap();
+        let app = router(st);
+
+        let body = body_string(get(app, &format!("/p/{}/_terminal", project.id)).await).await;
+        assert!(
+            body.contains(r#"title="shell""#),
+            "once the dispatched run finishes the pane must read as a plain shell again: {body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     // --- card-terminals-1: cross-project feature cards badge their own checkout's panes ---
 
     /// A live feature with no worktree, and its own live sibling.
@@ -28043,6 +28169,105 @@ mod bee_route_tests {
         assert!(
             !rows.iter().any(|r| r["pane_id"] == shell.pane_id),
             "a bare shell pane must never appear in the switch drawer feed: {body}"
+        );
+    }
+
+    /// dispatched-pane-agent-visibility: a pane waggledance itself
+    /// dispatched a run into is an agent pane by waggledance's own
+    /// definition even when herdr's own snapshot still calls it a bare
+    /// shell (herdr classifies a pane from what it prints, so a fresh pane
+    /// read before the dispatched program paints its first frame still
+    /// looks like a shell to it) — `GET /api/agents` must show it, joined
+    /// off the same guard the reaper uses to find its own dispatched panes
+    /// (`status = 'working' AND preset_label IS NOT NULL`).
+    #[tokio::test]
+    async fn api_agents_shows_a_dispatched_pane_herdr_still_calls_shell() {
+        let dir = fresh_root("dispatched-pane-visibility-data");
+        enable_terminal(&dir);
+        let root = fresh_root("dispatched-pane-visibility-project");
+
+        let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        let pane = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "dispatched-visibility");
+        st.engine
+            .insert_run(
+                &waggledance_core::domain::Run {
+                    id: "run-dispatched-1".into(),
+                    project_id: project.id.clone(),
+                    pane_id: pane.pane_id.clone(),
+                    preset_label: Some("claude".into()),
+                    task: "do the thing".into(),
+                    baseline: String::new(),
+                    marker: "HERDR_DONE_abc123".into(),
+                    status: "working".into(),
+                    created_at: "2026-08-31T00:00:00Z".into(),
+                    updated_at: "2026-08-31T00:00:00Z".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let app = router(st);
+
+        let resp = get(app, "/api/agents").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+
+        assert!(
+            rows.iter().any(|r| r["pane_id"] == pane.pane_id
+                && r["project_id"] == project.id
+                && r["status"] == "working"),
+            "a pane with a live waggledance-dispatched run must appear as an agent, not a shell: {body}"
+        );
+    }
+
+    /// dispatched-pane-agent-visibility: the override never outlives the run
+    /// it came from — once the dispatched run leaves `working` (here,
+    /// `done`), the pane goes right back to reading as a plain shell and
+    /// drops out of the feed again, exactly like a pane with no run ever
+    /// did.
+    #[tokio::test]
+    async fn api_agents_drops_the_pane_again_once_its_dispatched_run_finishes() {
+        let dir = fresh_root("dispatched-pane-reverts-data");
+        enable_terminal(&dir);
+        let root = fresh_root("dispatched-pane-reverts-project");
+
+        let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        let pane = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "dispatched-reverts");
+        st.engine
+            .insert_run(
+                &waggledance_core::domain::Run {
+                    id: "run-dispatched-2".into(),
+                    project_id: project.id.clone(),
+                    pane_id: pane.pane_id.clone(),
+                    preset_label: Some("claude".into()),
+                    task: "do the thing".into(),
+                    baseline: String::new(),
+                    marker: "HERDR_DONE_def456".into(),
+                    status: "done".into(),
+                    created_at: "2026-08-31T00:00:00Z".into(),
+                    updated_at: "2026-08-31T00:05:00Z".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let app = router(st);
+
+        let resp = get(app, "/api/agents").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+
+        assert!(
+            !rows.iter().any(|r| r["pane_id"] == pane.pane_id),
+            "a pane whose dispatched run has already finished must not linger in the feed: {body}"
         );
     }
 
