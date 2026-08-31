@@ -23,7 +23,7 @@
 //! "event-driven, never a timer" lives in what reaches that gate: a
 //! transition, edge-detected by its own source, never "it is time again".
 //!
-//! Two detectors are wired. D4a, a run capped, is PUSHED: its source is the
+//! Three detectors are wired. D4a, a run capped, is PUSHED: its source is the
 //! reaper's own sweep verdict, arriving over the channel `Reaper::run` was
 //! given, because the reaper is the only thing in the process that can tell a
 //! run it capped apart from an ordinary healthy completion — from outside,
@@ -33,8 +33,12 @@
 //! [`TRIGGER_OVERRUN_THRESHOLD`]. What keeps a pulled detector on the
 //! event-driven side of D3 is its edge: a per-run seen-set, so an overrun
 //! fires once when the row crosses the threshold and never again while it
-//! stays across it. The remaining two D4 detectors (blocked, escalation row)
-//! hang off the same loop and reuse the same gate.
+//! stays across it. D4b, a run's pane entering `Blocked`, is PULLED the same
+//! way, off this task's own herdr snapshot and its own
+//! [`watcher::StatusCursor`](crate::watcher::StatusCursor) — the cursor is
+//! its edge, so a pane that stays blocked is silent after the first poll.
+//! The remaining D4 detector (escalation row) hangs off the same loop and
+//! reuses the same gate.
 //!
 //! Wired in behind the terminal family switch AND `terminal.trigger_enabled`
 //! by `crate::TerminalBackground` (`crates/waggledance/src/main.rs`), the same
@@ -53,9 +57,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use waggledance_core::domain::Project;
 use waggledance_core::Engine;
 
-use crate::herdr::Herdr;
+use crate::herdr::{AgentStatus, Herdr};
 use crate::orchestrate::{self, DispatchTarget, RunStatus};
 use crate::reaper::Verdict;
+use crate::watcher::{statuses_from, StatusCursor};
 
 /// D9's marker: the `feature` every tick this task dispatches is stamped
 /// with, and the one thing that keeps the trigger from observing itself.
@@ -141,6 +146,11 @@ pub const TRANSITION_CAPPED: &str = "a run was capped";
 /// own to it.
 pub const TRANSITION_OVERRUN: &str = "a run overran";
 
+/// D4b's transition kind. A value like the two above it, on the same terms:
+/// it is substituted into [`TRIGGER_TASK_TEMPLATE`] and contributes no
+/// wording of its own to the template.
+pub const TRANSITION_BLOCKED: &str = "a run's pane entered blocked";
+
 /// The whole task text, once, for every transition kind there is (D1).
 ///
 /// Three placeholders, all pure substitution: `{transition}` is the kind's
@@ -222,6 +232,21 @@ pub struct Trigger {
     /// shape D3 forbids. Not a record of anything observed (D5): ids only,
     /// in memory, and a restart legitimately starts over.
     seen_overrun: Mutex<HashSet<String>>,
+    /// D4b's edge: this task's OWN [`StatusCursor`], fed from this task's own
+    /// herdr snapshot on every poll.
+    ///
+    /// Its own, deliberately, on two counts. The type is reused verbatim from
+    /// `watcher.rs` — a second cursor type speaking the same vocabulary would
+    /// be a fork, not a feature — but the *instance* is this task's, because
+    /// `watcher.rs`'s cursor lives inside the notify watcher and only runs
+    /// when `terminal.notify_enabled` is on. Sharing it would make
+    /// `trigger_enabled` silently depend on a different opt-in switch, which
+    /// is exactly what D6's own reasoning forbids: each of these switches
+    /// means what it says on its own.
+    ///
+    /// Not a record of anything observed (D5): last-status per pane, in
+    /// memory, and a restart legitimately starts over.
+    blocked_cursor: Mutex<StatusCursor>,
     /// Flipped by the owner (`TerminalBackground`) the moment either switch
     /// is turned off. Checked immediately before the one call with an
     /// irreversible external side effect (`dispatch_run`, which spawns an
@@ -248,6 +273,7 @@ impl Trigger {
             dry_run,
             last_dispatch: Mutex::new(HashMap::new()),
             seen_overrun: Mutex::new(HashSet::new()),
+            blocked_cursor: Mutex::new(StatusCursor::new()),
             cancelled,
         }
     }
@@ -408,9 +434,10 @@ impl Trigger {
     /// was capped from the ledger) and `Awaited(Done | Timeout)` (the reaper
     /// called `await_run` and it finished). `Awaited(Blocked)` is
     /// deliberately excluded — a blocked run is D4b's transition and D4b's
-    /// alone, and letting it through here would double-detect it the moment
-    /// that detector lands. `LeftAlone` and `TooYoung` are not transitions
-    /// at all: nothing changed.
+    /// alone, and [`Trigger::scan_blocked`] is now here to take it, so
+    /// letting it through as well would double-detect the same event.
+    /// `LeftAlone` and `TooYoung` are not transitions at all: nothing
+    /// changed.
     pub async fn on_verdict(&self, run_id: &str, verdict: Verdict) -> Option<GateOutcome> {
         let capped = matches!(
             verdict,
@@ -517,6 +544,108 @@ impl Trigger {
         outcomes
     }
 
+    /// D4b: one blocked scan, over this task's own herdr snapshot. Returns the
+    /// outcome for each run it actually took to the gate, in the order
+    /// decided.
+    ///
+    /// The source is a fresh snapshot read through this task's own [`Herdr`]
+    /// handle, fed into this task's own [`StatusCursor`] — never the notify
+    /// watcher's, see [`Trigger::blocked_cursor`] for why that independence is
+    /// the point rather than an accident.
+    ///
+    /// The cursor is the edge, and the filter is this detector's own work:
+    /// `diff` surfaces EVERY status change it sees (`Working` → `Done` just
+    /// as much as anything → `Blocked`), so the entry-into-`Blocked` filter
+    /// below is applied to its output, here, rather than expected from it. A
+    /// pane that stays `Blocked` across polls is not a change and never
+    /// reaches this filter at all; a pane already `Blocked` on the first
+    /// snapshot is a first sight, which the cursor reports and this detector
+    /// treats as an entry — the same answer `watcher.rs`'s own cursors give,
+    /// and the right one: waggledance restarting does not un-block an agent.
+    ///
+    /// A pane is not a run. The ledger's still-`working` waggledance-spawned
+    /// rows — `list_unattended_working_runs`, the same list D4c scans — are
+    /// what turns one back into a run and so into a project: a blocked pane
+    /// that belongs to no such row is a human's own agent, and this task has
+    /// nothing to say about it (D7's consent is about projects waggledance
+    /// dispatches into, and a borrowed pane's row carries no `preset_label`
+    /// to be found by anyway).
+    ///
+    /// Then D9, before the gate: a pane belonging to a tick this task
+    /// dispatched is never a transition — a tick that blocks waiting on its
+    /// own input must not wake a tick pointed at itself. The gate would catch
+    /// it too; catching it here keeps the log honest about what was dropped
+    /// and why.
+    pub async fn scan_blocked(&self) -> Vec<(String, GateOutcome)> {
+        let snapshot = match self.herdr.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                // The cursor is deliberately NOT advanced here: nothing was
+                // observed, so nothing is finished with, and the next poll
+                // judges the same panes fresh.
+                tracing::debug!("observer tick could not read a herdr snapshot: {e}");
+                return Vec::new();
+            }
+        };
+        let statuses = statuses_from(&snapshot);
+        // Lock, diff, filter, unlock — all before the first `.await` below.
+        let entered_blocked: Vec<String> = {
+            let mut cursor = self.blocked_cursor.lock().unwrap();
+            cursor
+                .diff(&statuses)
+                .into_iter()
+                .filter(|change| change.status == AgentStatus::Blocked)
+                .map(|change| change.pane_id)
+                .collect()
+        };
+        if entered_blocked.is_empty() {
+            return Vec::new();
+        }
+        let runs = match self.engine.store.list_unattended_working_runs() {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!("observer tick could not list working runs: {e}");
+                return Vec::new();
+            }
+        };
+        let mut outcomes: Vec<(String, GateOutcome)> = Vec::new();
+        for pane_id in entered_blocked {
+            // (1) The pane, resolved back to the run that owns it.
+            let Some(run) = runs.iter().find(|run| run.pane_id == pane_id) else {
+                continue;
+            };
+            // (2) D9.
+            let own = self
+                .engine
+                .run_feature(&run.id)
+                .ok()
+                .flatten()
+                .is_some_and(|f| f == TRIGGER_FEATURE_MARKER);
+            if own {
+                tracing::debug!(
+                    run = %run.id,
+                    pane = %pane_id,
+                    "observer tick skipped: the blocked pane belongs to a tick this task dispatched"
+                );
+                continue;
+            }
+            // (3) The project.
+            let project = match self.engine.get_project(&run.project_id) {
+                Ok(Some(project)) => project,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("observer tick could not read run {}'s project: {e}", run.id);
+                    continue;
+                }
+            };
+            let outcome = self
+                .maybe_dispatch(&project, TRANSITION_BLOCKED, Some(&run.id))
+                .await;
+            outcomes.push((run.id.clone(), outcome));
+        }
+        outcomes
+    }
+
     /// Run the trigger loop. `ticks` counts every completed poll — a real,
     /// externally observable side effect of the loop still running, which is
     /// what proves a switch-off actually stopped the task rather than merely
@@ -532,9 +661,10 @@ impl Trigger {
     /// receiver.
     ///
     /// The poll branch is where the pulling detectors live: D4c's overrun
-    /// scan runs there, and the counter advances after it, so a tick means a
-    /// poll that completed its scan. D4a takes the other arm — its source
-    /// pushes, so it needs no polling at all.
+    /// scan and D4b's blocked scan both run there, in that order, and the
+    /// counter advances after both — so a tick means a poll that completed
+    /// every scan it owns, never a poll that merely started. D4a takes the
+    /// other arm — its source pushes, so it needs no polling at all.
     pub async fn run(
         self,
         ticks: Arc<AtomicU64>,
@@ -548,6 +678,7 @@ impl Trigger {
             tokio::select! {
                 _ = poll.tick() => {
                     self.scan_overruns().await;
+                    self.scan_blocked().await;
                     ticks.fetch_add(1, Ordering::Relaxed);
                 }
                 received = next_verdict(&mut verdicts) => {
@@ -689,10 +820,27 @@ mod tests {
     /// The same row with `updated_at` chosen — D4c reads nothing else, so
     /// this is the whole of "a run that has been sitting for N".
     fn seed_run_at(engine: &Engine, id: &str, feature: Option<&str>, updated_at: &str) {
+        seed_run_on(engine, id, feature, updated_at, "w9:p9");
+    }
+
+    /// The same row with its `pane_id` chosen — D4b's only join between a
+    /// herdr snapshot and the ledger, so this is the whole of "this run owns
+    /// that pane".
+    fn seed_run_on_pane(engine: &Engine, id: &str, feature: Option<&str>, pane_id: &str) {
+        seed_run_on(engine, id, feature, &now_rfc3339(), pane_id);
+    }
+
+    fn seed_run_on(
+        engine: &Engine,
+        id: &str,
+        feature: Option<&str>,
+        updated_at: &str,
+        pane_id: &str,
+    ) {
         let run = Run {
             id: id.into(),
             project_id: "proj-1".into(),
-            pane_id: "w9:p9".into(),
+            pane_id: pane_id.into(),
             preset_label: Some("claude".into()),
             task: "do the thing".into(),
             baseline: "before".into(),
@@ -1024,6 +1172,137 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         assert!(older_than(LONG_AGO, now, TRIGGER_OVERRUN_THRESHOLD));
         assert!(!older_than(&now_rfc3339(), now, TRIGGER_OVERRUN_THRESHOLD));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D4b's whole path and its whole table, in the order a live fleet
+    /// produces them: a pane that is not blocked yet, the entry into
+    /// `Blocked` (one tick), the same pane still blocked on the next poll
+    /// (nothing — a block is a transition, not a condition that keeps being
+    /// true at you), and the way back out (nothing — leaving is a change, but
+    /// not a change INTO `Blocked`). The same table `watcher.rs`'s own
+    /// `StatusCursor` tests hold, judged here through the dispatch gate.
+    #[tokio::test]
+    async fn a_pane_entering_blocked_dispatches_once_and_not_while_it_stays_blocked() {
+        let root = temp_root("blocked");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        seed_run_on_pane(&engine, "run-on-p3", None, "w2:p3");
+        // A cooldown of zero so every later poll below is free to dispatch —
+        // whatever stops them must be the cursor, never D8's window.
+        let (trigger, _cancel) = trigger_for(herdr.clone(), engine.clone(), false, Duration::ZERO);
+
+        // The independence this detector owes D6: the notify watcher's switch
+        // is off, and this scan is about to work anyway.
+        assert!(
+            !engine.config.terminal.notify_enabled,
+            "this detector must not need notify_enabled to be on"
+        );
+
+        // First poll: w2:p3 is not blocked. The fake's w1:p2 IS blocked and is
+        // a first sight, but it belongs to no waggledance-spawned run — a
+        // human's own agent is not this task's business.
+        assert!(
+            trigger.scan_blocked().await.is_empty(),
+            "nothing entered blocked, and a blocked pane with no run behind it is not a transition"
+        );
+        assert!(dispatched_ticks(&engine).is_empty());
+
+        herdr
+            .set_status("w2:p3", AgentStatus::Blocked)
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.scan_blocked().await,
+            vec![("run-on-p3".to_string(), GateOutcome::Dispatched)],
+            "the entry into blocked is the transition"
+        );
+        let ticks = dispatched_ticks(&engine);
+        assert_eq!(ticks.len(), 1, "exactly one tick per transition");
+        assert!(
+            ticks[0].task.contains(TRANSITION_BLOCKED) && ticks[0].task.contains("run-on-p3"),
+            "the tick names the transition and its evidence pointer: {:?}",
+            ticks[0].task
+        );
+
+        assert!(
+            trigger.scan_blocked().await.is_empty(),
+            "a pane that is still blocked is not a second transition"
+        );
+        herdr
+            .set_status("w2:p3", AgentStatus::Working)
+            .await
+            .unwrap();
+        assert!(
+            trigger.scan_blocked().await.is_empty(),
+            "leaving blocked is a status change, but it is not D4b's transition"
+        );
+        assert_eq!(
+            dispatched_ticks(&engine).len(),
+            1,
+            "one entry into blocked, one tick"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The restart case, pinned deliberately: a run whose pane is ALREADY
+    /// blocked when this task first looks fires, because a first sight is an
+    /// entry as far as the cursor is concerned — and that is the right
+    /// answer. waggledance restarting does not un-block an agent, and the
+    /// human waiting on that pane is no less stuck for it.
+    #[tokio::test]
+    async fn a_pane_already_blocked_at_the_first_snapshot_is_an_entry() {
+        let root = temp_root("blocked-first-sight");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        // The fake seeds w1:p2 blocked from the start.
+        seed_run_on_pane(&engine, "run-on-p2", None, "w1:p2");
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), false, Duration::ZERO);
+
+        assert_eq!(
+            trigger.scan_blocked().await,
+            vec![("run-on-p2".to_string(), GateOutcome::Dispatched)]
+        );
+        assert_eq!(dispatched_ticks(&engine).len(), 1);
+
+        assert!(
+            trigger.scan_blocked().await.is_empty(),
+            "and once seen, it is finished with"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D9 in the blocked detector: a tick this task dispatched, sitting
+    /// blocked on its own prompt, is never a transition. Without this the
+    /// next poll would wake a tick about the first tick's own pane.
+    #[tokio::test]
+    async fn a_blocked_pane_belonging_to_the_tasks_own_tick_is_never_a_transition() {
+        let root = temp_root("blocked-self");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        seed_run_on_pane(
+            &engine,
+            "run-own-tick",
+            Some(TRIGGER_FEATURE_MARKER),
+            "w2:p4",
+        );
+        let (trigger, _cancel) = trigger_for(herdr.clone(), engine.clone(), false, Duration::ZERO);
+
+        assert!(trigger.scan_blocked().await.is_empty());
+        herdr
+            .set_status("w2:p4", AgentStatus::Blocked)
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.scan_blocked().await.is_empty(),
+            "the task's own pane is dropped before it is ever a transition"
+        );
+        assert_eq!(
+            dispatched_ticks(&engine).len(),
+            1,
+            "the seeded tick is the only marked run -- no second one was spawned"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
