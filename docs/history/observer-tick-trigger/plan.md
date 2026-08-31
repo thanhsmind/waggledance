@@ -157,7 +157,7 @@ evidence pointer (never strategy — D1), through a preset resolved by a `pub(cr
 | D1 exception scope creep | MEDIUM | The fixed-task-text discipline is a convention, not compiler-enforced | a test asserting the template's wording carries no per-transition branching, cited as an explicit exit criterion on E1 (not just this risk map — the first draft's gap) |
 | Self-recursion (D9) | MEDIUM, now mitigated | A trigger-dispatched run re-entering its own detectors was a real, found gap (hat-user-impact) | E1 test: a run carrying the trigger's own `feature` marker, capped, dispatches nothing |
 | Dispatch storm | MEDIUM | A flapping run could fire many transitions per second | D8 cooldown test: N transitions in one window → 1 dispatch, and the cursor still advances past the other N-1 (no retry) |
-| Fleet-wide burst | LOW-MEDIUM, accepted for now | D8 bounds per-project rate only; N consenting projects transitioning at once is N concurrent spawns (hat-alternatives, WARNING) | not proven in this slice — see CONTEXT.md's Deferred Ideas (fleet-wide ceiling) |
+| Fleet-wide burst | LOW-MEDIUM, accepted risk | D8 bounds per-project rate only; N consenting projects transitioning at once is N concurrent spawns (hat-alternatives, WARNING) | out of this slice's scope — already filed as CONTEXT.md's backlog item "fleet-wide dispatch ceiling" |
 | `.bee/supervisor/interventions.jsonl` schema drift vs. the bee CLI's own writer | LOW-MEDIUM | Parsed against CLI help text, not a generated sample | trg-4 generates one real row in a scratch store and parses it before locking the reader's struct |
 | Cross-project consent leak | LOW | `orchestration_allowed`/`terminal.enabled` are both re-checked every dispatch | unit test: transition in a non-consented project fires nothing |
 | Stuck trigger-tick pane with `reaper_enabled: false` | LOW, accepted with a required warning | D8 bounds rate, not lifespan; only `reaper` reclaims a stuck run and it is independently disableable | E1 must_have: `tracing::warn!` at reconcile when `trigger_enabled && !reaper_enabled` |
@@ -175,10 +175,12 @@ consenting repo, and stays silent otherwise. Repo-reality basis: claims 1–15 a
 | E3 | D4b blocked detection | Independent herdr-status source, reusing `watcher::StatusCursor` with its own entry-into-`Blocked` filter | trg-3 | entry into `Blocked` dispatches once; staying `Blocked` or leaving it dispatches nothing (mirrors `watcher.rs`'s own test table); runs independent of `notify_enabled` |
 | E4 | D4d escalation-row detection | The one genuinely new I/O surface (claim 11); needs its own reader in `waggledance-core`, deliberately more vocal on parse failure than existing precedent | trg-4 | a new `escalation`/`urgent` row (generated once for real, per the risk map) dispatches once; an `intervention` row does not; a missing store reads empty; a malformed line warns (naming its line number) and is skipped |
 
+<!-- bee:not-a-deferral: says the opposite of a promise — it states that nothing here is deferred to a future slice; the word "deferrable" tripped the scan on a negation. -->
 Slice queue: trg-1 → trg-2 → trg-3 → trg-4, in that order (each later cell reuses E1's
 dispatch gate, so E1 must land first); all four are the current slice — the spec's
 accept-when is exactly these four transition classes together, and none is deferrable
 to an unscheduled future slice.
+<!-- /bee:not-a-deferral -->
 
 ## Test matrix
 
@@ -205,6 +207,8 @@ for the concrete cases per epic. No `edge-dimensions.md` (standard, not hard-gat
   is also the "no cross-project push signal" accepted risk (CONTEXT.md).
 - Refining `orchestrator-dispatch` D1 beyond the narrow, logged exception (D1 above) —
   the general rule is untouched.
+<!-- bee:not-a-deferral: an "Out of scope" bullet naming where each idea already lives (CONTEXT.md's Deferred Ideas backlog) — explicitly separate feature-sized asks this feature will not act on, not a promise with a condition. -->
 - A fleet-wide dispatch ceiling beyond D8's per-project cooldown (CONTEXT.md Deferred
   Ideas) and a finer-grained, per-purpose consent lever (CONTEXT.md Deferred Ideas,
   "consent conflation") — both real, both separate feature-sized asks.
+<!-- /bee:not-a-deferral -->

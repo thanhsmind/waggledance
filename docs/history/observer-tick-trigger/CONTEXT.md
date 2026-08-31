@@ -70,11 +70,13 @@ These are fixed. Planning must implement them exactly — cited, never reinterpr
   interval beats reaper's 60s grace window in practice. Untested; low real-world
   exposure (an actively-awaited run already has a human's attention).
 
+<!-- bee:not-a-deferral: names where the idea already lives (the "Deferred Ideas" list below) rather than promising this feature will act on it — the feature's own out-of-scope section (plan.md) is explicit that a board/notify surface is separate feature-sized work, not a scheduled follow-up with a condition to trigger on. -->
 - **No cross-project push signal.** D5 forbids a local observation store, and this
   feature adds no board/UI surface (out of scope). An operator watching project A gets
   no push when a tick fires in project B — only D10's dry-run log (when on) or the
   target project's own run ledger surface it. Accepted for this feature; a real fix is
   a board/notify surface, deferred (see Deferred Ideas).
+<!-- /bee:not-a-deferral -->
 - **Consent conflation.** D7 reuses the same `orchestration_enabled` bit that already
   gates human-initiated dispatch (`orchestrator-dispatch`, `wd-supervisor-seat`). A
   project that opted in for that reason gets this feature's autonomous dispatch too,
@@ -194,7 +196,9 @@ by D1–D10:
 None — the one real gray area found during scouting (the D1 conflict) was put to the
 owner directly and resolved as D1 above.
 
+<!-- bee:not-a-deferral: template section heading — it labels the list below (questions planning already resolved into D4c/D8/etc.), it does not itself promise future action. -->
 ### Deferred To Planning
+<!-- /bee:not-a-deferral -->
 
 - [ ] Overrun threshold (D4c): exact value, and constant vs. config field.
 - [ ] Per-project cooldown window (D8): exact value, and constant vs. config field.
@@ -205,7 +209,9 @@ owner directly and resolved as D1 above.
       generated record rather than CLI help text alone.
 - [ ] Cell breakdown and slice order.
 
+<!-- bee:not-a-deferral: template section heading — it labels the backlog-idea list below (explicitly out-of-scope, separate feature-sized asks per plan.md), it does not itself promise this feature will act. -->
 ## Deferred Ideas
+<!-- /bee:not-a-deferral -->
 
 - Any refinement to the bee-side `bee supervisor` handshake itself — tracked
   separately under beehive PBI `sup-20260831-7f3a`; this feature does not wait on it
@@ -213,16 +219,19 @@ owner directly and resolved as D1 above.
 - A board/notify surface showing trigger-dispatched runs across the whole fleet (closes
   the "no cross-project push signal" accepted risk above) — not asked for, no UI scope
   in this feature.
+<!-- bee:not-a-deferral: a backlog idea in the "Deferred Ideas" list, not a scheduled action — "a real but separate feature" names it as out-of-scope future work with no condition this feature will trigger on. -->
 - A finer-grained, per-purpose consent lever distinguishing "this project accepts
   human-initiated dispatch" from "this project accepts autonomous trigger dispatch"
   (closes the "consent conflation" accepted risk above) — a real but separate feature;
   `orchestration_enabled` stays the single flag for both, for now.
+<!-- /bee:not-a-deferral -->
 - A fleet-wide dispatch ceiling (bounding total concurrent trigger-originated runs
   across all projects, on top of D8's per-project cooldown) — raised at the hat wave
   (`hat-alternatives`) as a WARNING, not a BLOCKER; left to Agent's Discretion in
   plan.md rather than locked here, since D8 already bounds the worst case per project
   and no evidence yet shows the fleet-wide case is live.
 
+<!-- bee:not-a-deferral: standard Handoff Note boilerplate — describes what planning already read and consumed (the "Deferred To Planning" questions were resolved into D4c/D8/etc.), it does not itself promise future action. -->
 ## Handoff Note
 
 CONTEXT.md is the source of truth. Decision IDs (D1–D10) are stable — cited, never
@@ -230,3 +239,4 @@ renumbered. Planning reads the locked decisions, the code context, the canonical
 references, and the deferred-to-planning questions above before drafting cells. D9 and
 D10 were added post-Gate-1 by planning's hat wave (2026-08-31) — new decisions are the
 sanctioned way to evolve a locked record; D1–D8 were not reinterpreted.
+<!-- /bee:not-a-deferral -->

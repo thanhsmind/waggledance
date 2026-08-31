@@ -13,11 +13,13 @@ BLOCKERS:
    reaching `blocked` — outside D4's closed list and colliding with D4b — fixed by
    sourcing D4a from `Reaper`'s own verdict channel instead (which never emits
    `Awaited(Blocked)`).
+<!-- bee:not-a-deferral: describes a deferral in the FIRST DRAFT that this hat wave already fixed — historical record of what changed, not a live promise to act later. -->
 3. Preset resolution was deferred to Open Questions favoring `preset_label: None`,
    which is unworkable (`DispatchTarget::Spawn` requires a resolved `entry`; an
    unlabeled run is invisible to `list_unattended_working_runs`'s own filter) — fixed:
    Approach now names `resolve_preset` made `pub(crate)` as the resolution path, and
    the Open Questions entry is removed.
+<!-- /bee:not-a-deferral -->
 
 WARNINGS: 3 claims-table rows were reflowed rather than byte-verbatim; one claim (bee.rs
 readers "warn + skip by line number") was factually wrong (the module has zero
@@ -47,12 +49,14 @@ SMALLER PATH: FAIL (cheaper shape exists) in the first draft — adopted in full
    (`terminal.trigger_dry_run`), a strictly more useful, equally cheap valve, adopted
    as a new locked decision.
 
+<!-- bee:not-a-deferral: historical record of the hat wave's own disposition — records that the fleet-wide idea was filed into CONTEXT.md's Deferred Ideas, it does not itself promise future action. -->
 Also adopted as WARNINGs: name the trigger's own poll interval explicitly (mirroring
 `reaper::SWEEP_INTERVAL`); state the `reaper_enabled` soft-dependency explicitly (now a
 required `tracing::warn!` must_have on E1, also independently raised by hat-user-impact);
 flag a fleet-wide dispatch ceiling as real but out of this slice's scope (recorded in
 CONTEXT.md's Deferred Ideas, not locked — no evidence yet that the fleet-wide case is
 live, and D8 already bounds the per-project worst case).
+<!-- /bee:not-a-deferral -->
 
 ## hat-user-impact (sonnet)
 
@@ -63,6 +67,7 @@ CONTEXT.md D9 — every detector filters out a run/row carrying the trigger's ow
 `feature` marker before treating it as a transition; E1's Proof Needed now includes
 this as an explicit exit criterion.
 
+<!-- bee:not-a-deferral: historical record of where this hat-wave seat's findings were filed (CONTEXT.md's Accepted risks / Deferred Ideas) — not itself a promise of future action. -->
 Also found: no cross-project push signal reaches the operator when a tick fires
 elsewhere in the fleet; the shared `orchestration_enabled` flag conflates two different
 kinds of consent (human-initiated dispatch vs. this feature's autonomous dispatch);
@@ -72,6 +77,7 @@ D1-D8 shape itself — recorded as CONTEXT.md's "Accepted risks" (with the
 `reaper_enabled` warning promoted to a required must_have, since it is cheap and both
 other seats' own WARNING lists raised it independently) and as Deferred Ideas for the
 two that need real, separate feature work (a visibility surface, a finer consent lever).
+<!-- /bee:not-a-deferral -->
 
 ## Disposition
 
