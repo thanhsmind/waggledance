@@ -2962,6 +2962,18 @@ struct TerminalConfigJson {
     /// safely (reads as off) rather than with a hard parse error.
     #[serde(default)]
     unassigned_enabled: bool,
+    /// observer-tick-trigger (D6): the in-daemon fleet-transition trigger's
+    /// own switch, off unless the owner made a deliberate act — see
+    /// `TerminalConfig::trigger_enabled`'s doc for the full reasoning.
+    /// `#[serde(default)]` matches every other switch on this struct.
+    #[serde(default)]
+    trigger_enabled: bool,
+    /// observer-tick-trigger (D10): log-only preview of the trigger above —
+    /// see `TerminalConfig::trigger_dry_run`'s doc. Independent in meaning
+    /// from `trigger_enabled`, but only takes effect while it is also on
+    /// (`reconcile_trigger`'s `enabled` gate in `main.rs`).
+    #[serde(default)]
+    trigger_dry_run: bool,
     /// D7/D9 notification destination — a plain (non-secret) field, see
     /// `TerminalConfig::notify_chat_id`. Only overwrites the stored value
     /// when non-blank, matching every other optional field on this form
@@ -3012,6 +3024,8 @@ async fn update_terminal_config(
     cfg.terminal.supervisor_enabled = form.supervisor_enabled;
     cfg.terminal.notify_enabled = form.notify_enabled;
     cfg.terminal.unassigned_enabled = form.unassigned_enabled;
+    cfg.terminal.trigger_enabled = form.trigger_enabled;
+    cfg.terminal.trigger_dry_run = form.trigger_dry_run;
     if let Some(dest) = form
         .notify_chat_id
         .as_deref()
@@ -13998,6 +14012,55 @@ mod bee_route_tests {
         assert!(saved.terminal.supervisor_enabled);
         assert!(saved.terminal.notify_enabled);
         assert!(saved.terminal.unassigned_enabled);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// trigger-settings-toggle: `trigger_enabled` and `trigger_dry_run` had
+    /// no Settings checkbox and no field on this route's JSON body, so the
+    /// only way to reach them was hand-editing config.toml plus a daemon
+    /// restart. Proves the two new fields are saved AND, like every other
+    /// switch on this route (`gated_switch_route_starts_and_stops_the_live_background_tasks`),
+    /// reconciled into a live task synchronously with no restart — the
+    /// route already unconditionally passes `Some(st.engine.clone())` to
+    /// `reconcile`, and `trigger_runs_only_with_the_family_switch_and_its_own_switch_on`
+    /// (main.rs) already proves that combination arms the trigger.
+    #[tokio::test]
+    async fn json_post_saves_and_arms_the_observer_tick_trigger_with_no_restart() {
+        let dir = fresh_root("terminal-trigger-switch-live");
+        let st = build_state_with_dir(&dir);
+        let app = router(st.clone());
+
+        assert!(!st.terminal_background.trigger_running());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1")
+                    .method("POST")
+                    .uri("/api/terminal-config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "enabled": true,
+                            "trigger_enabled": true,
+                            "trigger_dry_run": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_redirection());
+
+        let saved = Config::load_from(&dir.join("config.toml"));
+        assert!(saved.terminal.trigger_enabled);
+        assert!(saved.terminal.trigger_dry_run);
+        assert!(
+            st.terminal_background.trigger_running(),
+            "turning trigger_enabled on through the gated route must arm the trigger task with no restart"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

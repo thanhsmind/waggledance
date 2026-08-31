@@ -10897,6 +10897,9 @@ pub fn settings_page(
       <label class="fg-check"><input type="checkbox" name="notify_enabled" {term_notify}><span class="fg-check__text">Notify on agent status change</span></label>
       <label class="fg-check"><input type="checkbox" name="unassigned_enabled" {term_unassigned}><span class="fg-check__text">Show unassigned agent panes</span></label>
       <span class="fg-field__hint">Off by default. Turning this on makes every agent pane on this machine readable and writable through the browser, including ones outside any project waggledance knows about — unrelated repositories, root shells, other people's agents. It has no boundary check of its own.</span>
+      <label class="fg-check"><input type="checkbox" name="trigger_enabled" {term_trigger}><span class="fg-check__text">Wake a bee supervisor tick on fleet events</span></label>
+      <label class="fg-check"><input type="checkbox" name="trigger_dry_run" {term_trigger_dry_run}><span class="fg-check__text">Dry run: log what a tick would do, without waking one or calling an LLM</span></label>
+      <span class="fg-field__hint">Off by default. When on, a run capped, blocked, or overrun — or a new escalation row — wakes one cold `bee supervisor` observation tick in that project, spawning an LLM agent with no human in the loop. Dry run only takes effect while the switch above it is also on: it logs every detection and the tick it would have dispatched, but never spawns one — a way to watch real trigger volume before it costs an LLM call.</span>
     </fieldset>
     <fieldset><legend>Telegram notification</legend>
       <div class="fg-field">
@@ -10939,6 +10942,8 @@ pub fn settings_page(
         term_supervisor = checked(cfg.terminal.supervisor_enabled),
         term_notify = checked(cfg.terminal.notify_enabled),
         term_unassigned = checked(cfg.terminal.unassigned_enabled),
+        term_trigger = checked(cfg.terminal.trigger_enabled),
+        term_trigger_dry_run = checked(cfg.terminal.trigger_dry_run),
         notify_chat_id = esc(cfg.terminal.notify_chat_id.as_deref().unwrap_or("")),
         notify_credential_hint = notify_credential_hint,
         notify_credential_placeholder = esc(&notify_credential_placeholder),
