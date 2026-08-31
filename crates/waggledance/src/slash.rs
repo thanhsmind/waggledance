@@ -18,20 +18,35 @@
 //! Every read here is best-effort: a missing `.claude/commands` directory is
 //! the normal case, not an error, and an unreadable file drops out of the list
 //! rather than failing the request.
+//!
+//! Feature `slash-builtin-commands` adds a third source after those two: the
+//! commands the agent CLI itself answers (`/model`, `/usage`, …), taken from
+//! the static per-vendor table in [`crate::slash_builtins`] (D1 `86c7ef5f`).
+//! They are appended LAST, so the same first-seen-wins loop makes the shadow
+//! order project → user → builtin (D3 `2104c427`), and they appear only when
+//! the caller resolved a vendor for the pane's agent (D2 `fe5b9256`) — a
+//! shell pane suggesting `/model` would be a lie.
 
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::slash_builtins::CLAUDE_BUILTINS;
+
 /// How long a description may be before it is cut — the popup shows one line.
 const DESCRIPTION_MAX: usize = 120;
 
-/// Which of the two things a suggestion is. Serialized as the bare lowercase
-/// word (`"command"` / `"skill"`) the endpoint's JSON contract promises.
+/// Which of the three things a suggestion is. Serialized as the bare lowercase
+/// word (`"command"` / `"skill"` / `"builtin"`) the endpoint's JSON contract
+/// promises — the popup badges an entry by this string, so the third value
+/// needs no client change (D3 `2104c427`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SlashKind {
     Command,
     Skill,
+    /// A command the agent CLI answers itself, from the vendor table — never
+    /// a file under `.claude/`.
+    Builtin,
 }
 
 /// One suggestion: what the user types after `/`, what it is, and the one line
@@ -47,12 +62,52 @@ pub struct SlashEntry {
     pub description: String,
 }
 
-/// Every slash command and skill offerable behind a pane: the project's own
-/// (when the page has a project) shadowing the user-level set, sorted by name.
+/// The vendor whose built-in table applies to an agent of this `kind`, or
+/// `None` when nothing is known for it (D2 `fe5b9256`).
+///
+/// Deliberately the same substring classification `views.rs::bee_hub_agent_logo`
+/// uses, so `claude-code`, `Claude`, and `claude` all land on one vendor. Only
+/// `claude` has a table today (D1 `86c7ef5f`): every other kind answers `None`
+/// rather than a guessed list, because no other agent CLI was installed to
+/// extract one from and a list written from memory is provably wrong.
+pub fn vendor_for_kind(kind: &str) -> Option<&'static str> {
+    let k = kind.trim().to_ascii_lowercase();
+    if k.contains("claude") {
+        Some("claude")
+    } else {
+        None
+    }
+}
+
+/// The vendor's own commands as suggestions. An unknown vendor yields nothing.
+fn builtin_entries(vendor: &str) -> Vec<SlashEntry> {
+    let table: &[(&str, &str, &str)] = match vendor {
+        "claude" => CLAUDE_BUILTINS,
+        _ => return Vec::new(),
+    };
+    table
+        .iter()
+        .map(|(name, _hint, description)| SlashEntry {
+            name: (*name).to_string(),
+            kind: SlashKind::Builtin,
+            description: truncate(description),
+        })
+        .collect()
+}
+
+/// Every slash command, skill, and built-in offerable behind a pane: the
+/// project's own (when the page has a project) shadowing the user-level set,
+/// both shadowing the pane agent's built-ins, sorted by name.
 ///
 /// `project_root` is `None` for pages with no project — `/_slash` — which then
-/// serves the user level alone.
-pub fn slash_entries(project_root: Option<&Path>, home: &Path) -> Vec<SlashEntry> {
+/// serves the user level alone. `vendor` is `None` when the caller could not
+/// resolve an agent for the pane — no pane parameter, an unknown pane, or a
+/// plain shell pane — and no built-in is then offered at all (D2 `fe5b9256`).
+pub fn slash_entries(
+    project_root: Option<&Path>,
+    home: &Path,
+    vendor: Option<&str>,
+) -> Vec<SlashEntry> {
     let mut entries: Vec<SlashEntry> = Vec::new();
     let mut seen: HashSet<(SlashKind, String)> = HashSet::new();
 
@@ -83,6 +138,21 @@ pub fn slash_entries(project_root: Option<&Path>, home: &Path) -> Vec<SlashEntry
         &mut entries,
         &mut seen,
     );
+
+    // Built-ins go last so the file-based sources above already own their
+    // names: a project or user command called `model` is the one the user
+    // wrote, and it keeps the agent's own `/model` out of the list (D3
+    // `2104c427`). Unlike the file sources, which shadow per name+kind, a
+    // built-in loses to ANY earlier entry of the same name — the agent
+    // resolves one `/model`, whatever kind of thing shadowed it.
+    if let Some(vendor) = vendor {
+        let taken: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let fresh: Vec<SlashEntry> = builtin_entries(vendor)
+            .into_iter()
+            .filter(|e| !taken.contains(e.name.as_str()))
+            .collect();
+        entries.extend(fresh);
+    }
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
@@ -299,7 +369,7 @@ mod tests {
             "---\ndescription: user deploy\n---\n",
         );
 
-        let entries = slash_entries(Some(&root), &home);
+        let entries = slash_entries(Some(&root), &home, None);
 
         assert_eq!(
             entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
@@ -326,7 +396,7 @@ mod tests {
             "---\ndescription: z\n---\n",
         );
 
-        let entries = slash_entries(Some(&root), &home);
+        let entries = slash_entries(Some(&root), &home, None);
 
         assert_eq!(find(&entries, "x").kind, SlashKind::Command);
         assert_eq!(find(&entries, "y").kind, SlashKind::Skill);
@@ -360,7 +430,7 @@ mod tests {
             "---\ndescription: user plan command\n---\n",
         );
 
-        let entries = slash_entries(Some(&root), &home);
+        let entries = slash_entries(Some(&root), &home, None);
 
         let plans: Vec<_> = entries.iter().filter(|e| e.name == "plan").collect();
         assert_eq!(
@@ -411,7 +481,7 @@ mod tests {
             &format!("---\ndescription: {}\n---\n", "x".repeat(200)),
         );
 
-        let entries = slash_entries(None, &home);
+        let entries = slash_entries(None, &home, None);
 
         assert_eq!(find(&entries, "quoted").description, "from frontmatter");
         assert_eq!(find(&entries, "bodied").description, "The first real line.");
@@ -433,7 +503,7 @@ mod tests {
         let home = tmp.path().join("home");
 
         assert!(
-            slash_entries(Some(&root), &home).is_empty(),
+            slash_entries(Some(&root), &home, None).is_empty(),
             "nothing on disk at all yields an empty list, never a panic"
         );
 
@@ -443,7 +513,7 @@ mod tests {
         );
         fs::create_dir_all(root.join(".claude/skills")).unwrap();
 
-        let entries = slash_entries(Some(&root), &home);
+        let entries = slash_entries(Some(&root), &home, None);
         assert_eq!(
             entries.len(),
             1,
@@ -452,9 +522,141 @@ mod tests {
         assert_eq!(entries[0].name, "only");
 
         assert_eq!(
-            slash_entries(None, &home),
+            slash_entries(None, &home, None),
             entries,
             "no project means the user-level list alone"
+        );
+    }
+
+    /// D2 `fe5b9256`: the kind→vendor map is the substring classification
+    /// `bee_hub_agent_logo` uses, and only `claude` has a table (D1) — every
+    /// other kind, including a shell pane's absent one, resolves to nothing
+    /// rather than to a guessed list.
+    #[test]
+    fn vendor_for_kind_matches_claude_by_substring_and_nothing_else_yet() {
+        assert_eq!(vendor_for_kind("claude"), Some("claude"));
+        assert_eq!(vendor_for_kind("Claude-Code"), Some("claude"));
+        assert_eq!(vendor_for_kind("  claude  "), Some("claude"));
+        assert_eq!(vendor_for_kind("codex"), None);
+        assert_eq!(vendor_for_kind("gemini"), None);
+        assert_eq!(vendor_for_kind(""), None);
+    }
+
+    /// A claude pane is offered claude's own commands beside the files, and a
+    /// pane with no resolved vendor is offered none of them.
+    #[test]
+    fn a_claude_vendor_adds_builtins_and_no_vendor_adds_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        let home = tmp.path().join("home");
+        write(
+            root.join(".claude/commands/x.md"),
+            "---\ndescription: run x\n---\n",
+        );
+
+        let with = slash_entries(Some(&root), &home, Some("claude"));
+        let model = find(&with, "model");
+        assert_eq!(model.kind, SlashKind::Builtin);
+        assert_eq!(
+            serde_json::to_value(model).unwrap()["kind"],
+            serde_json::json!("builtin"),
+            "the third value of the endpoint's kind contract"
+        );
+        assert!(
+            !model.description.is_empty(),
+            "the table carries the vendor's own blurb: {model:?}"
+        );
+        assert_eq!(find(&with, "usage").kind, SlashKind::Builtin);
+        assert_eq!(
+            find(&with, "x").kind,
+            SlashKind::Command,
+            "the project's own command is still there beside the built-ins"
+        );
+
+        let without = slash_entries(Some(&root), &home, None);
+        assert_eq!(
+            without.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["x"],
+            "no vendor means no built-in at all"
+        );
+        assert!(
+            !without.iter().any(|e| e.kind == SlashKind::Builtin),
+            "and no builtin-kinded entry either"
+        );
+
+        assert!(
+            slash_entries(Some(&root), &home, Some("no-such-vendor"))
+                .iter()
+                .all(|e| e.kind != SlashKind::Builtin),
+            "an unknown vendor has no table, and is not an error"
+        );
+    }
+
+    /// D3 `2104c427`: built-ins come last, so a file-based command of the same
+    /// name wins — and unlike the per-name+kind shadowing between files, the
+    /// built-in loses to it outright rather than sitting beside it.
+    #[test]
+    fn a_project_command_shadows_the_builtin_of_the_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        let home = tmp.path().join("home");
+        write(
+            root.join(".claude/commands/model.md"),
+            "---\ndescription: our own model picker\n---\n",
+        );
+        write(
+            home.join(".claude/skills/usage/SKILL.md"),
+            "---\ndescription: user usage skill\n---\n",
+        );
+
+        let entries = slash_entries(Some(&root), &home, Some("claude"));
+
+        let models: Vec<_> = entries.iter().filter(|e| e.name == "model").collect();
+        assert_eq!(models.len(), 1, "one /model survives, not two: {models:?}");
+        assert_eq!(models[0].kind, SlashKind::Command);
+        assert_eq!(models[0].description, "our own model picker");
+
+        let usages: Vec<_> = entries.iter().filter(|e| e.name == "usage").collect();
+        assert_eq!(
+            usages.len(),
+            1,
+            "a user SKILL shadows the built-in too, across kinds: {usages:?}"
+        );
+        assert_eq!(usages[0].kind, SlashKind::Skill);
+
+        assert!(
+            entries.iter().any(|e| e.name == "compact"),
+            "the built-ins nobody shadowed are still offered"
+        );
+        assert!(
+            entries.windows(2).all(|w| w[0].name <= w[1].name),
+            "still sorted by name after the built-ins are appended"
+        );
+    }
+
+    /// D1 `86c7ef5f`: the table is extracted data, not recall. These names
+    /// were in a memory-written list and are NOT registered by claude 2.1.251;
+    /// their presence would mean somebody hand-edited the table back.
+    #[test]
+    fn the_builtin_table_carries_no_hand_written_entries() {
+        let entries = builtin_entries("claude");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for invented in ["cost", "review", "doctor", "todos", "rewind", "vim"] {
+            assert!(
+                !names.contains(&invented),
+                "/{invented} is not registered by the extracted bundle"
+            );
+        }
+        for real in ["model", "usage", "compact", "clear", "help"] {
+            assert!(names.contains(&real), "/{real} must come from the table");
+        }
+        assert!(
+            !names.contains(&"agents"),
+            "a `(removed)` row must be dropped, not transcribed"
+        );
+        assert!(
+            names.windows(2).all(|w| w[0] <= w[1]),
+            "the table itself is stored sorted by name"
         );
     }
 }

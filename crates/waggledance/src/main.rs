@@ -12,6 +12,7 @@ mod reaper;
 mod runtime;
 mod server;
 mod slash;
+mod slash_builtins;
 mod supervisor;
 mod views;
 mod watch;
