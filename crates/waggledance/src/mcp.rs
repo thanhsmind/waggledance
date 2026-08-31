@@ -819,7 +819,14 @@ fn attach_panes(
 /// (`orchestrator-dispatch` D3, unweakened). Nor does this widen who may
 /// dispatch: `terminal.enabled` and the per-project `orchestration.enabled`
 /// are checked by the caller and remain the only gate (D5).
-fn resolve_preset(
+///
+/// `pub(crate)` rather than private since observer-tick-trigger: the trigger
+/// (`crates/waggledance/src/trigger.rs`) dispatches its own ticks and needs a
+/// resolved entry to spawn one at all, so it calls this — the one resolver,
+/// with its global-then-project order intact — rather than growing a second
+/// copy that could disagree with it. Visibility only; no caller's answer
+/// changes.
+pub(crate) fn resolve_preset(
     engine: &Engine,
     project: &waggledance_core::domain::Project,
     label: &str,

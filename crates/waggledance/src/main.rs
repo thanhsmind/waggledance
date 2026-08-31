@@ -21,6 +21,7 @@ mod server;
 mod slash;
 mod slash_builtins;
 mod supervisor;
+mod trigger;
 mod views;
 mod watch;
 mod watcher;
@@ -79,6 +80,15 @@ pub struct TerminalBackground {
     /// board-run-reaper: the third background task, same shape as the other
     /// two — a slot, a cancel flag, and a tick counter.
     reaper: Mutex<Option<CancellableTask>>,
+    /// observer-tick-trigger: the fourth background task, same shape again.
+    trigger: Mutex<Option<CancellableTask>>,
+    /// The trigger's D4a inbox, handed to the reaper at construction so every
+    /// sweep verdict reaches it (`reaper::Reaper::run`'s `verdicts`
+    /// parameter). `None` whenever the trigger is off, which is what makes a
+    /// terminal-family-off or trigger-off install cost the reaper exactly
+    /// nothing. `reconcile` reconciles the trigger BEFORE the reaper so this
+    /// slot is already correct when the reaper reads it.
+    trigger_verdicts: Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, reaper::Verdict)>>>,
     /// The notification store handed down to the dispatch path while
     /// notifications are enabled (D6/dbn-3). `None` when notifications
     /// are disabled.
@@ -88,6 +98,7 @@ pub struct TerminalBackground {
     supervisor_stopping: Mutex<Option<JoinHandle<()>>>,
     notify_stopping: Mutex<Option<JoinHandle<()>>>,
     reaper_stopping: Mutex<Option<JoinHandle<()>>>,
+    trigger_stopping: Mutex<Option<JoinHandle<()>>>,
     /// Incremented once per completed health check while the supervisor
     /// task is actually running — a real side effect, not bookkeeping.
     supervisor_ticks: Arc<AtomicU64>,
@@ -97,6 +108,16 @@ pub struct TerminalBackground {
     /// Incremented once per completed sweep while the reaper task is
     /// actually running.
     reaper_ticks: Arc<AtomicU64>,
+    /// Incremented once per completed poll while the trigger task is
+    /// actually running.
+    trigger_ticks: Arc<AtomicU64>,
+    /// Whether the reaper currently running was constructed WITH the
+    /// trigger's verdict inbox. The inbox is a construction-time parameter,
+    /// so this is what tells "already running, leave it" apart from "already
+    /// running, but wired for the other configuration".
+    reaper_verdicts_armed: AtomicBool,
+    /// The same question for the trigger's own D10 dry-run mode.
+    trigger_dry_run_armed: AtomicBool,
 }
 
 /// A live background task plus the flag that lets its owner cancel the next
@@ -131,6 +152,11 @@ impl TerminalBackground {
         self.reaper.lock().unwrap().is_some()
     }
 
+    /// True while the observer-tick trigger's task is live.
+    pub fn trigger_running(&self) -> bool {
+        self.trigger.lock().unwrap().is_some()
+    }
+
     /// The notification store available to the dispatch path while the notify
     /// switch is on (D6/dbn-3). Returns `None` when notifications are
     /// disabled so no alerts are raised or enqueued outside the opt-in switch.
@@ -161,6 +187,14 @@ impl TerminalBackground {
         self.reaper_ticks.load(Ordering::SeqCst)
     }
 
+    /// How many polls the observer-tick trigger has actually completed —
+    /// same counter contract as the three above. Only this module's own
+    /// tests read it today.
+    #[cfg(test)]
+    fn trigger_ticks(&self) -> u64 {
+        self.trigger_ticks.load(Ordering::SeqCst)
+    }
+
     /// Start what `cfg` says should be running and isn't; stop (abort) what
     /// is running and shouldn't be. A switch already in the state `cfg`
     /// wants is left untouched — flipping the *other* switch never disturbs
@@ -181,6 +215,10 @@ impl TerminalBackground {
         engine: Option<Arc<waggledance_core::Engine>>,
     ) {
         self.reconcile_supervisor(cfg.supervisor_enabled, herdr.clone());
+        // observer-tick-trigger: reconciled BEFORE the reaper, and only for
+        // that reason — the reaper is constructed with the trigger's D4a
+        // inbox, so the inbox has to be armed (or cleared) first.
+        self.reconcile_trigger(cfg, herdr.clone(), engine.clone());
         // board-run-reaper: mastered by the terminal family switch on top of
         // its own, unlike the two above — the reaper's own switch defaults
         // ON, so `enabled` is what keeps a terminal-family-off install from
@@ -215,6 +253,11 @@ impl TerminalBackground {
     /// A `None` engine switches the reaper off no matter what the config
     /// says: the sweep reads and writes the run ledger, and there is no
     /// ledger to sweep without one.
+    ///
+    /// The trigger's D4a inbox (`self.trigger_verdicts`) is read here rather
+    /// than passed in, so every existing caller — production and test —
+    /// keeps its own signature and gets `None`, which is the pre-trigger
+    /// behaviour byte for byte.
     fn reconcile_reaper_with_timings(
         &self,
         enabled: bool,
@@ -224,42 +267,152 @@ impl TerminalBackground {
         grace: Duration,
     ) {
         let enabled = enabled && engine.is_some();
+        let verdicts = self.trigger_verdicts.lock().unwrap().clone();
+        let want_verdicts = verdicts.is_some();
         let mut slot = self.reaper.lock().unwrap();
-        match (enabled, slot.take()) {
-            (true, Some(existing)) => *slot = Some(existing), // already running
-            (true, None) => {
-                let Some(engine) = engine else { return };
-                let previous = self.reaper_stopping.lock().unwrap().take();
-                let cancelled = Arc::new(AtomicBool::new(false));
-                let sweep = reaper::Reaper::with_cancel_flag(
-                    control,
-                    engine,
-                    interval,
-                    grace,
-                    cancelled.clone(),
-                );
-                let ticks = self.reaper_ticks.clone();
-                let handle = tokio::spawn(async move {
-                    if let Some(prev) = previous {
-                        let _ = prev.await;
-                    }
-                    sweep.run(ticks).await;
-                });
-                *slot = Some(CancellableTask {
-                    handle,
-                    cancel: cancelled,
-                });
-            }
-            (false, Some(existing)) => {
-                // Cancel first — checked by the sweep immediately before the
-                // one call that can close a pane — then abort, keeping the
-                // handle so the next switch-on waits for this one to be gone.
-                existing.cancel.store(true, Ordering::SeqCst);
-                existing.handle.abort();
-                *self.reaper_stopping.lock().unwrap() = Some(existing.handle);
-            }
-            (false, None) => {}
+        let running = slot.take();
+        // A sweep already running with the WRONG verdict wiring is restarted
+        // rather than left alone: the inbox is a construction-time
+        // parameter, so arming the trigger while the reaper is already
+        // sweeping can only reach it through a fresh task. Same wiring,
+        // still running: untouched, exactly as before.
+        if enabled
+            && running.is_some()
+            && self.reaper_verdicts_armed.load(Ordering::SeqCst) == want_verdicts
+        {
+            *slot = running;
+            return;
         }
+        if let Some(existing) = running {
+            // Cancel first — checked by the sweep immediately before the
+            // one call that can close a pane — then abort, keeping the
+            // handle so the next switch-on waits for this one to be gone.
+            existing.cancel.store(true, Ordering::SeqCst);
+            existing.handle.abort();
+            *self.reaper_stopping.lock().unwrap() = Some(existing.handle);
+        }
+        if !enabled {
+            return;
+        }
+        let Some(engine) = engine else { return };
+        let previous = self.reaper_stopping.lock().unwrap().take();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let sweep =
+            reaper::Reaper::with_cancel_flag(control, engine, interval, grace, cancelled.clone());
+        let ticks = self.reaper_ticks.clone();
+        let handle = tokio::spawn(async move {
+            if let Some(prev) = previous {
+                let _ = prev.await;
+            }
+            sweep.run(ticks, verdicts).await;
+        });
+        self.reaper_verdicts_armed
+            .store(want_verdicts, Ordering::SeqCst);
+        *slot = Some(CancellableTask {
+            handle,
+            cancel: cancelled,
+        });
+    }
+
+    /// observer-tick-trigger (D6): the same reconcile shape as the three
+    /// tasks above — mastered by the terminal family switch on top of its
+    /// own like the reaper, and switched off entirely by a `None` engine,
+    /// since every gate it applies (the run ledger, the project registry,
+    /// D7's per-project consent bit) is read through one.
+    ///
+    /// Takes the whole `TerminalConfig` rather than a resolved `bool`
+    /// because it owns the one cross-switch check in this section: the
+    /// reaper is the only thing that reclaims a dispatched observation tick
+    /// whose pane wedges, so arming this task with the reaper off is a legal
+    /// configuration that leaks one stuck pane per stuck tick. Legal, and
+    /// never silent.
+    fn reconcile_trigger(
+        &self,
+        cfg: &waggledance_core::config::TerminalConfig,
+        control: Arc<dyn herdr::Herdr>,
+        engine: Option<Arc<waggledance_core::Engine>>,
+    ) {
+        if let Some(warning) = trigger::lifecycle_warning(cfg) {
+            tracing::warn!("{warning}");
+        }
+        self.reconcile_trigger_with_timings(
+            cfg.enabled && cfg.trigger_enabled,
+            cfg.trigger_dry_run,
+            control,
+            engine,
+            trigger::TRIGGER_POLL_INTERVAL,
+            trigger::TRIGGER_DISPATCH_COOLDOWN,
+        );
+    }
+
+    /// `interval`/`cooldown` are parameterized for the same reason as
+    /// [`reconcile_reaper_with_timings`](Self::reconcile_reaper_with_timings):
+    /// only so a test can drive the loop fast enough to observe real ticks.
+    ///
+    /// Switching on is also what arms `self.trigger_verdicts`, the D4a inbox
+    /// the reaper is constructed with — which is why `reconcile` runs this
+    /// before `reconcile_reaper`.
+    fn reconcile_trigger_with_timings(
+        &self,
+        enabled: bool,
+        dry_run: bool,
+        control: Arc<dyn herdr::Herdr>,
+        engine: Option<Arc<waggledance_core::Engine>>,
+        interval: Duration,
+        cooldown: Duration,
+    ) {
+        let enabled = enabled && engine.is_some();
+        let mut slot = self.trigger.lock().unwrap();
+        let running = slot.take();
+        // Same restart-on-mismatch rule as the reaper's verdict wiring:
+        // `dry_run` is a construction-time parameter, so flipping D10's
+        // switch on a live task has to go through a fresh one or it would
+        // silently keep dispatching for real.
+        if enabled
+            && running.is_some()
+            && self.trigger_dry_run_armed.load(Ordering::SeqCst) == dry_run
+        {
+            *slot = running;
+            return;
+        }
+        if let Some(existing) = running {
+            // Cancel first — checked immediately before the one call that
+            // spawns an agent — then abort, keeping the handle so the next
+            // switch-on waits for this one to be gone.
+            *self.trigger_verdicts.lock().unwrap() = None;
+            existing.cancel.store(true, Ordering::SeqCst);
+            existing.handle.abort();
+            *self.trigger_stopping.lock().unwrap() = Some(existing.handle);
+        }
+        if !enabled {
+            *self.trigger_verdicts.lock().unwrap() = None;
+            return;
+        }
+        let Some(engine) = engine else { return };
+        let previous = self.trigger_stopping.lock().unwrap().take();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (verdicts_tx, verdicts_rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.trigger_verdicts.lock().unwrap() = Some(verdicts_tx);
+        let task = trigger::Trigger::with_cancel_flag(
+            control,
+            engine,
+            interval,
+            cooldown,
+            dry_run,
+            cancelled.clone(),
+        );
+        let ticks = self.trigger_ticks.clone();
+        let handle = tokio::spawn(async move {
+            if let Some(prev) = previous {
+                let _ = prev.await;
+            }
+            task.run(ticks, Some(verdicts_rx)).await;
+        });
+        self.trigger_dry_run_armed.store(dry_run, Ordering::SeqCst);
+        *slot = Some(CancellableTask {
+            handle,
+            cancel: cancelled,
+        });
     }
 
     fn reconcile_supervisor(&self, enabled: bool, control: Arc<dyn herdr::Herdr>) {
@@ -527,6 +680,14 @@ impl Drop for TerminalBackground {
             t.cancel.store(true, Ordering::SeqCst);
             t.handle.abort();
         }
+        if let Some(t) = self.trigger.lock().unwrap().take() {
+            t.cancel.store(true, Ordering::SeqCst);
+            t.handle.abort();
+        }
+        if let Some(h) = self.trigger_stopping.lock().unwrap().take() {
+            h.abort();
+        }
+        *self.trigger_verdicts.lock().unwrap() = None;
         if let Some(h) = self.supervisor_stopping.lock().unwrap().take() {
             h.abort();
         }
@@ -923,6 +1084,122 @@ mod terminal_background_tests {
             ticks_at_off,
             bg.reaper_ticks(),
             "switching off must stop the sweep from ticking again"
+        );
+    }
+
+    /// observer-tick-trigger D6: the trigger is off in a default config, and
+    /// mastered by BOTH the terminal family switch and its own — the
+    /// off-by-default class, unlike the reaper beside it.
+    #[tokio::test]
+    async fn trigger_runs_only_with_the_family_switch_and_its_own_switch_on() {
+        let bg = TerminalBackground::new();
+        let fake = Arc::new(FakeHerdr::new());
+
+        assert!(
+            !TerminalConfig::default().trigger_enabled,
+            "a task that spawns an LLM agent must never default on"
+        );
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake.clone(),
+            store(),
+            None,
+            Some(engine()),
+        );
+        assert!(!bg.trigger_running(), "default config starts no trigger");
+
+        // Its own switch on, family off: still nothing.
+        let mut cfg = TerminalConfig {
+            trigger_enabled: true,
+            ..Default::default()
+        };
+        bg.reconcile(&cfg, fake.clone(), store(), None, Some(engine()));
+        assert!(
+            !bg.trigger_running(),
+            "the family switch masters this one too"
+        );
+
+        cfg.enabled = true;
+        bg.reconcile(&cfg, fake.clone(), store(), None, Some(engine()));
+        assert!(bg.trigger_running(), "both switches on starts the trigger");
+
+        // And with no engine there is no ledger, registry, or consent bit to
+        // read — switches or not.
+        bg.reconcile(&cfg, fake, store(), None, None);
+        assert!(!bg.trigger_running(), "no engine, no trigger");
+    }
+
+    /// The trigger's own teeth, mirroring `reaper_off_actually_stops_the_sweep`
+    /// exactly: `trigger_ticks` counts completed polls, so a switch-off that
+    /// only emptied the slot would leave this advancing.
+    #[tokio::test]
+    async fn trigger_off_actually_stops_the_loop() {
+        let bg = TerminalBackground::new();
+        let fake: Arc<dyn crate::herdr::Herdr> = Arc::new(FakeHerdr::new());
+        let fast = Duration::from_millis(15);
+
+        assert_eq!(bg.trigger_ticks(), 0, "nothing ticks before the switch-on");
+        bg.reconcile_trigger_with_timings(true, false, fake.clone(), Some(engine()), fast, fast);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        let ticks_while_on = bg.trigger_ticks();
+        assert!(
+            ticks_while_on >= 2,
+            "the trigger must actually poll while switched on (ticks={ticks_while_on})"
+        );
+
+        bg.reconcile_trigger_with_timings(false, false, fake, Some(engine()), fast, fast);
+        let ticks_at_off = bg.trigger_ticks();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            ticks_at_off,
+            bg.trigger_ticks(),
+            "switching off must stop the trigger from polling again"
+        );
+    }
+
+    /// The D4a wiring, at the seam `reconcile` owns: the reaper is handed
+    /// the trigger's verdict inbox exactly when the trigger is armed, and
+    /// nothing otherwise — including when the trigger is armed AFTER the
+    /// reaper was already sweeping, which only a restart can deliver.
+    #[tokio::test]
+    async fn the_reaper_carries_the_triggers_verdict_inbox_only_while_it_is_armed() {
+        let bg = TerminalBackground::new();
+        let fake = Arc::new(FakeHerdr::new());
+
+        // Reaper alone (the default pair): no inbox exists at all.
+        let mut cfg = TerminalConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        bg.reconcile(&cfg, fake.clone(), store(), None, Some(engine()));
+        assert!(bg.reaper_running());
+        assert!(
+            bg.trigger_verdicts.lock().unwrap().is_none(),
+            "a trigger-off install costs the reaper nothing"
+        );
+
+        // Arming the trigger while the reaper is already sweeping must reach
+        // the reaper, which means restarting it.
+        cfg.trigger_enabled = true;
+        bg.reconcile(&cfg, fake.clone(), store(), None, Some(engine()));
+        assert!(bg.trigger_running());
+        assert!(
+            bg.trigger_verdicts.lock().unwrap().is_some(),
+            "the inbox is armed with the trigger"
+        );
+        assert!(
+            bg.reaper_verdicts_armed.load(Ordering::SeqCst),
+            "the running sweep must have been rebuilt around the new inbox"
+        );
+
+        // Disarming clears it again, both halves.
+        cfg.trigger_enabled = false;
+        bg.reconcile(&cfg, fake, store(), None, Some(engine()));
+        assert!(!bg.trigger_running());
+        assert!(bg.trigger_verdicts.lock().unwrap().is_none());
+        assert!(
+            !bg.reaper_verdicts_armed.load(Ordering::SeqCst),
+            "and the sweep goes back to dropping its verdicts"
         );
     }
 
