@@ -23,13 +23,18 @@
 //! "event-driven, never a timer" lives in what reaches that gate: a
 //! transition, edge-detected by its own source, never "it is time again".
 //!
-//! Today one detector is wired: D4a, a run capped. Its source is the
-//! reaper's own sweep verdict, arriving over the channel
-//! `Reaper::run` was given, because the reaper is the only thing in the
-//! process that can tell a run it capped apart from an ordinary healthy
-//! completion — from outside, the ledger's status column reads identically
-//! for both. The remaining three D4 detectors (blocked, overrun, escalation
-//! row) hang off the poll branch of the same loop and reuse the same gate.
+//! Two detectors are wired. D4a, a run capped, is PUSHED: its source is the
+//! reaper's own sweep verdict, arriving over the channel `Reaper::run` was
+//! given, because the reaper is the only thing in the process that can tell a
+//! run it capped apart from an ordinary healthy completion — from outside,
+//! the ledger's status column reads identically for both. D4c, a run
+//! overrun, is PULLED: the poll branch scans the same ledger list the reaper
+//! sweeps and compares each row's age against
+//! [`TRIGGER_OVERRUN_THRESHOLD`]. What keeps a pulled detector on the
+//! event-driven side of D3 is its edge: a per-run seen-set, so an overrun
+//! fires once when the row crosses the threshold and never again while it
+//! stays across it. The remaining two D4 detectors (blocked, escalation row)
+//! hang off the same loop and reuse the same gate.
 //!
 //! Wired in behind the terminal family switch AND `terminal.trigger_enabled`
 //! by `crate::TerminalBackground` (`crates/waggledance/src/main.rs`), the same
@@ -37,11 +42,13 @@
 //! tasks already follow: `reconcile_trigger` is the only place a [`Trigger`]
 //! is ever constructed, and either switch off drives it to spawn nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::mpsc::UnboundedReceiver;
 use waggledance_core::domain::Project;
 use waggledance_core::Engine;
@@ -101,12 +108,38 @@ pub const TRIGGER_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// [`Trigger::maybe_dispatch`] for the contract every detector follows.
 pub const TRIGGER_DISPATCH_COOLDOWN: Duration = Duration::from_secs(900);
 
+/// D4c: how long a still-`working` run must have sat untouched before this
+/// task calls it overrun.
+///
+/// One hour, and the reasoning is entirely about what the reaper has already
+/// ruled out by then. [`crate::reaper::GRACE_WINDOW`] (60s) plus its
+/// `AWAIT_BUDGET` (5s) is the whole window in which a run is merely
+/// *unattended*; past it the reaper judges the row on every
+/// [`crate::reaper::SWEEP_INTERVAL`] (30s) and caps it the moment the pane is
+/// gone or the marker lands. So a row still `working` an hour later is one
+/// the reaper has looked at some 120 times and deliberately left alone every
+/// time: the pane is alive, the agent has not declared done, and nothing
+/// mechanical is going to resolve it. That is the condition worth waking an
+/// observer for — sixty times the reaper's own window, so no ordinary slow
+/// agent and no await race can reach it, and short enough that a wedged
+/// session is noticed inside one working session rather than the next day.
+///
+/// D4's own wording is the constraint on how this is computed: an overrun is
+/// "computed by waggledance from its own run ledger, never LLM-judged". It is
+/// arithmetic on `updated_at`, and that is all it will ever be.
+pub const TRIGGER_OVERRUN_THRESHOLD: Duration = Duration::from_secs(3600);
+
 /// D4a's transition kind, as it is named to the woken observer.
 ///
 /// The kind is a value substituted into [`TRIGGER_TASK_TEMPLATE`], never a
 /// branch in it (D1). Each later detector adds its own constant beside this
 /// one; none of them may add wording.
 pub const TRANSITION_CAPPED: &str = "a run was capped";
+
+/// D4c's transition kind. A value, exactly like [`TRANSITION_CAPPED`] — it
+/// is substituted into [`TRIGGER_TASK_TEMPLATE`] and adds no wording of its
+/// own to it.
+pub const TRANSITION_OVERRUN: &str = "a run overran";
 
 /// The whole task text, once, for every transition kind there is (D1).
 ///
@@ -182,6 +215,13 @@ pub struct Trigger {
     /// last dispatched into. Not a record of what was observed (D5) —
     /// nothing about the transition itself is stored, only that one happened.
     last_dispatch: Mutex<HashMap<String, Instant>>,
+    /// D4c's edge, and the reason a poll is not a timer: the run ids this
+    /// task has already reported as overrun. A row stays overrun for as long
+    /// as it stays stuck, so without this set every poll would re-fire the
+    /// same transition — which is exactly the "fires because time passed"
+    /// shape D3 forbids. Not a record of anything observed (D5): ids only,
+    /// in memory, and a restart legitimately starts over.
+    seen_overrun: Mutex<HashSet<String>>,
     /// Flipped by the owner (`TerminalBackground`) the moment either switch
     /// is turned off. Checked immediately before the one call with an
     /// irreversible external side effect (`dispatch_run`, which spawns an
@@ -207,6 +247,7 @@ impl Trigger {
             cooldown,
             dry_run,
             last_dispatch: Mutex::new(HashMap::new()),
+            seen_overrun: Mutex::new(HashSet::new()),
             cancelled,
         }
     }
@@ -403,6 +444,79 @@ impl Trigger {
         )
     }
 
+    /// D4c: one overrun scan, over every still-`working` run waggledance
+    /// spawned. Returns the outcome for each run it actually took to the
+    /// gate, in the order decided.
+    ///
+    /// The source is `list_unattended_working_runs` — the reaper's own sweep
+    /// list, project-blind and age-blind, and the only source this detector
+    /// has. No new store method exists for it: the threshold below is
+    /// policy, and policy stays out of the store exactly as that method's own
+    /// doc asks.
+    ///
+    /// Four filters in this order, each cheap before the one after it:
+    ///
+    /// 1. D9 — a row carrying [`TRIGGER_FEATURE_MARKER`] is a tick this task
+    ///    dispatched, and a wedged tick must never wake a tick about itself.
+    ///    [`Trigger::maybe_dispatch`] would catch it too; catching it here
+    ///    keeps a stuck tick out of the seen-set as well.
+    /// 2. Age — [`TRIGGER_OVERRUN_THRESHOLD`] against `updated_at`, the same
+    ///    fail-closed parse the reaper's own age check uses.
+    /// 3. The project, resolved. Fail-closed and *without* marking the run
+    ///    seen: a row whose project will not read is undecided, not
+    ///    finished with, so a later poll may still judge it.
+    /// 4. The seen-set — fire once per run id, forever. It is set before the
+    ///    gate is called, because the gate's contract is that every outcome
+    ///    means this transition is finished with.
+    pub async fn scan_overruns(&self) -> Vec<(String, GateOutcome)> {
+        let runs = match self.engine.store.list_unattended_working_runs() {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!("observer tick could not list working runs: {e}");
+                return Vec::new();
+            }
+        };
+        let now = OffsetDateTime::now_utc();
+        let mut outcomes: Vec<(String, GateOutcome)> = Vec::new();
+        for run in runs {
+            // (1) D9.
+            let own = self
+                .engine
+                .run_feature(&run.id)
+                .ok()
+                .flatten()
+                .is_some_and(|f| f == TRIGGER_FEATURE_MARKER);
+            if own {
+                continue;
+            }
+            // (2) Age.
+            if !older_than(&run.updated_at, now, TRIGGER_OVERRUN_THRESHOLD) {
+                continue;
+            }
+            // (3) The project.
+            let project = match self.engine.get_project(&run.project_id) {
+                Ok(Some(project)) => project,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("observer tick could not read run {}'s project: {e}", run.id);
+                    continue;
+                }
+            };
+            // (4) Fire once per run, whatever the gate then decides.
+            {
+                let mut seen = self.seen_overrun.lock().unwrap();
+                if !seen.insert(run.id.clone()) {
+                    continue;
+                }
+            }
+            let outcome = self
+                .maybe_dispatch(&project, TRANSITION_OVERRUN, Some(&run.id))
+                .await;
+            outcomes.push((run.id, outcome));
+        }
+        outcomes
+    }
+
     /// Run the trigger loop. `ticks` counts every completed poll — a real,
     /// externally observable side effect of the loop still running, which is
     /// what proves a switch-off actually stopped the task rather than merely
@@ -417,9 +531,10 @@ impl Trigger {
     /// dropped and the loop carries on rather than spinning on a dead
     /// receiver.
     ///
-    /// The poll branch is where the remaining detectors live. Today it only
-    /// advances the tick counter — D4a needs no polling, since its source
-    /// pushes.
+    /// The poll branch is where the pulling detectors live: D4c's overrun
+    /// scan runs there, and the counter advances after it, so a tick means a
+    /// poll that completed its scan. D4a takes the other arm — its source
+    /// pushes, so it needs no polling at all.
     pub async fn run(
         self,
         ticks: Arc<AtomicU64>,
@@ -432,6 +547,7 @@ impl Trigger {
         loop {
             tokio::select! {
                 _ = poll.tick() => {
+                    self.scan_overruns().await;
                     ticks.fetch_add(1, Ordering::Relaxed);
                 }
                 received = next_verdict(&mut verdicts) => {
@@ -462,6 +578,23 @@ async fn next_verdict(
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Whether `updated_at` is at least `threshold` old as of `now` — D4c's whole
+/// arithmetic.
+///
+/// Fail-closed in both odd directions, for the same reason
+/// `reaper::older_than` is (and deliberately the same shape as it): a
+/// timestamp that will not parse, and one stamped in the future (clock skew),
+/// both answer `false`. An age this task cannot prove is not an overrun, and
+/// waking a cold agent about a row on the strength of an unparseable
+/// timestamp is exactly the kind of noise D3 and D8 exist to keep out.
+fn older_than(updated_at: &str, now: OffsetDateTime, threshold: Duration) -> bool {
+    let Ok(stamped) = OffsetDateTime::parse(updated_at, &Rfc3339) else {
+        return false;
+    };
+    let threshold = time::Duration::try_from(threshold).unwrap_or(time::Duration::ZERO);
+    now - stamped >= threshold
 }
 
 /// The configuration combination that leaves a dispatched tick unreclaimable,
@@ -542,9 +675,20 @@ mod tests {
         herdr
     }
 
+    /// A long-dead RFC3339 stamp — any row carrying it is past
+    /// [`TRIGGER_OVERRUN_THRESHOLD`] by years, whatever the threshold's value
+    /// is later tuned to.
+    const LONG_AGO: &str = "2020-01-01T00:00:00Z";
+
     /// A run row the reaper would have swept: waggledance-spawned
     /// (`preset_label` present), stamped with `feature`.
     fn seed_run(engine: &Engine, id: &str, feature: Option<&str>) {
+        seed_run_at(engine, id, feature, &now_rfc3339());
+    }
+
+    /// The same row with `updated_at` chosen — D4c reads nothing else, so
+    /// this is the whole of "a run that has been sitting for N".
+    fn seed_run_at(engine: &Engine, id: &str, feature: Option<&str>, updated_at: &str) {
         let run = Run {
             id: id.into(),
             project_id: "proj-1".into(),
@@ -555,7 +699,7 @@ mod tests {
             marker: "HERDR_DONE_seed".into(),
             status: "working".into(),
             created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
+            updated_at: updated_at.to_string(),
         };
         engine.insert_run(&run, feature).unwrap();
     }
@@ -791,6 +935,108 @@ mod tests {
         );
         assert!(dispatched_ticks(&engine).is_empty());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D4c's whole path, and its edge: a still-`working` row past the
+    /// threshold wakes exactly one tick, and the SAME row — still working,
+    /// still overrun — wakes nothing on the next poll. An overrun is a
+    /// transition, not a condition that keeps being true at you.
+    #[tokio::test]
+    async fn an_overrun_run_dispatches_once_and_not_again_on_the_next_poll() {
+        let root = temp_root("overrun");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        seed_run_at(&engine, "run-stuck", None, LONG_AGO);
+        // A cooldown of zero so a second dispatch would be free to happen —
+        // this test must prove the seen-set stopped it, never D8's window.
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), false, Duration::ZERO);
+
+        let first = trigger.scan_overruns().await;
+        assert_eq!(
+            first,
+            vec![("run-stuck".to_string(), GateOutcome::Dispatched)],
+            "one overrun row, one dispatch"
+        );
+        let ticks = dispatched_ticks(&engine);
+        assert_eq!(ticks.len(), 1);
+        assert!(
+            ticks[0].task.contains(TRANSITION_OVERRUN) && ticks[0].task.contains("run-stuck"),
+            "the tick names the transition and its evidence pointer: {:?}",
+            ticks[0].task
+        );
+
+        let second = trigger.scan_overruns().await;
+        assert!(
+            second.is_empty(),
+            "a still-overrunning row is not a second transition: {second:?}"
+        );
+        assert_eq!(
+            dispatched_ticks(&engine).len(),
+            1,
+            "fire once per run, forever"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D9 in the pulling detector: a tick this task dispatched, wedged and
+    /// long overdue, is never an overrun transition. Without this a stuck
+    /// tick would wake a tick about itself on the very next poll.
+    #[tokio::test]
+    async fn the_tasks_own_stuck_tick_is_never_an_overrun() {
+        let root = temp_root("overrun-self");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        seed_run_at(
+            &engine,
+            "run-own-tick",
+            Some(TRIGGER_FEATURE_MARKER),
+            LONG_AGO,
+        );
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), false, Duration::ZERO);
+
+        assert!(
+            trigger.scan_overruns().await.is_empty(),
+            "the task's own row is dropped before it is ever a transition"
+        );
+        assert_eq!(
+            dispatched_ticks(&engine).len(),
+            1,
+            "the seeded tick is the only marked run -- no second one was spawned"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other side of the threshold, and the fail-closed parse with it: a
+    /// fresh row is not overrun, and neither is one whose age cannot be read.
+    #[tokio::test]
+    async fn a_run_younger_than_the_threshold_dispatches_nothing() {
+        let root = temp_root("overrun-young");
+        let engine = test_engine(true, &root);
+        let herdr = spawnable_herdr(&root).await;
+        seed_run(&engine, "run-fresh", None);
+        seed_run_at(&engine, "run-unreadable", None, "whenever");
+        seed_run_at(&engine, "run-skewed", None, "2099-01-01T00:00:00Z");
+        let (trigger, _cancel) = trigger_for(herdr, engine.clone(), false, Duration::ZERO);
+
+        assert!(trigger.scan_overruns().await.is_empty());
+        assert!(dispatched_ticks(&engine).is_empty());
+
+        let now = OffsetDateTime::now_utc();
+        assert!(older_than(LONG_AGO, now, TRIGGER_OVERRUN_THRESHOLD));
+        assert!(!older_than(&now_rfc3339(), now, TRIGGER_OVERRUN_THRESHOLD));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The threshold is chosen against the reaper's own windows, not picked
+    /// out of the air — a value inside them would fire on runs the reaper is
+    /// still in the middle of judging.
+    #[test]
+    fn the_overrun_threshold_sits_well_past_what_the_reaper_handles() {
+        assert!(
+            TRIGGER_OVERRUN_THRESHOLD > crate::reaper::GRACE_WINDOW * 10,
+            "an overrun must be a run the reaper has repeatedly left alone, \
+             not one it has not looked at yet"
+        );
     }
 
     /// D1's discipline, made mechanical: the task text is ONE template with
