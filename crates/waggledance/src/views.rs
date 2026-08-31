@@ -2371,9 +2371,30 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    child of `.term-controls`". */
 .term-keys { display: grid; grid-template-columns: repeat(6, minmax(44px, 1fr)); gap: var(--space-1); }
 .term-keys button { padding: var(--space-1) var(--space-2); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; font-size: var(--type-caption-size); }
+/* term-keys-nav-tint D1 (`334b8353`): the four arrows are NAVIGATION, a
+   different class of control from the keys around them — Esc/Tab/⇧Tab/
+   Ctrl+C/Enter send a key to the program, Approve/Stage/Paste act on the
+   session — so they read as their own cluster instead of four more action
+   buttons. The tint is the INFO accent on purpose, never `--color-action`:
+   the action colour is what Send and a latched modifier wear, and it would
+   say "act" over a control that only moves the cursor. `color-mix` over the
+   same surface token every other key uses keeps both themes correct with no
+   literal colour (the idiom `.fg-callout` and `.bee-hub__group-waiting`
+   already use). */
+   The cluster is selected by its own class, never by per-arrow attribute
+   selectors: any such literal in this stylesheet sits BEFORE the markup and
+   is what every assertion locating a key by its bare attribute would find
+   first. That is not hypothetical — it is how the grid-order test broke on
+   the first attempt here, and then a second time from this very comment
+   quoting the selector it was warning about
+   (`docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`).
+   Nothing in this block may spell one out, prose included. */
+.term-keys button.term-keys__nav { background: color-mix(in srgb, var(--color-accent-alt-2) 14%, var(--color-surface-raised)); border-color: color-mix(in srgb, var(--color-accent-alt-2) 40%, var(--color-border)); color: var(--color-accent-alt-2); }
 /* D2: a latched modifier (Ctrl/Shift/Alt) reads the same way Send already
    does — filled with the action colour — so the one lit key is obvious
-   before the next tap combines with it and clears the latch. */
+   before the next tap combines with it and clears the latch. The arrow
+   tint above is deliberately declared BEFORE this rule: a latched arrow (a
+   combo like Ctrl+←) must still light up the same as any other key. */
 .term-keys button[aria-pressed="true"] { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); }
 /* D3: Paste dims exactly like Approve does when it is withheld — the same
    rule, the same reason: a control that cannot act yet must look like it
@@ -3257,14 +3278,14 @@ fn pane_controls(
       <button type="button" data-key="escape">Esc</button>
       <button type="button" data-key="tab">Tab</button>
       {approve_btn}
-      <button type="button" data-key="up">↑</button>
+      <button type="button" class="term-keys__nav" data-key="up">↑</button>
       <button type="button" class="term-reply__stage" data-pane-id="{pane_id}">Stage</button>
       <button type="button" data-key="ctrl+c">Ctrl+C</button>
       <button type="button" data-key="shift+tab">⇧Tab</button>
       <button type="button" class="term-keys__paste" aria-label="Paste into the reply to {name}">Paste</button>
-      <button type="button" data-key="left">←</button>
-      <button type="button" data-key="down">↓</button>
-      <button type="button" data-key="right">→</button>
+      <button type="button" class="term-keys__nav" data-key="left">←</button>
+      <button type="button" class="term-keys__nav" data-key="down">↓</button>
+      <button type="button" class="term-keys__nav" data-key="right">→</button>
       <button type="button" data-key="enter">Enter</button>
     </div>
   </div>
@@ -14857,6 +14878,63 @@ mod tests {
             !html.contains(".term-reply__send { min-width: 44px")
                 && !html.contains(".term-reply__stage { min-width: 44px"),
             "the reply buttons must carry no such rule: {html}"
+        );
+    }
+
+    /// term-keys-nav-tint D1 (`334b8353`): the four arrows carry their own
+    /// colour so the navigation cluster reads apart from the action keys
+    /// beside it. Three things are pinned, and each would be a real
+    /// regression on its own: every one of the four arrows is selected (a
+    /// rule that named three would leave one odd key behind), the tint is
+    /// the INFO accent rather than `--color-action` (which Send and a
+    /// latched modifier own — see the rule right below it), and the colour
+    /// arrives through tokens so both themes stay correct. Needles are
+    /// single selectors, never a span of adjacent declarations — the pitfall
+    /// in `docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`.
+    #[test]
+    fn the_arrow_keys_are_tinted_apart_from_the_action_keys() {
+        // The markup half needs a pane actually rendered, so it comes from
+        // `pane_controls` (the idiom the other grid-markup tests use); the
+        // stylesheet half comes from the page that ships it.
+        let html = pane_controls("pane-1", "Agent One", false, None, None);
+        let project = sample_project();
+        let css = terminal_page(&project, &[], None, &[]);
+        for key in ["up", "down", "left", "right"] {
+            assert!(
+                html.contains(&format!(
+                    "<button type=\"button\" class=\"term-keys__nav\" data-key=\"{key}\">"
+                )),
+                "the {key} arrow must carry the navigation class: {html}"
+            );
+        }
+        // Nothing else in the grid wears the class — leaked onto another key
+        // it would silently join the cluster.
+        assert_eq!(
+            html.matches("class=\"term-keys__nav\"").count(),
+            4,
+            "exactly the four arrows may carry the navigation class: {html}"
+        );
+        // The other half of the handshake: the class the markup wears is the
+        // one the stylesheet actually paints.
+        assert!(
+            css.contains(".term-keys button.term-keys__nav {"),
+            "the navigation tint must select the arrows by that class: {css}"
+        );
+        assert!(
+            css.contains("color: var(--color-accent-alt-2); }"),
+            "the arrows must take the info accent as their glyph colour: {css}"
+        );
+        assert!(
+            css.contains("color-mix(in srgb, var(--color-accent-alt-2) 14%, var(--color-surface-raised))"),
+            "the arrow ground must be the info accent mixed over the shared surface token: {css}"
+        );
+        // The action colour stays what it was: Send's and a latched
+        // modifier's, never the arrows'.
+        assert!(
+            css.contains(
+                ".term-keys button[aria-pressed=\"true\"] { background: var(--color-action);"
+            ),
+            "the latch rule must still own the action colour: {css}"
         );
     }
 
