@@ -2139,111 +2139,13 @@
   })();
 
 
-  // Terminal FILES | DIFF panel (changes-diff-screen, D8/D9): the terminal
-  // page can put this project's own file tree or its working-tree diff in the
-  // TOP HALF of the screen area, the terminal compressing into the bottom
-  // half — watching an agent work and reading what it just wrote is one
-  // glance, not two tabs. Clicking the tab that is already open closes the
-  // panel and the terminal returns to full height.
-  //
-  // D9's two addresses are the SERVER's (`views.rs::terminal_embed_panel`):
-  // each button carries its own `data-embed-src`, already escaped, and this
-  // module only ever copies that attribute onto the frame. No project id is
-  // assembled here, and no URL that is not one of those two attributes can
-  // ever reach the iframe — including on the restore path below, where the
-  // stored value only ever NAMES a tab this page already rendered.
-  //
-  // The frame is lazy in the markup itself (no `src` ships), and once loaded
-  // it stays loaded: closing hides the panel rather than tearing the frame
-  // down, so reopening the same tab shows a page that is already there.
-  (function () {
-    var root = document.querySelector(".term-embed[data-project-id]");
-    if (!root) return;
-    var tabs = Array.prototype.slice.call(
-      root.querySelectorAll(".term-embed__tab[data-embed-tab]")
-    );
-    var panel = root.querySelector(".term-embed__panel");
-    var frame = root.querySelector(".term-embed__frame");
-    if (!tabs.length || !panel || !frame) return;
-    // The split is a property of the whole content area, not of the panel:
-    // `<main>` is what has to stop scrolling the page and start dividing a
-    // fixed height between the two halves.
-    var main = document.querySelector("main.fg-page[data-project-id]");
-    var KEY = "waggledance-term-panel:" + root.getAttribute("data-project-id");
-    var openTab = "";
-
-    function paint() {
-      tabs.forEach(function (btn) {
-        var on = btn.getAttribute("data-embed-tab") === openTab;
-        btn.setAttribute("aria-pressed", on ? "true" : "false");
-        btn.classList.toggle("term-embed__tab--on", on);
-      });
-      panel.hidden = !openTab;
-      root.classList.toggle("term-embed--open", !!openTab);
-      if (main) main.classList.toggle("term-split", !!openTab);
-      // The terminal keeps its full WIDTH either way — the panel is above it,
-      // never beside it — but the bottom half becomes its own scroll
-      // container, and that scrollbar can take a few pixels off the screen's
-      // available width. The screen poller already refits on `resize` and
-      // already skips a pane whose available width did not actually move, so
-      // this reuses that path instead of reaching into the poller: nothing
-      // about polling, input or scrollback changes here.
-      try { window.dispatchEvent(new Event("resize")); } catch (e) {}
-    }
-
-    function tabButton(name) {
-      var found = null;
-      tabs.forEach(function (btn) {
-        if (btn.getAttribute("data-embed-tab") === name) found = btn;
-      });
-      return found;
-    }
-
-    function show(name) {
-      var btn = tabButton(name);
-      if (!btn) return;
-      var src = btn.getAttribute("data-embed-src") || "";
-      if (!src) return;
-      openTab = name;
-      if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);
-      paint();
-    }
-
-    function close() {
-      openTab = "";
-      paint();
-    }
-
-    // Storage is a hostile input like everywhere else (the rail and tab-bar
-    // collapses above take the same shape): a disabled or quota-blocked
-    // `sessionStorage` throws on read or write, and every failure degrades to
-    // the default this page already renders — closed.
-    function persist() {
-      try {
-        if (openTab) sessionStorage.setItem(KEY, openTab);
-        else sessionStorage.removeItem(KEY);
-      } catch (e) {}
-    }
-
-    tabs.forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        var name = btn.getAttribute("data-embed-tab") || "";
-        if (name && name === openTab) close();
-        else show(name);
-        persist();
-      });
-    });
-
-    var stored = null;
-    try { stored = sessionStorage.getItem(KEY); } catch (e) { stored = null; }
-    if (stored) show(stored);
-  })();
-
-  // Homepage terminals tab: Files | Diff sidebar + the panel above the
-  // terminal (home-terminal-panel, D1/D2/D3). The shape the project page's
-  // panel above already has, split in two: the SIDEBAR carries the two nav
-  // frames (a file tree, a changed-file list), and the PANEL above the
-  // terminal carries whatever a row in one of them opens.
+  // Terminal Files | Diff workspace (home-terminal-panel, D1/D2/D3): ONE
+  // panel + sidebar serving BOTH the project terminal page and the homepage
+  // Terminals tab. `views.rs::term_workspace` renders the same frame for both
+  // pages, so there is one block here rather than a variant each. It is split
+  // in two: the SIDEBAR carries the two nav frames (a file tree, a
+  // changed-file list), and the PANEL above the terminal carries whatever a
+  // row in one of them opens.
   //
   // What makes it one feature rather than two is the thing this module does
   // NOT do: it never routes a click from the sidebar to the panel. The panel
@@ -2254,35 +2156,43 @@
   // the split opens on the frame's own `load` event: it follows navigations
   // this module never saw.
   //
-  // Every URL here is the SERVER's (`views.rs::home_term_sidebar`): each tab
+  // Every URL here is the SERVER's (`views.rs::term_work_sidebar`): each tab
   // button carries its own `data-nav-src`, the sidebar carries the panel's
   // `data-panel-src`, and this module only ever copies one of those
   // attributes onto a frame. No project id is assembled here, on the restore
   // path included — a stored value only ever NAMES a tab this page rendered.
   (function () {
-    var root = document.querySelector(".home-term");
+    var root = document.querySelector(".term-work");
     if (!root) return;
-    var side = root.querySelector(".home-term__side");
-    var panel = root.querySelector(".home-term__panel");
-    var panelFrame = root.querySelector(".home-term__frame");
+    var side = root.querySelector(".term-work__side");
+    var panel = root.querySelector(".term-work__panel");
+    var panelFrame = root.querySelector(".term-work__frame");
     var tabs = Array.prototype.slice.call(
-      root.querySelectorAll(".home-term__tab[data-nav-tab]")
+      root.querySelectorAll(".term-work__tab[data-nav-tab]")
     );
     var navs = Array.prototype.slice.call(
-      root.querySelectorAll(".home-term__nav[data-nav-for]")
+      root.querySelectorAll(".term-work__nav[data-nav-for]")
     );
     // A pane outside every registered project renders the sidebar's
     // explanation and no frames at all — nothing to wire, and nothing about
     // the terminal below changes.
     if (!side || !panel || !panelFrame || !tabs.length || !navs.length) return;
-    // The split is a property of the whole content area, exactly as it is on
-    // the project page: `<main>` is what stops scrolling as one column and
-    // starts dividing a fixed height between the panel and the terminal.
-    // This tab's `<main>` carries no `data-project-id` (homepage-terminal-full
-    // D5), so it is matched by position instead.
+    // The split is a property of the whole content area: `<main>` is what
+    // stops scrolling as one column and starts dividing a fixed height
+    // between the panel and the terminal. The homepage tab's `<main>` carries
+    // no `data-project-id` (homepage-terminal-full D5) and the project page's
+    // does, so `<main>` is matched by position instead — one selector that
+    // finds the right element on either page.
     var main = root.closest ? root.closest("main.fg-page") : null;
+    // ONE key for both pages: the Files/Diff choice follows the PROJECT, not
+    // the page the choice was made on, so opening Diff here and then arriving
+    // from the other page shows Diff again. Adopting this one name retires
+    // the homepage's old key, which resets every viewer's remembered tab
+    // exactly once — acceptable because it is a per-viewer `sessionStorage`
+    // convenience, not state anyone can lose work from, and what it falls
+    // back to is the closed default this page already renders.
     var KEY =
-      "waggledance-home-panel:" + (root.getAttribute("data-panel-project") || "");
+      "waggledance-term-panel:" + (root.getAttribute("data-panel-project") || "");
     var openTab = "";
     var split = false;
 
@@ -2290,17 +2200,17 @@
       tabs.forEach(function (btn) {
         var on = btn.getAttribute("data-nav-tab") === openTab;
         btn.setAttribute("aria-pressed", on ? "true" : "false");
-        btn.classList.toggle("home-term__tab--on", on);
+        btn.classList.toggle("term-work__tab--on", on);
       });
       navs.forEach(function (frame) {
         frame.hidden = frame.getAttribute("data-nav-for") !== openTab;
       });
-      side.classList.toggle("home-term__side--open", !!openTab);
+      side.classList.toggle("term-work__side--open", !!openTab);
     }
 
     function paintSplit() {
       panel.hidden = !split;
-      root.classList.toggle("home-term--split", split);
+      root.classList.toggle("term-work--split", split);
       if (main) main.classList.toggle("term-split", split);
       // The terminal keeps its full WIDTH either way — the panel is above
       // it, never beside it — but the bottom half becomes its own scroll
@@ -2366,10 +2276,10 @@
       openPanel();
     }
 
-    // Storage is a hostile input like everywhere else (the project page's
-    // panel and the rail collapses take the same shape): a disabled or
-    // quota-blocked `sessionStorage` throws on read or write, and every
-    // failure degrades to what this page already rendered — no tab open.
+    // Storage is a hostile input like everywhere else (the rail and tab-bar
+    // collapses above take the same shape): a disabled or quota-blocked
+    // `sessionStorage` throws on read or write, and every failure degrades to
+    // what this page already rendered — no tab open.
     function persist() {
       try {
         if (openTab) sessionStorage.setItem(KEY, openTab);
