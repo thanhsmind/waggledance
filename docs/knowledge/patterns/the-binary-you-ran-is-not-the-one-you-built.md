@@ -61,6 +61,34 @@ the running process while every install and restart reported success.
 *This defeats both earlier remedies:* the freshly built artifact was correctly
 resolved and correctly installed. It was simply not the file being executed.
 
+**Disguise 4 — a concurrent session overwrites the shared target, and the
+content check does not discriminate.** Disguise 2's shared `CARGO_TARGET_DIR` is
+not only an A/B hazard. With several sessions live in the same repo, *any* of
+them building from main between your build and your install replaces the
+artifact at the path cargo just handed you — no comparison tree required, and
+nothing in your own transcript looks wrong.
+
+*This defeats "prove by content" too,* when the literal you grep for is not
+unique to the new code. A change that MOVES an existing string rather than
+adding one leaves the old binary matching your check:
+
+```
+# the change inlined this button into its parent format string
+$ rg -a -c 'term-create__pane">New shell' new-build   # 1
+$ rg -a -c 'term-create__pane">New shell' old-build   # 1  ← proves nothing
+```
+
+Both builds contain that literal; only the new one contains it *indented, joined
+to the enclosing `<div>`*. The check that separates them has to be the one the
+old artifact cannot satisfy:
+
+```
+$ rg -a -c '^  <button type="button" class="term-create__pane">New shell' old-build   # 0
+```
+
+The give-away that the check was hollow: the freshly restarted daemon still
+served the old behaviour while every content check printed `1`.
+
 ## The tell
 
 Any of these, and the artifact is unverified:
@@ -77,9 +105,17 @@ Any of these, and the artifact is unverified:
 - **Prove the artifact by its content, not its identity.** Grep the binary for a
   string only the new code contains — a new route, a new attribute, a new error
   message. `strings <path> | rg -c '<literal from this change>'` answers in one
-  line and no disguise defeats it.
-- **Give every comparison tree its own `CARGO_TARGET_DIR`,** and verify the two
-  artifacts actually differ (`sha256sum`, `cmp`) before trusting any A/B result.
+  line.
+- **Prove the check itself first: run it against the OLD artifact and require
+  `0`.** A check that matches both builds is not a check, and a change that moves
+  or re-indents an existing literal produces exactly that (disguise 4). If the
+  change adds no new string, grep for the literal *in its new surroundings* —
+  the enclosing tag, the leading indentation — and confirm the old build scores
+  zero before you trust the new build scoring one.
+- **Give every build its own `CARGO_TARGET_DIR`** — not only comparison trees.
+  With sibling sessions live in the repo, the shared target is overwritten
+  between your build and your install (disguise 4). Verify differing artifacts
+  (`sha256sum`, `cmp`) before trusting any A/B result.
 - **Resolve the running process, never the command name:** `readlink -f /proc/<pid>/exe`,
   or `which -a <name>` to see the whole shadowing order. A restart is proven by the
   new process pointing at the new file, not by the restart command's own output.
@@ -96,6 +132,12 @@ Any of these, and the artifact is unverified:
 - Reloading the daemon for UAT (2026-08-30) — disguise 3. Caught only because the
   new route answered `404` when it should have answered `200`; every install and
   restart message had reported success.
+- `home-terminal-new-shell` (2026-08-31) — disguise 4, both halves. A sibling
+  session's build from main replaced the shared-target artifact between the build
+  and the install, and the content check passed anyway because the change had
+  moved an existing button literal instead of adding a new one. Caught only by
+  closing the loop on behaviour: the restarted daemon's `/?tab=terminals` still
+  omitted the create box that the new code always renders.
 
 ## Related
 
