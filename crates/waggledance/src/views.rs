@@ -23941,6 +23941,15 @@ mod tests {
             APP_JS.contains("/_slash"),
             "app.js must still fetch its suggestions from the _slash endpoint"
         );
+        // csl-3: on the shared pane-form loop the project id comes from the
+        // form's own `data-term-base` (`/p/<id>/_terminal/<pane>`), so the
+        // home page's Terminals tab — which renders these forms with no
+        // page-level `data-project-id` — still asks that pane's project
+        // endpoint instead of falling back to the user-level list.
+        assert!(
+            APP_JS.contains(r#"base.split("/")[2]"#),
+            "app.js must still derive the pane's project id from data-term-base for the _slash fetch"
+        );
 
         // The markup side of the same handshake, for both composer families
         // D1 names: the pane reply box and the paseo agent composer.
