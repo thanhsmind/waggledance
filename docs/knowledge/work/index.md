@@ -60,6 +60,7 @@ never a generation timestamp or any other wall-clock value.
 - [herdr-session-liveness/](herdr-session-liveness/index.md) — 1 concept(s)
 - [home-board-perf/](home-board-perf/index.md) — 1 concept(s)
 - [home-terminal-header/](home-terminal-header/index.md) — 1 concept(s)
+- [home-terminal-new-shell/](home-terminal-new-shell/index.md) — 1 concept(s)
 - [home-terminal-panel/](home-terminal-panel/index.md) — 1 concept(s)
 - [home-terminal-parity/](home-terminal-parity/index.md) — 1 concept(s)
 - [homepage-tabs/](homepage-tabs/index.md) — 1 concept(s)
