@@ -2703,16 +2703,22 @@ fn terminals_tab(
     // home-terminal-parity-2: create targets the *selected* pane's own
     // project, so a new agent starts where the terminal being
     // watched lives — never a default or the first project in the list.
-    // home-terminal-header: agent presets only here (`plain_shell: false`) —
-    // the plain "New shell" button belongs to a page that is already scoped
-    // to one project, which this tab is not.
+    // home-terminal-new-shell: this tab offers the plain "New shell" button
+    // too, so its switcher is the project terminal page's switcher and not a
+    // near-copy of it. `home-terminal-header` had withheld the button on the
+    // grounds that a page not scoped to one project could only guess which
+    // project a new shell belonged to — true when it was written, and retired
+    // by `terminals-tab-project-scope-1`: the tab IS scoped now. The line
+    // above resolves the project from the pane the reader is actually
+    // watching, and the switcher beside it lists only that project's panes,
+    // so "new shell here" names exactly the same project here as there.
     // A selected pane resolved through `unassigned_panes` (`project_id:
     // None`) renders no create controls at all: `/p/:id/_terminal/create/…`
     // is the only create route that exists, and there is no `:id` for a
     // pane outside every registered project.
     let create = effective
         .and_then(|pane| pane.project_id.as_deref())
-        .map(|project_id| terminal_create_controls(project_id, presets, false))
+        .map(|project_id| terminal_create_controls(project_id, presets))
         .unwrap_or_default();
 
     // D7: reproduces the tab's own `/?tab=terminals&pane={pane_id}`
@@ -2765,8 +2771,10 @@ fn terminals_tab(
     let project_id = effective.and_then(|pane| pane.project_id.as_deref());
     // Deliberately NOT `data-project-id`: homepage-terminal-full D5 forbids
     // a page-root project id on this tab — every pane control reads its own
-    // `data-term-base` instead, and a test pins that absence so no later
-    // widget can quietly reintroduce the fallback. This attribute scopes ONE
+    // `data-term-base` instead, and a test pins that the page's only
+    // `data-project-id` is `.term-create`'s own (the create route's target),
+    // so no later widget can quietly reintroduce the fallback beside it.
+    // This attribute scopes ONE
     // widget, the sidebar's sessionStorage key, and is named for that widget
     // so the two can never be read as the same thing.
     let panel_project = project_id
@@ -3192,18 +3200,22 @@ fn pane_controls(
 /// route-level half of that same truth is `terminal_create_agent`'s own
 /// refusal when `body.preset` matches nothing.
 ///
-/// home-terminal-header: `plain_shell` gates that always-offered button, and
-/// only the homepage Terminals tab passes `false`. There, the Agents drawer
-/// is already the way a terminal is reached and started, and a second,
-/// project-guessing "New shell" sitting above someone else's running screen
-/// only offered a shell in whichever project the *watched* pane happened to
-/// belong to. The project terminal page passes `true` and is untouched — a
-/// page scoped to one project is exactly where "new shell here" means
-/// something. With `plain_shell` false and no presets configured, nothing
-/// would render at all, so the `.term-create` box itself is omitted rather
-/// than shipped empty — the same silence a pane outside every registered
-/// project already gets from [`terminals_tab`].
-fn terminal_create_controls(project_id: &str, presets: &[String], plain_shell: bool) -> String {
+/// home-terminal-new-shell: "New shell" is unconditional, and the
+/// `plain_shell` flag `home-terminal-header` introduced to withhold it from
+/// the homepage Terminals tab is gone with it. That flag had exactly one
+/// caller passing `false`, on the reasoning that the tab was not scoped to a
+/// single project and so could only guess where a new shell belonged;
+/// `terminals-tab-project-scope-1` scoped the tab, and
+/// [`terminals_tab`] now passes the project of the pane the reader is
+/// watching, so both callers mean the same thing by "new shell here" and a
+/// flag with one live value is no flag at all.
+///
+/// Every caller therefore always has at least this one button to offer, and
+/// the `.term-create` box is never empty — the earlier early-return that
+/// omitted it went with the flag. A caller with no project to name renders
+/// nothing at all, but that decision belongs to the caller: see
+/// [`terminals_tab`]'s own `project_id: None` case.
+fn terminal_create_controls(project_id: &str, presets: &[String]) -> String {
     let preset_buttons: String = presets
         .iter()
         .map(|label| {
@@ -3214,21 +3226,12 @@ fn terminal_create_controls(project_id: &str, presets: &[String], plain_shell: b
             )
         })
         .collect();
-    if !plain_shell && preset_buttons.is_empty() {
-        return String::new();
-    }
-    let pane_button = if plain_shell {
-        r#"<button type="button" class="term-create__pane">New shell</button>
-  "#
-    } else {
-        ""
-    };
     format!(
         r#"<div class="term-create" data-project-id="{pid}">
-  {pane_button}{preset_buttons}
+  <button type="button" class="term-create__pane">New shell</button>
+  {preset_buttons}
 </div>"#,
         pid = esc(project_id),
-        pane_button = pane_button,
         preset_buttons = preset_buttons,
     )
 }
@@ -3342,7 +3345,7 @@ pub fn terminal_page(
     let bar = pane_bar(
         panes,
         selected,
-        &terminal_create_controls(&project.id, presets, true),
+        &terminal_create_controls(&project.id, presets),
         &|pane_id: &str| format!("/p/{}/_terminal/pane/{}", project.id, pane_id),
     );
     // `data-project-id` lets `assets/app.js`'s screen poller build each
@@ -14101,53 +14104,39 @@ mod tests {
     /// module follows.
     #[test]
     fn terminal_create_controls_escapes_preset_labels() {
-        let html =
-            terminal_create_controls("proj-1", &["<script>alert(1)</script>".to_string()], true);
+        let html = terminal_create_controls("proj-1", &["<script>alert(1)</script>".to_string()]);
         assert!(!html.contains("<script>alert(1)</script>"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
-    /// home-terminal-header: `plain_shell` is the whole difference between
-    /// the two callers. `true` (the project terminal page) keeps the
-    /// always-offered plain-shell button; `false` (the homepage Terminals
-    /// tab) drops it and leaves the configured agent presets standing. With
-    /// `false` and nothing configured, no `.term-create` box renders at all
-    /// rather than an empty one — the same silence a pane outside every
-    /// registered project already gets.
+    /// home-terminal-new-shell: "New shell" is what every caller of this
+    /// function offers, with or without configured presets — the
+    /// `plain_shell` flag that used to withhold it from one caller is gone,
+    /// and this test is what stops it coming back under another name. The
+    /// box is therefore never empty, so there is no longer any input that
+    /// makes this function return nothing; the one surface that renders no
+    /// controls decides that for itself by never calling in
+    /// (`terminals_tab`'s `project_id: None` case, pinned separately).
     #[test]
-    fn terminal_create_controls_offer_the_plain_shell_button_only_when_asked() {
-        let presets = vec!["Claude".to_string()];
-
-        let with_shell = terminal_create_controls("proj-1", &presets, true);
+    fn terminal_create_controls_always_offer_the_plain_shell_button() {
+        let with_presets = terminal_create_controls("proj-1", &["Claude".to_string()]);
         assert!(
-            with_shell.contains("class=\"term-create__pane\""),
-            "{with_shell}"
+            with_presets.contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "{with_presets}"
         );
         assert!(
-            with_shell.contains(r#"data-preset="Claude""#),
-            "{with_shell}"
+            with_presets.contains(r#"data-preset="Claude""#),
+            "{with_presets}"
         );
 
-        let without_shell = terminal_create_controls("proj-1", &presets, false);
+        let no_presets = terminal_create_controls("proj-1", &[]);
         assert!(
-            !without_shell.contains("class=\"term-create__pane\"")
-                && !without_shell.contains(">New shell<"),
-            "the plain-shell button must not render when it was not asked for: {without_shell}"
+            no_presets.contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "no configured preset must still leave the shell button standing: {no_presets}"
         );
         assert!(
-            without_shell.contains(r#"data-preset="Claude""#)
-                && without_shell.contains(r#"class="term-create" data-project-id="proj-1""#),
-            "the agent presets must still render, still targeting the project: {without_shell}"
-        );
-
-        let nothing = terminal_create_controls("proj-1", &[], false);
-        assert!(
-            nothing.is_empty(),
-            "no button to offer must render no box at all: {nothing}"
-        );
-        assert!(
-            terminal_create_controls("proj-1", &[], true).contains("class=\"term-create__pane\""),
-            "a plain-shell caller with no presets still gets its button"
+            no_presets.contains(r#"class="term-create" data-project-id="proj-1""#),
+            "the box must still name the project it creates into: {no_presets}"
         );
     }
 
@@ -14746,6 +14735,15 @@ mod tests {
     /// reply/keys group [`pane_controls`] renders — carries that pane's own
     /// `data-term-base` rather than falling back to a page-root
     /// `data-project-id` this page does not have.
+    ///
+    /// home-terminal-new-shell: that used to be pinned as "the string
+    /// `data-project-id` appears nowhere", which held only because this
+    /// case configures no presets and the create box therefore did not
+    /// render at all. It renders now (New shell alone), and it has always
+    /// carried its own `data-project-id` whenever a preset was configured —
+    /// that attribute is how `app.js` builds `/p/:id/_terminal/create/…`,
+    /// and D5 never forbade it. So the pin is narrowed to what D5 actually
+    /// says: the only one on the page is `.term-create`'s own.
     #[test]
     fn terminals_tab_controls_carry_the_selected_panes_own_base() {
         let pane = menu_pane("w1:p1", Some("proj-1"), "Proj One");
@@ -14759,9 +14757,14 @@ mod tests {
             html.matches(base_attr.as_str()).count() >= 4,
             "every pane control must carry data-term-base=\"{base}\": {html}"
         );
+        assert_eq!(
+            html.matches("data-project-id").count(),
+            1,
+            "the tab must carry no project id beyond the create box's own: {html}"
+        );
         assert!(
-            !html.contains("data-project-id"),
-            "the tab must never fall back to a page-root data-project-id: {html}"
+            html.contains(r#"class="term-create" data-project-id="proj-1""#),
+            "and that one must be the create box's: {html}"
         );
     }
 
@@ -14794,6 +14797,14 @@ mod tests {
         assert!(
             with_project[bar_start..bar_end].contains(r#"data-preset="Claude""#),
             "the creation controls must live inside the pane_bar switcher: {with_project}"
+        );
+        // home-terminal-new-shell: parity with the project terminal page's
+        // own switcher — this tab offers the plain shell button too, in the
+        // same place, targeting the selected pane's project.
+        assert!(
+            with_project[bar_start..bar_end]
+                .contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "the tab must offer New shell inside the switcher: {with_project}"
         );
 
         let unassigned_pane = menu_pane("w1:p2", None, "Unassigned");

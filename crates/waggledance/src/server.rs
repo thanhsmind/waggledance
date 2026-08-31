@@ -22894,14 +22894,15 @@ mod bee_route_tests {
     /// is the only create route there is and an unassigned pane has no
     /// `:id` to build one against.
     ///
-    /// home-terminal-header: what those controls *offer* here is now agent
-    /// presets only. The plain "New shell" button is gone from this tab —
-    /// the Agents drawer is how a terminal is reached and started from the
-    /// home page, and a shell button above someone else's running screen
-    /// only ever meant "a shell in whichever project that screen belongs
-    /// to". It stays on the project terminal page, which
-    /// `terminal_page_drawer_and_create_controls_are_unchanged` and the
-    /// `views.rs` `terminal_page_*` tests still prove.
+    /// home-terminal-new-shell: what those controls offer here is exactly
+    /// what the project terminal page offers — the configured agent presets
+    /// AND the plain "New shell" button. `home-terminal-header` had withheld
+    /// the shell button on the grounds that a button above someone else's
+    /// running screen could only mean "a shell in whichever project that
+    /// screen belongs to"; that is now the whole point, because
+    /// `terminals-tab-project-scope-1` scoped this tab to the selected
+    /// pane's own project — the same project the assertion below reads off
+    /// `data-project-id`.
     #[tokio::test]
     async fn terminals_tab_create_controls_render_for_project_pane_and_absent_for_unassigned() {
         use crate::herdr::fake::FakeHerdr;
@@ -22956,9 +22957,8 @@ mod bee_route_tests {
             "a configured agent preset must still be offered: {project_body}"
         );
         assert!(
-            !project_body.contains(">New shell<")
-                && !project_body.contains("class=\"term-create__pane\""),
-            "the Terminals tab must offer no plain-shell button: {project_body}"
+            project_body.contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "the Terminals tab must offer the plain-shell button too: {project_body}"
         );
 
         let unassigned_body = body_string(
@@ -22978,13 +22978,16 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&scratch).ok();
     }
 
-    /// home-terminal-header: with the plain-shell button gone from this tab,
-    /// a deployment that configures no agent presets has nothing left to
-    /// offer here — so the `.term-create` box itself must not ship, rather
-    /// than shipping empty. Same silence a selected unassigned pane already
-    /// gets, for the same reason: no control to render.
+    /// home-terminal-new-shell: the plain-shell button is back on this tab,
+    /// so a deployment that configures no agent presets still has something
+    /// to offer here — the `.term-create` box ships carrying New shell
+    /// alone, exactly as the project terminal page's does. `home-terminal-
+    /// header` used to pin the opposite (no preset, no button, no box); the
+    /// only silence left is the one a selected *unassigned* pane gets, and
+    /// that has a different cause — no `:id` to build a create route from,
+    /// pinned by the test above.
     #[tokio::test]
-    async fn terminals_tab_renders_no_create_box_when_no_preset_is_configured() {
+    async fn terminals_tab_renders_the_create_box_when_no_preset_is_configured() {
         use crate::herdr::fake::FakeHerdr;
 
         let dir = fresh_root("terminals-tab-create-none");
@@ -23018,8 +23021,12 @@ mod bee_route_tests {
         )
         .await;
         assert!(
-            !body.contains("class=\"term-create\""),
-            "no configured preset and no plain-shell button must render no create box at all: {body}"
+            body.contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "no configured preset must still leave the shell button standing: {body}"
+        );
+        assert!(
+            !body.contains("data-preset="),
+            "nothing was configured, so no preset button may appear: {body}"
         );
         assert!(
             body.contains(r#"class="fg-card term-pane""#),
