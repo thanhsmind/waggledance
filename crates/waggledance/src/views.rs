@@ -806,11 +806,7 @@ fn bee_hub_agent_mark_svg_sized(
     class: &str,
     label: Option<&str>,
 ) -> String {
-    let paint = if mark.stroked {
-        r#"fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round""#
-    } else {
-        r#"fill="currentColor" stroke="none""#
-    };
+    let paint = agent_mark_paint(mark);
     let class_attr = if class.is_empty() {
         String::new()
     } else {
@@ -832,6 +828,19 @@ fn bee_hub_agent_mark_svg_sized(
         paint = paint,
         body = mark.body,
     )
+}
+
+/// The `fill`/`stroke` presentation attributes an agent mark's artwork needs
+/// so `currentColor` actually reaches it -- shared by
+/// [`bee_hub_agent_mark_svg_sized`] (every server-rendered surface) and
+/// [`agent_mark_sprite`] (the drawer's client-cloned `<symbol>`s) so the two
+/// can never disagree about how a mark is painted again.
+fn agent_mark_paint(mark: &AgentMark) -> &'static str {
+    if mark.stroked {
+        r#"fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round""#
+    } else {
+        r#"fill="currentColor" stroke="none""#
+    }
 }
 
 /// Every mark this file draws, in the order [`AGENT_MARKS`] lists them --
@@ -872,9 +881,10 @@ pub fn agent_mark_sprite() -> String {
         .iter()
         .map(|mark| {
             format!(
-                r#"<symbol id="agent-mark-{id}" viewBox="{view_box}">{body}</symbol>"#,
+                r#"<symbol id="agent-mark-{id}" viewBox="{view_box}" {paint}>{body}</symbol>"#,
                 id = mark.id,
                 view_box = mark.view_box,
+                paint = agent_mark_paint(mark),
                 body = mark.body,
             )
         })
@@ -19168,11 +19178,16 @@ mod tests {
         for mark in AGENT_MARKS {
             assert!(
                 sprite.contains(&format!(
-                    r#"<symbol id="agent-mark-{id}" viewBox="{vb}">"#,
+                    r#"<symbol id="agent-mark-{id}" viewBox="{vb}" {paint}>"#,
                     id = mark.id,
-                    vb = mark.view_box
+                    vb = mark.view_box,
+                    paint = agent_mark_paint(mark)
                 )),
-                "mark `{}` must reach the sprite carrying its own viewBox: {sprite}",
+                "mark `{}` must reach the sprite carrying its own viewBox AND the same \
+                 fill/stroke paint bee_hub_agent_mark_svg_sized uses -- a symbol with no \
+                 paint attribute clones as an unpainted <path>, whose fill inherits the \
+                 SVG default of black rather than currentColor, so status tinting (e.g. \
+                 .pane-mark--working's warning color) never reaches the drawer: {sprite}",
                 mark.id
             );
             assert!(
