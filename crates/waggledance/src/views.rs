@@ -489,7 +489,7 @@ const HOME_RAIL_BACKDROP: &str =
 
 /// console-phone-layout (P2): the handset's bottom bar — `Board` · `Agents`
 /// · `Projects` · `Hướng dẫn` · `Settings`, in that order, hidden above
-/// 700px by `app.css` and never rendered conditionally (see [`home_page`]'s
+/// 900px by `app.css` and never rendered conditionally (see [`home_page`]'s
 /// call). guide-vi added the fourth destination: the built-in guide is
 /// reachable from a phone without opening the top bar's menu, and the CSS
 /// grid widened to five columns in the same edit.
@@ -1518,8 +1518,8 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
 /// narrow strip carrying nothing but this same button, and the choice is
 /// remembered per browser in `localStorage["waggledance-rail-hidden"]` --
 /// which is what makes it survive the whole-page reload `assets/app.js`
-/// performs on every watched change. The handset drawer (<=700px) is
-/// untouched: the CSS scopes every collapsed rule to `min-width: 701px`.
+/// performs on every watched change. The handset drawer (<=900px) is
+/// untouched: the CSS scopes every collapsed rule to `min-width: 901px`.
 ///
 /// Like the filter field above it, the button ships `hidden` and
 /// `assets/app.js` unhides it -- collapsing is a client-side act with no
@@ -4388,7 +4388,7 @@ fn bee_hub_style() -> String {
    breakpoint in app.css) so a phone never needs the page itself to scroll
    sideways — a genuinely wide container (the agent board's columns) keeps
    its own `overflow-x` above instead of forcing the page wider. */
-@media (max-width: 700px) {
+@media (max-width: 900px) {
   .bee-hub__groups,
   .bee-panels,
   .bee-done-grid {
@@ -11841,7 +11841,7 @@ mod tests {
     fn the_new_task_button_leaves_the_handset_bar_with_the_orchestrator_button() {
         let css = include_str!("../assets/app.css");
         let query = css
-            .find("@media (max-width: 700px) {")
+            .find("@media (max-width: 900px) {")
             .expect("app.css declares no handset block for the home shell");
         let end = css[query + 1..]
             .find("@media")
@@ -13960,7 +13960,7 @@ mod tests {
             .find(".home-rail__backdrop {\n  display: none;\n}")
             .expect("the drawer backdrop must be hidden by default (wide screens)");
         let query = css
-            .find("@media (max-width: 700px) {")
+            .find("@media (max-width: 900px) {")
             .expect("app.css declares no handset block for the home shell");
         assert!(
             bar_hidden < query && backdrop_hidden < query,
@@ -21273,18 +21273,18 @@ mod tests {
     }
 
     /// inprogress-priority-order-2 (D1, must-have): the In Progress
-    /// ordering rule lives INSIDE the existing `@media (max-width: 700px)`
+    /// ordering rule lives INSIDE the existing `@media (max-width: 900px)`
     /// block, reuses that same breakpoint (no new one), and never leaks
     /// outside it -- a wide-screen render must carry no `order` rule at
     /// all.
     #[test]
     fn bee_hub_style_puts_in_progress_order_rule_only_inside_the_narrow_media_query() {
         let css = bee_hub_style();
-        let media_at = css.find("@media (max-width: 700px)").unwrap_or_else(|| {
+        let media_at = css.find("@media (max-width: 900px)").unwrap_or_else(|| {
             panic!("the existing narrow-screen breakpoint must still exist: {css}")
         });
         assert!(
-            css.matches("@media (max-width: 700px)").count() == 1,
+            css.matches("@media (max-width: 900px)").count() == 1,
             "D1 must reuse the existing breakpoint, never add a second one: {css}"
         );
         let media_end = css[media_at..]
@@ -21300,7 +21300,7 @@ mod tests {
         let after_media = &css[media_end..];
         assert!(
             !before_media.contains("order: -1;") && !after_media.contains("order: -1;"),
-            "the order rule must never appear outside the max-width: 700px block, so wide-screen rendering is unchanged: {css}"
+            "the order rule must never appear outside the max-width: 900px block, so wide-screen rendering is unchanged: {css}"
         );
     }
 
@@ -22234,11 +22234,11 @@ mod tests {
     fn bee_hub_style_keeps_every_phone_board_rule_inside_the_one_narrow_media_query() {
         let css = bee_hub_style();
         assert_eq!(
-            css.matches("@media (max-width: 700px)").count(),
+            css.matches("@media (max-width: 900px)").count(),
             1,
             "the board must still declare exactly one narrow block: {css}"
         );
-        let media_at = css.find("@media (max-width: 700px)").expect("narrow block");
+        let media_at = css.find("@media (max-width: 900px)").expect("narrow block");
         let media_end = css[media_at..]
             .find("</style>")
             .map(|i| media_at + i)

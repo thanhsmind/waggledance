@@ -868,9 +868,9 @@ html[data-scheme="dark"] .topbar .home {
    active row, a step up from the rail in both schemes.
 
    console-phone-layout (P1/P2) settled the phone phase this block once
-   owed: under 700px the shell is one column, the rail is an off-canvas
+   owed: under 900px the shell is one column, the rail is an off-canvas
    drawer over it, and a fixed bottom bar carries the four sections. That
-   answer lives in the `@media (max-width: 700px)` block below
+   answer lives in the `@media (max-width: 900px)` block below
    `.home-sidebar__foot`, together with the two defaults — a hidden tab bar
    and a hidden backdrop — that keep every wider screen exactly as it was.
    ───────────────────────────────────────────────── */
@@ -979,12 +979,12 @@ html[data-scheme="dark"] .topbar .home {
 .home-sidebar__collapse-icon--out {
   display: none;
 }
-/* The collapsed strip is a WIDE-SCREEN state only: under 700px the rail is
+/* The collapsed strip is a WIDE-SCREEN state only: under 900px the rail is
    an off-canvas drawer that is already fully out of the way, and a second
    way to hide it would only be a control the drawer has no room for. Every
    rule the collapse adds is scoped here, so the handset block below sees
    none of them however `waggledance-rail-hidden` was left. */
-@media (min-width: 701px) {
+@media (min-width: 901px) {
   .home-sidebar--collapsed {
     /* Structural: the head's two `--space-2` paddings plus the button's own
        24px box — the strip is exactly the expand control and nothing else. */
@@ -1029,9 +1029,9 @@ html[data-scheme="dark"] .topbar .home {
 .home-rail__backdrop {
   display: none;
 }
-/* 700px is the breakpoint the board's own narrow block already uses
+/* 900px is the breakpoint the board's own narrow block already uses
    (`bee_hub_style`); one number for one phone layout. */
-@media (max-width: 700px) {
+@media (max-width: 900px) {
   /* One column. `block` rather than a one-column grid because the rail is
      about to leave the flow entirely — what is left in it is `<main>`
      alone. */

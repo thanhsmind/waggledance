@@ -143,19 +143,20 @@ At most one thing in this frame is marked the current page: the Orchestrator
 link while the board is showing, or, on the terminals view, the pinned row of
 the terminal actually on screen.
 
-On a handset the same frame answers, narrowed rather than replaced: one page,
-one address, one reading, laid out in a single column below the narrow-screen
-width the rest of this surface already uses. What changes is where the frame's
-parts sit, never what they say:
+On a handset or an iPad-width display, the same frame answers, narrowed rather
+than replaced: one page, one address, and one reading. Through 900 CSS pixels,
+the frame uses one column. At 901 CSS pixels, the wide-screen layout returns.
+What changes is where the frame's parts sit, never what they say:
 
 - The rail leaves the flow and becomes a drawer over the page, opened from a
   **Projects** item and dismissed by tapping the page behind it. It needs no
   scripting, so it survives the reload the page performs on its own, and a
   reader's collapsed project groups are still collapsed when the drawer opens.
-- A **bottom bar** carries four items — **Board**, **Agents**, **Projects**,
-  **Settings** — and marks the section on screen by more than colour alone.
-  Board and Agents are the frame's two existing addresses, Projects is the
-  drawer, Settings the settings page. The Orchestrator link stands down at
+- A **bottom bar** carries five items: **Board**, **Agents**, **Projects**,
+  **Hướng dẫn**, and **Settings**. It marks the section on screen by more than
+  colour alone. Board and Agents are the frame's two existing addresses,
+  Projects is the drawer, Hướng dẫn is the built-in guide, and Settings is the
+  settings page. The Orchestrator link stands down at
   this width because the Board item already answers it, which keeps the rule
   above intact: exactly one thing still marks itself the current page.
 - The board opens with three figures — **working**, **need you** and
