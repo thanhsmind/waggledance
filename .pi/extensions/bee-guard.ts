@@ -66,33 +66,28 @@
 // on eight distinct lifecycle events. The Pi belt maps each row onto the
 // closest honest Pi lifecycle carrier and passes the original Claude event
 // name in hook_event_name (activity is a state machine keyed on Claude names):
-//   1. UserPromptSubmit    -> before_agent_start (session_id, prompt, cwd)
-//   2. PreToolUse          -> NAMED EXCLUSION: no honest advisory carrier on Pi
-//                             (Pi's tool_call is strictly the fail-closed blocking
-//                             path; no advisory pre-tool lifecycle event exists)
+//   1. UserPromptSubmit    -> before_agent_start (session_id, prompt, cwd) and ui_prompt_end
+//   2. PreToolUse          -> tool_execution_start (session_id, tool_name, tool_use_id, cwd)
 //   3. PostToolUse         -> tool_result when !isError (session_id, tool_name, tool_use_id, cwd)
 //   4. PostToolUseFailure  -> tool_result when isError (session_id, tool_name, tool_use_id, cwd)
-//   5. PermissionRequest   -> NAMED EXCLUSION: Pi 0.84.x has no interactive permission prompt event
-//   6. Notification        -> NAMED EXCLUSION: Pi 0.84.x has no notification event
+//   5. PermissionRequest   -> NAMED EXCLUSION: Pi 0.84–0.85 has no interactive permission prompt event
+//   6. Notification        -> ui_prompt_start (session_id, cwd; notification_type: agent_needs_input)
 //   7. Stop                -> agent_settled (session_id, cwd)
 //   8. SessionEnd          -> session_shutdown when reason is not "reload" (session_id, cwd, reason)
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { execFile, execFileSync } from "node:child_process"
-import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
 
 const BINARY_NAMES = ["bee", "bee.exe"]
 
 // ─── store + binary discovery (re-run on EVERY call, never cached) ──────────
 
-/** Every root this project's Pi session might find a bee store under, in
- * priority order: the project directory first, then (for a linked worktree
- * with no vendored store of its own) the main worktree root via
- * `git rev-parse --git-common-dir`. Mirrors the shell fallback chain in
- * packages/bee/hooks/claude-hooks.json. */
-function candidateRoots(directory: string): string[] {
-  const roots = [directory]
+/** Resolves the main checkout root for a directory. For a linked worktree,
+ * this returns the main worktree root via `git rev-parse --git-common-dir`.
+ * For a direct checkout, returns the directory itself. */
+function mainCheckoutRoot(directory: string): string {
   try {
     const commonDir = execFileSync(
       "git",
@@ -100,14 +95,25 @@ function candidateRoots(directory: string): string[] {
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
     ).trim()
     if (commonDir) {
-      // commonDir is "<main-worktree-root>/.git" for a linked worktree.
-      roots.push(path.dirname(commonDir))
+      const absCommonDir = path.isAbsolute(commonDir)
+        ? commonDir
+        : path.resolve(directory, commonDir)
+      return path.dirname(absCommonDir)
     }
   } catch {
-    // not a git repo, or git unavailable — the direct-project root above is
-    // all there is.
+    // not a git repo, or git unavailable — the direct-project root above is all there is.
   }
-  return roots
+  return directory
+}
+
+/** Every root this project's Pi session might find a bee store under, in
+ * priority order: the project directory first, then (for a linked worktree
+ * with no vendored store of its own) the main worktree root via
+ * `git rev-parse --git-common-dir`. Mirrors the shell fallback chain in
+ * packages/bee/hooks/claude-hooks.json. */
+function candidateRoots(directory: string): string[] {
+  const main = mainCheckoutRoot(directory)
+  return main === directory ? [directory] : [directory, main]
 }
 
 function isDirectory(candidate: string): boolean {
@@ -606,6 +612,16 @@ let selfBusy = false
  * `sendUserMessage`. */
 const inFlightClaims = new Set<string>()
 
+/**
+ * Nested UI prompt depth tracking across sessions.
+ * Outer ui_prompt_start emits Notification (agent_needs_input) to enter waiting_input.
+ * Inner prompts increment depth without re-emitting.
+ * Inner ends decrement depth without ending the wait span.
+ * Matching outer ui_prompt_end emits UserPromptSubmit (without prompt text) to return to working.
+ * Unmatched ends are ignored. Unended prompts remain waiting until Stop (agent_settled).
+ */
+const promptDepths = new Map<string, number>()
+
 /** Where a previous module instance parked its timer. Pi's `/reload` can hand
  * this file a fresh module scope while the old interval is still armed; the
  * slot is how the new instance finds and clears the old one instead of leaving
@@ -636,16 +652,13 @@ function usableInboxToken(token: string | undefined): string | null {
   return trimmed
 }
 
-/** This session's inbox, searched over the SAME roots the binary chain uses.
- * The writing side resolves `.bee` from the MAIN worktree root while a linked
- * worktree may carry a `.bee` of its own, so both are probed and the one that
- * actually holds this token's directory wins. Null means nothing has ever been
- * dispatched into this session's inbox — the ordinary case, and not an error. */
+/** This session's inbox, resolved under the MAIN checkout root (.bee/result-inbox/<token>).
+ * The writing side (herding/run.rs) always writes under the main checkout's .bee,
+ * never a linked worktree's .bee. */
 function resultInboxDir(directory: string, token: string): string | null {
-  for (const root of candidateRoots(directory)) {
-    const dir = path.join(root, ".bee", "result-inbox", token)
-    if (isDirectory(dir)) return dir
-  }
+  const mainRoot = mainCheckoutRoot(directory)
+  const dir = path.join(mainRoot, ".bee", "result-inbox", token)
+  if (isDirectory(dir)) return dir
   return null
 }
 
@@ -736,6 +749,7 @@ function renderResultInjection(
     if (rendered.length > 0) rows.push(`${key}: ${rendered}`)
   }
   push("job_id", marker.job_id)
+  push("seat", marker.seat)
   push("cell_id", marker.cell_id)
   push("status", result.status)
   push("summary", result.summary)
@@ -752,20 +766,83 @@ function renderResultInjection(
   )
 }
 
+const carriedInboxTokens = new Map<string, string[]>()
+
+function loadRelocationCarry(mainRoot: string): void {
+  try {
+    const file = path.join(mainRoot, ".bee", "relocation-carry.json")
+    if (!existsSync(file)) return
+    const content = JSON.parse(readFileSync(file, "utf8"))
+    if (content && typeof content === "object") {
+      for (const [k, v] of Object.entries(content)) {
+        if (typeof k === "string" && Array.isArray(v)) {
+          const current = carriedInboxTokens.get(k) ?? []
+          const merged = Array.from(
+            new Set([...current, ...v.filter((x): x is string => typeof x === "string")]),
+          )
+          carriedInboxTokens.set(k, merged)
+        }
+      }
+    }
+  } catch {}
+}
+
+function saveRelocationCarry(mainRoot: string): void {
+  try {
+    const beeDir = path.join(mainRoot, ".bee")
+    if (!isDirectory(beeDir)) return
+    const file = path.join(beeDir, "relocation-carry.json")
+    const obj: Record<string, string[]> = {}
+    for (const [k, v] of carriedInboxTokens.entries()) {
+      obj[k] = v
+    }
+    writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8")
+  } catch {}
+}
+
+function recordCarry(mainRoot: string, oldSessionId: string, newSessionId: string): string[] {
+  loadRelocationCarry(mainRoot)
+  const prior = carriedInboxTokens.get(oldSessionId) ?? []
+  const tokens = Array.from(new Set([...prior, oldSessionId]))
+  carriedInboxTokens.set(newSessionId, tokens)
+  saveRelocationCarry(mainRoot)
+  return tokens
+}
+
 /** One tick: at most ONE result injected, oldest marker first (filename sort,
  * which is chronological for `job-<ms>` ids). Never throws — every failure
- * either skips the marker or requeues its own claim. */
+ * either skips the marker or requeues its own claim. Reads both this session's
+ * own inbox folder and any carried inbox folders from previous sessions across
+ * relocation, resolved under the MAIN checkout's .bee. */
 async function drainResultInbox(pi: any, directory: string, token: string): Promise<void> {
   if (turnStartPending) return // F1: an idle injection is still opening its turn
-  const dir = resultInboxDir(directory, token)
-  if (!dir) return // nothing was ever dispatched into this session's inbox
-  let names: string[]
-  try {
-    names = readdirSync(dir)
-  } catch {
-    return
+  const mainRoot = mainCheckoutRoot(directory)
+  loadRelocationCarry(mainRoot)
+
+  const carried = carriedInboxTokens.get(token) ?? []
+  const tokensToDrain = [token, ...carried.filter((t) => t !== token)]
+
+  const candidates: Array<{ dir: string; name: string }> = []
+  for (const tok of tokensToDrain) {
+    const dir = path.join(mainRoot, ".bee", "result-inbox", tok)
+    if (!isDirectory(dir)) continue
+    let names: string[]
+    try {
+      names = readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      if (name.endsWith(".json")) {
+        candidates.push({ dir, name })
+      }
+    }
   }
-  for (const name of names.filter((n) => n.endsWith(".json")).sort()) {
+  if (candidates.length === 0) return
+
+  candidates.sort((a, b) => a.name.localeCompare(b.name))
+
+  for (const { dir, name } of candidates) {
     const markerPath = path.join(dir, name)
     const marker = readJsonObject(markerPath)
     const mailbox = typeof marker?.mailbox === "string" ? (marker.mailbox as string) : null
@@ -832,6 +909,11 @@ function startResultDrain(pi: any, directory: string, sessionId: string | undefi
   const token = usableInboxToken(sessionId)
   if (!token) return
 
+  const mainRoot = mainCheckoutRoot(directory)
+  loadRelocationCarry(mainRoot)
+
+  // A carried folder is read for unclaimed markers only, and orphan reclaim
+  // NEVER runs over it — orphan reclaim runs on this session's own inbox folder only.
   const dir = resultInboxDir(directory, token)
   if (dir) reclaimOrphanClaims(dir)
 
@@ -1517,20 +1599,107 @@ async function performSessionTransition(ctx: any, intent: SessionTransitionInten
     }
 
     let switchResult: any
+    let reboundSessionFrom: string | null = null
+    let reboundSessionTo: string | null = null
+    let carryRecordedNewSession: string | null = null
+    const mainRoot = mainCheckoutRoot(intent.sourceCwd)
+
     try {
       switchResult = await ctx.switchSession(forkedSessionFile, {
         withSession: async (replacedCtx: any) => {
+          let newSessionId = sessionIdOf(replacedCtx)
+          if (!newSessionId && forkedSessionFile) {
+            try {
+              const firstLine = readFileSync(forkedSessionFile, "utf8").split("\n")[0]
+              const parsed = JSON.parse(firstLine)
+              if (typeof parsed?.id === "string") newSessionId = parsed.id
+            } catch {}
+          }
+
+          let carriedJobsCount = 0
+          let reboundClaimsCount = 0
+
+          if (newSessionId) {
+            const carriedTokens = recordCarry(mainRoot, currentSessionId, newSessionId)
+            carryRecordedNewSession = newSessionId
+            for (const tok of carriedTokens) {
+              const tokDir = path.join(mainRoot, ".bee", "result-inbox", tok)
+              if (isDirectory(tokDir)) {
+                try {
+                  const names = readdirSync(tokDir)
+                  carriedJobsCount += names.filter((n) => n.endsWith(".json")).length
+                } catch {}
+              }
+            }
+
+            // The main checkout, never `intent.targetCwd`: `cells rebind-session`
+            // reads the shared control plane and REFUSES inside a granted feature
+            // worktree, so a worktree cwd turns every rebind into a warning and a
+            // no-op (reproduced live, 2026-09-16).
+            const rebindResult = await execBeeCli(
+              mainRoot,
+              ["cells", "rebind-session", "--from", currentSessionId, "--to", newSessionId, "--json"],
+              newSessionId,
+            )
+            if (rebindResult.exitCode === 0) {
+              reboundSessionFrom = currentSessionId
+              reboundSessionTo = newSessionId
+              try {
+                const parsed = JSON.parse(rebindResult.stdout)
+                if (Array.isArray(parsed?.rebound)) {
+                  reboundClaimsCount = parsed.rebound.length
+                }
+              } catch {}
+            } else {
+              const errDetail =
+                rebindResult.stderr.trim() || rebindResult.stdout.trim() || "unknown error"
+              replacedCtx.ui?.notify?.(
+                `Warning: Failed to rebind cell claims from session ${currentSessionId} to ${newSessionId}: ${errDetail}. ` +
+                  `To rebind manually, run: bee cells rebind-session --from ${currentSessionId} --to ${newSessionId}`,
+                "warning",
+              )
+            }
+          }
+
+          const details: string[] = []
+          if (reboundClaimsCount > 0) {
+            details.push(`rebound ${reboundClaimsCount} ${reboundClaimsCount === 1 ? "claim" : "claims"}`)
+          }
+          if (carriedJobsCount > 0) {
+            details.push(`carried ${carriedJobsCount} ${carriedJobsCount === 1 ? "job" : "jobs"}`)
+          }
+          const detailSuffix = details.length > 0 ? ` — ${details.join(", ")}` : ""
+
           if (intent.operation === "exit-worktree-before-merge") {
+            if (details.length > 0) {
+              replacedCtx.ui?.notify?.(
+                `Relocated session before merge (${intent.targetCwd})${detailSuffix}`,
+                "info",
+              )
+            }
             await handlePostExitMerge(replacedCtx, intent)
           } else {
             replacedCtx.ui?.notify?.(
-              `Relocated session to worktree ${intent.worktreeId || ""} (${intent.targetCwd})`,
+              `Relocated session to worktree ${intent.worktreeId || ""} (${intent.targetCwd})${detailSuffix}`,
               "info",
             )
           }
         },
       })
     } catch (switchErr: any) {
+      if (reboundSessionFrom && reboundSessionTo) {
+        try {
+          await execBeeCli(
+            mainRoot,
+            ["cells", "rebind-session", "--from", reboundSessionTo, "--to", reboundSessionFrom, "--json"],
+            currentSessionId,
+          )
+        } catch {}
+      }
+      if (carryRecordedNewSession) {
+        carriedInboxTokens.delete(carryRecordedNewSession)
+        saveRelocationCarry(mainRoot)
+      }
       if (!transitionTeardownOccurred) {
         if (forkedSessionFile && existsSync(forkedSessionFile)) {
           try {
@@ -1560,6 +1729,19 @@ async function performSessionTransition(ctx: any, intent: SessionTransitionInten
     }
 
     if (switchResult && switchResult.cancelled) {
+      if (reboundSessionFrom && reboundSessionTo) {
+        try {
+          await execBeeCli(
+            mainRoot,
+            ["cells", "rebind-session", "--from", reboundSessionTo, "--to", reboundSessionFrom, "--json"],
+            currentSessionId,
+          )
+        } catch {}
+      }
+      if (carryRecordedNewSession) {
+        carriedInboxTokens.delete(carryRecordedNewSession)
+        saveRelocationCarry(mainRoot)
+      }
       if (!transitionTeardownOccurred && forkedSessionFile && existsSync(forkedSessionFile)) {
         try {
           rmSync(forkedSessionFile, { force: true })
@@ -1619,6 +1801,8 @@ export default function (pi: ExtensionAPI) {
         cachedPreamble = null
         preambleInjected = false
         sessionInitRun = false
+        const activeSessionId = sessionIdOf(ctx) ?? ""
+        promptDepths.delete(activeSessionId)
       }
       const directory = directoryOf(ctx)
       // D4: the result-inbox drain arms HERE and only here — never at module
@@ -1634,6 +1818,7 @@ export default function (pi: ExtensionAPI) {
         session_id: sessionIdOf(ctx),
         source: sessionSource(reason),
         cwd: directory,
+        runtime: "pi",
       })
       sessionInitRun = true
       if (text) cachedPreamble = text
@@ -1687,6 +1872,71 @@ export default function (pi: ExtensionAPI) {
     } catch (err: any) {
       console.error(`bee prompt-context (advisory): ${err?.message ?? err}`)
       return undefined
+    }
+  }) as any)
+
+  // ── ADVISORY: pre-tool activity. Maps to PreToolUse in activity.
+  // Records working activity before the blocking tool_call path runs.
+  pi.on("tool_execution_start", (async (event: any, ctx: any) => {
+    try {
+      const directory = directoryOf(ctx)
+      const mapped = mapToolCall(String(event?.toolName ?? ""), event?.args)
+      runAdvisoryHook(directory, "activity", {
+        hook_event_name: "PreToolUse",
+        session_id: sessionIdOf(ctx),
+        cwd: directory,
+        tool_name: mapped.tool_name,
+        tool_use_id: typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
+      })
+    } catch (err: any) {
+      console.error(`bee activity tool_execution_start (advisory): ${err?.message ?? err}`)
+    }
+  }) as any)
+
+  // ── ADVISORY: UI prompt start maps to Notification:agent_needs_input.
+  // Tracks nested UI prompt depth. Only the outermost start enters waiting_input.
+  pi.on("ui_prompt_start", (async (_event: any, ctx: any) => {
+    try {
+      const activeSessionId = sessionIdOf(ctx) ?? ""
+      const currentDepth = promptDepths.get(activeSessionId) ?? 0
+      promptDepths.set(activeSessionId, currentDepth + 1)
+      if (currentDepth === 0) {
+        const directory = directoryOf(ctx)
+        runAdvisoryHook(directory, "activity", {
+          hook_event_name: "Notification",
+          notification_type: "agent_needs_input",
+          session_id: sessionIdOf(ctx),
+          cwd: directory,
+        })
+      }
+    } catch (err: any) {
+      console.error(`bee activity ui_prompt_start (advisory): ${err?.message ?? err}`)
+    }
+  }) as any)
+
+  // ── ADVISORY: UI prompt end maps to UserPromptSubmit without prompt text.
+  // Ends the waiting_input span and returns activity to working. Unmatched
+  // ends are ignored. Inner ends decrement depth without ending the wait span.
+  pi.on("ui_prompt_end", (async (_event: any, ctx: any) => {
+    try {
+      const activeSessionId = sessionIdOf(ctx) ?? ""
+      const currentDepth = promptDepths.get(activeSessionId) ?? 0
+      if (currentDepth <= 0) {
+        return // unmatched end is ignored
+      }
+      if (currentDepth === 1) {
+        promptDepths.delete(activeSessionId)
+        const directory = directoryOf(ctx)
+        runAdvisoryHook(directory, "activity", {
+          hook_event_name: "UserPromptSubmit",
+          session_id: sessionIdOf(ctx),
+          cwd: directory,
+        })
+      } else {
+        promptDepths.set(activeSessionId, currentDepth - 1)
+      }
+    } catch (err: any) {
+      console.error(`bee activity ui_prompt_end (advisory): ${err?.message ?? err}`)
     }
   }) as any)
 
@@ -1755,6 +2005,8 @@ export default function (pi: ExtensionAPI) {
     // crash is reclaimed at the next `session_start`, which is what makes this
     // channel at-least-once rather than at-most-once.
     try {
+      const activeSessionId = sessionIdOf(ctx) ?? ""
+      promptDepths.delete(activeSessionId)
       selfBusy = false
       turnStartPending = false
       for (const processing of inFlightClaims) rmSync(processing, { force: true })
@@ -1906,6 +2158,8 @@ export default function (pi: ExtensionAPI) {
     } catch (err: any) {
       console.error(`bee session_shutdown (advisory): ${err?.message ?? err}`)
     }
+    const activeSessionId = sessionIdOf(ctx) ?? ""
+    promptDepths.delete(activeSessionId)
     pendingTransitions.clear()
     pendingRelocationTokens.clear()
     return undefined

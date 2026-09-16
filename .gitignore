@@ -34,6 +34,7 @@
 .bee/mailbox/
 .bee/human-mailbox/
 .bee/result-inbox/
+.bee/authorizations/
 # BEE:END
 # DISTILL:START
 /upstreams/
