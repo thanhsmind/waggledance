@@ -71,4 +71,13 @@ codegen-units = 16
 incremental = true
 strip = "debuginfo"
 
+# `cargo test` and plain `cargo build` use `dev`. Full debuginfo on every
+# dependency made target/debug the heaviest tree (4.8 GB, 2.2 GB of it
+# incremental). Keep line tables for our own crates so backtraces still name
+# file:line, and drop debuginfo from dependencies entirely.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
