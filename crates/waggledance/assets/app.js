@@ -4495,4 +4495,44 @@
       }, 0);
     });
   })();
+
+  // sheets-task-sync (D4/D7i): Sync Sheets ghost button on project overview page
+  (function () {
+    var btn = document.querySelector("[data-sheets-sync]");
+    if (!btn) return;
+    var projectId = btn.getAttribute("data-project-id");
+    if (!projectId) return;
+
+    btn.addEventListener("click", function () {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = "Syncing…";
+
+      fetch("/api/projects/" + encodeURIComponent(projectId) + "/sheets/sync", {
+        method: "POST",
+        credentials: "same-origin",
+      })
+        .then(function (res) {
+          return res.json().catch(function () { return null; }).then(function (data) {
+            if (res.ok) {
+              var summary = (data && typeof data.added === "number")
+                ? (data.added + " added, " + data.amended + " amended, " + data.status_changed + " status changed")
+                : "Synced";
+              btn.textContent = summary;
+              setTimeout(function () {
+                location.reload();
+              }, 500);
+            } else {
+              var errMsg = (data && data.error) || res.statusText || "Sync failed";
+              btn.textContent = errMsg;
+              btn.disabled = false;
+            }
+          });
+        })
+        .catch(function (err) {
+          btn.textContent = (err && err.message) || "Sync failed";
+          btn.disabled = false;
+        });
+    });
+  })();
 })();
