@@ -10,6 +10,7 @@
 
 mod cli;
 mod doctor;
+mod gsheets;
 mod guide;
 mod herdr;
 mod mcp;
