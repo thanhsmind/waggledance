@@ -514,6 +514,10 @@ fn router(state: AppState) -> Router {
         // `create_project_pbi` for why the project's own `.bee/bin/bee` is
         // the only thing that ever writes it.
         .route("/api/projects/:id/pbi", post(create_project_pbi))
+        .route(
+            "/api/projects/:id/sheets/sync",
+            post(sync_project_sheets),
+        )
         // Gated (D4/D7/D12): `terminal_family_enabled` is the only check
         // left in front of this route.
         .route("/p/:id/_terminal", get(terminal_page))
@@ -1888,7 +1892,7 @@ fn split_task(task: &str) -> Option<(String, String)> {
 /// daemon's PATH write into a repo that never vendored one. `bee.exe` is
 /// tried for the same reason the repo's own hooks try it — a Windows
 /// checkout vendors that name.
-fn project_bee_binary(root: &std::path::Path) -> Option<PathBuf> {
+pub(crate) fn project_bee_binary(root: &std::path::Path) -> Option<PathBuf> {
     ["bee", "bee.exe"]
         .iter()
         .map(|name| root.join(".bee").join("bin").join(name))
@@ -1915,7 +1919,7 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 /// Every refusal this route makes, in the one shape the dialog reads back
 /// (N3): a JSON `{error}` whose text is shown inline under the textarea.
 /// Never an HTML error page — this route's only caller is `fetch`.
-fn pbi_error(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn pbi_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
@@ -1925,7 +1929,7 @@ fn pbi_error(status: StatusCode, message: impl Into<String>) -> Response {
 /// body; the *tail* rather than the head because bee prints its actual
 /// refusal last. Counted in characters, never bytes, so the cut can never
 /// land mid-character.
-fn stderr_tail(stderr: &[u8]) -> String {
+pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
     const MAX: usize = 300;
     let text = String::from_utf8_lossy(stderr);
     let text = text.trim();
@@ -1946,7 +1950,7 @@ fn stderr_tail(stderr: &[u8]) -> String {
 /// block is ([`first_json_object`]). [`scan_json_id`] below is the fallback
 /// for the one case that framing cannot survive: an unbalanced brace inside
 /// the echoed title.
-fn parse_pbi_id(stdout: &str) -> Option<String> {
+pub(crate) fn parse_pbi_id(stdout: &str) -> Option<String> {
     if let Some(id) = first_json_object(stdout)
         .and_then(|v| v.get("id")?.as_str().map(str::to_string))
         .filter(|id| !id.is_empty())
@@ -2054,6 +2058,59 @@ async fn create_project_pbi(
         Json(json!({ "id": pbi_id, "project_id": project.id })),
     )
         .into_response()
+}
+
+/// `POST /api/projects/:id/sheets/sync` (D4) — sync project backlog tasks and cells with Google Sheets.
+async fn sync_project_sheets(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Ok(Some(project)) = st.engine.get_project(&id) else {
+        return pbi_error(StatusCode::NOT_FOUND, "project not found");
+    };
+    let cfg = waggledance_core::Config::load_from(&waggledance_core::config::config_path_override(
+        st.config_data_dir.as_deref(),
+    ));
+    if !cfg.sheets.is_configured() {
+        return pbi_error(
+            StatusCode::BAD_REQUEST,
+            "Google Sheets sync is not configured: spreadsheet_id and credentials_path must be set in ~/.waggledance/config.toml under [sheets]",
+        );
+    }
+    let Some(creds_path) = &cfg.sheets.credentials_path else {
+        return pbi_error(
+            StatusCode::BAD_REQUEST,
+            "Google Sheets sync credentials_path is not set",
+        );
+    };
+    let key = match crate::gsheets::ServiceAccountKey::from_file(creds_path) {
+        Ok(k) => k,
+        Err(e) => {
+            return pbi_error(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to load service account key: {e}"),
+            );
+        }
+    };
+    let client = crate::gsheets::SheetsClient::new(key, reqwest::Client::new());
+    let state_dir = st
+        .config_data_dir
+        .clone()
+        .unwrap_or_else(waggledance_core::config::data_dir);
+
+    match crate::sheets_sync_run::sync_project(&project, &cfg.sheets, &client, &state_dir).await {
+        Ok(report) => Json(json!(report)).into_response(),
+        Err(err @ crate::sheets_sync_run::SyncError::AlreadyRunning(_)) => {
+            pbi_error(StatusCode::CONFLICT, err.to_string())
+        }
+        Err(crate::sheets_sync_run::SyncError::NotConfigured(msg)) => {
+            pbi_error(StatusCode::BAD_REQUEST, msg)
+        }
+        Err(crate::sheets_sync_run::SyncError::NoBee(msg)) => {
+            pbi_error(StatusCode::BAD_REQUEST, msg)
+        }
+        Err(e) => pbi_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 /// `POST /p/:id/_bee/actions` body (board-approve-actions D1/D3/D4) — the
@@ -3439,7 +3496,18 @@ async fn project_home(State(st): State<AppState>, Path(id): Path<String>) -> Res
         return not_found("project has no markdown files");
     }
     let entry = pick_entry_file(&files).map(|f| f.rel_path.as_str());
-    Html(views::project_home_page(&project, entry, bee)).into_response()
+    let sheets_configured = waggledance_core::Config::load_from(
+        &waggledance_core::config::config_path_override(st.config_data_dir.as_deref()),
+    )
+    .sheets
+    .is_configured();
+    Html(views::project_home_page(
+        &project,
+        entry,
+        bee,
+        sheets_configured,
+    ))
+    .into_response()
 }
 
 /// D3's presence rule: a project shows the bee surface iff its `root_path`
@@ -33130,6 +33198,139 @@ needs_you:
         assert!(
             body.contains("<header class=\"topbar\">") && body.contains("<aside id=\"sidebar\""),
             "panel=1 without embed=1 is the ordinary Code page: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sheets_sync_route_404_unknown_project() {
+        let st = build_state();
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .uri("/api/projects/unknown-proj-999/sheets/sync")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(st).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let s = body_string(resp).await;
+        let body: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(body["error"], "project not found");
+    }
+
+    #[tokio::test]
+    async fn test_sheets_sync_route_400_unconfigured() {
+        let dir = fresh_root("sheets-sync-unconfigured");
+        let root = fresh_root("sheets-sync-unconfigured-proj");
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "unconfigured-proj");
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .uri(format!("/api/projects/{}/sheets/sync", project.id))
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(st).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let s = body_string(resp).await;
+        let body: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let err_msg = body["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("Google Sheets sync is not configured"),
+            "error should have setup hint: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sheets_sync_api_config_no_private_key() {
+        let dir = fresh_root("sheets-sync-config-test");
+        let st = build_state_with_dir(&dir);
+
+        let config_path = dir.join("config.toml");
+        let toml_str = r#"
+[sheets]
+spreadsheet_id = "test-spreadsheet-id-xyz"
+credentials_path = "/path/to/key.json"
+"#;
+        std::fs::write(&config_path, toml_str).unwrap();
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .uri("/api/config")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(st).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("test-spreadsheet-id-xyz"),
+            "response should carry configured spreadsheet_id: {body}"
+        );
+        assert!(
+            !body.contains("private_key"),
+            "GET /api/config must never contain private_key bytes: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sheets_sync_route_409_already_running() {
+        let dir = fresh_root("sheets-sync-409");
+        let root = fresh_root("sheets-sync-409-proj");
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "running-proj");
+
+        let creds_path = dir.join("creds.json");
+        std::fs::write(
+            &creds_path,
+            serde_json::json!({
+                "client_email": "test@example.com",
+                "private_key": crate::sheets_sync_run::TEST_PKCS8_PEM,
+                "token_uri": "http://127.0.0.1:0/token",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config_path = dir.join("config.toml");
+        let toml_str = format!(
+            r#"
+[sheets]
+spreadsheet_id = "test-spreadsheet-id-xyz"
+credentials_path = "{}"
+"#,
+            creds_path.display()
+        );
+        std::fs::write(&config_path, toml_str).unwrap();
+
+        let sync_dir = dir.join("sheets-sync");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        std::fs::write(sync_dir.join(format!("{}.lock", project.id)), "locked").unwrap();
+
+        let bee_bin_dir = root.join(".bee").join("bin");
+        std::fs::create_dir_all(&bee_bin_dir).unwrap();
+        let bee_script = bee_bin_dir.join("bee");
+        std::fs::write(&bee_script, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bee_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .uri(format!("/api/projects/{}/sheets/sync", project.id))
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(st).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let s = body_string(resp).await;
+        let body: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let err_msg = body["error"].as_str().unwrap();
+        assert_eq!(
+            err_msg,
+            format!("Sync is already running for project '{}'", project.id),
+            "409 body must carry full display message, not bare project id"
         );
     }
 }

@@ -16,6 +16,7 @@ pub struct Config {
     pub renderer: RendererConfig,
     pub search: SearchConfig,
     pub terminal: TerminalConfig,
+    pub sheets: SheetsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +177,24 @@ pub struct TerminalConfig {
 pub struct AgentPreset {
     pub label: String,
     pub argv: Vec<String>,
+}
+
+/// Google Sheets two-way task sync configuration (D3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SheetsConfig {
+    pub spreadsheet_id: String,
+    pub credentials_path: Option<PathBuf>,
+}
+
+impl SheetsConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.spreadsheet_id.trim().is_empty()
+            && self
+                .credentials_path
+                .as_ref()
+                .map_or(false, |p| !p.as_os_str().is_empty())
+    }
 }
 
 /// Hand-written so `reaper_enabled` can ship **on** while every
@@ -1130,6 +1149,37 @@ mod tests {
             "telegram credential file must be owner-read/write only"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sheets_config_defaults_empty_and_unconfigured() {
+        let c = Config::default();
+        assert_eq!(c.sheets.spreadsheet_id, "");
+        assert_eq!(c.sheets.credentials_path, None);
+        assert!(!c.sheets.is_configured());
+    }
+
+    #[test]
+    fn sheets_config_roundtrips_through_toml() {
+        let mut c = Config::default();
+        c.sheets.spreadsheet_id = "test-sheet-id".into();
+        c.sheets.credentials_path = Some(PathBuf::from("/etc/creds.json"));
+        assert!(c.sheets.is_configured());
+
+        let dir = std::env::temp_dir().join(format!("waggledance-cfg-sheets-{}", std::process::id()));
+        let p = dir.join("config.toml");
+        c.save_to(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[sheets]"));
+        assert!(text.contains("spreadsheet_id = \"test-sheet-id\""));
+        let loaded = Config::load_from(&p);
+        assert_eq!(loaded.sheets.spreadsheet_id, "test-sheet-id");
+        assert_eq!(
+            loaded.sheets.credentials_path,
+            Some(PathBuf::from("/etc/creds.json"))
+        );
+        assert!(loaded.sheets.is_configured());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
