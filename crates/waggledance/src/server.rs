@@ -2100,8 +2100,8 @@ async fn sync_project_sheets(
 
     match crate::sheets_sync_run::sync_project(&project, &cfg.sheets, &client, &state_dir).await {
         Ok(report) => Json(json!(report)).into_response(),
-        Err(crate::sheets_sync_run::SyncError::AlreadyRunning(msg)) => {
-            pbi_error(StatusCode::CONFLICT, msg)
+        Err(err @ crate::sheets_sync_run::SyncError::AlreadyRunning(_)) => {
+            pbi_error(StatusCode::CONFLICT, err.to_string())
         }
         Err(crate::sheets_sync_run::SyncError::NotConfigured(msg)) => {
             pbi_error(StatusCode::BAD_REQUEST, msg)
@@ -33269,6 +33269,68 @@ credentials_path = "/path/to/key.json"
         assert!(
             !body.contains("private_key"),
             "GET /api/config must never contain private_key bytes: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sheets_sync_route_409_already_running() {
+        let dir = fresh_root("sheets-sync-409");
+        let root = fresh_root("sheets-sync-409-proj");
+        let st = build_state_with_dir(&dir);
+        let project = register(&st, &root, "running-proj");
+
+        let creds_path = dir.join("creds.json");
+        std::fs::write(
+            &creds_path,
+            serde_json::json!({
+                "client_email": "test@example.com",
+                "private_key": crate::sheets_sync_run::TEST_PKCS8_PEM,
+                "token_uri": "http://127.0.0.1:0/token",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config_path = dir.join("config.toml");
+        let toml_str = format!(
+            r#"
+[sheets]
+spreadsheet_id = "test-spreadsheet-id-xyz"
+credentials_path = "{}"
+"#,
+            creds_path.display()
+        );
+        std::fs::write(&config_path, toml_str).unwrap();
+
+        let sync_dir = dir.join("sheets-sync");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        std::fs::write(sync_dir.join(format!("{}.lock", project.id)), "locked").unwrap();
+
+        let bee_bin_dir = root.join(".bee").join("bin");
+        std::fs::create_dir_all(&bee_bin_dir).unwrap();
+        let bee_script = bee_bin_dir.join("bee");
+        std::fs::write(&bee_script, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bee_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .uri(format!("/api/projects/{}/sheets/sync", project.id))
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(st).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let s = body_string(resp).await;
+        let body: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let err_msg = body["error"].as_str().unwrap();
+        assert_eq!(
+            err_msg,
+            format!("Sync is already running for project '{}'", project.id),
+            "409 body must carry full display message, not bare project id"
         );
     }
 }

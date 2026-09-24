@@ -338,17 +338,8 @@ pub async fn sync_project(
                     }
                 } else {
                     errors.push(format!(
-                        "bee backlog pbi add for '{title}' succeeded but stdout contained no ID"
+                        "bee backlog pbi add for '{title}' created PBI but its id could not be read"
                     ));
-                    failed_adds.push(SheetRow {
-                        sheet_index: row_index,
-                        id: String::new(),
-                        kind: RowKind::Task,
-                        title,
-                        status,
-                        description: cos,
-                        feature: String::new(),
-                    });
                 }
             }
             SyncOp::Amend { id, title, cos } => {
@@ -492,6 +483,9 @@ pub async fn sync_project(
 }
 
 #[cfg(test)]
+pub(crate) use tests::TEST_PKCS8_PEM;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::extract::Path as AxPath;
@@ -504,7 +498,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    const TEST_PKCS8_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+    pub(crate) const TEST_PKCS8_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC5w1is4/YKniI0
 +/EuH5b248KiYb5KigbWtNWENpd95hUqGiw4Bni/lC/amlFV3jnOON9uu0aBDQgH
 ZODrzdhcYXAGMn/Cz9mtjggM3JxM2fdDDojDSP9fiCqMy69VXlpTW6n9uBbKYo8l
@@ -750,6 +744,7 @@ sgjI3687NnKVf2hyV4epQthL
 dir="$(cd "$(dirname "$0")/../.." && pwd)"
 log_file="$dir/bee_argv.log"
 fail_file="$dir/bee_fail"
+no_id_file="$dir/bee_no_id"
 echo "$@" >> "$log_file"
 
 if [ -f "$fail_file" ]; then
@@ -763,6 +758,11 @@ act="$3"
 
 if [ "$cmd" = "backlog" ] && [ "$sub" = "pbi" ]; then
     if [ "$act" = "add" ]; then
+        if [ -f "$no_id_file" ]; then
+            echo '{"kind":"pbi","id":"p-added-no-id","title":"Task Without Output ID","status":"proposed","cos":"","feature":""}' >> "$dir/.bee/backlog.jsonl"
+            echo "created task successfully but no json id"
+            exit 0
+        fi
         echo '{"id": "p-test-add-1", "title": "Added task"}'
         exit 0
     elif [ "$act" = "amend" ]; then
@@ -1064,6 +1064,78 @@ exit 0
     }
 
     #[tokio::test]
+    async fn test_sheets_sync_add_without_id_no_duplicate() {
+        let state = MockSheetsState::default();
+        let (base_url, _handle) = start_mock_server(state.clone()).await;
+
+        let (_temp, project) = setup_test_project("NoIdAddProj", &[]);
+        let state_dir = tempfile::tempdir().unwrap();
+
+        let cfg = SheetsConfig {
+            spreadsheet_id: "sheet-123".to_string(),
+            credentials_path: Some(PathBuf::from("/fake/path.json")),
+        };
+        let client = SheetsClient::new(test_key(), reqwest::Client::new())
+            .with_endpoints(format!("{base_url}/token"), base_url);
+
+        // Initial sync creates header
+        sync_project(&project, &cfg, &client, state_dir.path())
+            .await
+            .unwrap();
+
+        // Add ID-less row on the sheet
+        {
+            let mut values_map = state.values.lock().await;
+            let rows = values_map.get_mut("NoIdAddProj").unwrap();
+            rows.push(vec![
+                "".to_string(),
+                "task".to_string(),
+                "Task Without Output ID".to_string(),
+                "proposed".to_string(),
+                "no id desc".to_string(),
+                "".to_string(),
+            ]);
+        }
+
+        // Arm stub bee to exit 0 printing no id
+        std::fs::write(project.root_path.join("bee_no_id"), "no-id").unwrap();
+
+        let report = sync_project(&project, &cfg, &client, state_dir.path())
+            .await
+            .unwrap();
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("created PBI but its id could not be read")),
+            "must report that PBI was created without readable ID: {:?}",
+            report.errors
+        );
+
+        // After the sync, the rewritten tab has no ID-less copy of that row
+        let values_map = state.values.lock().await;
+        let rows = values_map.get("NoIdAddProj").unwrap();
+        for row in rows.iter().skip(1) {
+            assert!(
+                !row[0].is_empty(),
+                "rewritten tab must not have an ID-less row, but found: {row:?}"
+            );
+        }
+        assert!(
+            rows.iter().any(|r| r[2] == "Task Without Output ID"),
+            "the task row is present on the tab with its ID from bee: {rows:?}"
+        );
+        drop(values_map);
+
+        // A second sync must issue zero adds and create no duplicate PBI
+        let second_report = sync_project(&project, &cfg, &client, state_dir.path())
+            .await
+            .unwrap();
+        assert_eq!(second_report.added, 0, "second sync must add 0 duplicate PBIs");
+    }
+
+    #[tokio::test]
     async fn test_sheets_sync_failing_bee_op_overlay() {
         let state = MockSheetsState::default();
         let (base_url, _handle) = start_mock_server(state.clone()).await;
@@ -1171,7 +1243,13 @@ exit 0
             .expect_err("must fail on held lock");
 
         match err {
-            SyncError::AlreadyRunning(pid) => assert_eq!(pid, project.id),
+            SyncError::AlreadyRunning(ref pid) => {
+                assert_eq!(pid, &project.id);
+                assert_eq!(
+                    err.to_string(),
+                    format!("Sync is already running for project '{}'", project.id)
+                );
+            }
             other => panic!("expected AlreadyRunning, got: {other:?}"),
         }
     }
