@@ -88,11 +88,6 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Google Sheets two-way sync commands.
-    Sheets {
-        #[command(subcommand)]
-        action: SheetsAction,
-    },
     /// Print the version (same value as `--version`).
     Version,
 }
@@ -101,22 +96,6 @@ pub enum Command {
 pub enum ConfigAction {
     /// Open the config file (`~/.waggledance/config.toml`) in $EDITOR.
     Edit,
-}
-
-#[derive(Subcommand)]
-pub enum SheetsAction {
-    /// Synchronize project tasks with Google Sheets.
-    Sync {
-        /// Project ID or name to synchronize.
-        #[arg(long)]
-        project: Option<String>,
-        /// Synchronize all registered projects.
-        #[arg(long)]
-        all: bool,
-        /// Output JSON.
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -150,9 +129,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Mcp => crate::mcp::run(),
         Command::Config { action } => match action {
             ConfigAction::Edit => cmd_config_edit(),
-        },
-        Command::Sheets { action } => match action {
-            SheetsAction::Sync { project, all, json } => cmd_sheets_sync(project, all, json),
         },
         Command::Version => {
             // Single source of truth: the workspace Cargo package version.
@@ -233,97 +209,6 @@ fn cmd_config_edit() -> Result<()> {
         "{}",
         classify_config_edit_outcome(&path, std::fs::read_to_string(&path))
     );
-    Ok(())
-}
-
-fn cmd_sheets_sync(project: Option<String>, all: bool, json: bool) -> Result<()> {
-    if !all && project.is_none() {
-        anyhow::bail!("either --project <id-or-name> or --all is required");
-    }
-
-    let engine = runtime::build_engine()?;
-    let all_projects = engine.list_projects()?;
-
-    let target_projects: Vec<waggledance_core::domain::Project> = if all {
-        all_projects
-    } else {
-        let arg = project.as_deref().unwrap();
-        if let Some(p) = all_projects.iter().find(|p| p.id == arg) {
-            vec![p.clone()]
-        } else {
-            let name_matches: Vec<_> = all_projects.iter().filter(|p| p.name == arg).collect();
-            if name_matches.len() > 1 {
-                let ids = name_matches
-                    .iter()
-                    .map(|p| p.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow::bail!("ambiguous project name '{arg}'; matching project IDs: {ids}");
-            } else if let Some(p) = name_matches.first() {
-                vec![(*p).clone()]
-            } else {
-                anyhow::bail!("project '{arg}' not found");
-            }
-        }
-    };
-
-    let cfg = Config::load_from(&waggledance_core::config::config_path());
-    if !cfg.sheets.is_configured() {
-        anyhow::bail!(
-            "Google Sheets sync is not configured: spreadsheet_id and credentials_path must be set in ~/.waggledance/config.toml under [sheets]"
-        );
-    }
-    let creds_path = cfg
-        .sheets
-        .credentials_path
-        .as_ref()
-        .context("credentials_path is not set under [sheets]")?;
-    let key = crate::gsheets::ServiceAccountKey::from_file(creds_path)
-        .context("failed to load service account key")?;
-    let client = crate::gsheets::SheetsClient::new(key, reqwest::Client::new());
-    let state_dir = waggledance_core::config::data_dir();
-
-    let rt = tokio::runtime::Runtime::new()?;
-    let mut any_error = false;
-
-    for proj in &target_projects {
-        match rt.block_on(crate::sheets_sync_run::sync_project(
-            proj,
-            &cfg.sheets,
-            &client,
-            &state_dir,
-        )) {
-            Ok(report) => {
-                if !report.errors.is_empty() {
-                    any_error = true;
-                }
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
-                    println!("{}", report.summary());
-                }
-            }
-            Err(e) => {
-                any_error = true;
-                if json {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "project": proj.name,
-                            "error": e.to_string(),
-                        })
-                    );
-                } else {
-                    eprintln!("error syncing {}: {e}", proj.name);
-                }
-            }
-        }
-    }
-
-    if any_error {
-        anyhow::bail!("sync completed with errors");
-    }
-
     Ok(())
 }
 
@@ -852,15 +737,6 @@ mod open_url_shape_tests {
         assert_eq!(
             text,
             "Viewable at (pick a reachable IP):\n  http://192.168.1.5:7700\n  http://10.0.0.2:7700"
-        );
-    }
-
-    #[test]
-    fn test_sheets_sync_cli_refuses_without_project_or_all() {
-        let err = cmd_sheets_sync(None, false, false).unwrap_err();
-        assert!(
-            err.to_string().contains("either --project <id-or-name> or --all is required"),
-            "unexpected error: {err}"
         );
     }
 }

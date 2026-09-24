@@ -2028,20 +2028,7 @@ fn bee_hub_terminal_badge_groups(
 /// redirect straight to its entry file and never show the Terminal tab at
 /// all. `bee` gates only the Bee board card; the tab strip itself is
 /// unconditional.
-pub fn project_home_page(
-    project: &Project,
-    entry: Option<&str>,
-    bee: bool,
-    sheets_configured: bool,
-) -> String {
-    let sync_button = if sheets_configured {
-        format!(
-            r#"<button type="button" class="fg-btn fg-btn--ghost" data-sheets-sync data-project-id="{pid}">Sync Sheets</button>"#,
-            pid = esc(&project.id)
-        )
-    } else {
-        String::new()
-    };
+pub fn project_home_page(project: &Project, entry: Option<&str>, bee: bool) -> String {
     let docs_card = match entry {
         Some(rel) => format!(
             r#"<a class="fg-card proj-card__link" href="/p/{pid}/{rel}">
@@ -2080,7 +2067,7 @@ pub fn project_home_page(
                 "<span class=\"crumb\">{name}</span>",
                 name = esc(&project.name)
             ),
-            &sync_button,
+            "",
             &project_tabs(&project.id, "overview"),
         ),
         tab_style = PROJECT_TAB_STYLE,
@@ -11988,34 +11975,10 @@ mod tests {
         );
 
         let project = sample_project();
-        let project_html = project_home_page(&project, None, false, false);
+        let project_html = project_home_page(&project, None, false);
         assert!(
             !project_html.contains("data-agent-drawer-homepage"),
             "a project page's drawer must not carry the homepage marker: {project_html}"
-        );
-    }
-
-    #[test]
-    fn test_sheets_sync_views_button_configured() {
-        let project = sample_project();
-        let unconfigured_html = project_home_page(&project, None, false, false);
-        assert!(
-            !unconfigured_html.contains("Sync Sheets"),
-            "button must not appear when [sheets] is not configured: {unconfigured_html}"
-        );
-
-        let configured_html = project_home_page(&project, None, false, true);
-        assert!(
-            configured_html.contains("Sync Sheets"),
-            "button must appear when [sheets] is configured: {configured_html}"
-        );
-        assert!(
-            configured_html.contains("data-sheets-sync"),
-            "button must carry data-sheets-sync: {configured_html}"
-        );
-        assert!(
-            configured_html.contains(&format!("data-project-id=\"{}\"", project.id)),
-            "button must carry data-project-id: {configured_html}"
         );
     }
 

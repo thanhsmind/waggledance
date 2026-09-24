@@ -10,7 +10,6 @@
 
 mod cli;
 mod doctor;
-mod gsheets;
 mod guide;
 mod herdr;
 mod mcp;
@@ -19,7 +18,6 @@ mod orchestrate;
 mod reaper;
 mod runtime;
 mod server;
-mod sheets_sync_run;
 mod slash;
 mod slash_builtins;
 mod supervisor;

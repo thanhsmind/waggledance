@@ -22,7 +22,6 @@ pub mod paths_boundary;
 pub mod process;
 pub mod render;
 pub mod repository;
-pub mod sheets_sync;
 pub mod short_link;
 pub mod transcript;
 

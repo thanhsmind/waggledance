@@ -228,7 +228,6 @@ waggledance open <file.md>                # print the browser URL (auto-starts t
 waggledance register <dir> [--name ...]   # recursive scan + index a project
 waggledance search "query"                # full-text search (FTS5)
 waggledance status                        # is the daemon up?
-waggledance sheets sync --project <name>   # sync backlog tasks with Google Sheets
 waggledance config edit                   # edit ~/.waggledance/config.toml in $EDITOR
 waggledance restart                       # restart the daemon (apply config changes)
 waggledance doctor [--fix]                # diagnose & repair the integration
@@ -237,14 +236,6 @@ waggledance serve [--host H] [--port P]   # optional: pre-start / bind a custom 
 
 Most commands accept `--json`. Full reference, SSH workflows, and settings live in the
 **[usage guide](docs/usage.md)**.
-
----
-
-## Google Sheets sync
-
-Waggle Dance synchronizes project tasks and work cells with a Google spreadsheet, maintaining one tab per project. The project overview page provides a **Sync Sheets** button when configured, and the CLI provides `waggledance sheets sync`.
-
-Setup steps, sheet layout, editable fields, and merge rules are documented in the [Google Sheets task sync guide](docs/knowledge/concepts/google-sheets-task-sync.md).
 
 ---
 
