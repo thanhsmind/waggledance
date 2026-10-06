@@ -82,6 +82,7 @@ never a generation timestamp or any other wall-clock value.
 - [orchestrator-dispatch/](orchestrator-dispatch/index.md) — 1 concept(s)
 - [pane-bar-mobile-menu/](pane-bar-mobile-menu/index.md) — 1 concept(s)
 - [pbi-detail/](pbi-detail/index.md) — 1 concept(s)
+- [pi-paseo-plugin/](pi-paseo-plugin/index.md) — 1 concept(s)
 - [poller-inflight-guard/](poller-inflight-guard/index.md) — 1 concept(s)
 - [project-color-identity/](project-color-identity/index.md) — 1 concept(s)
 - [project-suggestions/](project-suggestions/index.md) — 1 concept(s)

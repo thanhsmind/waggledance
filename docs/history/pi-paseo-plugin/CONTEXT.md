@@ -63,7 +63,7 @@ from Paseo, no pi session presence reporting.
 
 ## Outstanding Questions
 
-### Deferred To Planning
+### Resolved In Planning
 
-- [ ] Board transport: a `waggledance board --json` CLI vs a new `/api/board` route — must keep root paths off the unauthenticated HTTP API.
-- [ ] The repo's `commands.test` points at `packages/bee-rs`, which this repo does not have — planning names the real proof commands.
+- [x] Board transport: a new `/api/board` route without root paths; the workspace-to-project match runs `waggledance list --json` on the Paseo host (plan.md, Approach).
+- [x] Proof commands: each cell names its own (`cargo test -p waggledance` filters, `node --test`, `tsc`), since `commands.test` points at `packages/bee-rs`, which this repo does not have.
