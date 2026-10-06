@@ -83,6 +83,15 @@ pub enum Command {
     },
     /// Run the MCP server over stdio (used by Claude Code).
     Mcp,
+    /// Install (or --remove) the pi extension or the Paseo plugin.
+    Setup {
+        #[arg(value_enum)]
+        target: crate::setup::Target,
+        #[arg(long)]
+        remove: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Edit configuration.
     Config {
         #[command(subcommand)]
@@ -127,6 +136,11 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Restart => cmd_restart(),
         Command::Doctor { json, dry_run, fix } => crate::doctor::run(json, dry_run, fix),
         Command::Mcp => crate::mcp::run(),
+        Command::Setup {
+            target,
+            remove,
+            json,
+        } => crate::setup::run(target, remove, json),
         Command::Config { action } => match action {
             ConfigAction::Edit => cmd_config_edit(),
         },

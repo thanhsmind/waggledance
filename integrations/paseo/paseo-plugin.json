@@ -1,0 +1,5 @@
+{
+  "id": "waggledance",
+  "description": "Waggle Dance in Paseo: what waits on you, what is in progress, and the live agents (read-only)",
+  "requirements": { "paseo": ">=0.10.0" }
+}
