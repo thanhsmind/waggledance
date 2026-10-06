@@ -18,6 +18,7 @@ mod orchestrate;
 mod reaper;
 mod runtime;
 mod server;
+mod setup;
 mod slash;
 mod slash_builtins;
 mod supervisor;
