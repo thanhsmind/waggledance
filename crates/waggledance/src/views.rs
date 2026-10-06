@@ -5372,6 +5372,55 @@ fn bee_hub_in_progress_tier(panes: &[TerminalPaneView]) -> u8 {
     }
 }
 
+pub(crate) fn bee_board_json(rollups: &[(&Project, &BeeProjectRollup)]) -> serde_json::Value {
+    type Key = (u8, Option<time::OffsetDateTime>, String);
+    let mut in_progress: Vec<(Key, serde_json::Value)> = Vec::new();
+    let mut ready_to_merge: Vec<(Key, serde_json::Value)> = Vec::new();
+    for (project, rollup) in rollups {
+        let archived: std::collections::HashSet<String> = rollup
+            .archived_features
+            .iter()
+            .map(|a| a.feature.clone())
+            .collect();
+        let row = |feature: &str, docs: Option<&waggledance_core::bee::BeeFeatureDocs>| {
+            serde_json::json!({
+                "project_id": project.id,
+                "project_name": project.name,
+                "feature": feature,
+                "title": docs.and_then(|d| d.title.as_deref()).unwrap_or(feature),
+                "url": format!("/p/{}/_bee/feature/{}", project.id, feature),
+            })
+        };
+        for placement in bee_classify_features(&rollup.snapshot, &archived) {
+            match placement {
+                BeeHubPlacement::InProgress(c) => {
+                    let waiting = c.reason.as_deref().is_some_and(|r| !r.is_empty());
+                    let (_, since, feature) =
+                        bee_hub_in_progress_sort_key(&c.feature, c.last_activity.as_deref(), &[]);
+                    let mut value = row(&c.feature, c.docs.as_ref());
+                    value["done"] = c.done.into();
+                    value["total"] = c.total.into();
+                    value["waiting"] = waiting.into();
+                    value["reason"] = c.reason.into();
+                    value["last_activity"] = c.last_activity.into();
+                    in_progress.push(((u8::from(!waiting), since, feature), value));
+                }
+                BeeHubPlacement::ReadyToMerge(d, merge) => ready_to_merge.push((
+                    bee_hub_ready_to_merge_key(&merge, &d.feature),
+                    row(&d.feature, d.docs.as_ref()),
+                )),
+                _ => {}
+            }
+        }
+    }
+    in_progress.sort_by(|a, b| bee_hub_in_progress_cmp(&a.0, &b.0));
+    ready_to_merge.sort_by(|a, b| bee_hub_ready_to_merge_cmp(&a.0, &b.0));
+    serde_json::json!({
+        "in_progress": in_progress.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        "ready_to_merge": ready_to_merge.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+    })
+}
+
 /// D7's own sort key for one In Progress card: its terminal tier
 /// ([`bee_hub_in_progress_tier`]), its own `last_activity` parsed as RFC
 /// 3339 the same way [`bee_fmt_trace_time`] already parses it (`None` for

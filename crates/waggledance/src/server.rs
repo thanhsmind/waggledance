@@ -426,6 +426,7 @@ fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/status", get(status))
         .route("/api/projects", get(api_projects))
+        .route("/api/board", get(api_board))
         // agent-switch-drawer: the cross-project pane switcher's own feed —
         // every agent-backed pane on the host, from every registered
         // project plus the Unassigned group, gated the same as the rest of
@@ -1297,6 +1298,19 @@ async fn api_projects(State(st): State<AppState>) -> impl IntoResponse {
         })
         .collect();
     Json(json!({ "projects": arr }))
+}
+
+async fn api_board(State(st): State<AppState>) -> impl IntoResponse {
+    let bee_projects: Vec<waggledance_core::domain::Project> = st
+        .engine
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_bee_project)
+        .collect();
+    let rollups = cross_project_rollup(st.bee_cache.clone(), bee_projects).await;
+    let refs: Vec<_> = rollups.iter().map(|(p, r)| (p, r)).collect();
+    Json(views::bee_board_json(&refs))
 }
 
 /// One project's public API summary. Deliberately omits the absolute
@@ -8562,6 +8576,137 @@ mod bee_route_tests {
                 "trace": {{"worker": "w1"{capped_field}}}
             }}"#
         )
+    }
+
+    #[tokio::test]
+    async fn api_board_lists_in_progress_waiting_first_and_ready_to_merge_without_paths() {
+        let root = fresh_root("api-board");
+        write(
+            &root,
+            ".bee/lanes/todo-feat.json",
+            &lane_json(
+                "todo-feat",
+                "swarming",
+                "standard",
+                "keep going",
+                None,
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/t.json",
+            &feature_cell_json("tf-1", "todo-feat", "open", None, None),
+        );
+        write(
+            &root,
+            ".bee/lanes/progress-feat.json",
+            &lane_json(
+                "progress-feat",
+                "swarming",
+                "standard",
+                "keep going",
+                Some(r#""context": true, "shape": true, "execution": true, "review": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/p.json",
+            &feature_cell_json("pf-1", "progress-feat", "claimed", None, None),
+        );
+        write(
+            &root,
+            ".bee/lanes/gated-feat.json",
+            &lane_json(
+                "gated-feat",
+                "swarming",
+                "standard",
+                "keep going",
+                Some(r#""context": true, "shape": false, "execution": false, "review": false"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/g.json",
+            &feature_cell_json("gf-1", "gated-feat", "claimed", None, None),
+        );
+        write(
+            &root,
+            ".bee/lanes/merge-feat.json",
+            &lane_json(
+                "merge-feat",
+                "swarming",
+                "standard",
+                "merge the worktree",
+                Some(r#""context": true, "shape": true, "execution": true, "uat": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/m.json",
+            &merge_cell_json("mf-1", "merge-feat", "capped", Some("2026-08-21T10:00:00Z")),
+        );
+        let sibling = make_worktree_sibling("api-board-merge-wt");
+        write(
+            &sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"merge-feat","mode":"standard"}"#,
+        );
+        write(
+            &root,
+            ".bee/runtime/worktree-grants.json",
+            &grants_json(&["api-board-merge-wt"]),
+        );
+
+        let st = build_state();
+        let project = register(&st, &root, "api-board");
+        let resp = get(router(st), "/api/board").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        let in_progress = v["in_progress"].as_array().expect("in_progress array");
+        let features: Vec<&str> = in_progress
+            .iter()
+            .map(|c| c["feature"].as_str().unwrap())
+            .collect();
+        assert_eq!(features, ["gated-feat", "progress-feat"], "{body}");
+        assert_eq!(in_progress[0]["waiting"], true, "{body}");
+        assert!(
+            in_progress[0]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("Waiting on you"),
+            "{body}"
+        );
+        assert_eq!(in_progress[0]["project_id"], project.id.as_str());
+        assert_eq!(in_progress[0]["project_name"], "api-board");
+        assert_eq!(in_progress[0]["title"], "Gated Feat");
+        assert_eq!(in_progress[0]["done"], 0);
+        assert_eq!(in_progress[0]["total"], 1);
+        assert_eq!(
+            in_progress[0]["url"],
+            format!("/p/{}/_bee/feature/gated-feat", project.id)
+        );
+        assert_eq!(in_progress[1]["waiting"], false, "{body}");
+        assert!(in_progress[1]["reason"].is_null(), "{body}");
+
+        let ready = v["ready_to_merge"]
+            .as_array()
+            .expect("ready_to_merge array");
+        assert_eq!(ready.len(), 1, "{body}");
+        assert_eq!(ready[0]["feature"], "merge-feat");
+        assert_eq!(
+            ready[0]["url"],
+            format!("/p/{}/_bee/feature/merge-feat", project.id)
+        );
+
+        assert!(!body.contains("root_path"), "{body}");
+        assert!(!body.contains(root.to_str().unwrap()), "{body}");
+        assert!(!body.contains(sibling.to_str().unwrap()), "{body}");
     }
 
     /// (console-theme-kanban ctk-8, widened by bee-agent-activity R1 —
