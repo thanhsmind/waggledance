@@ -9,14 +9,16 @@
 
 use crate::herdr::{socket::SocketHerdr, Herdr};
 use crate::orchestrate;
+use crate::paseo::{self, Leader, Paseo, PaseoCli};
 use crate::runtime;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use waggledance_core::bee;
-use waggledance_core::config::registry_db_path;
+use waggledance_core::config::{registry_db_path, resolve_data_dir};
 use waggledance_core::domain::{Project, Run};
+use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::notify_store::NotifyStore;
 use waggledance_core::{Config, Engine, Error, SqliteStore};
 
@@ -239,15 +241,17 @@ fn dispatch_schema() -> Value {
         "description": "Dispatch a task to an agent pane in a project that has opted into \
     orchestrator dispatch (D6 — refused, naming the remedy, when the project or the terminal \
     surface has not been switched on). Either spawn a fresh agent via an operator-configured \
-    preset label, or target an already-running pane by id — exactly one of `preset`/`pane_id`, \
-    never both, and never a raw command. Returns a `run_id` immediately; poll completion with \
-    `waggledance_await`.",
+    preset label, target an already-running pane by id, or hand the task to the project's Paseo \
+    leader with `leader: true` (found by label, or started in the configured Paseo workspace) — \
+    exactly one of `preset`/`pane_id`/`leader`, and never a raw command. Returns a `run_id` \
+    immediately; poll completion with `waggledance_await`.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": { "type": "string", "description": "Registered project id" },
                 "preset": { "type": "string", "description": "Operator-configured agent preset label to spawn a fresh pane — mutually exclusive with pane_id" },
                 "pane_id": { "type": "string", "description": "An already-running pane id to target — mutually exclusive with preset" },
+                "leader": { "type": "boolean", "description": "true sends the task to the project's Paseo leader — mutually exclusive with preset and pane_id" },
                 "task": { "type": "string", "description": "The task text sent to the agent" }
             },
             "required": ["project", "task"]
@@ -918,15 +922,25 @@ fn handle_dispatch(
         .get("pane_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    match (preset_label, pane_id_arg) {
-        (Some(_), Some(_)) => {
+    let leader = args.get("leader").and_then(Value::as_bool).unwrap_or(false);
+    match [preset_label.is_some(), pane_id_arg.is_some(), leader]
+        .iter()
+        .filter(|t| **t)
+        .count()
+    {
+        0 => {
             return tool_error(
                 id,
-                "specify exactly one of \"preset\" or \"pane_id\", not both",
+                "specify one of \"preset\", \"pane_id\" or \"leader\": true",
             )
         }
-        (None, None) => return tool_error(id, "specify one of \"preset\" or \"pane_id\""),
-        _ => {}
+        1 => {}
+        _ => {
+            return tool_error(
+                id,
+                "specify exactly one of \"preset\", \"pane_id\" or \"leader\": true, not both",
+            )
+        }
     }
 
     let project = match engine.get_project(project_id) {
@@ -934,6 +948,10 @@ fn handle_dispatch(
         Ok(None) => return tool_error(id, &format!("project not found: {project_id}")),
         Err(e) => return tool_error(id, &format!("project lookup failed: {e}")),
     };
+    if leader {
+        let cli = PaseoCli::new(&engine.config.paseo);
+        return dispatch_to_leader(id, engine, &project, task, &cli, &resolve_data_dir(None));
+    }
     if !engine.config.terminal.enabled {
         return tool_error(
             id,
@@ -942,13 +960,7 @@ fn handle_dispatch(
         );
     }
     if !engine.orchestration_allowed(&project) {
-        return tool_error(
-            id,
-            &format!(
-                "project {project_id} has not opted into orchestrator dispatch — enable it \
-                 from the project's settings page"
-            ),
-        );
+        return tool_error(id, &not_opted_in(project_id));
     }
 
     // Resolved before any herdr call so an unresolvable label never touches
@@ -994,6 +1006,107 @@ fn handle_dispatch(
         }
         Err(msg) => tool_error(id, &msg),
     }
+}
+
+fn not_opted_in(project_id: &str) -> String {
+    format!(
+        "project {project_id} has not opted into orchestrator dispatch — enable it from the \
+         project's settings page"
+    )
+}
+
+fn dispatch_to_leader(
+    id: Option<Value>,
+    engine: &Engine,
+    project: &Project,
+    task: &str,
+    paseo: &dyn Paseo,
+    data_dir: &Path,
+) -> Value {
+    if !engine.orchestration_allowed(project) {
+        return tool_error(id, &not_opted_in(&project.id));
+    }
+    if !engine.config.paseo.enabled {
+        return tool_error(
+            id,
+            "Paseo leader dispatch is off — add the lines `[paseo]` and `enabled = true` to \
+             ~/.waggledance/config.toml",
+        );
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => return tool_error(id, &format!("failed to start the dispatch runtime: {e}")),
+    };
+    match runtime.block_on(leader_dispatch(paseo, engine, project, task, data_dir)) {
+        Ok((run_id, agent_id, workspace, how)) => ok(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": format!(
+                    "dispatched run {run_id} to project {}'s Paseo leader {agent_id} ({how})",
+                    project.id
+                ) }],
+                "structuredContent": {
+                    "run_id": run_id,
+                    "warnings": Vec::<String>::new(),
+                    "agent_id": agent_id,
+                    "workspace": workspace,
+                    "leader": how
+                }
+            }),
+        ),
+        Err(msg) => tool_error(id, &msg),
+    }
+}
+
+async fn leader_dispatch(
+    paseo: &dyn Paseo,
+    engine: &Engine,
+    project: &Project,
+    task: &str,
+    data_dir: &Path,
+) -> std::result::Result<(String, String, Option<String>, &'static str), String> {
+    let leader = paseo::resolve_leader(paseo, &engine.config.paseo, project, data_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let baseline = now_rfc3339();
+    let (agent_id, workspace, how) = match leader {
+        Leader::Existing { id, busy: true } => {
+            return Err(format!(
+                "project {}'s Paseo leader {id} is busy — refusing to interrupt its current \
+                 run; retry after it ends",
+                project.id
+            ))
+        }
+        Leader::Existing { id, busy: false } => {
+            paseo.send(&id, task).await.map_err(|e| e.to_string())?;
+            (id, None, "reused")
+        }
+        Leader::Start(start) => {
+            let workspace = start.workspace.clone();
+            let id = start.run(paseo, task).await.map_err(|e| e.to_string())?;
+            (id, Some(workspace), "started")
+        }
+    };
+    let now = now_rfc3339();
+    let run = Run {
+        id: format!("run-{:016x}", rand::random::<u64>()),
+        project_id: project.id.clone(),
+        pane_id: format!("{}{agent_id}", orchestrate::PASEO_PANE_PREFIX),
+        preset_label: None,
+        task: task.to_string(),
+        baseline,
+        marker: String::new(),
+        status: "working".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    engine
+        .insert_run(&run, None)
+        .map_err(|e| format!("run persistence failed: {e}"))?;
+    Ok((run.id, agent_id, workspace, how))
 }
 
 /// The dispatch protocol sequence itself (D1/D3/D5): resolve the target pane
@@ -1102,7 +1215,8 @@ fn handle_await(
                 "structuredContent": {
                     "run_id": run_id,
                     "status": outcome.status.as_str(),
-                    "delta": outcome.delta
+                    "delta": outcome.delta,
+                    "warnings": outcome.warnings
                 }
             }),
         ),
@@ -2417,5 +2531,188 @@ mod tests {
 
         std::fs::remove_dir_all(&pa.root_path).ok();
         std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    fn leader_engine(
+        tag: &str,
+        terminal: bool,
+        paseo_on: bool,
+        opted_in: bool,
+    ) -> (Engine, Project, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "waggledance-mcp-leader-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# Project\n");
+        let mut config = Config::default();
+        config.terminal.enabled = terminal;
+        config.paseo.enabled = paseo_on;
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
+        let project = engine.register(&dir, None).unwrap();
+        engine
+            .set_orchestration_enabled(&project.id, opted_in)
+            .unwrap();
+        let project = engine.get_project(&project.id).unwrap().unwrap();
+        let data_dir = dir.join(".data");
+        (engine, project, data_dir)
+    }
+
+    fn leader_call(
+        engine: &Engine,
+        project: &Project,
+        paseo: &crate::paseo::fake::FakePaseo,
+        data_dir: &Path,
+        task: &str,
+    ) -> Value {
+        dispatch_to_leader(Some(json!(1)), engine, project, task, paseo, data_dir)
+    }
+
+    fn text_of(resp: &Value) -> String {
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn dispatch_refuses_leader_beside_another_target() {
+        let (engine, pa) = dispatch_engine("dispatch-leader-xor");
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "preset": "p", "leader": true }),
+        );
+        let text = text_of(&resp);
+        assert!(text.contains("exactly one of"), "{text}");
+        assert!(text.contains("leader"), "{text}");
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    #[test]
+    fn leader_dispatch_with_orchestration_off_is_refused_before_any_paseo_call() {
+        let (engine, project, data_dir) = leader_engine("orch-off", true, true, false);
+        let paseo = crate::paseo::fake::FakePaseo::default();
+        let resp = leader_call(&engine, &project, &paseo, &data_dir, "go");
+        assert_eq!(resp["result"]["isError"], true);
+        let text = text_of(&resp);
+        assert!(
+            text.contains(&project.id) && text.contains("has not opted into"),
+            "{text}"
+        );
+        assert!(paseo.calls().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn leader_dispatch_with_paseo_off_is_refused_naming_the_config_line() {
+        let (engine, project, data_dir) = leader_engine("paseo-off", true, false, true);
+        let paseo = crate::paseo::fake::FakePaseo::default();
+        let text = text_of(&leader_call(&engine, &project, &paseo, &data_dir, "go"));
+        assert!(text.contains("~/.waggledance/config.toml"), "{text}");
+        assert!(
+            text.contains("`[paseo]`") && text.contains("`enabled = true`"),
+            "{text}"
+        );
+        assert!(paseo.calls().is_empty());
+
+        let through_the_tool = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": project.id, "task": "go", "leader": true }),
+        );
+        assert!(text_of(&through_the_tool).contains("enabled = true"));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn leader_dispatch_is_not_gated_by_the_terminal_surface() {
+        let (engine, project, data_dir) = leader_engine("terminal-off", false, false, true);
+        let through_the_tool = text_of(&call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": project.id, "task": "go", "leader": true }),
+        ));
+        assert!(
+            !through_the_tool.contains("terminal.enabled") && through_the_tool.contains("[paseo]"),
+            "{through_the_tool}"
+        );
+
+        let (engine, project, data_dir2) = leader_engine("terminal-off-on", false, true, true);
+        let paseo = crate::paseo::fake::FakePaseo::default();
+        paseo.add_leader(&project.id, "agent-7", "idle", false);
+        let resp = leader_call(&engine, &project, &paseo, &data_dir2, "go");
+        assert_ne!(resp["result"]["isError"], true, "{resp}");
+        let run_id = resp["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap();
+        assert!(engine.get_run(run_id).unwrap().is_some());
+        std::fs::remove_dir_all(&project.root_path).ok();
+        std::fs::remove_dir_all(data_dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_busy_leader_refuses_naming_its_id_and_nothing_is_sent() {
+        let (engine, project, data_dir) = leader_engine("busy", true, true, true);
+        let paseo = crate::paseo::fake::FakePaseo::default();
+        paseo.add_leader(&project.id, "agent-busy", "running", false);
+        let resp = leader_call(&engine, &project, &paseo, &data_dir, "go");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(text_of(&resp).contains("agent-busy"), "{resp}");
+        assert!(!paseo
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::paseo::fake::Call::Send(..))));
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn an_idle_leader_receives_the_unchanged_task_and_a_paseo_run_is_stored() {
+        let (engine, project, data_dir) = leader_engine("idle", true, true, true);
+        let paseo = crate::paseo::fake::FakePaseo::default();
+        paseo.add_leader(&project.id, "agent-idle", "idle", false);
+        let task = "--help me\n  ship the thing  ";
+        let resp = leader_call(&engine, &project, &paseo, &data_dir, task);
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["leader"], "reused", "{resp}");
+        assert_eq!(sc["agent_id"], "agent-idle");
+        assert!(paseo.calls().contains(&crate::paseo::fake::Call::Send(
+            "agent-idle".into(),
+            task.into()
+        )));
+        let run = engine
+            .get_run(sc["run_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.pane_id, "paseo:agent-idle");
+        assert_eq!(run.preset_label, None);
+        assert_eq!(run.task, task);
+        assert_eq!(run.marker, "");
+        assert_eq!(run.status, "working");
+        assert!(run.baseline <= run.created_at, "{run:?}");
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn no_leader_starts_one_in_the_resolved_workspace() {
+        let (engine, project, data_dir) = leader_engine("start", true, true, true);
+        let paseo = crate::paseo::fake::FakePaseo::default();
+        paseo.add_workspace("wks_root", "local", &project.root_path);
+        let resp = leader_call(&engine, &project, &paseo, &data_dir, "go");
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["leader"], "started", "{resp}");
+        assert_eq!(sc["workspace"], "wks_root");
+        let agent = sc["agent_id"].as_str().unwrap();
+        let run = engine
+            .get_run(sc["run_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.pane_id, format!("paseo:{agent}"));
+        assert!(paseo
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::paseo::fake::Call::Run(spec) if spec.task == "go")));
+        std::fs::remove_dir_all(&project.root_path).ok();
     }
 }
