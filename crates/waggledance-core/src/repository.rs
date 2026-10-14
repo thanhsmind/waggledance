@@ -220,6 +220,15 @@ impl SqliteStore {
         Ok(changed == 1)
     }
 
+    pub fn set_run_request(&self, id: &str, request_id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET request_id=?2 WHERE id=?1",
+            params![id, request_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_run_pane(&self, id: &str, pane_id: &str) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
@@ -1684,6 +1693,14 @@ mod tests {
         plain.id = "r-e".into();
         s.insert_run(&plain, None).unwrap();
         assert!(s.insert_run(&plain, None).is_err());
+        s.set_run_request("r-d", "req-2").unwrap();
+        assert_eq!(
+            s.run_by_request(&plain.project_id, "req-2")
+                .unwrap()
+                .unwrap()
+                .id,
+            "r-d"
+        );
     }
 
     #[test]

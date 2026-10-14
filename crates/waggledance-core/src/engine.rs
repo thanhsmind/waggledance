@@ -472,6 +472,10 @@ impl Engine {
         self.store.claim_queued_run(id)
     }
 
+    pub fn set_run_request(&self, id: &str, request_id: &str) -> Result<()> {
+        self.store.set_run_request(id, request_id)
+    }
+
     pub fn set_run_pane(&self, id: &str, pane_id: &str) -> Result<()> {
         self.store.set_run_pane(id, pane_id)
     }

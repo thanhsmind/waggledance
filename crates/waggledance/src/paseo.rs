@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -105,6 +107,10 @@ pub trait Paseo: Send + Sync {
     async fn send(&self, id: &str, text: &str) -> Result<()>;
     async fn wait(&self, id: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn logs_since(&self, id: &str, since: &str) -> Result<String>;
+}
+
+pub fn delivery_heartbeat_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("paseo-delivery.heartbeat")
 }
 
 pub fn project_label(project_id: &str) -> String {
