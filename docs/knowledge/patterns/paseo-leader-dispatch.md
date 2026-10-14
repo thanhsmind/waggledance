@@ -128,7 +128,9 @@ that line, not by time.
   `[[paseo.leaders]]` entry fail this way, and the `lost` run carries the refusal text.
 - **After the send.** A timeout marks the run `lost` "the leader may still be
   finishing", and the project's queue holds until its leader is idle. Killing a blocking
-  send does not end the leader's turn, so the task is never sent again (D6).
+  send does not end the leader's turn, so the task is never sent again (D6). Only a
+  failure to start the binary or to write the prompt file counts as "before the send";
+  any other send error is treated as sent, so a request is never delivered twice.
 - **Daemon restart.** A run claimed but not yet sent (still `paseo:pending`) goes back to
   `queued`. A run already sent becomes `lost` with "daemon restarted — the leader may
   still be finishing; check its chat", is never re-sent, and its project holds until the
@@ -155,7 +157,9 @@ being asked (D4):
 - through the existing notify path, and
 - when the run has a caller that is not the leader itself, with one `paseo send
   --no-wait` to that agent. The notice goes out only while the caller is idle (D5),
-  after the status is written, and is retried for up to an hour.
+  after the status is written, and is retried for up to an hour. Notices for one caller
+  are combined into a single message per tick, followed by 30 seconds of quiet, because
+  Paseo still reports a just-messaged agent as idle for a few seconds.
 
 The notice text:
 
