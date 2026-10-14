@@ -87,6 +87,19 @@ the assertion never became code.
   the upstream's 933 and 1168 — and the feature named for porting had already
   shipped here weeks earlier. The name existed; the relationship it implied did
   not. Before any "port X from Y", verify the direction still runs that way.
+- `leader-delivery` (2026-10-14) — three facts about the Paseo 0.11.2 CLI were
+  knowable only by running it. The `~/.local/bin/paseo` wrapper, run inside a
+  Paseo agent, prints multi-line `[login-shell-env] … {` startup objects on
+  stdout and creates no agent; `logs --since` is ignored; and a send into a
+  running turn interrupts it. Each one changed the design: binary resolution
+  prefers `$PASEO_CLI`, the reply is found by its `[User]` line, and nothing is
+  sent to a running agent. The rule taken from the piggery study (its rule 9):
+  every external CLI behaviour the code relies on keeps a raw capture per
+  version, and the tests parse that capture through the production parser —
+  `crates/waggledance/testdata/fixtures/paseo-0.11.2/`, whose README names each
+  file's command, environment, and the behaviour it pins. A new Paseo version
+  gets a new sibling directory, so a changed answer fails a test instead of a
+  live delivery.
 
 ## Related
 
