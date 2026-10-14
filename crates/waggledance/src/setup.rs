@@ -51,8 +51,16 @@ const PASEO_FILES: &[(&str, &str)] = &[
         include_str!("../../../integrations/paseo/client/board.tsx"),
     ),
     (
+        "client/composer.tsx",
+        include_str!("../../../integrations/paseo/client/composer.tsx"),
+    ),
+    (
         "client/settings.tsx",
         include_str!("../../../integrations/paseo/client/settings.tsx"),
+    ),
+    (
+        "server/dispatch.ts",
+        include_str!("../../../integrations/paseo/server/dispatch.ts"),
     ),
     (
         "server/installed.ts",
