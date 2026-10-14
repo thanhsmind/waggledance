@@ -19,7 +19,7 @@ pub struct Config {
     pub paseo: PaseoConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PaseoConfig {
     pub enabled: bool,
@@ -27,7 +27,22 @@ pub struct PaseoConfig {
     pub provider: String,
     pub mode: String,
     pub thinking: String,
+    pub turn_timeout_secs: u64,
     pub leaders: Vec<PaseoLeader>,
+}
+
+impl Default for PaseoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary: String::new(),
+            provider: String::new(),
+            mode: String::new(),
+            thinking: String::new(),
+            turn_timeout_secs: 3600,
+            leaders: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,14 +53,6 @@ pub struct PaseoLeader {
 }
 
 impl PaseoConfig {
-    pub fn binary(&self) -> &str {
-        if self.binary.is_empty() {
-            "paseo"
-        } else {
-            &self.binary
-        }
-    }
-
     pub fn workspace_for(&self, project_id: &str, project_name: &str) -> Option<&str> {
         self.leaders
             .iter()
@@ -902,7 +909,8 @@ mod tests {
         let c = Config::load_from(Path::new("/nonexistent/waggledance/config.toml"));
         assert_eq!(c.paseo, PaseoConfig::default());
         assert!(!c.paseo.enabled);
-        assert_eq!(c.paseo.binary(), "paseo");
+        assert!(c.paseo.binary.is_empty());
+        assert_eq!(c.paseo.turn_timeout_secs, 3600);
         assert!(
             c.paseo.provider.is_empty() && c.paseo.mode.is_empty() && c.paseo.thinking.is_empty()
         );
@@ -912,7 +920,10 @@ mod tests {
         )
         .unwrap();
         assert!(parsed.paseo.enabled);
-        assert_eq!(parsed.paseo.binary(), "/opt/paseo");
+        assert_eq!(parsed.paseo.binary, "/opt/paseo");
+        assert_eq!(parsed.paseo.turn_timeout_secs, 3600);
+        let tuned: Config = toml::from_str("[paseo]\nturn_timeout_secs = 90\n").unwrap();
+        assert_eq!(tuned.paseo.turn_timeout_secs, 90);
         assert_eq!(
             parsed.paseo.workspace_for("p-1", "waggledance"),
             Some("wks_a")

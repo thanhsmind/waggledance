@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -52,7 +53,23 @@ pub struct AgentState {
     pub status: String,
     pub archived: bool,
     pub pending_permissions: usize,
+    pub permissions: Vec<PendingPermission>,
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PendingPermission {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub tool: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEnd {
+    Completed,
+    Permission,
+    Other { status: String, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -83,8 +100,10 @@ pub trait Paseo: Send + Sync {
     async fn inspect(&self, id: &str) -> Result<AgentState>;
     async fn workspaces(&self) -> Result<Vec<Workspace>>;
     async fn create_workspace(&self, path: &Path) -> Result<String>;
-    async fn run(&self, spec: &RunSpec) -> Result<String>;
+    async fn run_and_wait(&self, spec: &RunSpec, timeout: Duration) -> Result<(String, TurnEnd)>;
+    async fn send_and_wait(&self, id: &str, text: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn send(&self, id: &str, text: &str) -> Result<()>;
+    async fn wait(&self, id: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn logs_since(&self, id: &str, since: &str) -> Result<String>;
 }
 
@@ -107,8 +126,7 @@ pub fn leaders_args(project_id: &str) -> Vec<String> {
 pub fn run_args(spec: &RunSpec) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
-        "-d".into(),
-        "-q".into(),
+        "--json".into(),
         "--workspace".into(),
         spec.workspace.clone(),
         "--cwd".into(),
@@ -148,69 +166,167 @@ fn is_startup_log(line: &str) -> bool {
         })
 }
 
+pub fn resolve_binary(configured: &str, paseo_cli: Option<OsString>) -> String {
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    match paseo_cli {
+        Some(cli) if Path::new(&cli).is_file() => cli.to_string_lossy().into_owned(),
+        _ => "paseo".to_string(),
+    }
+}
+
+pub fn command(binary: &str, args: &[String]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.args(args)
+        .env_remove("PASEO_AGENT_ID")
+        .env_remove("PASEO_AGENT_CWD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    cmd
+}
+
+pub fn strip_noise(stdout: &str) -> String {
+    let mut in_object = false;
+    let mut kept = String::new();
+    for line in stdout.split_inclusive('\n') {
+        let bare = line.trim_end();
+        if in_object {
+            if bare == "}" {
+                in_object = false;
+                continue;
+            }
+            if bare.is_empty() || bare.starts_with(char::is_whitespace) {
+                continue;
+            }
+            in_object = false;
+        }
+        if is_startup_log(bare) {
+            in_object = bare.ends_with('{');
+            continue;
+        }
+        kept.push_str(line);
+    }
+    kept
+}
+
+pub fn document(stdout: &str) -> Option<&str> {
+    let mut offset = 0;
+    for line in stdout.split_inclusive('\n') {
+        if line.starts_with('{') || line.starts_with('[') {
+            return Some(&stdout[offset..]);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+pub fn parse_document<T: serde::de::DeserializeOwned>(
+    stdout: &str,
+) -> std::result::Result<T, String> {
+    let doc = document(stdout).ok_or("no JSON document on stdout")?;
+    serde_json::Deserializer::from_str(doc)
+        .into_iter::<T>()
+        .next()
+        .ok_or("empty JSON document")?
+        .map_err(|e| e.to_string())
+}
+
+pub fn last_id(stdout: &str) -> Option<String> {
+    strip_noise(stdout)
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+pub fn parse_leaders(stdout: &str) -> std::result::Result<Vec<String>, String> {
+    let agents: Vec<ListedAgent> = parse_document(stdout)?;
+    Ok(agents.into_iter().map(|a| a.id).collect())
+}
+
+pub fn parse_inspect(stdout: &str) -> std::result::Result<AgentState, String> {
+    let i: Inspected = parse_document(stdout)?;
+    Ok(AgentState {
+        status: i.status,
+        archived: i.archived,
+        pending_permissions: i.pending_permissions.len(),
+        permissions: i.pending_permissions,
+        updated_at: i.updated_at,
+    })
+}
+
+pub fn parse_turn_end(stdout: &str) -> std::result::Result<(String, TurnEnd), String> {
+    let t: TurnReport = parse_document(stdout)?;
+    let end = match t.status.as_str() {
+        "completed" => TurnEnd::Completed,
+        "permission" => TurnEnd::Permission,
+        _ => TurnEnd::Other {
+            status: t.status,
+            message: t.message,
+        },
+    };
+    Ok((t.agent_id, end))
+}
+
 pub struct PaseoCli {
-    binary: String,
+    configured: String,
 }
 
 impl PaseoCli {
     pub fn new(config: &PaseoConfig) -> Self {
         Self {
-            binary: config.binary().to_string(),
+            configured: config.binary.clone(),
         }
     }
 
-    async fn exec(&self, args: &[String]) -> Result<String> {
+    fn binary(&self) -> String {
+        resolve_binary(&self.configured, std::env::var_os("PASEO_CLI"))
+    }
+
+    async fn exec(&self, args: &[String], timeout: Duration) -> Result<String> {
+        let binary = self.binary();
         let command = args.first().cloned().unwrap_or_default();
-        let child = tokio::process::Command::new(&self.binary)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
+        let child = self::command(&binary, args)
             .spawn()
             .map_err(|e| PaseoError::Spawn {
-                binary: self.binary.clone(),
+                binary: binary.clone(),
                 message: e.to_string(),
             })?;
-        let output = tokio::time::timeout(TIMEOUT, child.wait_with_output())
+        let output = tokio::time::timeout(timeout, child.wait_with_output())
             .await
             .map_err(|_| PaseoError::Timeout {
-                binary: self.binary.clone(),
+                binary: binary.clone(),
                 command: command.clone(),
-                secs: TIMEOUT.as_secs(),
+                secs: timeout.as_secs(),
             })?
             .map_err(|e| PaseoError::Spawn {
-                binary: self.binary.clone(),
+                binary: binary.clone(),
                 message: e.to_string(),
             })?;
         if !output.status.success() {
             return Err(PaseoError::Failed {
-                binary: self.binary.clone(),
+                binary,
                 command,
                 status: output.status.to_string(),
             });
         }
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .split_inclusive('\n')
-            .filter(|line| !is_startup_log(line))
-            .collect())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn unparsable(&self, command: &str, message: impl ToString) -> PaseoError {
         PaseoError::Unparsable {
-            binary: self.binary.clone(),
+            binary: self.binary(),
             command: command.to_string(),
             message: message.to_string(),
         }
     }
 
-    fn first_id(&self, command: &str, stdout: &str) -> Result<String> {
-        stdout
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| self.unparsable(command, "no id on stdout"))
+    async fn turn(&self, args: &[String], timeout: Duration) -> Result<(String, TurnEnd)> {
+        let out = self.exec(args, timeout).await?;
+        parse_turn_end(&out).map_err(|e| self.unparsable(&args[0], e))
     }
 }
 
@@ -226,83 +342,117 @@ struct Inspected {
     #[serde(default)]
     archived: bool,
     #[serde(default)]
-    pending_permissions: Vec<serde_json::Value>,
+    pending_permissions: Vec<PendingPermission>,
     #[serde(default)]
     updated_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnReport {
+    #[serde(default)]
+    agent_id: String,
+    status: String,
+    #[serde(default)]
+    message: String,
 }
 
 #[async_trait]
 impl Paseo for PaseoCli {
     async fn leaders(&self, project_id: &str) -> Result<Vec<String>> {
-        let out = self.exec(&leaders_args(project_id)).await?;
-        let agents: Vec<ListedAgent> =
-            serde_json::from_str(&out).map_err(|e| self.unparsable("ls", e))?;
-        Ok(agents.into_iter().map(|a| a.id).collect())
+        let out = self.exec(&leaders_args(project_id), TIMEOUT).await?;
+        parse_leaders(&out).map_err(|e| self.unparsable("ls", e))
     }
 
     async fn inspect(&self, id: &str) -> Result<AgentState> {
         let out = self
-            .exec(&["inspect".into(), id.into(), "--json".into()])
+            .exec(&["inspect".into(), id.into(), "--json".into()], TIMEOUT)
             .await?;
-        let i: Inspected = serde_json::from_str(&out).map_err(|e| self.unparsable("inspect", e))?;
-        Ok(AgentState {
-            status: i.status,
-            archived: i.archived,
-            pending_permissions: i.pending_permissions.len(),
-            updated_at: i.updated_at,
-        })
+        parse_inspect(&out).map_err(|e| self.unparsable("inspect", e))
     }
 
     async fn workspaces(&self) -> Result<Vec<Workspace>> {
         let out = self
-            .exec(&["workspace".into(), "ls".into(), "--json".into()])
+            .exec(&["workspace".into(), "ls".into(), "--json".into()], TIMEOUT)
             .await?;
-        serde_json::from_str(&out).map_err(|e| self.unparsable("workspace", e))
+        parse_document(&out).map_err(|e| self.unparsable("workspace", e))
     }
 
     async fn create_workspace(&self, path: &Path) -> Result<String> {
         let out = self
-            .exec(&[
-                "workspace".into(),
-                "create".into(),
-                "--path".into(),
-                path.to_string_lossy().into_owned(),
-                "--isolation".into(),
-                "local".into(),
-                "-q".into(),
-            ])
+            .exec(
+                &[
+                    "workspace".into(),
+                    "create".into(),
+                    "--path".into(),
+                    path.to_string_lossy().into_owned(),
+                    "--isolation".into(),
+                    "local".into(),
+                    "-q".into(),
+                ],
+                TIMEOUT,
+            )
             .await?;
-        self.first_id("workspace", &out)
+        last_id(&out).ok_or_else(|| self.unparsable("workspace", "no id on stdout"))
     }
 
-    async fn run(&self, spec: &RunSpec) -> Result<String> {
-        let out = self.exec(&run_args(spec)).await?;
-        self.first_id("run", &out)
+    async fn run_and_wait(&self, spec: &RunSpec, timeout: Duration) -> Result<(String, TurnEnd)> {
+        self.turn(&run_args(spec), timeout).await
     }
 
-    async fn send(&self, id: &str, text: &str) -> Result<()> {
+    async fn send_and_wait(&self, id: &str, text: &str, timeout: Duration) -> Result<TurnEnd> {
         let file = PromptFile::write(text)?;
-        self.exec(&[
+        let args = [
             "send".into(),
             id.into(),
             "--prompt-file".into(),
             file.0.to_string_lossy().into_owned(),
-            "--no-wait".into(),
-        ])
+            "--json".into(),
+        ];
+        Ok(self.turn(&args, timeout).await?.1)
+    }
+
+    async fn send(&self, id: &str, text: &str) -> Result<()> {
+        let file = PromptFile::write(text)?;
+        self.exec(
+            &[
+                "send".into(),
+                id.into(),
+                "--prompt-file".into(),
+                file.0.to_string_lossy().into_owned(),
+                "--no-wait".into(),
+            ],
+            TIMEOUT,
+        )
         .await
         .map(|_| ())
     }
 
-    async fn logs_since(&self, id: &str, since: &str) -> Result<String> {
-        self.exec(&[
-            "logs".into(),
+    async fn wait(&self, id: &str, timeout: Duration) -> Result<TurnEnd> {
+        let args = [
+            "wait".into(),
             id.into(),
-            "--since".into(),
-            since.into(),
-            "--filter".into(),
-            "text".into(),
-        ])
+            "--timeout".into(),
+            timeout.as_secs().to_string(),
+            "--json".into(),
+        ];
+        Ok(self.turn(&args, timeout + TIMEOUT).await?.1)
+    }
+
+    async fn logs_since(&self, id: &str, since: &str) -> Result<String> {
+        self.exec(
+            &[
+                "logs".into(),
+                id.into(),
+                "--since".into(),
+                since.into(),
+                "--filter".into(),
+                "text".into(),
+            ],
+            TIMEOUT,
+        )
         .await
+        .map(|out| strip_noise(&out))
     }
 }
 
@@ -390,12 +540,13 @@ pub struct Start {
     provider: String,
     mode: String,
     thinking: String,
+    turn_timeout: Duration,
     _lock: LeaderLock,
 }
 
 impl Start {
-    pub async fn run(self, paseo: &dyn Paseo, task: &str) -> Result<String> {
-        let spec = RunSpec {
+    pub fn spec(&self, task: &str) -> RunSpec {
+        RunSpec {
             workspace: self.workspace.clone(),
             cwd: self.cwd.clone(),
             title: self.title.clone(),
@@ -404,8 +555,14 @@ impl Start {
             mode: self.mode.clone(),
             thinking: self.thinking.clone(),
             task: task.to_string(),
-        };
-        paseo.run(&spec).await
+        }
+    }
+
+    pub async fn run(self, paseo: &dyn Paseo, task: &str) -> Result<String> {
+        let (id, _) = paseo
+            .run_and_wait(&self.spec(task), self.turn_timeout)
+            .await?;
+        Ok(id)
     }
 }
 
@@ -458,6 +615,7 @@ pub async fn resolve_leader(
         provider: config.provider.clone(),
         mode: config.mode.clone(),
         thinking: config.thinking.clone(),
+        turn_timeout: Duration::from_secs(config.turn_timeout_secs),
         _lock: lock,
     }))
 }
@@ -465,7 +623,7 @@ pub async fn resolve_leader(
 #[cfg(test)]
 pub mod fake {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,7 +633,9 @@ pub mod fake {
         Workspaces,
         CreateWorkspace(PathBuf),
         Run(RunSpec),
+        SendAndWait(String, String),
         Send(String, String),
+        Wait(String),
         LogsSince(String, String),
     }
 
@@ -485,6 +645,7 @@ pub mod fake {
         pub agents: HashMap<String, AgentState>,
         pub workspaces: Vec<Workspace>,
         pub logs: HashMap<String, String>,
+        pub turn_ends: VecDeque<TurnEnd>,
         pub calls: Vec<Call>,
     }
 
@@ -510,9 +671,43 @@ pub mod fake {
                     status: status.to_string(),
                     archived,
                     pending_permissions: 0,
+                    permissions: Vec::new(),
                     updated_at: None,
                 },
             );
+        }
+
+        pub fn push_turn_end(&self, end: TurnEnd) {
+            self.state.lock().unwrap().turn_ends.push_back(end);
+        }
+
+        pub fn set_status(&self, id: &str, status: &str) {
+            if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
+                a.status = status.to_string();
+            }
+        }
+
+        pub fn set_permissions(&self, id: &str, tools: &[&str]) {
+            if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
+                a.permissions = tools
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tool)| PendingPermission {
+                        id: format!("permission-{i}"),
+                        tool: tool.to_string(),
+                    })
+                    .collect();
+                a.pending_permissions = a.permissions.len();
+            }
+        }
+
+        fn next_turn_end(&self) -> TurnEnd {
+            self.state
+                .lock()
+                .unwrap()
+                .turn_ends
+                .pop_front()
+                .unwrap_or(TurnEnd::Completed)
         }
 
         pub fn add_workspace(&self, id: &str, isolation: &str, cwd: &Path) {
@@ -559,7 +754,11 @@ pub mod fake {
             Ok(id)
         }
 
-        async fn run(&self, spec: &RunSpec) -> Result<String> {
+        async fn run_and_wait(
+            &self,
+            spec: &RunSpec,
+            _timeout: Duration,
+        ) -> Result<(String, TurnEnd)> {
             self.record(Call::Run(spec.clone()));
             tokio::task::yield_now().await;
             let id = format!("agent-{}", self.state.lock().unwrap().agents.len() + 1);
@@ -570,12 +769,22 @@ pub mod fake {
             {
                 self.add_leader(project, &id, "running", false);
             }
-            Ok(id)
+            Ok((id, self.next_turn_end()))
+        }
+
+        async fn send_and_wait(&self, id: &str, text: &str, _timeout: Duration) -> Result<TurnEnd> {
+            self.record(Call::SendAndWait(id.to_string(), text.to_string()));
+            Ok(self.next_turn_end())
         }
 
         async fn send(&self, id: &str, text: &str) -> Result<()> {
             self.record(Call::Send(id.to_string(), text.to_string()));
             Ok(())
+        }
+
+        async fn wait(&self, id: &str, _timeout: Duration) -> Result<TurnEnd> {
+            self.record(Call::Wait(id.to_string()));
+            Ok(self.next_turn_end())
         }
 
         async fn logs_since(&self, id: &str, since: &str) -> Result<String> {
@@ -801,7 +1010,8 @@ mod tests {
     fn run_argv_carries_workspace_cwd_labels_title_and_dashdash_before_the_task() {
         let args = run_args(&spec("", "", "", "--rm -rf; $(x)"));
         let pair = |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
-        assert_eq!(&args[..3], &["run", "-d", "-q"]);
+        assert_eq!(&args[..2], &["run", "--json"]);
+        assert!(!args.iter().any(|a| a == "-d" || a == "-q"), "{args:?}");
         assert!(pair("--workspace", "wks_1"));
         assert!(pair("--cwd", "/root/proj"));
         assert!(pair("--title", "proj leader"));
@@ -874,10 +1084,11 @@ mod tests {
                 "  inspect*) printf '{\"Status\":\"running\",\"Archived\":false,\"PendingPermissions\":[{}],\"UpdatedAt\":\"2026-10-14T14:04:56.399Z\"}' ;;\n",
                 "  'workspace ls') printf '[{\"workspaceId\":\"wks_1\",\"isolation\":\"local\",\"cwd\":\"/x\"}]' ;;\n",
                 "  'workspace create') echo wks_new ;;\n",
-                "  run*) echo agent-9 ;;\n",
+                "  run*) printf '{\\n  \"agentId\": \"agent-9\",\\n  \"status\": \"completed\"\\n}\\n' ;;\n",
+                "  wait*) printf '{\"agentId\":\"a\",\"status\":\"idle\",\"message\":\"Agent is idle.\"}' ;;\n",
                 "  logs*) printf '[User] do it\\n12:00:00 done\\n' ;;\n",
                 "  ls*) printf 'not json' ;;\n",
-                "  send*) cat \"$4\" > \"$(dirname \"$0\")/sent\" ;;\n",
+                "  send*) cat \"$4\" > \"$(dirname \"$0\")/sent\"; printf '{\"agentId\":\"a\",\"status\":\"permission\"}' ;;\n",
                 "esac\n",
             ),
         )
@@ -904,6 +1115,10 @@ mod tests {
                 status: "running".into(),
                 archived: false,
                 pending_permissions: 1,
+                permissions: vec![PendingPermission {
+                    id: String::new(),
+                    tool: String::new(),
+                }],
                 updated_at: Some("2026-10-14T14:04:56.399Z".into()),
             }
         );
@@ -912,7 +1127,24 @@ mod tests {
             cli.create_workspace(Path::new("/x")).await.unwrap(),
             "wks_new"
         );
-        assert_eq!(cli.run(&spec("", "", "", "t")).await.unwrap(), "agent-9");
+        let turn = Duration::from_secs(5);
+        assert_eq!(
+            cli.run_and_wait(&spec("", "", "", "t"), turn)
+                .await
+                .unwrap(),
+            ("agent-9".to_string(), TurnEnd::Completed)
+        );
+        assert_eq!(
+            cli.send_and_wait("a", "x", turn).await.unwrap(),
+            TurnEnd::Permission
+        );
+        assert_eq!(
+            cli.wait("a", turn).await.unwrap(),
+            TurnEnd::Other {
+                status: "idle".into(),
+                message: "Agent is idle.".into()
+            }
+        );
         assert_eq!(
             cli.logs_since("a", "2026-10-14T00:00:00Z").await.unwrap(),
             "[User] do it\n12:00:00 done\n"
@@ -925,6 +1157,164 @@ mod tests {
             std::fs::read_to_string(dir.path().join("sent")).unwrap(),
             "hello $(not run)"
         );
+    }
+
+    #[test]
+    fn binary_resolution_prefers_config_then_an_existing_paseo_cli_then_paseo() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("paseo-bundled");
+        std::fs::write(&cli, "").unwrap();
+        let bundled = || Some(cli.clone().into_os_string());
+        assert_eq!(resolve_binary("/opt/paseo", bundled()), "/opt/paseo");
+        assert_eq!(resolve_binary("", bundled()), cli.to_string_lossy());
+        assert_eq!(
+            resolve_binary("", Some(dir.path().join("gone").into_os_string())),
+            "paseo"
+        );
+        assert_eq!(resolve_binary("", Some(OsString::new())), "paseo");
+        assert_eq!(resolve_binary("", None), "paseo");
+    }
+
+    #[test]
+    fn child_processes_drop_the_caller_agent_and_keep_paseo_home() {
+        let cmd = command("paseo", &["ls".into()]);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        for key in ["PASEO_AGENT_ID", "PASEO_AGENT_CWD"] {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(key), None)),
+                "{envs:?}"
+            );
+        }
+        assert!(!envs.iter().any(|(k, _)| *k == "PASEO_HOME"), "{envs:?}");
+        assert_eq!(envs.len(), 2, "{envs:?}");
+    }
+
+    #[tokio::test]
+    async fn the_fake_scripts_turn_ends_statuses_and_permissions_and_records_calls() {
+        let fake = FakePaseo::default();
+        fake.add_leader("proj-1", "a", "idle", false);
+        fake.push_turn_end(TurnEnd::Permission);
+        fake.set_status("a", "running");
+        fake.set_permissions("a", &["Write"]);
+        let turn = Duration::from_secs(1);
+        assert_eq!(
+            fake.send_and_wait("a", "go", turn).await.unwrap(),
+            TurnEnd::Permission
+        );
+        let state = fake.inspect("a").await.unwrap();
+        assert_eq!(state.status, "running");
+        assert_eq!(state.pending_permissions, 1);
+        assert_eq!(state.permissions[0].tool, "Write");
+        assert_eq!(fake.wait("a", turn).await.unwrap(), TurnEnd::Completed);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::SendAndWait("a".into(), "go".into()),
+                Call::Inspect("a".into()),
+                Call::Wait("a".into()),
+            ]
+        );
+    }
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!("../testdata/fixtures/paseo-0.11.2/", $name))
+        };
+    }
+
+    #[test]
+    fn blocking_run_and_send_fixtures_end_their_turn_completed() {
+        assert_eq!(
+            parse_turn_end(fixture!("run-blocking-cli.out")).unwrap(),
+            (
+                "9950faad-b964-46a9-ac31-121939d43222".to_string(),
+                TurnEnd::Completed
+            )
+        );
+        for out in [
+            fixture!("send-blocking.out"),
+            fixture!("send-while-busy.out"),
+        ] {
+            assert_eq!(parse_turn_end(out).unwrap().1, TurnEnd::Completed);
+        }
+        assert_eq!(
+            parse_turn_end(fixture!("send-perm.out")).unwrap().1,
+            TurnEnd::Permission
+        );
+        assert_eq!(
+            parse_turn_end(fixture!("send-nowait.out")).unwrap().1,
+            TurnEnd::Other {
+                status: "sent".into(),
+                message: "Message sent, not waiting for completion".into()
+            }
+        );
+        assert!(parse_turn_end(fixture!("send-killed.out")).is_err());
+    }
+
+    #[test]
+    fn wait_fixture_reports_idle_with_the_last_activity() {
+        match parse_turn_end(fixture!("wait.out")).unwrap().1 {
+            TurnEnd::Other { status, message } => {
+                assert_eq!(status, "idle");
+                assert!(message.starts_with("Agent is idle.\n"), "{message}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_fixtures_name_status_and_pending_permissions() {
+        let pending = parse_inspect(fixture!("inspect-pending.out")).unwrap();
+        assert_eq!(pending.status, "running");
+        assert_eq!(pending.pending_permissions, 1);
+        assert_eq!(
+            pending.permissions,
+            vec![PendingPermission {
+                id: "permission-048112ac-89df-4631-ae6e-f0509a0980a1".into(),
+                tool: "Write".into(),
+            }]
+        );
+        let running = parse_inspect(fixture!("inspect-running.out")).unwrap();
+        assert_eq!(running.status, "running");
+        assert!(running.permissions.is_empty());
+        let permits: Vec<serde_json::Value> = parse_document(fixture!("permit-ls.out")).unwrap();
+        assert_eq!(permits.len(), 1);
+        assert_eq!(permits[0]["name"], "Write");
+    }
+
+    #[test]
+    fn the_inside_agent_wrapper_prints_only_noise_including_multi_line_objects() {
+        let out = fixture!("run-blocking.out");
+        assert_eq!(strip_noise(out), "");
+        assert!(parse_turn_end(out).is_err());
+        assert_eq!(last_id(out), None);
+        let followed = format!("{out}{}", fixture!("send-blocking.out"));
+        assert_eq!(parse_turn_end(&followed).unwrap().1, TurnEnd::Completed);
+        assert_eq!(last_id(&format!("{out}wks_9\n")).as_deref(), Some("wks_9"));
+    }
+
+    #[test]
+    fn the_systemd_wrapper_lists_agents_after_its_noise_lines() {
+        let ids = parse_leaders(fixture!("wrapper-systemd-ls.out")).unwrap();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(ids[0], "35eca12c-e112-4690-bf48-af0222f659e1");
+        assert!(strip_noise(fixture!("wrapper-systemd-ls.out")).starts_with('['));
+        assert!(parse_leaders(fixture!("wrapper-systemd-ls.err")).is_err());
+    }
+
+    #[test]
+    fn logs_fixtures_keep_every_line_and_show_the_interrupted_turn() {
+        let busy = fixture!("logs-after-busy.out");
+        assert_eq!(strip_noise(busy), busy);
+        assert!(busy.lines().any(|l| l == "SHORT-DONE"));
+        assert!(!busy.lines().any(|l| l == "LONG-DONE"));
+        let killed = fixture!("logs-after-kill.out");
+        assert_eq!(strip_noise(killed), killed);
+        assert!(killed
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("[Task notification]"));
     }
 
     #[tokio::test]

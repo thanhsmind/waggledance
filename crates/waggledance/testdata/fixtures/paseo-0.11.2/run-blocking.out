@@ -1,0 +1,29 @@
+22:38:47.160 › [desktop] app startup { version: '0.11.2', platform: 'linux', arch: 'x64', isPackaged: true }
+22:38:47.165 › [linux-sandbox] { enabled: false, reason: 'requested by --no-sandbox' }
+22:38:47.170 › [login-shell-env] start {
+  shell: '/usr/bin/bash',
+  shellArgs: [ '-i', '-l', '-c' ],
+  attempts: [
+    { attemptKind: 'interactive', shellArgs: [Array] },
+    { attemptKind: 'non-interactive', shellArgs: [Array] }
+  ],
+  timeoutMs: 30000,
+  beforePath: '/tmp/.mount_Paseo.MNN3ss:/tmp/.mount_Paseo.MNN3ss/usr/sbin:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/tmp/.mount_Paseo.C0veTi:/tmp/.mount_Paseo.C0veTi/usr/sbin:/home/thanhsmind/.local/share/mise/installs/codex/latest/bin:/home/thanhsmind/.local/share/mise/installs/copilot/latest:/home/thanhsmind/.local/share/mise/installs/gemini/latest/node_modules/.bin:/home/thanhsmind/.local/share/mise/installs/gh/latest/gh_2.101.0_linux_amd64/bin:/home/thanhsmind/.local/share/mise/installs/github-can1357-oh-my-pi/latest:/home/thanhsmind/.local/share/mise/installs/go/1.24.13/bin:/home/thanhsmind/.local/share/mise/installs/node/24.19.0/bin:/home/thanhsmind/.local/share/mise/installs/npm-playwright/latest/node_modules/.bin:/home/thanhsmind/.local/share/mise/installs/opencode/latest:/home/thanhsmind/.local/share/mise/installs/pi/latest/pi:/home/thanhsmind/.local/share/mise/shims:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/tmp/.mount_Paseo.yYkUw4:/tmp/.mount_Paseo.yYkUw4/usr/sbin:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/usr/share/omarchy/bin:/home/thanhsmind/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/cuda/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl'
+}
+22:38:47.305 › [login-shell-env] attempt applied {
+  attemptKind: 'interactive',
+  shell: '/usr/bin/bash',
+  shellArgs: [ '-i', '-l', '-c' ],
+  reason: 'success',
+  durationMs: 134,
+  timeoutMs: 15000
+}
+22:38:47.306 › [login-shell-env] applied {
+  attemptKind: 'interactive',
+  durationMs: 138,
+  timeoutMs: 30000,
+  beforePath: '/tmp/.mount_Paseo.MNN3ss:/tmp/.mount_Paseo.MNN3ss/usr/sbin:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/tmp/.mount_Paseo.C0veTi:/tmp/.mount_Paseo.C0veTi/usr/sbin:/home/thanhsmind/.local/share/mise/installs/codex/latest/bin:/home/thanhsmind/.local/share/mise/installs/copilot/latest:/home/thanhsmind/.local/share/mise/installs/gemini/latest/node_modules/.bin:/home/thanhsmind/.local/share/mise/installs/gh/latest/gh_2.101.0_linux_amd64/bin:/home/thanhsmind/.local/share/mise/installs/github-can1357-oh-my-pi/latest:/home/thanhsmind/.local/share/mise/installs/go/1.24.13/bin:/home/thanhsmind/.local/share/mise/installs/node/24.19.0/bin:/home/thanhsmind/.local/share/mise/installs/npm-playwright/latest/node_modules/.bin:/home/thanhsmind/.local/share/mise/installs/opencode/latest:/home/thanhsmind/.local/share/mise/installs/pi/latest/pi:/home/thanhsmind/.local/share/mise/shims:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/tmp/.mount_Paseo.yYkUw4:/tmp/.mount_Paseo.yYkUw4/usr/sbin:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/usr/share/omarchy/bin:/home/thanhsmind/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/cuda/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl',
+  afterPath: '/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/tmp/.mount_Paseo.MNN3ss:/tmp/.mount_Paseo.MNN3ss/usr/sbin:/home/thanhsmind/.local/share/mise/installs/codex/latest/bin:/home/thanhsmind/.local/share/mise/installs/copilot/latest:/home/thanhsmind/.local/share/mise/installs/gemini/latest/node_modules/.bin:/home/thanhsmind/.local/share/mise/installs/gh/latest/gh_2.101.0_linux_amd64/bin:/home/thanhsmind/.local/share/mise/installs/github-can1357-oh-my-pi/latest:/home/thanhsmind/.local/share/mise/installs/go/1.24.13/bin:/home/thanhsmind/.local/share/mise/installs/http-muse/latest:/home/thanhsmind/.local/share/mise/installs/node/24.19.0/bin:/home/thanhsmind/.local/share/mise/installs/npm-playwright/latest/node_modules/.bin:/home/thanhsmind/.local/share/mise/installs/opencode/latest:/home/thanhsmind/.local/share/mise/installs/pi/latest/pi:/home/thanhsmind/.local/share/mise/shims:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/tmp/.mount_Paseo.yYkUw4:/tmp/.mount_Paseo.yYkUw4/usr/sbin:/home/thanhsmind/.local/bin:/home/thanhsmind/.local/bin:/usr/share/omarchy/bin:/home/thanhsmind/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/cuda/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl:/tmp/.mount_Paseo.C0veTi:/tmp/.mount_Paseo.C0veTi/usr/sbin',
+  pathChanged: true,
+  shell: '/usr/bin/bash'
+}
