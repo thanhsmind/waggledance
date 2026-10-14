@@ -132,6 +132,7 @@ pub struct Reaper {
     /// before spawning: cancelling the task only lands at its next `.await`
     /// point, which can be after the decision to act but before the act.
     cancelled: Arc<AtomicBool>,
+    sweeps_herdr: Arc<AtomicBool>,
 }
 
 impl Reaper {
@@ -146,6 +147,7 @@ impl Reaper {
             SWEEP_INTERVAL,
             GRACE_WINDOW,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
         )
     }
 
@@ -161,6 +163,7 @@ impl Reaper {
         interval: Duration,
         grace: Duration,
         cancelled: Arc<AtomicBool>,
+        sweeps_herdr: Arc<AtomicBool>,
     ) -> Self {
         Reaper {
             herdr,
@@ -169,6 +172,7 @@ impl Reaper {
             interval,
             grace,
             cancelled,
+            sweeps_herdr,
         }
     }
 
@@ -179,7 +183,10 @@ impl Reaper {
     /// is still young costs herdr nothing at all, and the whole sweep takes
     /// exactly one snapshot — never one per run.
     pub async fn sweep_once(&self) -> Vec<(String, Verdict)> {
-        let mut verdicts = self.sweep_herdr().await;
+        let mut verdicts = Vec::new();
+        if self.sweeps_herdr.load(Ordering::SeqCst) {
+            verdicts.extend(self.sweep_herdr().await);
+        }
         if self.engine.config.paseo.enabled {
             verdicts.extend(self.sweep_paseo().await);
         }
@@ -767,6 +774,32 @@ mod tests {
         assert!(verdicts.is_empty(), "{verdicts:?}");
         assert!(paseo.calls().is_empty());
         assert_eq!(status_of(&engine, "run-paseo"), "working");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_the_terminal_family_off_only_paseo_runs_are_swept() {
+        let engine = paseo_engine(true);
+        seed_run(&engine, "run-gone", "w9:p9", "before", "HERDR_DONE_gone");
+        let herdr = Arc::new(FakeHerdr::new());
+        let reaper = Reaper::with_cancel_flag(
+            herdr.clone(),
+            engine.clone(),
+            SWEEP_INTERVAL,
+            GRACE_WINDOW,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_paseo(leader("idle", false, "[User] do the thing\nall finished\n"));
+
+        let verdicts = reaper.sweep_once().await;
+
+        assert_eq!(
+            verdicts,
+            vec![("run-paseo".to_string(), Verdict::Awaited(RunStatus::Done))]
+        );
+        assert_eq!(status_of(&engine, "run-gone"), "working");
+        assert!(herdr.read_pane_log().await.is_empty());
+        assert!(herdr.closed_panes().await.is_empty());
     }
 
     #[test]
