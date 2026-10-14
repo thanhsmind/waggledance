@@ -26,6 +26,15 @@ Origin: the piggery v0.10.2 study (this session), recommendations 1–4.
 | D3 | A request to a busy leader is accepted and held in a per-leader queue, delivered in order when the leader is free; never refused for being busy. Leader creation stays serialized per project. Supersedes `paseo-leader-dispatch` D7. | Piggery holds mail for a busy recipient. |
 | D4 | When a leader run ends (done, blocked, lost), waggledance tells the caller unasked: through the existing notify path, and directly to the calling Paseo agent when the dispatch came from one. | Piggery wakes the lead with the reply instead of making it poll. |
 
+### Added at the plan-step hat wave and the second probe (agent-decided under gate bypass full)
+
+| ID | Decision | Rationale |
+|----|----------|-----------|
+| D5 | waggledance never sends to a Paseo agent whose status is running or initializing; leader deliveries and caller notices wait until that agent is idle, including turns a human started. | A send into a running Claude turn interrupted it (probe: `LONG-DONE` never produced). |
+| D6 | A failure before the task is sent returns the run to queued with backoff, lost with a notice after 5 attempts. After a send, a timeout or a daemon restart marks the run lost as "the leader may still be finishing", and the project's queue holds until its leader is idle. A run claimed but never sent goes back to queued on restart. | Killing a blocking send does not end the turn (probe); a never-sent request is not lost. |
+| D7 | `request_id` is exact on the leader path (the queued row is the reservation) and sequential on the herdr path (checked before the send). | Herdr stores a run only after a confirmed send by design. |
+| D8 | A held request reports status `queued` with its age; dispatch and await say "paused — waggledance daemon not running" when the delivery heartbeat is stale. A new leader starts with the task through a blocking `paseo run` (no bootstrap turn). Default turn timeout: 1 hour. | Queued-forever reads as success; blocking `run` returns `completed` at the first turn end (probe). |
+
 Inherited unchanged: `paseo-leader-dispatch` D1–D6, D8–D10; `orchestrator-dispatch` D1 (waggledance never chooses what to dispatch).
 
 ### Agent's Discretion
@@ -58,4 +67,4 @@ Captured in `.bee/cache/paseo-probe/` and to be committed as fixtures:
 
 ### Resolved In Planning
 
-- [ ] Whether a blocking `paseo send` returns `completed` when a human is also typing to the same leader — planning decides how the delivery loop tolerates it.
+- [x] A human typing to the leader during a delivery: a send into a running turn interrupts it (second probe), so D5 forbids sending while the leader runs; a human message sent while a delivery is in flight is Paseo's own interruption, and the run's `completed` then means the leader's turn ended — recorded as a known limit in the concept doc.
