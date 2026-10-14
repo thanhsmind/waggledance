@@ -121,10 +121,22 @@ impl SqliteStore {
     /// [`Run`] is constructed by literal in several places this cell may
     /// not touch; see `Run`'s own doc for the note.
     pub fn insert_run(&self, r: &Run, feature: Option<&str>) -> Result<()> {
+        self.insert_run_with_request(r, feature, None, None)
+            .map(|_| ())
+    }
+
+    pub fn insert_run_with_request(
+        &self,
+        r: &Run,
+        feature: Option<&str>,
+        request_id: Option<&str>,
+        caller: Option<&str>,
+    ) -> Result<String> {
         let c = self.conn.lock().unwrap();
-        c.execute(
-            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        let inserted = c.execute(
+            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature,request_id,caller)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(project_id,request_id) WHERE request_id IS NOT NULL DO NOTHING",
             params![
                 r.id,
                 r.project_id,
@@ -136,10 +148,114 @@ impl SqliteStore {
                 r.status,
                 r.created_at,
                 r.updated_at,
-                feature
+                feature,
+                request_id,
+                caller
             ],
         )?;
+        if inserted == 1 {
+            return Ok(r.id.clone());
+        }
+        Ok(c.query_row(
+            "SELECT id FROM runs WHERE project_id=?1 AND request_id=?2",
+            params![r.project_id, request_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn run_by_request(&self, project_id: &str, request_id: &str) -> Result<Option<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE project_id=?1 AND request_id=?2",
+        )?;
+        let mut rows = stmt.query(params![project_id, request_id])?;
+        Ok(rows.next()?.map(row_to_run))
+    }
+
+    pub fn run_caller(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT caller FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
+    }
+
+    pub fn run_attempts(&self, id: &str) -> Result<Option<i64>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT attempts FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows.next()?.and_then(|r| r.get::<_, i64>(0).ok()))
+    }
+
+    pub fn list_queued_paseo_runs(&self, project_id: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE project_id=?1 AND status='queued' AND pane_id LIKE 'paseo:%'
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn list_projects_with_queued_paseo_runs(&self) -> Result<Vec<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT DISTINCT project_id FROM runs
+             WHERE status='queued' AND pane_id LIKE 'paseo:%' ORDER BY project_id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn claim_queued_run(&self, id: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let changed = c.execute(
+            "UPDATE runs SET status='working' WHERE id=?1 AND status='queued'",
+            params![id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_run_request(&self, id: &str, request_id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET request_id=?2 WHERE id=?1",
+            params![id, request_id],
+        )?;
         Ok(())
+    }
+
+    pub fn set_run_pane(&self, id: &str, pane_id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET pane_id=?2 WHERE id=?1",
+            params![id, pane_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn requeue_run(&self, id: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let changed = c.execute(
+            "UPDATE runs SET status='queued', attempts=attempts+1 WHERE id=?1 AND status='working'",
+            params![id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn list_inflight_paseo_runs(&self) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE status IN ('working','blocked') AND pane_id LIKE 'paseo:%'
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Update a run's status (and its `updated_at` stamp). `baseline`/`marker`
@@ -554,10 +670,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (2, migration_2_orchestration_enabled),
     (3, migration_3_runs_feature),
     (4, migration_4_runs_final_transcript),
+    (5, migration_5_runs_request),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -635,6 +752,27 @@ fn migration_4_runs_final_transcript(conn: &Connection) -> Result<()> {
     if !has_column(conn, "runs", "final_transcript")? {
         conn.execute("ALTER TABLE runs ADD COLUMN final_transcript TEXT", [])?;
     }
+    Ok(())
+}
+
+fn migration_5_runs_request(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "runs", "request_id")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN request_id TEXT", [])?;
+    }
+    if !has_column(conn, "runs", "caller")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN caller TEXT", [])?;
+    }
+    if !has_column(conn, "runs", "attempts")? {
+        conn.execute(
+            "ALTER TABLE runs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_request ON runs(project_id, request_id)
+         WHERE request_id IS NOT NULL",
+        [],
+    )?;
     Ok(())
 }
 
@@ -724,7 +862,10 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     feature TEXT,
-    final_transcript TEXT
+    final_transcript TEXT,
+    request_id TEXT,
+    caller TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
 "#;
@@ -1459,6 +1600,171 @@ mod tests {
             Some("recovered"),
             "the migrated column is writable"
         );
+    }
+
+    fn queued_leader_run(id: &str, project_id: &str, created_at: &str) -> Run {
+        let mut run = sample_run();
+        run.id = id.into();
+        run.project_id = project_id.into();
+        run.pane_id = "paseo:pending".into();
+        run.preset_label = None;
+        run.status = "queued".into();
+        run.created_at = created_at.into();
+        run
+    }
+
+    #[test]
+    fn migrate_adds_the_runs_request_columns_to_a_v4_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 feature TEXT,
+                 final_transcript TEXT
+             );
+             INSERT INTO runs VALUES('r-old','p1','paseo:a1',NULL,'t','','m','done','t','t',NULL,'fin');
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            for column in ["request_id", "caller", "attempts"] {
+                assert!(has_column(&c, "runs", column).unwrap(), "{column}");
+            }
+            super::migrate(&c).unwrap();
+            super::migration_5_runs_request(&c).unwrap();
+        }
+        assert_eq!(s.get_run("r-old").unwrap().unwrap().status, "done");
+        assert_eq!(
+            s.run_final_transcript("r-old").unwrap().as_deref(),
+            Some("fin")
+        );
+        assert_eq!(s.run_attempts("r-old").unwrap(), Some(0));
+        assert_eq!(s.run_caller("r-old").unwrap(), None);
+    }
+
+    #[test]
+    fn runs_with_one_request_id_insert_once_per_project() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        let first = queued_leader_run("r-a", "p1", "2026-08-16T00:00:00Z");
+        assert_eq!(
+            s.insert_run_with_request(&first, None, Some("req-1"), Some("agent-x"))
+                .unwrap(),
+            "r-a"
+        );
+        let repeat = queued_leader_run("r-b", "p1", "2026-08-16T00:00:01Z");
+        assert_eq!(
+            s.insert_run_with_request(&repeat, None, Some("req-1"), None)
+                .unwrap(),
+            "r-a"
+        );
+        assert!(s.get_run("r-b").unwrap().is_none());
+        assert_eq!(s.run_by_request("p1", "req-1").unwrap().unwrap().id, "r-a");
+        assert_eq!(s.run_caller("r-a").unwrap().as_deref(), Some("agent-x"));
+
+        let other = queued_leader_run("r-c", "p2", "2026-08-16T00:00:02Z");
+        assert_eq!(
+            s.insert_run_with_request(&other, None, Some("req-1"), None)
+                .unwrap(),
+            "r-c"
+        );
+        assert!(s.run_by_request("p1", "req-missing").unwrap().is_none());
+
+        let mut plain = sample_run();
+        plain.id = "r-d".into();
+        s.insert_run(&plain, None).unwrap();
+        plain.id = "r-e".into();
+        s.insert_run(&plain, None).unwrap();
+        assert!(s.insert_run(&plain, None).is_err());
+        s.set_run_request("r-d", "req-2").unwrap();
+        assert_eq!(
+            s.run_by_request(&plain.project_id, "req-2")
+                .unwrap()
+                .unwrap()
+                .id,
+            "r-d"
+        );
+    }
+
+    #[test]
+    fn queued_paseo_runs_claim_once_and_requeue_with_an_attempt() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for run in [
+            queued_leader_run("r-late", "p1", "2026-08-16T00:00:02Z"),
+            queued_leader_run("r-early", "p1", "2026-08-16T00:00:01Z"),
+            queued_leader_run("r-p2", "p2", "2026-08-16T00:00:03Z"),
+        ] {
+            s.insert_run(&run, None).unwrap();
+        }
+        let mut herdr = queued_leader_run("r-herdr", "p1", "2026-08-16T00:00:00Z");
+        herdr.pane_id = "w1:p1".into();
+        s.insert_run(&herdr, None).unwrap();
+
+        assert_eq!(
+            s.list_queued_paseo_runs("p1")
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r-early", "r-late"]
+        );
+        assert_eq!(
+            s.list_projects_with_queued_paseo_runs().unwrap(),
+            vec!["p1".to_string(), "p2".to_string()]
+        );
+
+        assert!(s.claim_queued_run("r-early").unwrap());
+        assert!(!s.claim_queued_run("r-early").unwrap());
+        let claimed = s.get_run("r-early").unwrap().unwrap();
+        assert_eq!(claimed.status, "working");
+        assert_eq!(claimed.pane_id, "paseo:pending");
+
+        s.set_run_pane("r-early", "paseo:agent-1").unwrap();
+        s.update_run_status("r-late", "blocked", "t", None, None)
+            .unwrap();
+        assert_eq!(
+            s.list_inflight_paseo_runs()
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r-early", "r-late"]
+        );
+
+        assert!(s.requeue_run("r-early").unwrap());
+        assert!(!s.requeue_run("r-early").unwrap());
+        assert_eq!(s.run_attempts("r-early").unwrap(), Some(1));
+        assert_eq!(s.get_run("r-early").unwrap().unwrap().status, "queued");
+        assert_eq!(s.run_attempts("r-unknown").unwrap(), None);
+    }
+
+    #[test]
+    fn queued_runs_are_not_in_the_unattended_working_runs_sweep() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        let mut run = queued_leader_run("r-q", "p1", "2026-08-16T00:00:00Z");
+        run.preset_label = Some("claude".into());
+        s.insert_run(&run, None).unwrap();
+        assert!(s.list_unattended_working_runs().unwrap().is_empty());
+        assert!(s.list_working_paseo_runs().unwrap().is_empty());
     }
 
     #[test]

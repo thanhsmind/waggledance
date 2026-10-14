@@ -224,7 +224,9 @@ re-reading files.
 When waggledance runs beside Paseo, each project can have one
 long-lived leader agent in its Paseo workspace. Turn on `[paseo]` in
 `~/.waggledance/config.toml`, opt the project into orchestration, and
-`waggledance_dispatch` with `leader: true` sends the task to that leader, or starts one.
+`waggledance_dispatch` with `leader: true` queues the task; the running daemon
+(`waggledance serve`) delivers it when that leader is idle, or starts one, and tells the
+caller when the leader's turn ends. Pass a `request_id` so a retry never sends twice.
 The waggledance agent in Paseo, the request box in the Waggle Dance Paseo plugin, and any
 external agent running `waggledance mcp` all use this path. The config block, the
 workspace rules, and the run statuses are in

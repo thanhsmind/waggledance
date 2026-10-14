@@ -9,7 +9,7 @@
 
 use crate::herdr::{socket::SocketHerdr, Herdr};
 use crate::orchestrate;
-use crate::paseo::{self, Leader, Paseo, PaseoCli};
+use crate::paseo;
 use crate::runtime;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -242,9 +242,9 @@ fn dispatch_schema() -> Value {
     orchestrator dispatch (D6 — refused, naming the remedy, when the project or the terminal \
     surface has not been switched on). Either spawn a fresh agent via an operator-configured \
     preset label, target an already-running pane by id, or hand the task to the project's Paseo \
-    leader with `leader: true` (found by label, or started in the configured Paseo workspace) — \
-    exactly one of `preset`/`pane_id`/`leader`, and never a raw command. Returns a `run_id` \
-    immediately; poll completion with `waggledance_await`.",
+    leader with `leader: true` (queued and delivered by the waggledance daemon once the leader is \
+    idle) — exactly one of `preset`/`pane_id`/`leader`, and never a raw command. Returns a \
+    `run_id` immediately; poll completion with `waggledance_await`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -252,7 +252,8 @@ fn dispatch_schema() -> Value {
                 "preset": { "type": "string", "description": "Operator-configured agent preset label to spawn a fresh pane — mutually exclusive with pane_id" },
                 "pane_id": { "type": "string", "description": "An already-running pane id to target — mutually exclusive with preset" },
                 "leader": { "type": "boolean", "description": "true sends the task to the project's Paseo leader — mutually exclusive with preset and pane_id" },
-                "task": { "type": "string", "description": "The task text sent to the agent" }
+                "task": { "type": "string", "description": "The task text sent to the agent" },
+                "request_id": { "type": "string", "description": "Caller-chosen id for this request — pass one on every call so a retry never sends twice" }
             },
             "required": ["project", "task"]
         }
@@ -314,7 +315,9 @@ fn handle_tool_call(
         "waggledance_projects" => handle_projects(id, engine),
         "waggledance_ask_state" => handle_ask_state(id, engine, orchestration, &args),
         "waggledance_dispatch" => handle_dispatch(id, engine, orchestration, &args),
-        "waggledance_await" => handle_await(id, engine, orchestration, &args),
+        "waggledance_await" => {
+            handle_await(id, engine, orchestration, &args, &resolve_data_dir(None))
+        }
         "waggledance_runs" => handle_runs(id, engine, &args),
         _ => err(id, -32602, "unknown tool"),
     }
@@ -923,6 +926,10 @@ fn handle_dispatch(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
     let leader = args.get("leader").and_then(Value::as_bool).unwrap_or(false);
+    let request_id = args
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
     match [preset_label.is_some(), pane_id_arg.is_some(), leader]
         .iter()
         .filter(|t| **t)
@@ -948,9 +955,26 @@ fn handle_dispatch(
         Ok(None) => return tool_error(id, &format!("project not found: {project_id}")),
         Err(e) => return tool_error(id, &format!("project lookup failed: {e}")),
     };
+    if let Some(request_id) = request_id {
+        match engine.run_by_request(&project.id, request_id) {
+            Ok(Some(run)) => return duplicate(id, &run),
+            Ok(None) => {}
+            Err(e) => return tool_error(id, &format!("request lookup failed: {e}")),
+        }
+    }
     if leader {
-        let cli = PaseoCli::new(&engine.config.paseo);
-        return dispatch_to_leader(id, engine, &project, task, &cli, &resolve_data_dir(None));
+        let caller = std::env::var("PASEO_AGENT_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        return dispatch_to_leader(
+            id,
+            engine,
+            &project,
+            task,
+            request_id,
+            caller.as_deref(),
+            &resolve_data_dir(None),
+        );
     }
     if !engine.config.terminal.enabled {
         return tool_error(
@@ -990,7 +1014,12 @@ fn handle_dispatch(
         // that says the agent started — not left in the daemon's log, where a
         // warning is indistinguishable from no warning at the moment the
         // operator is looking at a pane that will not move.
-        Ok((run_id, warnings)) => {
+        Ok((run_id, mut warnings)) => {
+            if let Some(request_id) = request_id {
+                if let Err(e) = engine.set_run_request(&run_id, request_id) {
+                    warnings.push(format!("request_id not recorded: {e}"));
+                }
+            }
             let text = if warnings.is_empty() {
                 format!("dispatched run {run_id}")
             } else {
@@ -1000,7 +1029,7 @@ fn handle_dispatch(
                 id,
                 json!({
                     "content": [{ "type": "text", "text": text }],
-                    "structuredContent": { "run_id": run_id, "warnings": warnings }
+                    "structuredContent": { "run_id": run_id, "duplicate": false, "warnings": warnings }
                 }),
             )
         }
@@ -1015,12 +1044,38 @@ fn not_opted_in(project_id: &str) -> String {
     )
 }
 
+const DELIVERY_PAUSED: &str =
+    "paused — waggledance daemon not running (start it with `waggledance serve`)";
+
+fn delivery_paused(data_dir: &Path) -> bool {
+    match std::fs::metadata(paseo::delivery_heartbeat_path(data_dir)).and_then(|m| m.modified()) {
+        Ok(beat) => beat
+            .elapsed()
+            .is_ok_and(|age| age > std::time::Duration::from_secs(30)),
+        Err(_) => true,
+    }
+}
+
+fn duplicate(id: Option<Value>, run: &Run) -> Value {
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": format!(
+                "request already accepted as run {} ({}) — nothing sent again",
+                run.id, run.status
+            ) }],
+            "structuredContent": { "run_id": run.id, "status": run.status, "duplicate": true }
+        }),
+    )
+}
+
 fn dispatch_to_leader(
     id: Option<Value>,
     engine: &Engine,
     project: &Project,
     task: &str,
-    paseo: &dyn Paseo,
+    request_id: Option<&str>,
+    caller: Option<&str>,
     data_dir: &Path,
 ) -> Value {
     if !engine.orchestration_allowed(project) {
@@ -1033,80 +1088,55 @@ fn dispatch_to_leader(
              ~/.waggledance/config.toml",
         );
     }
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => return tool_error(id, &format!("failed to start the dispatch runtime: {e}")),
-    };
-    match runtime.block_on(leader_dispatch(paseo, engine, project, task, data_dir)) {
-        Ok((run_id, agent_id, workspace, how)) => ok(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": format!(
-                    "dispatched run {run_id} to project {}'s Paseo leader {agent_id} ({how})",
-                    project.id
-                ) }],
-                "structuredContent": {
-                    "run_id": run_id,
-                    "warnings": Vec::<String>::new(),
-                    "agent_id": agent_id,
-                    "workspace": workspace,
-                    "leader": how
-                }
-            }),
-        ),
-        Err(msg) => tool_error(id, &msg),
-    }
-}
-
-async fn leader_dispatch(
-    paseo: &dyn Paseo,
-    engine: &Engine,
-    project: &Project,
-    task: &str,
-    data_dir: &Path,
-) -> std::result::Result<(String, String, Option<String>, &'static str), String> {
-    let leader = paseo::resolve_leader(paseo, &engine.config.paseo, project, data_dir)
-        .await
-        .map_err(|e| e.to_string())?;
-    let baseline = now_rfc3339();
-    let (agent_id, workspace, how) = match leader {
-        Leader::Existing { id, busy: true } => {
-            return Err(format!(
-                "project {}'s Paseo leader {id} is busy — refusing to interrupt its current \
-                 run; retry after it ends",
-                project.id
-            ))
-        }
-        Leader::Existing { id, busy: false } => {
-            paseo.send(&id, task).await.map_err(|e| e.to_string())?;
-            (id, None, "reused")
-        }
-        Leader::Start(start) => {
-            let workspace = start.workspace.clone();
-            let id = start.run(paseo, task).await.map_err(|e| e.to_string())?;
-            (id, Some(workspace), "started")
-        }
-    };
     let now = now_rfc3339();
     let run = Run {
         id: format!("run-{:016x}", rand::random::<u64>()),
         project_id: project.id.clone(),
-        pane_id: format!("{}{agent_id}", orchestrate::PASEO_PANE_PREFIX),
+        pane_id: format!("{}pending", orchestrate::PASEO_PANE_PREFIX),
         preset_label: None,
         task: task.to_string(),
-        baseline,
+        baseline: now.clone(),
         marker: String::new(),
-        status: "working".to_string(),
+        status: "queued".to_string(),
         created_at: now.clone(),
         updated_at: now,
     };
-    engine
-        .insert_run(&run, None)
-        .map_err(|e| format!("run persistence failed: {e}"))?;
-    Ok((run.id, agent_id, workspace, how))
+    let stored = match engine.insert_run_with_request(&run, None, request_id, caller) {
+        Ok(stored) => stored,
+        Err(e) => return tool_error(id, &format!("run persistence failed: {e}")),
+    };
+    if stored != run.id {
+        return match engine.get_run(&stored) {
+            Ok(Some(existing)) => duplicate(id, &existing),
+            Ok(None) => tool_error(id, &format!("run {stored} vanished")),
+            Err(e) => tool_error(id, &format!("run lookup failed: {e}")),
+        };
+    }
+    let warnings: Vec<String> = if delivery_paused(data_dir) {
+        vec![DELIVERY_PAUSED.to_string()]
+    } else {
+        Vec::new()
+    };
+    let mut text = format!(
+        "queued run {} for project {}'s Paseo leader",
+        run.id, project.id
+    );
+    for warning in &warnings {
+        text.push_str("; ");
+        text.push_str(warning);
+    }
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": {
+                "run_id": run.id,
+                "status": "queued",
+                "duplicate": false,
+                "warnings": warnings
+            }
+        }),
+    )
 }
 
 /// The dispatch protocol sequence itself (D1/D3/D5): resolve the target pane
@@ -1178,6 +1208,7 @@ fn handle_await(
     engine: &Engine,
     orchestration: &mut Option<Orchestration>,
     args: &Value,
+    data_dir: &Path,
 ) -> Value {
     let Some(run_id) = args
         .get("run_id")
@@ -1208,18 +1239,46 @@ fn handle_await(
         timeout,
         orch.notify_store.as_ref(),
     )) {
-        Ok(outcome) => ok(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": format!("run {run_id}: {}", outcome.status.as_str()) }],
-                "structuredContent": {
-                    "run_id": run_id,
-                    "status": outcome.status.as_str(),
-                    "delta": outcome.delta,
-                    "warnings": outcome.warnings
-                }
-            }),
-        ),
+        Ok(mut outcome) => {
+            let mut text = format!("run {run_id}: {}", outcome.status.as_str());
+            let mut report = json!({
+                "run_id": run_id,
+                "status": outcome.status.as_str(),
+                "delta": outcome.delta,
+            });
+            if outcome.status == orchestrate::RunStatus::Queued {
+                let age = time::OffsetDateTime::parse(
+                    &run.created_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map(|at| {
+                    (time::OffsetDateTime::now_utc() - at)
+                        .whole_seconds()
+                        .max(0)
+                })
+                .unwrap_or(0);
+                text.push_str(&format!(" for {age}s"));
+                report["age_secs"] = json!(age);
+            }
+            if run.pane_id.starts_with(orchestrate::PASEO_PANE_PREFIX)
+                && !outcome.status.is_terminal()
+                && delivery_paused(data_dir)
+            {
+                outcome.warnings.push(DELIVERY_PAUSED.to_string());
+            }
+            for warning in &outcome.warnings {
+                text.push_str("; ");
+                text.push_str(warning);
+            }
+            report["warnings"] = json!(outcome.warnings);
+            ok(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": report
+                }),
+            )
+        }
         Err(e) => tool_error(id, &format!("await failed: {e}")),
     }
 }
@@ -2561,11 +2620,19 @@ mod tests {
     fn leader_call(
         engine: &Engine,
         project: &Project,
-        paseo: &crate::paseo::fake::FakePaseo,
         data_dir: &Path,
         task: &str,
+        request_id: Option<&str>,
     ) -> Value {
-        dispatch_to_leader(Some(json!(1)), engine, project, task, paseo, data_dir)
+        dispatch_to_leader(
+            Some(json!(1)),
+            engine,
+            project,
+            task,
+            request_id,
+            Some("agent-caller"),
+            data_dir,
+        )
     }
 
     fn text_of(resp: &Value) -> String {
@@ -2573,6 +2640,14 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    fn beat(data_dir: &Path, age_secs: u64) {
+        std::fs::create_dir_all(data_dir).unwrap();
+        let path = crate::paseo::delivery_heartbeat_path(data_dir);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs))
+            .unwrap();
     }
 
     #[test]
@@ -2590,31 +2665,38 @@ mod tests {
     }
 
     #[test]
-    fn leader_dispatch_with_orchestration_off_is_refused_before_any_paseo_call() {
+    fn dispatch_schema_offers_a_request_id_for_every_target() {
+        let schema = dispatch_schema();
+        let desc = schema["inputSchema"]["properties"]["request_id"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("retry never sends twice"), "{desc}");
+    }
+
+    #[test]
+    fn leader_dispatch_with_orchestration_off_is_refused_and_stores_nothing() {
         let (engine, project, data_dir) = leader_engine("orch-off", true, true, false);
-        let paseo = crate::paseo::fake::FakePaseo::default();
-        let resp = leader_call(&engine, &project, &paseo, &data_dir, "go");
+        let resp = leader_call(&engine, &project, &data_dir, "go", None);
         assert_eq!(resp["result"]["isError"], true);
         let text = text_of(&resp);
         assert!(
             text.contains(&project.id) && text.contains("has not opted into"),
             "{text}"
         );
-        assert!(paseo.calls().is_empty());
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 
     #[test]
     fn leader_dispatch_with_paseo_off_is_refused_naming_the_config_line() {
         let (engine, project, data_dir) = leader_engine("paseo-off", true, false, true);
-        let paseo = crate::paseo::fake::FakePaseo::default();
-        let text = text_of(&leader_call(&engine, &project, &paseo, &data_dir, "go"));
+        let text = text_of(&leader_call(&engine, &project, &data_dir, "go", None));
         assert!(text.contains("~/.waggledance/config.toml"), "{text}");
         assert!(
             text.contains("`[paseo]`") && text.contains("`enabled = true`"),
             "{text}"
         );
-        assert!(paseo.calls().is_empty());
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
 
         let through_the_tool = call_tool(
             &engine,
@@ -2627,7 +2709,7 @@ mod tests {
 
     #[test]
     fn leader_dispatch_is_not_gated_by_the_terminal_surface() {
-        let (engine, project, data_dir) = leader_engine("terminal-off", false, false, true);
+        let (engine, project, _) = leader_engine("terminal-off", false, false, true);
         let through_the_tool = text_of(&call_tool(
             &engine,
             "waggledance_dispatch",
@@ -2637,82 +2719,173 @@ mod tests {
             !through_the_tool.contains("terminal.enabled") && through_the_tool.contains("[paseo]"),
             "{through_the_tool}"
         );
+        std::fs::remove_dir_all(&project.root_path).ok();
 
-        let (engine, project, data_dir2) = leader_engine("terminal-off-on", false, true, true);
-        let paseo = crate::paseo::fake::FakePaseo::default();
-        paseo.add_leader(&project.id, "agent-7", "idle", false);
-        let resp = leader_call(&engine, &project, &paseo, &data_dir2, "go");
+        let (engine, project, data_dir) = leader_engine("terminal-off-on", false, true, true);
+        let resp = leader_call(&engine, &project, &data_dir, "go", None);
         assert_ne!(resp["result"]["isError"], true, "{resp}");
         let run_id = resp["result"]["structuredContent"]["run_id"]
             .as_str()
             .unwrap();
         assert!(engine.get_run(run_id).unwrap().is_some());
         std::fs::remove_dir_all(&project.root_path).ok();
-        std::fs::remove_dir_all(data_dir.parent().unwrap()).ok();
     }
 
     #[test]
-    fn a_busy_leader_refuses_naming_its_id_and_nothing_is_sent() {
-        let (engine, project, data_dir) = leader_engine("busy", true, true, true);
-        let paseo = crate::paseo::fake::FakePaseo::default();
-        paseo.add_leader(&project.id, "agent-busy", "running", false);
-        let resp = leader_call(&engine, &project, &paseo, &data_dir, "go");
-        assert_eq!(resp["result"]["isError"], true);
-        assert!(text_of(&resp).contains("agent-busy"), "{resp}");
-        assert!(!paseo
-            .calls()
-            .iter()
-            .any(|c| matches!(c, crate::paseo::fake::Call::Send(..))));
-        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
-        std::fs::remove_dir_all(&project.root_path).ok();
-    }
-
-    #[test]
-    fn an_idle_leader_receives_the_unchanged_task_and_a_paseo_run_is_stored() {
-        let (engine, project, data_dir) = leader_engine("idle", true, true, true);
-        let paseo = crate::paseo::fake::FakePaseo::default();
-        paseo.add_leader(&project.id, "agent-idle", "idle", false);
+    fn a_leader_dispatch_stores_a_queued_run_and_sends_nothing() {
+        let (engine, project, data_dir) = leader_engine("queued", true, true, true);
+        beat(&data_dir, 0);
         let task = "--help me\n  ship the thing  ";
-        let resp = leader_call(&engine, &project, &paseo, &data_dir, task);
+        let resp = leader_call(&engine, &project, &data_dir, task, Some("req-1"));
         let sc = &resp["result"]["structuredContent"];
-        assert_eq!(sc["leader"], "reused", "{resp}");
-        assert_eq!(sc["agent_id"], "agent-idle");
-        assert!(paseo.calls().contains(&crate::paseo::fake::Call::Send(
-            "agent-idle".into(),
-            task.into()
-        )));
+        assert_eq!(sc["status"], "queued", "{resp}");
+        assert_eq!(sc["duplicate"], false);
+        assert_eq!(sc["warnings"], json!([]));
         let run = engine
             .get_run(sc["run_id"].as_str().unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(run.pane_id, "paseo:agent-idle");
+        assert_eq!(run.pane_id, "paseo:pending");
         assert_eq!(run.preset_label, None);
         assert_eq!(run.task, task);
         assert_eq!(run.marker, "");
-        assert_eq!(run.status, "working");
-        assert!(run.baseline <= run.created_at, "{run:?}");
+        assert_eq!(run.status, "queued");
+        assert_eq!(
+            engine.run_caller(&run.id).unwrap().as_deref(),
+            Some("agent-caller")
+        );
+        assert_eq!(
+            engine
+                .run_by_request(&project.id, "req-1")
+                .unwrap()
+                .unwrap()
+                .id,
+            run.id
+        );
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 
     #[test]
-    fn no_leader_starts_one_in_the_resolved_workspace() {
-        let (engine, project, data_dir) = leader_engine("start", true, true, true);
-        let paseo = crate::paseo::fake::FakePaseo::default();
-        paseo.add_workspace("wks_root", "local", &project.root_path);
-        let resp = leader_call(&engine, &project, &paseo, &data_dir, "go");
-        let sc = &resp["result"]["structuredContent"];
-        assert_eq!(sc["leader"], "started", "{resp}");
-        assert_eq!(sc["workspace"], "wks_root");
-        let agent = sc["agent_id"].as_str().unwrap();
-        let run = engine
-            .get_run(sc["run_id"].as_str().unwrap())
-            .unwrap()
-            .unwrap();
-        assert_eq!(run.pane_id, format!("paseo:{agent}"));
-        assert!(paseo
-            .calls()
-            .iter()
-            .any(|c| matches!(c, crate::paseo::fake::Call::Run(spec) if spec.task == "go")));
+    fn a_leader_dispatch_is_accepted_while_an_earlier_one_is_still_held() {
+        let (engine, project, data_dir) = leader_engine("busy", true, true, true);
+        beat(&data_dir, 0);
+        let first = leader_call(&engine, &project, &data_dir, "one", None);
+        let second = leader_call(&engine, &project, &data_dir, "two", None);
+        assert_ne!(second["result"]["isError"], true, "{second}");
+        assert_eq!(second["result"]["structuredContent"]["status"], "queued");
+        assert_ne!(
+            first["result"]["structuredContent"]["run_id"],
+            second["result"]["structuredContent"]["run_id"]
+        );
+        let queued = engine.list_queued_paseo_runs(&project.id).unwrap();
+        let tasks: Vec<&str> = queued.iter().map(|r| r.task.as_str()).collect();
+        assert_eq!(tasks, ["one", "two"]);
         std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_warns_delivery_is_paused_on_a_missing_or_stale_heartbeat() {
+        let (engine, project, data_dir) = leader_engine("heartbeat", true, true, true);
+        let missing = leader_call(&engine, &project, &data_dir, "a", None);
+        assert_eq!(
+            missing["result"]["structuredContent"]["warnings"],
+            json!([DELIVERY_PAUSED])
+        );
+        assert!(text_of(&missing).contains("paused — waggledance daemon not running"));
+
+        beat(&data_dir, 60);
+        let stale = leader_call(&engine, &project, &data_dir, "b", None);
+        assert_eq!(
+            stale["result"]["structuredContent"]["warnings"],
+            json!([DELIVERY_PAUSED])
+        );
+
+        beat(&data_dir, 5);
+        let fresh = leader_call(&engine, &project, &data_dir, "c", None);
+        assert_eq!(fresh["result"]["structuredContent"]["warnings"], json!([]));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn await_on_a_queued_leader_run_reports_its_age_and_a_paused_daemon() {
+        let (engine, project, data_dir) = leader_engine("await-queued", false, true, true);
+        let sent = leader_call(&engine, &project, &data_dir, "go", None);
+        let run_id = sent["result"]["structuredContent"]["run_id"].clone();
+        let args = json!({ "run_id": run_id, "timeout_seconds": 0 });
+        let mut orchestration = None;
+
+        let paused = handle_await(
+            Some(json!(2)),
+            &engine,
+            &mut orchestration,
+            &args,
+            &data_dir,
+        );
+        let report = &paused["result"]["structuredContent"];
+        assert_eq!(report["status"], "queued");
+        assert!(
+            report["age_secs"].as_i64().is_some_and(|a| a >= 0),
+            "{report}"
+        );
+        assert_eq!(report["warnings"], json!([DELIVERY_PAUSED]));
+        assert!(text_of(&paused).contains("queued for"));
+
+        beat(&data_dir, 0);
+        let live = handle_await(
+            Some(json!(3)),
+            &engine,
+            &mut orchestration,
+            &args,
+            &data_dir,
+        );
+        assert_eq!(live["result"]["structuredContent"]["warnings"], json!([]));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_with_a_repeated_leader_request_id_returns_the_first_run() {
+        let (engine, project, data_dir) = leader_engine("repeat", true, true, true);
+        let first = leader_call(&engine, &project, &data_dir, "go", Some("req-7"));
+        let again = leader_call(&engine, &project, &data_dir, "go", Some("req-7"));
+        assert_eq!(
+            again["result"]["structuredContent"]["run_id"],
+            first["result"]["structuredContent"]["run_id"]
+        );
+        assert_eq!(again["result"]["structuredContent"]["duplicate"], true);
+        assert_eq!(engine.list_runs(&project.id, 10).unwrap().len(), 1);
+
+        let through_the_tool = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": project.id, "task": "go", "leader": true, "request_id": "req-7" }),
+        );
+        let sc = &through_the_tool["result"]["structuredContent"];
+        assert_eq!(sc["run_id"], first["result"]["structuredContent"]["run_id"]);
+        assert_eq!(sc["status"], "queued");
+        assert_eq!(sc["duplicate"], true);
+        assert_eq!(engine.list_runs(&project.id, 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_with_a_repeated_herdr_request_id_returns_the_stored_run_without_herdr() {
+        let (engine, pa) = dispatch_engine("dispatch-herdr-repeat");
+        engine.set_orchestration_enabled(&pa.id, true).unwrap();
+        let stored = engine
+            .insert_run_with_request(&seeded_run(&pa.id, "run-h"), None, Some("req-h"), None)
+            .unwrap();
+        let mut orchestration: Option<Orchestration> = None;
+        let resp = call_tool_with_orchestration(
+            &engine,
+            &mut orchestration,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "pane_id": "w9:p9", "request_id": "req-h" }),
+        );
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["run_id"], stored, "{resp}");
+        assert_eq!(sc["status"], "working");
+        assert_eq!(sc["duplicate"], true);
+        assert!(orchestration.is_none());
+        std::fs::remove_dir_all(&pa.root_path).ok();
     }
 }

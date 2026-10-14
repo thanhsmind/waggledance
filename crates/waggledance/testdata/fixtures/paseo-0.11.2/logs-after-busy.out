@@ -1,0 +1,7 @@
+[User] Reply with exactly the word FIRST-RUN and nothing else.
+FIRST-RUN
+[User] Run the shell command `sleep 25` and then reply with exactly LONG-DONE.
+[Shell] sleep 25
+[Shell] sleep 25
+[User] Reply with exactly the word SHORT-DONE.
+SHORT-DONE

@@ -5,10 +5,11 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { sendToLeader } from "../server/dispatch.ts";
+import { runStatus, sendToLeader } from "../server/dispatch.ts";
 import { waggledancePath } from "../server/installed.ts";
 import { loadBoard, pickBin, projectFor } from "../server/waggledance.ts";
 import { linkTo, pollEvery, sections, BUSY_MS, QUIET_MS } from "../shared/board.ts";
+import { describeRun, describeSent } from "../shared/rpc.ts";
 
 type Route = { status: number; body: string; type?: string; location?: string };
 
@@ -198,31 +199,58 @@ const calls = (log: string) =>
     .map((l) => JSON.parse(l))
     .filter((m) => m.method === "tools/call");
 
-test("a send calls waggledance_dispatch with only project, task and leader:true", async () => {
-  const { bin, log } = fakeMcp({ content: [{ type: "text", text: "dispatched" }], structuredContent: { run_id: "r1", warnings: [], agent_id: "ag1", workspace: null, leader: "reused" } });
-  const r = await sendToLeader(bin, "p1", "  fix the build\nthen report  ");
-  assert.deepEqual(r, { ok: true, run_id: "r1", agent_id: "ag1", workspace: null, leader: "reused" });
+test("a send calls waggledance_dispatch with project, task, leader:true and the draft's request_id", async () => {
+  const { bin, log } = fakeMcp({ content: [{ type: "text", text: "queued" }], structuredContent: { run_id: "r1", status: "queued", duplicate: false, warnings: [] } });
+  const r = await sendToLeader(bin, "p1", "  fix the build\nthen report  ", "req-1");
+  assert.deepEqual(r, { ok: true, run_id: "r1", status: "queued", duplicate: false, warnings: [] });
   const sent = calls(log);
   assert.equal(sent.length, 1);
-  assert.deepEqual(sent[0].params, { name: "waggledance_dispatch", arguments: { project: "p1", task: "  fix the build\nthen report  ", leader: true } });
+  assert.deepEqual(sent[0].params, { name: "waggledance_dispatch", arguments: { project: "p1", task: "  fix the build\nthen report  ", leader: true, request_id: "req-1" } });
+  assert.equal(describeSent("P1", r.ok ? r : { run_id: "", duplicate: false, warnings: [] }), "Queued for P1 leader (run r1)");
+});
+
+test("a retry reuses the request_id and a duplicate reads as already sent", async () => {
+  const { bin, log } = fakeMcp({ content: [{ type: "text", text: "dup" }], structuredContent: { run_id: "r1", status: "working", duplicate: true } });
+  const first = await sendToLeader(bin, "p1", "go", "req-7");
+  const retry = await sendToLeader(bin, "p1", "go", "req-7");
+  assert.deepEqual(retry, { ok: true, run_id: "r1", status: "working", duplicate: true, warnings: [] });
+  assert.deepEqual(first, retry);
+  assert.deepEqual(calls(log).map((c) => c.params.arguments.request_id), ["req-7", "req-7"]);
+  assert.equal(describeSent("P1", retry.ok ? retry : { run_id: "", duplicate: false, warnings: [] }), "Already sent (run r1)");
+  assert.equal(describeSent("P1", { run_id: "r2", duplicate: false, warnings: ["paused — waggledance daemon not running"] }), "Queued for P1 leader (run r2) — paused — waggledance daemon not running");
+});
+
+test("run_status calls waggledance_await with timeout 0 and maps the status words", async () => {
+  const { bin, log } = fakeMcp({ content: [{ type: "text", text: "run r1: queued" }], structuredContent: { run_id: "r1", status: "queued", age_secs: 42 } });
+  assert.deepEqual(await runStatus(bin, "r1"), { ok: true, status: "queued", age_secs: 42 });
+  assert.deepEqual(calls(log)[0].params, { name: "waggledance_await", arguments: { run_id: "r1", timeout_seconds: 0 } });
+  const plain = fakeMcp({ content: [], structuredContent: { run_id: "r1", status: "blocked", delta: "" } });
+  assert.deepEqual(await runStatus(plain.bin, "r1"), { ok: true, status: "blocked" });
+  assert.deepEqual(describeRun("queued", 42), { text: "queued for 42s", final: false });
+  assert.deepEqual(describeRun("queued"), { text: "queued", final: false });
+  assert.deepEqual(describeRun("working"), { text: "working", final: false });
+  assert.deepEqual(describeRun("timeout"), { text: "working", final: false });
+  assert.deepEqual(describeRun("blocked"), { text: "blocked — waiting for a permission in the leader's chat", final: false });
+  assert.deepEqual(describeRun("done"), { text: "done", final: true });
+  assert.deepEqual(describeRun("lost"), { text: "lost", final: true });
 });
 
 test("a refusal from the tool comes back verbatim", async () => {
   const refusal = "Paseo leader dispatch is off — add the lines `[paseo]` and `enabled = true` to ~/.waggledance/config.toml";
   const { bin } = fakeMcp({ content: [{ type: "text", text: refusal }], isError: true });
-  assert.deepEqual(await sendToLeader(bin, "p1", "go"), { ok: false, code: "failed", error: refusal });
+  assert.deepEqual(await sendToLeader(bin, "p1", "go", "req-1"), { ok: false, code: "failed", error: refusal });
 });
 
 test("a missing binary is named on send", async () => {
   const bin = join(tmpdir(), "no-such-waggledance");
-  const r = await sendToLeader(bin, "p1", "go");
+  const r = await sendToLeader(bin, "p1", "go", "req-1");
   assert.equal(r.ok || r.code, "failed");
   assert.match(r.ok ? "" : r.error, new RegExp(`not found at "${bin}"`));
 });
 
-test("a send that never answers says it may have been sent and to check Runs", async () => {
+test("a send that never answers says it may already be queued and retrying is safe", async () => {
   const { bin } = fakeMcp(null);
-  const r = await sendToLeader(bin, "p1", "go", 300);
+  const r = await sendToLeader(bin, "p1", "go", "req-1", 300);
   assert.equal(r.ok || r.code, "failed");
-  assert.match(r.ok ? "" : r.error, /may have been sent; check Runs before retrying/);
+  assert.match(r.ok ? "" : r.error, /may already be queued; retrying is safe/);
 });

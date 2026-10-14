@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err)]
 
 mod cli;
+mod delivery;
 mod doctor;
 mod guide;
 mod herdr;
@@ -94,7 +95,8 @@ pub struct TerminalBackground {
     /// The notification store handed down to the dispatch path while
     /// notifications are enabled (D6/dbn-3). `None` when notifications
     /// are disabled.
-    notify_store: Mutex<Option<Arc<waggledance_core::notify_store::NotifyStore>>>,
+    notify_store: delivery::NotifySlot,
+    delivery: Mutex<Option<JoinHandle<()>>>,
     /// The most recently stopped task's handle, kept only until the next
     /// switch-on has waited for it to finish.
     supervisor_stopping: Mutex<Option<JoinHandle<()>>>,
@@ -118,7 +120,6 @@ pub struct TerminalBackground {
     /// so this is what tells "already running, leave it" apart from "already
     /// running, but wired for the other configuration".
     reaper_verdicts_armed: AtomicBool,
-    reaper_sweeps_herdr: Arc<AtomicBool>,
     /// The same question for the trigger's own D10 dry-run mode.
     trigger_dry_run_armed: AtomicBool,
 }
@@ -226,15 +227,36 @@ impl TerminalBackground {
         // its own, unlike the two above — the reaper's own switch defaults
         // ON, so `enabled` is what keeps a terminal-family-off install from
         // sweeping anything at all.
-        let paseo_on = engine.as_ref().is_some_and(|e| e.config.paseo.enabled);
-        self.reaper_sweeps_herdr
-            .store(cfg.enabled, Ordering::SeqCst);
         self.reconcile_reaper(
-            cfg.reaper_enabled && (cfg.enabled || paseo_on),
+            cfg.enabled && cfg.reaper_enabled,
             herdr.clone(),
             engine.clone(),
         );
+        self.reconcile_delivery(engine.clone().filter(|e| e.config.paseo.enabled));
         self.reconcile_notify(cfg.notify_enabled, herdr, notify_store, telegram, engine);
+    }
+
+    fn reconcile_delivery(&self, engine: Option<Arc<waggledance_core::Engine>>) {
+        let mut slot = self.delivery.lock().unwrap();
+        match (engine, slot.take()) {
+            (Some(_), Some(running)) => *slot = Some(running),
+            (Some(engine), None) => {
+                let task = delivery::Delivery::new(
+                    Arc::new(paseo::PaseoCli::new(&engine.config.paseo)),
+                    engine,
+                    waggledance_core::config::resolve_data_dir(None),
+                    self.notify_store.clone(),
+                );
+                *slot = Some(tokio::spawn(task.run()));
+            }
+            (None, Some(running)) => running.abort(),
+            (None, None) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn delivery_running(&self) -> bool {
+        self.delivery.lock().unwrap().is_some()
     }
 
     fn reconcile_reaper(
@@ -303,14 +325,8 @@ impl TerminalBackground {
         let Some(engine) = engine else { return };
         let previous = self.reaper_stopping.lock().unwrap().take();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let sweep = reaper::Reaper::with_cancel_flag(
-            control,
-            engine,
-            interval,
-            grace,
-            cancelled.clone(),
-            self.reaper_sweeps_herdr.clone(),
-        );
+        let sweep =
+            reaper::Reaper::with_cancel_flag(control, engine, interval, grace, cancelled.clone());
         let ticks = self.reaper_ticks.clone();
         let handle = tokio::spawn(async move {
             if let Some(prev) = previous {
@@ -1074,7 +1090,7 @@ mod terminal_background_tests {
     }
 
     #[tokio::test]
-    async fn paseo_alone_runs_the_reaper_without_the_herdr_sweep() {
+    async fn paseo_alone_runs_delivery_and_no_reaper() {
         let bg = TerminalBackground::new();
         let fake = Arc::new(FakeHerdr::new());
         let mut config = waggledance_core::Config::default();
@@ -1091,8 +1107,11 @@ mod terminal_background_tests {
             None,
             Some(paseo_engine),
         );
-        assert!(bg.reaper_running(), "paseo on is enough to start the sweep");
-        assert!(!bg.reaper_sweeps_herdr.load(Ordering::SeqCst));
+        assert!(bg.delivery_running(), "paseo on starts delivery");
+        assert!(
+            !bg.reaper_running(),
+            "the reaper no longer sweeps paseo runs"
+        );
 
         bg.reconcile(
             &TerminalConfig::default(),
@@ -1101,7 +1120,7 @@ mod terminal_background_tests {
             None,
             Some(engine()),
         );
-        assert!(!bg.reaper_running(), "terminal and paseo off run no reaper");
+        assert!(!bg.delivery_running(), "paseo off stops delivery");
     }
 
     /// The reaper's own teeth: `reaper_ticks` counts completed sweeps, so a
