@@ -315,7 +315,9 @@ fn handle_tool_call(
         "waggledance_projects" => handle_projects(id, engine),
         "waggledance_ask_state" => handle_ask_state(id, engine, orchestration, &args),
         "waggledance_dispatch" => handle_dispatch(id, engine, orchestration, &args),
-        "waggledance_await" => handle_await(id, engine, orchestration, &args),
+        "waggledance_await" => {
+            handle_await(id, engine, orchestration, &args, &resolve_data_dir(None))
+        }
         "waggledance_runs" => handle_runs(id, engine, &args),
         _ => err(id, -32602, "unknown tool"),
     }
@@ -1206,6 +1208,7 @@ fn handle_await(
     engine: &Engine,
     orchestration: &mut Option<Orchestration>,
     args: &Value,
+    data_dir: &Path,
 ) -> Value {
     let Some(run_id) = args
         .get("run_id")
@@ -1236,18 +1239,46 @@ fn handle_await(
         timeout,
         orch.notify_store.as_ref(),
     )) {
-        Ok(outcome) => ok(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": format!("run {run_id}: {}", outcome.status.as_str()) }],
-                "structuredContent": {
-                    "run_id": run_id,
-                    "status": outcome.status.as_str(),
-                    "delta": outcome.delta,
-                    "warnings": outcome.warnings
-                }
-            }),
-        ),
+        Ok(mut outcome) => {
+            let mut text = format!("run {run_id}: {}", outcome.status.as_str());
+            let mut report = json!({
+                "run_id": run_id,
+                "status": outcome.status.as_str(),
+                "delta": outcome.delta,
+            });
+            if outcome.status == orchestrate::RunStatus::Queued {
+                let age = time::OffsetDateTime::parse(
+                    &run.created_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map(|at| {
+                    (time::OffsetDateTime::now_utc() - at)
+                        .whole_seconds()
+                        .max(0)
+                })
+                .unwrap_or(0);
+                text.push_str(&format!(" for {age}s"));
+                report["age_secs"] = json!(age);
+            }
+            if run.pane_id.starts_with(orchestrate::PASEO_PANE_PREFIX)
+                && !outcome.status.is_terminal()
+                && delivery_paused(data_dir)
+            {
+                outcome.warnings.push(DELIVERY_PAUSED.to_string());
+            }
+            for warning in &outcome.warnings {
+                text.push_str("; ");
+                text.push_str(warning);
+            }
+            report["warnings"] = json!(outcome.warnings);
+            ok(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": report
+                }),
+            )
+        }
         Err(e) => tool_error(id, &format!("await failed: {e}")),
     }
 }
@@ -2772,6 +2803,42 @@ mod tests {
         beat(&data_dir, 5);
         let fresh = leader_call(&engine, &project, &data_dir, "c", None);
         assert_eq!(fresh["result"]["structuredContent"]["warnings"], json!([]));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn await_on_a_queued_leader_run_reports_its_age_and_a_paused_daemon() {
+        let (engine, project, data_dir) = leader_engine("await-queued", false, true, true);
+        let sent = leader_call(&engine, &project, &data_dir, "go", None);
+        let run_id = sent["result"]["structuredContent"]["run_id"].clone();
+        let args = json!({ "run_id": run_id, "timeout_seconds": 0 });
+        let mut orchestration = None;
+
+        let paused = handle_await(
+            Some(json!(2)),
+            &engine,
+            &mut orchestration,
+            &args,
+            &data_dir,
+        );
+        let report = &paused["result"]["structuredContent"];
+        assert_eq!(report["status"], "queued");
+        assert!(
+            report["age_secs"].as_i64().is_some_and(|a| a >= 0),
+            "{report}"
+        );
+        assert_eq!(report["warnings"], json!([DELIVERY_PAUSED]));
+        assert!(text_of(&paused).contains("queued for"));
+
+        beat(&data_dir, 0);
+        let live = handle_await(
+            Some(json!(3)),
+            &engine,
+            &mut orchestration,
+            &args,
+            &data_dir,
+        );
+        assert_eq!(live["result"]["structuredContent"]["warnings"], json!([]));
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 
