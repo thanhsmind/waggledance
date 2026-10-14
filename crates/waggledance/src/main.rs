@@ -15,6 +15,8 @@ mod herdr;
 mod mcp;
 mod notify;
 mod orchestrate;
+#[allow(dead_code)]
+mod paseo;
 mod reaper;
 mod runtime;
 mod server;
