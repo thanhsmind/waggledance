@@ -227,7 +227,8 @@ impl TerminalBackground {
         // ON, so `enabled` is what keeps a terminal-family-off install from
         // sweeping anything at all.
         let paseo_on = engine.as_ref().is_some_and(|e| e.config.paseo.enabled);
-        self.reaper_sweeps_herdr.store(cfg.enabled, Ordering::SeqCst);
+        self.reaper_sweeps_herdr
+            .store(cfg.enabled, Ordering::SeqCst);
         self.reconcile_reaper(
             cfg.reaper_enabled && (cfg.enabled || paseo_on),
             herdr.clone(),
