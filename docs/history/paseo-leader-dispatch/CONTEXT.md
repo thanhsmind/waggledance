@@ -81,12 +81,12 @@ giao cho đúng leader đúng workspace»
 
 ## Outstanding Questions
 
-### Deferred To Planning
+### Resolved In Planning
 
-- [ ] How a Paseo run's `done` / `blocked` maps from Paseo agent status and attention reason.
-- [ ] Whether the plugin composer calls a new `waggledance` CLI subcommand or the MCP server.
+- [x] Run status mapping: `plan.md` Approach (archived → lost, pending permission → blocked, leader text after the task → done).
+- [x] Composer door: D9 — `waggledance mcp` over stdio.
 
-## Deferred Ideas
+## Out Of Scope
 
-- Stopping or archiving a leader from waggledance.
-- Images attached to a request.
+Filed as backlog items, not promised here: stopping or archiving a leader
+(`p-75c7b411`), images attached to a request (`p-6be4d51f`).

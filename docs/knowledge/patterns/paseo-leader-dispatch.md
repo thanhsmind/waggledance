@@ -14,6 +14,8 @@ bee:
 
 # A request for a project reaches its one Paseo leader through waggledance_dispatch
 
+Locked by paseo-leader-dispatch D1–D10 (`docs/history/paseo-leader-dispatch/CONTEXT.md`).
+
 ## Turn it on
 
 Add this block to `~/.waggledance/config.toml` on the host that runs the daemon:
