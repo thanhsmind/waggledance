@@ -135,6 +135,19 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
     args
 }
 
+fn is_startup_log(line: &str) -> bool {
+    let Some((clock, _)) = line.split_once(" › ") else {
+        return false;
+    };
+    let b = clock.as_bytes();
+    b.len() == 12
+        && b.iter().enumerate().all(|(i, c)| match i {
+            2 | 5 => *c == b':',
+            8 => *c == b'.',
+            _ => c.is_ascii_digit(),
+        })
+}
+
 pub struct PaseoCli {
     binary: String,
 }
@@ -177,7 +190,10 @@ impl PaseoCli {
                 status: output.status.to_string(),
             });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .split_inclusive('\n')
+            .filter(|line| !is_startup_log(line))
+            .collect())
     }
 
     fn unparsable(&self, command: &str, message: impl ToString) -> PaseoError {
@@ -849,7 +865,21 @@ mod tests {
         let bin = dir.path().join("paseo");
         std::fs::write(
             &bin,
-            "#!/bin/sh\necho 'startup noise' >&2\ncase \"$1\" in\n  inspect) printf '{\"Status\":\"running\",\"Archived\":false,\"PendingPermissions\":[{}],\"UpdatedAt\":\"2026-10-14T14:04:56.399Z\"}' ;;\n  workspace) printf '[{\"workspaceId\":\"wks_1\",\"isolation\":\"local\",\"cwd\":\"/x\"}]' ;;\n  ls) printf 'not json' ;;\n  send) cat \"$4\" > \"$(dirname \"$0\")/sent\" ;;\nesac\n",
+            concat!(
+                "#!/bin/sh\n",
+                "echo 'startup noise' >&2\n",
+                "echo \"21:52:26.724 › [desktop] app startup { version: '0.11.2', platform: 'linux', arch: 'x64', isPackaged: true }\"\n",
+                "echo \"21:52:26.731 › [linux-sandbox] { enabled: false, reason: 'requested by --no-sandbox' }\"\n",
+                "case \"$1 $2\" in\n",
+                "  inspect*) printf '{\"Status\":\"running\",\"Archived\":false,\"PendingPermissions\":[{}],\"UpdatedAt\":\"2026-10-14T14:04:56.399Z\"}' ;;\n",
+                "  'workspace ls') printf '[{\"workspaceId\":\"wks_1\",\"isolation\":\"local\",\"cwd\":\"/x\"}]' ;;\n",
+                "  'workspace create') echo wks_new ;;\n",
+                "  run*) echo agent-9 ;;\n",
+                "  logs*) printf '[User] do it\\n12:00:00 done\\n' ;;\n",
+                "  ls*) printf 'not json' ;;\n",
+                "  send*) cat \"$4\" > \"$(dirname \"$0\")/sent\" ;;\n",
+                "esac\n",
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -878,6 +908,15 @@ mod tests {
             }
         );
         assert_eq!(cli.workspaces().await.unwrap()[0].id, "wks_1");
+        assert_eq!(
+            cli.create_workspace(Path::new("/x")).await.unwrap(),
+            "wks_new"
+        );
+        assert_eq!(cli.run(&spec("", "", "", "t")).await.unwrap(), "agent-9");
+        assert_eq!(
+            cli.logs_since("a", "2026-10-14T00:00:00Z").await.unwrap(),
+            "[User] do it\n12:00:00 done\n"
+        );
         let err = cli.leaders("proj-1").await.unwrap_err();
         assert!(matches!(err, PaseoError::Unparsable { .. }), "{err}");
         assert!(err.to_string().contains("ls"), "{err}");
@@ -886,5 +925,19 @@ mod tests {
             std::fs::read_to_string(dir.path().join("sent")).unwrap(),
             "hello $(not run)"
         );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn real_paseo_cli_lists_workspaces_and_leaders() {
+        let cli = PaseoCli::new(&PaseoConfig::default());
+        let workspaces = cli.workspaces().await.unwrap();
+        let leaders = cli
+            .leaders("waggledance-probe-no-such-project")
+            .await
+            .unwrap();
+        println!("workspaces: {workspaces:?}");
+        println!("leaders: {leaders:?}");
+        assert!(leaders.is_empty());
     }
 }
