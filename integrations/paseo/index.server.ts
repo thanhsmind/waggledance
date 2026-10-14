@@ -1,8 +1,8 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { sendToLeader } from "./server/dispatch.ts";
+import { runStatus as readRunStatus, sendToLeader } from "./server/dispatch.ts";
 import { waggledancePath } from "./server/installed.ts";
 import { loadBoard, pickBin } from "./server/waggledance.ts";
-import { board, send, settings } from "./shared/rpc.ts";
+import { board, runStatus, send, settings } from "./shared/rpc.ts";
 
 export default function contribute(server: PluginServerContext) {
   const stored = server.registerSettings(settings);
@@ -17,7 +17,11 @@ export default function contribute(server: PluginServerContext) {
     return loadBoard({ fetchUrl: v.fetch_url, linkBase: v.link_base, bin: pickBin(v.path, waggledancePath), dir });
   });
 
-  server.handle(send, async ({ project_id, task }) => sendToLeader(pickBin((await values()).path, waggledancePath), project_id, task));
+  const bin = async () => pickBin((await values()).path, waggledancePath);
+
+  server.handle(send, async ({ project_id, task, request_id }) => sendToLeader(await bin(), project_id, task, request_id));
+
+  server.handle(runStatus, async ({ run_id }) => readRunStatus(await bin(), run_id));
 
   return () => {};
 }

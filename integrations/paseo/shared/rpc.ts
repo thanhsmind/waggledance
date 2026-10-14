@@ -46,12 +46,43 @@ export const board = defineRpc({
 
 export const send = defineRpc({
   name: "waggledance.send",
-  input: z.object({ project_id: z.string().min(1), task: z.string().min(1) }),
+  input: z.object({ project_id: z.string().min(1), task: z.string().min(1), request_id: z.string().min(1) }),
   output: z.union([
-    z.object({ ok: z.literal(true), run_id: z.string(), agent_id: z.string(), workspace: z.string().nullable(), leader: z.enum(["started", "reused"]) }),
+    z.object({ ok: z.literal(true), run_id: z.string(), status: z.string(), duplicate: z.boolean(), warnings: z.array(z.string()) }),
     Failure,
   ]),
 });
+
+export const runStatus = defineRpc({
+  name: "waggledance.run_status",
+  input: z.object({ run_id: z.string().min(1) }),
+  output: z.union([z.object({ ok: z.literal(true), status: z.string(), age_secs: z.number().optional() }), Failure]),
+});
+
+export const STATUS_POLL_MS = 10_000;
+
+export function describeSent(leader: string, r: { run_id: string; duplicate: boolean; warnings: string[] }): string {
+  const head = r.duplicate ? `Already sent (run ${r.run_id})` : `Queued for ${leader} leader (run ${r.run_id})`;
+  return [head, ...r.warnings].join(" — ");
+}
+
+export function describeRun(status: string, ageSecs?: number): { text: string; final: boolean } {
+  switch (status) {
+    case "queued":
+      return { text: ageSecs === undefined ? "queued" : `queued for ${ageSecs}s`, final: false };
+    case "working":
+    case "timeout":
+      return { text: "working", final: false };
+    case "blocked":
+      return { text: "blocked — waiting for a permission in the leader's chat", final: false };
+    case "done":
+      return { text: "done", final: true };
+    case "lost":
+      return { text: "lost", final: true };
+    default:
+      return { text: status, final: false };
+  }
+}
 
 export const settings = defineSettings({
   id: "waggledance",
