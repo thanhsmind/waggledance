@@ -152,6 +152,24 @@ either — ask the human which mode, rather than guessing.
    either call on its behalf. This seat dispatches and monitors; it does not merge, and
    it does not answer that repo's gate questions.
 
+## Leader mode — when the target project runs in Paseo
+
+When the host's waggledance config has `[paseo]` with `enabled = true` and the target
+project's lead lives in Paseo, dispatch with `{project, task, leader: true}` instead of
+`{project, task, preset}`. Everything else in both procedures holds unchanged: the mode
+gate, the correlation id, the provenance line as line 1, the spec body, and the
+file-and-stop or execute-to-completion contract.
+
+- waggledance finds the project's one long-lived leader by its labels, or starts one in
+  the project's configured Paseo workspace. Never name a workspace, an agent id, a
+  provider, or a working directory — config owns them.
+- An idle leader takes the task as a new message. That is reuse by design, not a
+  competing run, so step 2's live-lead check is the busy-leader refusal below.
+- Track the run with `waggledance_await` and `waggledance_runs` exactly as above.
+  `done` means the leader went idle after replying to this task; its reply is the delta.
+  `blocked` means the leader waits on a permission in Paseo — the human answers it
+  there. `lost` means the leader was archived.
+
 ## Refusals
 
 These are the shapes an operator or a lead actually meets running this skill, in either
@@ -175,6 +193,18 @@ mode unless noted. Recognize each one for what it is — most are not failures.
   when the target project has no in-boundary pane to carry the run. This means the
   target repo's workspace needs a focused pane before a lead can open there — it is not
   something this skill can route around by picking a different project.
+
+- **Paseo leader dispatch is off (leader mode).** The refusal names
+  `~/.waggledance/config.toml` and the lines `[paseo]` and `enabled = true`. Surface it to
+  the human; only the host's owner turns it on.
+
+- **The leader is busy (leader mode).** The refusal names the leader's id and says it
+  will not interrupt its current run. Retry after that run ends — never switch to a
+  `preset` or a `pane_id` to get around it.
+
+- **More than one Paseo workspace at the project root (leader mode).** The refusal names
+  every matching workspace id and the `[[paseo.leaders]]` entry that picks one. Surface it
+  to the human; never pick a workspace yourself.
 
 - **A lead is already working that repo.** Not an MCP error — this is what step 2's
   `waggledance_ask_state` check is for, in both modes. Seeing a live lead means: do not
