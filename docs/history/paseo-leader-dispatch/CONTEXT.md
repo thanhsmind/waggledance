@@ -31,6 +31,16 @@ giao cho đúng leader đúng workspace»
 | D4 | Three sources, one door: the waggledance agent chatting in Paseo (supervisor skill), a request composer in the Waggle Dance Paseo plugin, and external agents (aicoworker, openclaw, hermes) calling waggledance's MCP server. The caller names the project; waggledance never picks it or edits the task text (decision b2e63d04). | `orchestrator-dispatch` D1 holds unchanged. |
 | D5 | The existing gate holds: a Paseo dispatch is refused unless the target project has orchestration enabled. A caller passes a project and a task only — never argv, cwd, provider strings or workspace ids; those come from config. The plugin stays read-only except for sending a request to a project's leader, its first write path (narrows `pi-paseo-plugin` D3). | `orchestrator-dispatch` D3/D6 security posture. |
 
+### Added at the plan-step hat wave (agent-decided under gate bypass full)
+
+| ID | Decision | Rationale |
+|----|----------|-----------|
+| D6 | The leader path is gated by the project's orchestration flag plus `[paseo] enabled`; `terminal.enabled` does not gate it, and the Paseo client never builds the herdr handle. Each refusal names the config file and the exact line to add. | A Paseo-only host would otherwise be refused for a surface it does not use. |
+| D7 | A request to a running or initializing leader is refused with the leader's id — never queued or interleaved. Starting a new leader is serialized per project by a lock held from lookup through `paseo run`. | Fail-closed like the busy-pane refusal; duplicate leaders cannot be undone. |
+| D8 | D3's root fallback matches a workspace with `isolation` `local` whose realpath cwd equals the project root; more than one match with no `[[paseo.leaders]]` entry is refused, naming every matching workspace id and the config key. | D3: a guess would be ambiguous. |
+| D9 | The plugin composer spawns `waggledance mcp` over stdio and calls `waggledance_dispatch` with `leader: true`; no new CLI subcommand, no HTTP write route. The composer lives in the workspace panel. | One door for all three sources. |
+| D10 | `[paseo]` provider, mode and thinking default to empty (Paseo's own defaults); a new leader is titled `<project name> leader` and labelled `waggledance.role=leader`, `waggledance.project=<project id>`. | No stale model id, no unasked permission bypass. |
+
 ### Agent's Discretion
 
 - Config shape and key names (global Paseo defaults plus per-project leader
