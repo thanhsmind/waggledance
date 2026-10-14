@@ -14,7 +14,7 @@ bee:
 
 # A request for a project reaches its one Paseo leader through waggledance_dispatch
 
-Locked by paseo-leader-dispatch D1–D10 (`docs/history/paseo-leader-dispatch/CONTEXT.md`).
+Locked by paseo-leader-dispatch D1/D2/D3/D4/D5/D6/D7/D8/D9/D10 (`docs/history/paseo-leader-dispatch/CONTEXT.md`).
 
 ## Turn it on
 
