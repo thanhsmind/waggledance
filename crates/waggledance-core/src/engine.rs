@@ -437,6 +437,53 @@ impl Engine {
         self.store.run_final_transcript(id)
     }
 
+    pub fn insert_run_with_request(
+        &self,
+        run: &Run,
+        feature: Option<&str>,
+        request_id: Option<&str>,
+        caller: Option<&str>,
+    ) -> Result<String> {
+        self.store
+            .insert_run_with_request(run, feature, request_id, caller)
+    }
+
+    pub fn run_by_request(&self, project_id: &str, request_id: &str) -> Result<Option<Run>> {
+        self.store.run_by_request(project_id, request_id)
+    }
+
+    pub fn run_caller(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_caller(id)
+    }
+
+    pub fn run_attempts(&self, id: &str) -> Result<Option<i64>> {
+        self.store.run_attempts(id)
+    }
+
+    pub fn list_queued_paseo_runs(&self, project_id: &str) -> Result<Vec<Run>> {
+        self.store.list_queued_paseo_runs(project_id)
+    }
+
+    pub fn list_projects_with_queued_paseo_runs(&self) -> Result<Vec<String>> {
+        self.store.list_projects_with_queued_paseo_runs()
+    }
+
+    pub fn claim_queued_run(&self, id: &str) -> Result<bool> {
+        self.store.claim_queued_run(id)
+    }
+
+    pub fn set_run_pane(&self, id: &str, pane_id: &str) -> Result<()> {
+        self.store.set_run_pane(id, pane_id)
+    }
+
+    pub fn requeue_run(&self, id: &str) -> Result<bool> {
+        self.store.requeue_run(id)
+    }
+
+    pub fn list_inflight_paseo_runs(&self) -> Result<Vec<Run>> {
+        self.store.list_inflight_paseo_runs()
+    }
+
     pub fn list_files(&self, project_id: &str) -> Result<Vec<IndexedFile>> {
         self.store.list_files(project_id)
     }
