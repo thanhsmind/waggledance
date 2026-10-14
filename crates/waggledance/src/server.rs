@@ -3490,15 +3490,15 @@ fn project_live_board_runs(
     snapshot: Option<&herdr::Snapshot>,
 ) -> views::BeeHubLiveRuns {
     let mut out = views::BeeHubLiveRuns::new();
-    let Some(snap) = snapshot else {
-        return out;
-    };
     let Ok(runs) = engine.list_runs(project_id, BOARD_LIVE_RUN_SCAN) else {
         return out;
     };
     for run in runs.iter().filter(|r| r.status == "working") {
         let feature = engine.run_feature(&run.id).ok().flatten();
-        let pane_alive = snap.panes.iter().any(|p| p.pane_id == run.pane_id);
+        let pane_alive = run
+            .pane_id
+            .starts_with(crate::orchestrate::PASEO_PANE_PREFIX)
+            || snapshot.is_some_and(|snap| snap.panes.iter().any(|p| p.pane_id == run.pane_id));
         if let Some((feature, live)) = views::bee_hub_live_run_entry(
             feature.as_deref(),
             &run.status,
@@ -31387,6 +31387,51 @@ mod bee_route_tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn board_counts_a_working_paseo_run_alive_without_a_herdr_snapshot() {
+        let engine = Engine::new(
+            waggledance_core::SqliteStore::open_in_memory().unwrap(),
+            waggledance_core::Config::default(),
+        );
+        let now = now_rfc3339();
+        engine
+            .store
+            .upsert_project(&waggledance_core::domain::Project {
+                id: "proj-1".into(),
+                name: "proj".into(),
+                root_path: PathBuf::from("/tmp/board-paseo"),
+                created_at: now.clone(),
+                last_seen_at: now.clone(),
+                orchestration_enabled: true,
+            })
+            .unwrap();
+        for (id, pane, feature) in [
+            ("run-paseo", "paseo:agent-1", "paseo-feat"),
+            ("run-herdr", "w1:p1", "herdr-feat"),
+        ] {
+            engine
+                .insert_run(
+                    &waggledance_core::domain::Run {
+                        id: id.into(),
+                        project_id: "proj-1".into(),
+                        pane_id: pane.into(),
+                        preset_label: None,
+                        task: "/bee-capturing compound feature x".into(),
+                        baseline: String::new(),
+                        marker: String::new(),
+                        status: "working".into(),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                    Some(feature),
+                )
+                .unwrap();
+        }
+        let live = project_live_board_runs(&engine, "proj-1", None);
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live["paseo-feat"].pane_id, "paseo:agent-1");
     }
 
     /// bra-3, over the vendored client source `views::APP_JS`, beside the

@@ -50,7 +50,8 @@ use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::Engine;
 
 use crate::herdr::{AgentStatus, Herdr, ReadSource, Snapshot};
-use crate::orchestrate::{self, RunStatus, RECENT_LINES_CAP};
+use crate::orchestrate::{self, PaseoObservation, RunStatus, RECENT_LINES_CAP};
+use crate::paseo::{Paseo, PaseoCli};
 
 /// How long a `working` row must have sat untouched before the reaper will
 /// consider it unattended at all.
@@ -79,6 +80,8 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// marker scrolled out of the 1000-line window between those two reads —
 /// and bounds how long that race can hold a sweep up.
 const AWAIT_BUDGET: Duration = Duration::from_secs(5);
+
+const PASEO_POLL: Duration = Duration::from_secs(1);
 
 /// What one sweep decided about one run — returned so a caller (and this
 /// module's tests) can see the decision itself rather than infer it from
@@ -118,6 +121,7 @@ fn older_than(updated_at: &str, now: OffsetDateTime, grace: Duration) -> bool {
 /// The sweep loop itself. Construction is `TerminalBackground`'s alone.
 pub struct Reaper {
     herdr: Arc<dyn Herdr>,
+    paseo: Arc<dyn Paseo>,
     engine: Arc<Engine>,
     interval: Duration,
     grace: Duration,
@@ -145,6 +149,12 @@ impl Reaper {
         )
     }
 
+    #[cfg(test)]
+    fn with_paseo(mut self, paseo: Arc<dyn Paseo>) -> Self {
+        self.paseo = paseo;
+        self
+    }
+
     pub fn with_cancel_flag(
         herdr: Arc<dyn Herdr>,
         engine: Arc<Engine>,
@@ -154,6 +164,7 @@ impl Reaper {
     ) -> Self {
         Reaper {
             herdr,
+            paseo: Arc::new(PaseoCli::new(&engine.config.paseo)),
             engine,
             interval,
             grace,
@@ -168,6 +179,64 @@ impl Reaper {
     /// is still young costs herdr nothing at all, and the whole sweep takes
     /// exactly one snapshot — never one per run.
     pub async fn sweep_once(&self) -> Vec<(String, Verdict)> {
+        let mut verdicts = self.sweep_herdr().await;
+        if self.engine.config.paseo.enabled {
+            verdicts.extend(self.sweep_paseo().await);
+        }
+        verdicts
+    }
+
+    async fn sweep_paseo(&self) -> Vec<(String, Verdict)> {
+        let runs = match self.engine.store.list_working_paseo_runs() {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!("reaper could not list working paseo runs: {e}");
+                return Vec::new();
+            }
+        };
+        let now = OffsetDateTime::now_utc();
+        let mut verdicts = Vec::new();
+        for run in runs {
+            let verdict = if older_than(&run.updated_at, now, self.grace) {
+                self.reap_paseo(&run).await
+            } else {
+                Verdict::TooYoung
+            };
+            verdicts.push((run.id, verdict));
+        }
+        verdicts
+    }
+
+    async fn reap_paseo(&self, run: &Run) -> Verdict {
+        match orchestrate::observe_paseo_run(self.paseo.as_ref(), run).await {
+            Ok(PaseoObservation::Lost | PaseoObservation::Replied(_)) => {}
+            Ok(_) => return Verdict::LeftAlone,
+            Err(e) => {
+                tracing::warn!("reaper could not observe paseo run {}: {e}", run.id);
+                return Verdict::LeftAlone;
+            }
+        }
+        match orchestrate::await_paseo_run(
+            self.paseo.as_ref(),
+            self.herdr.as_ref(),
+            &self.engine,
+            run,
+            AWAIT_BUDGET,
+            PASEO_POLL,
+            None,
+        )
+        .await
+        {
+            Ok(outcome) if outcome.status == RunStatus::Lost => Verdict::Lost,
+            Ok(outcome) => Verdict::Awaited(outcome.status),
+            Err(e) => {
+                tracing::warn!("reaper could not finish paseo run {}: {e}", run.id);
+                Verdict::LeftAlone
+            }
+        }
+    }
+
+    async fn sweep_herdr(&self) -> Vec<(String, Verdict)> {
         let runs = match self.engine.store.list_unattended_working_runs() {
             Ok(runs) => runs,
             Err(e) => {
@@ -333,6 +402,7 @@ impl Reaper {
 mod tests {
     use super::*;
     use crate::herdr::fake::FakeHerdr;
+    use crate::paseo::fake::FakePaseo;
     use waggledance_core::domain::Project;
     use waggledance_core::{Config, SqliteStore};
 
@@ -572,6 +642,131 @@ mod tests {
 
         assert_eq!(verdicts, vec![("run-dark".to_string(), Verdict::LeftAlone)]);
         assert_eq!(status_of(&engine, "run-dark"), "working");
+    }
+
+    fn paseo_engine(enabled: bool) -> Arc<Engine> {
+        let mut config = Config::default();
+        config.paseo.enabled = enabled;
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
+        engine
+            .store
+            .upsert_project(&Project {
+                id: "proj-1".into(),
+                name: "test-proj".into(),
+                root_path: std::path::PathBuf::from("/tmp/test"),
+                created_at: now_rfc3339(),
+                last_seen_at: now_rfc3339(),
+                orchestration_enabled: true,
+            })
+            .unwrap();
+        engine
+            .insert_run(
+                &Run {
+                    id: "run-paseo".into(),
+                    project_id: "proj-1".into(),
+                    pane_id: "paseo:agent-1".into(),
+                    preset_label: None,
+                    task: "do the thing".into(),
+                    baseline: "2026-01-01T00:00:00Z".into(),
+                    marker: String::new(),
+                    status: "working".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                },
+                None,
+            )
+            .unwrap();
+        Arc::new(engine)
+    }
+
+    fn leader(status: &str, archived: bool, logs: &str) -> Arc<FakePaseo> {
+        let paseo = Arc::new(FakePaseo::default());
+        paseo.add_leader("proj-1", "agent-1", status, archived);
+        paseo
+            .state
+            .lock()
+            .unwrap()
+            .logs
+            .insert("agent-1".into(), logs.into());
+        paseo
+    }
+
+    async fn sweep_paseo(engine: &Arc<Engine>, paseo: Arc<FakePaseo>) -> Vec<(String, Verdict)> {
+        let herdr = Arc::new(FakeHerdr::new());
+        let verdicts = Reaper::new(herdr.clone(), engine.clone())
+            .with_paseo(paseo)
+            .sweep_once()
+            .await;
+        assert!(herdr.read_pane_log().await.is_empty());
+        assert!(herdr.closed_panes().await.is_empty());
+        verdicts
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unawaited_paseo_run_whose_leader_replied_is_done_in_one_sweep() {
+        let engine = paseo_engine(true);
+        let paseo = leader("idle", false, "[User] do the thing\nall finished\n");
+
+        let verdicts = sweep_paseo(&engine, paseo).await;
+
+        assert_eq!(
+            verdicts,
+            vec![("run-paseo".to_string(), Verdict::Awaited(RunStatus::Done))]
+        );
+        assert_eq!(status_of(&engine, "run-paseo"), "done");
+        assert_eq!(
+            engine.run_final_transcript("run-paseo").unwrap().as_deref(),
+            Some("all finished")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_paseo_run_whose_leader_is_archived_is_lost() {
+        let engine = paseo_engine(true);
+
+        let verdicts = sweep_paseo(&engine, leader("idle", true, "")).await;
+
+        assert_eq!(verdicts, vec![("run-paseo".to_string(), Verdict::Lost)]);
+        assert_eq!(status_of(&engine, "run-paseo"), "lost");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_or_running_or_unreachable_leader_leaves_the_run_working() {
+        let blocked = leader("idle", false, "[User] do the thing\nall finished\n");
+        blocked
+            .state
+            .lock()
+            .unwrap()
+            .agents
+            .get_mut("agent-1")
+            .unwrap()
+            .pending_permissions = 1;
+        for paseo in [
+            blocked,
+            leader("running", false, ""),
+            leader("idle", false, "[User] do the thing\n"),
+            Arc::new(FakePaseo::default()),
+        ] {
+            let engine = paseo_engine(true);
+            let verdicts = sweep_paseo(&engine, paseo).await;
+            assert_eq!(
+                verdicts,
+                vec![("run-paseo".to_string(), Verdict::LeftAlone)]
+            );
+            assert_eq!(status_of(&engine, "run-paseo"), "working");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paseo_runs_are_not_swept_while_paseo_is_disabled() {
+        let engine = paseo_engine(false);
+        let paseo = leader("idle", true, "");
+
+        let verdicts = sweep_paseo(&engine, paseo.clone()).await;
+
+        assert!(verdicts.is_empty(), "{verdicts:?}");
+        assert!(paseo.calls().is_empty());
+        assert_eq!(status_of(&engine, "run-paseo"), "working");
     }
 
     #[test]
