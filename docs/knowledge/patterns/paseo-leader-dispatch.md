@@ -15,8 +15,8 @@ bee:
 # A request for a project reaches its one Paseo leader through waggledance_dispatch
 
 Locked by paseo-leader-dispatch D1/D2/D3/D4/D5/D6/D8/D9/D10
-(`docs/history/paseo-leader-dispatch/CONTEXT.md`) and leader-delivery
-D1/D2/D3/D4/D5/D6/D7/D8 (`docs/history/leader-delivery/CONTEXT.md`). Leader-delivery D3
+(`docs/history/paseo-leader-dispatch/CONTEXT.md`) and
+leader-delivery D1/D2/D3/D4/D5/D6/D7/D8 (`docs/history/leader-delivery/CONTEXT.md`). Leader-delivery D3
 supersedes paseo-leader-dispatch D7: a busy leader no longer refuses a request.
 
 ## Turn it on

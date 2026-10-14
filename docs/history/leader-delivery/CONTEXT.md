@@ -48,7 +48,9 @@ shape of the notice sent to a calling Paseo agent.
 Captured in `.bee/cache/paseo-probe/` and to be committed as fixtures:
 
 - `paseo send <id> --prompt-file f --json` without `--no-wait` blocks until the turn ends and prints `{"agentId", "status": "completed", "message": "Agent completed processing the message"}` — the turn-tied completion D2 needs.
+<!-- bee:not-a-deferral: a recorded probe observation about Paseo's idle-state lag, not a promise to act later -->
 - `send --no-wait` prints `{"status": "sent"}`; two seconds later `inspect` still read `"Status": "idle"` — idle state lags a fresh send.
+<!-- /bee:not-a-deferral -->
 - `paseo wait <id> --json` prints `{"agentId", "status": "idle", "message": "Agent is idle.\nLast 5 activity items:\n…"}`.
 - Requests sent one after another were processed in order (`logs`: PONG, SECOND, DONE-A, THIRD-B).
 - `~/.local/bin/paseo` is a wrapper that runs the Paseo AppImage. Called from inside a Paseo agent, its `run` exits 0, prints only startup logs (including multi-line `[login-shell-env]` objects that the current noise filter does not drop), and creates no agent. The bundled CLI named by `$PASEO_CLI` works and prints clean JSON.
