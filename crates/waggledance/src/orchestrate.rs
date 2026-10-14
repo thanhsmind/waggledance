@@ -32,6 +32,9 @@ use waggledance_core::Engine;
 
 use crate::herdr::{self, AgentStatus, Herdr, HerdrError, ReadSource};
 use crate::notify;
+use crate::paseo::{Paseo, PaseoCli, PaseoError};
+
+pub const PASEO_PANE_PREFIX: &str = "paseo:";
 
 /// Herdr's own hard cap on a `recent` read (mirrors `pane_scroller.rs`'s own
 /// local copy of the same constant, `pane_scroller.rs:52`) — baseline/delta
@@ -65,6 +68,8 @@ pub enum OrchestrateError {
     Herdr(#[from] HerdrError),
     #[error("run persistence failed: {0}")]
     Store(#[from] waggledance_core::Error),
+    #[error(transparent)]
+    Paseo(#[from] PaseoError),
 }
 
 /// Why `preflight` refused a send, before any pane write happened (D5
@@ -641,6 +646,7 @@ impl RunStatus {
 pub struct AwaitOutcome {
     pub status: RunStatus,
     pub delta: String,
+    pub warnings: Vec<String>,
 }
 
 /// Bounded poll for `run`'s completion (D4/D5): `timeout` is clamped to
@@ -699,7 +705,25 @@ async fn await_run_with_poll_interval(
     // herdr at all: no snapshot, no `read_pane`.
     if let Some(status) = RunStatus::terminal_from_stored(&run.status) {
         let delta = engine.run_final_transcript(&run.id)?.unwrap_or_default();
-        return Ok(AwaitOutcome { status, delta });
+        return Ok(AwaitOutcome {
+            status,
+            delta,
+            warnings: Vec::new(),
+        });
+    }
+
+    if run.pane_id.starts_with(PASEO_PANE_PREFIX) {
+        let paseo = PaseoCli::new(&engine.config.paseo);
+        return await_paseo_run(
+            &paseo,
+            herdr,
+            engine,
+            run,
+            timeout,
+            poll_interval,
+            notify_store,
+        )
+        .await;
     }
 
     let deadline = tokio::time::Instant::now() + clamp_timeout(timeout);
@@ -901,7 +925,117 @@ async fn finish(
             );
         }
     }
-    Ok(AwaitOutcome { status, delta })
+    Ok(AwaitOutcome {
+        status,
+        delta,
+        warnings: Vec::new(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaseoObservation {
+    Lost,
+    Blocked,
+    Replied(String),
+    Working(Option<String>),
+}
+
+pub async fn observe_paseo_run(
+    paseo: &dyn Paseo,
+    run: &Run,
+) -> Result<PaseoObservation, PaseoError> {
+    let agent_id = run
+        .pane_id
+        .strip_prefix(PASEO_PANE_PREFIX)
+        .unwrap_or(&run.pane_id);
+    let state = paseo.inspect(agent_id).await?;
+    if state.archived {
+        return Ok(PaseoObservation::Lost);
+    }
+    if state.pending_permissions > 0 {
+        return Ok(PaseoObservation::Blocked);
+    }
+    match state.status.as_str() {
+        "idle" => {
+            let logs = paseo.logs_since(agent_id, &run.baseline).await?;
+            let reply = leader_reply(&logs, &run.task);
+            Ok(if reply.is_empty() {
+                PaseoObservation::Working(None)
+            } else {
+                PaseoObservation::Replied(reply)
+            })
+        }
+        "running" | "initializing" => Ok(PaseoObservation::Working(None)),
+        other => Ok(PaseoObservation::Working(Some(format!(
+            "paseo agent {agent_id} reports status `{other}`, which waggledance does not map"
+        )))),
+    }
+}
+
+fn leader_reply(logs: &str, task: &str) -> String {
+    let sent = format!("[User] {task}");
+    let Some(at) = logs.rfind(&sent) else {
+        return String::new();
+    };
+    logs[at + sent.len()..]
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("[User]"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub async fn await_paseo_run(
+    paseo: &dyn Paseo,
+    herdr: &dyn Herdr,
+    engine: &Engine,
+    run: &Run,
+    timeout: Duration,
+    poll_interval: Duration,
+    notify_store: Option<&NotifyStore>,
+) -> Result<AwaitOutcome, OrchestrateError> {
+    let deadline = tokio::time::Instant::now() + clamp_timeout(timeout);
+    let mut replied = false;
+    let mut warnings: Vec<String> = Vec::new();
+    loop {
+        let (verdict, delta) = match observe_paseo_run(paseo, run).await? {
+            PaseoObservation::Lost => (Some(RunStatus::Lost), String::new()),
+            PaseoObservation::Blocked => (Some(RunStatus::Blocked), String::new()),
+            PaseoObservation::Replied(text) if replied => (Some(RunStatus::Done), text),
+            PaseoObservation::Replied(text) => {
+                replied = true;
+                (None, text)
+            }
+            PaseoObservation::Working(warning) => {
+                replied = false;
+                if let Some(w) = warning.filter(|w| !warnings.contains(w)) {
+                    warnings.push(w);
+                }
+                (None, String::new())
+            }
+        };
+        let now = tokio::time::Instant::now();
+        let status = match verdict {
+            Some(status) => status,
+            None if now >= deadline => RunStatus::Working,
+            None => {
+                tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now)))
+                    .await;
+                continue;
+            }
+        };
+        let mut outcome = finish(
+            herdr,
+            engine,
+            run,
+            status,
+            Completion::Observed,
+            delta,
+            notify_store,
+        )
+        .await?;
+        outcome.warnings = warnings;
+        return Ok(outcome);
+    }
 }
 
 #[cfg(test)]
@@ -2236,5 +2370,125 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    fn paseo_leader(status: &str, logs: &str) -> crate::paseo::fake::FakePaseo {
+        let paseo = crate::paseo::fake::FakePaseo::default();
+        paseo.add_leader("proj-1", "agent-1", status, false);
+        paseo
+            .state
+            .lock()
+            .unwrap()
+            .logs
+            .insert("agent-1".into(), logs.into());
+        paseo
+    }
+
+    async fn await_leader(
+        paseo: &crate::paseo::fake::FakePaseo,
+        timeout: Duration,
+    ) -> (AwaitOutcome, Run, Engine) {
+        let engine = test_engine();
+        let run = build_run("run-paseo", "paseo:agent-1", "2026-10-14T14:00:00Z", "");
+        engine.insert_run(&run, None).unwrap();
+        let outcome = await_paseo_run(
+            paseo,
+            &FakeHerdr::new(),
+            &engine,
+            &run,
+            timeout,
+            Duration::from_millis(1),
+            None,
+        )
+        .await
+        .unwrap();
+        (outcome, run, engine)
+    }
+
+    #[tokio::test]
+    async fn await_on_an_idle_leader_holding_only_the_user_line_stays_working() {
+        let paseo = paseo_leader("idle", "[User] do the thing\n");
+        let (outcome, run, engine) = await_leader(&paseo, Duration::from_millis(30)).await;
+        assert_eq!(outcome.status, RunStatus::Working);
+        assert_eq!(engine.get_run(&run.id).unwrap().unwrap().status, "working");
+        assert!(paseo.calls().contains(&crate::paseo::fake::Call::LogsSince(
+            "agent-1".into(),
+            run.baseline.clone()
+        )));
+    }
+
+    #[tokio::test]
+    async fn await_returns_done_only_after_two_polls_with_assistant_text() {
+        let logs = "[User] old task\nold reply\n[User] do the thing\nline two of nothing\n";
+        let stale = paseo_leader("idle", "[User] old task\nold reply\n");
+        let (outcome, _, _) = await_leader(&stale, Duration::from_millis(30)).await;
+        assert_eq!(outcome.status, RunStatus::Working);
+
+        let single = paseo_leader("idle", logs);
+        let (outcome, _, _) = await_leader(&single, Duration::ZERO).await;
+        assert_eq!(outcome.status, RunStatus::Working);
+
+        let paseo = paseo_leader("idle", logs);
+        let (outcome, run, engine) = await_leader(&paseo, Duration::from_secs(5)).await;
+        assert_eq!(outcome.status, RunStatus::Done);
+        assert_eq!(outcome.delta, "line two of nothing");
+        assert_eq!(engine.get_run(&run.id).unwrap().unwrap().status, "done");
+        let inspects = paseo
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, crate::paseo::fake::Call::Inspect(_)))
+            .count();
+        assert_eq!(inspects, 2);
+    }
+
+    #[tokio::test]
+    async fn await_with_a_pending_permission_returns_blocked() {
+        let paseo = paseo_leader("running", "");
+        paseo
+            .state
+            .lock()
+            .unwrap()
+            .agents
+            .get_mut("agent-1")
+            .unwrap()
+            .pending_permissions = 1;
+        let (outcome, _, _) = await_leader(&paseo, Duration::from_secs(5)).await;
+        assert_eq!(outcome.status, RunStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn await_on_an_archived_leader_returns_lost() {
+        let paseo = crate::paseo::fake::FakePaseo::default();
+        paseo.add_leader("proj-1", "agent-1", "idle", true);
+        let (outcome, run, engine) = await_leader(&paseo, Duration::from_secs(5)).await;
+        assert_eq!(outcome.status, RunStatus::Lost);
+        assert_eq!(engine.get_run(&run.id).unwrap().unwrap().status, "lost");
+    }
+
+    #[tokio::test]
+    async fn await_on_an_unmapped_leader_status_stays_working_with_a_warning() {
+        let paseo = paseo_leader("error", "");
+        let (outcome, _, _) = await_leader(&paseo, Duration::from_millis(20)).await;
+        assert_eq!(outcome.status, RunStatus::Working);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("`error`"));
+    }
+
+    #[tokio::test]
+    async fn await_run_sends_a_paseo_run_to_paseo_and_never_to_herdr() {
+        let mut config = Config::default();
+        config.paseo.binary = "/nonexistent/paseo-for-await-test".into();
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
+        let herdr = FakeHerdr::new();
+        herdr.set_available(false);
+        let run = build_run("run-paseo-cli", "paseo:agent-1", "2026-10-14T14:00:00Z", "");
+        engine.insert_run(&run, None).unwrap();
+        let err = await_run(&herdr, &engine, &run, Duration::from_secs(1), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OrchestrateError::Paseo(_)), "{err}");
+        assert!(err
+            .to_string()
+            .contains("/nonexistent/paseo-for-await-test"));
     }
 }

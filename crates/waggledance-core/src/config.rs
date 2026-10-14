@@ -16,6 +16,43 @@ pub struct Config {
     pub renderer: RendererConfig,
     pub search: SearchConfig,
     pub terminal: TerminalConfig,
+    pub paseo: PaseoConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PaseoConfig {
+    pub enabled: bool,
+    pub binary: String,
+    pub provider: String,
+    pub mode: String,
+    pub thinking: String,
+    pub leaders: Vec<PaseoLeader>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PaseoLeader {
+    pub project: String,
+    pub workspace: String,
+}
+
+impl PaseoConfig {
+    pub fn binary(&self) -> &str {
+        if self.binary.is_empty() {
+            "paseo"
+        } else {
+            &self.binary
+        }
+    }
+
+    pub fn workspace_for(&self, project_id: &str, project_name: &str) -> Option<&str> {
+        self.leaders
+            .iter()
+            .find(|l| l.project == project_id || l.project == project_name)
+            .map(|l| l.workspace.as_str())
+            .filter(|w| !w.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -858,6 +895,31 @@ mod tests {
         assert!(loaded.terminal.supervisor_enabled);
         assert!(!loaded.terminal.unassigned_enabled);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paseo_config_defaults_off_and_empty_and_matches_leaders_by_id_or_name() {
+        let c = Config::load_from(Path::new("/nonexistent/waggledance/config.toml"));
+        assert_eq!(c.paseo, PaseoConfig::default());
+        assert!(!c.paseo.enabled);
+        assert_eq!(c.paseo.binary(), "paseo");
+        assert!(
+            c.paseo.provider.is_empty() && c.paseo.mode.is_empty() && c.paseo.thinking.is_empty()
+        );
+
+        let parsed: Config = toml::from_str(
+            "[paseo]\nenabled = true\nbinary = \"/opt/paseo\"\n\n[[paseo.leaders]]\nproject = \"waggledance\"\nworkspace = \"wks_a\"\n\n[[paseo.leaders]]\nproject = \"p-2\"\nworkspace = \"wks_b\"\n",
+        )
+        .unwrap();
+        assert!(parsed.paseo.enabled);
+        assert_eq!(parsed.paseo.binary(), "/opt/paseo");
+        assert_eq!(
+            parsed.paseo.workspace_for("p-1", "waggledance"),
+            Some("wks_a")
+        );
+        assert_eq!(parsed.paseo.workspace_for("p-2", "other"), Some("wks_b"));
+        assert_eq!(parsed.paseo.workspace_for("p-3", "other"), None);
+        assert!(parsed.paseo.mode.is_empty());
     }
 
     #[test]

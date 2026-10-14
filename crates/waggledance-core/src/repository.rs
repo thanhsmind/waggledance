@@ -237,6 +237,17 @@ impl SqliteStore {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    pub fn list_working_paseo_runs(&self) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE status='working' AND pane_id LIKE 'paseo:%'
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// The `feature` column of one run row, for the round-trip proof and for
     /// any caller that holds a [`Run`] and needs the column the struct does
     /// not carry. `Ok(None)` for both an unknown id and a NULL column.
@@ -1265,6 +1276,30 @@ mod tests {
             vec!["r-other-project"],
             "a reaped run is not swept twice: {sweep:?}"
         );
+    }
+
+    #[test]
+    fn working_paseo_runs_are_listed_apart_from_the_herdr_sweep() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for (id, pane, status) in [
+            ("r-paseo", "paseo:agent-1", "working"),
+            ("r-paseo-done", "paseo:agent-2", "done"),
+            ("r-herdr", "w1:p1", "working"),
+        ] {
+            let mut run = sample_run();
+            run.id = id.into();
+            run.pane_id = pane.into();
+            run.status = status.into();
+            run.preset_label = None;
+            s.insert_run(&run, None).unwrap();
+        }
+        let paseo = s.list_working_paseo_runs().unwrap();
+        assert_eq!(
+            paseo.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-paseo"]
+        );
+        assert!(s.list_unattended_working_runs().unwrap().is_empty());
     }
 
     /// A database whose `runs` table predates the `feature` column: SCHEMA's

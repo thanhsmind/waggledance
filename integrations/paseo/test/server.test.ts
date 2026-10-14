@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { sendToLeader } from "../server/dispatch.ts";
 import { waggledancePath } from "../server/installed.ts";
 import { loadBoard, pickBin, projectFor } from "../server/waggledance.ts";
 import { linkTo, pollEvery, sections, BUSY_MS, QUIET_MS } from "../shared/board.ts";
@@ -165,4 +166,63 @@ test("sections split waiting from in progress, and polling speeds up while anyth
   assert.equal(pollEvery({ in_progress: [BOARD.in_progress[1]], ready_to_merge: [] }, [AGENTS[1]]), QUIET_MS);
   assert.equal(pollEvery(undefined, undefined), QUIET_MS);
   assert.equal(linkTo("https://t.example/", "/p/a"), "https://t.example/p/a");
+});
+
+function fakeMcp(result: unknown): { bin: string; log: string } {
+  const dir = mkdtempSync(join(tmpdir(), "wd-paseo-mcp-"));
+  const bin = join(dir, "waggledance");
+  const log = join(dir, "log");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const fs = require("fs");
+if (process.argv.slice(2).join(" ") !== "mcp") process.exit(9);
+const result = ${JSON.stringify(result)};
+const reply = (id, r) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result: r }) + "\\n");
+require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
+  fs.appendFileSync(${JSON.stringify(log)}, line + "\\n");
+  const m = JSON.parse(line);
+  if (m.method === "initialize") reply(m.id, { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "waggledance" } });
+  if (m.method === "tools/call" && result !== null) reply(m.id, result);
+});
+`,
+  );
+  chmodSync(bin, 0o755);
+  return { bin, log };
+}
+
+const calls = (log: string) =>
+  readFileSync(log, "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l))
+    .filter((m) => m.method === "tools/call");
+
+test("a send calls waggledance_dispatch with only project, task and leader:true", async () => {
+  const { bin, log } = fakeMcp({ content: [{ type: "text", text: "dispatched" }], structuredContent: { run_id: "r1", warnings: [], agent_id: "ag1", workspace: null, leader: "reused" } });
+  const r = await sendToLeader(bin, "p1", "  fix the build\nthen report  ");
+  assert.deepEqual(r, { ok: true, run_id: "r1", agent_id: "ag1", workspace: null, leader: "reused" });
+  const sent = calls(log);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].params, { name: "waggledance_dispatch", arguments: { project: "p1", task: "  fix the build\nthen report  ", leader: true } });
+});
+
+test("a refusal from the tool comes back verbatim", async () => {
+  const refusal = "Paseo leader dispatch is off — add the lines `[paseo]` and `enabled = true` to ~/.waggledance/config.toml";
+  const { bin } = fakeMcp({ content: [{ type: "text", text: refusal }], isError: true });
+  assert.deepEqual(await sendToLeader(bin, "p1", "go"), { ok: false, code: "failed", error: refusal });
+});
+
+test("a missing binary is named on send", async () => {
+  const bin = join(tmpdir(), "no-such-waggledance");
+  const r = await sendToLeader(bin, "p1", "go");
+  assert.equal(r.ok || r.code, "failed");
+  assert.match(r.ok ? "" : r.error, new RegExp(`not found at "${bin}"`));
+});
+
+test("a send that never answers says it may have been sent and to check Runs", async () => {
+  const { bin } = fakeMcp(null);
+  const r = await sendToLeader(bin, "p1", "go", 300);
+  assert.equal(r.ok || r.code, "failed");
+  assert.match(r.ok ? "" : r.error, /may have been sent; check Runs before retrying/);
 });

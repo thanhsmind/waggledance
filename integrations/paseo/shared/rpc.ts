@@ -44,6 +44,15 @@ export const board = defineRpc({
   ]),
 });
 
+export const send = defineRpc({
+  name: "waggledance.send",
+  input: z.object({ project_id: z.string().min(1), task: z.string().min(1) }),
+  output: z.union([
+    z.object({ ok: z.literal(true), run_id: z.string(), agent_id: z.string(), workspace: z.string().nullable(), leader: z.enum(["started", "reused"]) }),
+    Failure,
+  ]),
+});
+
 export const settings = defineSettings({
   id: "waggledance",
   scope: "host",

@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import { agentMeta, featureMeta, linkTo, pollEvery, sections } from "../shared/board.ts";
 import { board } from "../shared/rpc.ts";
+import { Composer } from "./composer.tsx";
 
 function useBoard(dir: string | undefined, enabled: boolean) {
   const call = useRpc(board);
@@ -81,6 +82,7 @@ function BoardView({ theme, compact, q }: { theme: PluginTheme; compact: boolean
   return frame(
     <>
       {stale}
+      {d.project ? <Composer theme={theme} project={d.project} /> : null}
       {s.waiting.length + s.progress.length === 0 ? <Line theme={theme}>Nothing in progress</Line> : null}
       {s.waiting.length ? (
         <Section theme={theme} title="Waiting on you">

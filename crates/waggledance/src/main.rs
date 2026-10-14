@@ -15,6 +15,7 @@ mod herdr;
 mod mcp;
 mod notify;
 mod orchestrate;
+mod paseo;
 mod reaper;
 mod runtime;
 mod server;
@@ -117,6 +118,7 @@ pub struct TerminalBackground {
     /// so this is what tells "already running, leave it" apart from "already
     /// running, but wired for the other configuration".
     reaper_verdicts_armed: AtomicBool,
+    reaper_sweeps_herdr: Arc<AtomicBool>,
     /// The same question for the trigger's own D10 dry-run mode.
     trigger_dry_run_armed: AtomicBool,
 }
@@ -224,8 +226,11 @@ impl TerminalBackground {
         // its own, unlike the two above — the reaper's own switch defaults
         // ON, so `enabled` is what keeps a terminal-family-off install from
         // sweeping anything at all.
+        let paseo_on = engine.as_ref().is_some_and(|e| e.config.paseo.enabled);
+        self.reaper_sweeps_herdr
+            .store(cfg.enabled, Ordering::SeqCst);
         self.reconcile_reaper(
-            cfg.enabled && cfg.reaper_enabled,
+            cfg.reaper_enabled && (cfg.enabled || paseo_on),
             herdr.clone(),
             engine.clone(),
         );
@@ -298,8 +303,14 @@ impl TerminalBackground {
         let Some(engine) = engine else { return };
         let previous = self.reaper_stopping.lock().unwrap().take();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let sweep =
-            reaper::Reaper::with_cancel_flag(control, engine, interval, grace, cancelled.clone());
+        let sweep = reaper::Reaper::with_cancel_flag(
+            control,
+            engine,
+            interval,
+            grace,
+            cancelled.clone(),
+            self.reaper_sweeps_herdr.clone(),
+        );
         let ticks = self.reaper_ticks.clone();
         let handle = tokio::spawn(async move {
             if let Some(prev) = previous {
@@ -1060,6 +1071,37 @@ mod terminal_background_tests {
         cfg.reaper_enabled = true;
         bg.reconcile(&cfg, fake, store(), None, None);
         assert!(!bg.reaper_running(), "no engine, no reaper");
+    }
+
+    #[tokio::test]
+    async fn paseo_alone_runs_the_reaper_without_the_herdr_sweep() {
+        let bg = TerminalBackground::new();
+        let fake = Arc::new(FakeHerdr::new());
+        let mut config = waggledance_core::Config::default();
+        config.paseo.enabled = true;
+        let paseo_engine = Arc::new(waggledance_core::Engine::new(
+            waggledance_core::SqliteStore::open_in_memory().unwrap(),
+            config,
+        ));
+
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake.clone(),
+            store(),
+            None,
+            Some(paseo_engine),
+        );
+        assert!(bg.reaper_running(), "paseo on is enough to start the sweep");
+        assert!(!bg.reaper_sweeps_herdr.load(Ordering::SeqCst));
+
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake,
+            store(),
+            None,
+            Some(engine()),
+        );
+        assert!(!bg.reaper_running(), "terminal and paseo off run no reaper");
     }
 
     /// The reaper's own teeth: `reaper_ticks` counts completed sweeps, so a

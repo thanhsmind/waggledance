@@ -204,11 +204,11 @@ on your machine — it never writes config for a tool you don't have — exposin
   feature joined in — so an orchestrator can reuse an idle pane instead of only ever
   spawning. `panes` is absent when the terminal feature is off, and null-with-a-reason
   when the session host can't be reached.
-- **`waggledance_dispatch(project, task, preset? | pane_id?)`** → send a task to an agent
+- **`waggledance_dispatch(project, task, preset? | pane_id? | leader?)`** → send a task to an agent
   pane in a project that has **opted into orchestration**. Either spawn a fresh pane by
   `preset` (any agent label the *target project* declares — the same source the Start
-  button spawns from) or target an already-running `pane_id`; the two are mutually
-  exclusive. Returns a `run_id`.
+  button spawns from), target an already-running `pane_id`, or pass `leader: true` to hand
+  it to the project's Paseo leader; the three are mutually exclusive. Returns a `run_id`.
 - **`waggledance_await(run_id, timeout_seconds?)`** → block until that run completes,
   blocks on a human, or the timeout elapses (clamped to 60s server-side).
 - **`waggledance_runs(project?)`** → list dispatched runs and their current status,
@@ -218,6 +218,17 @@ Drop the snippet from [`docs/waggledance-agents-template.md`](docs/waggledance-a
 into your project's `AGENTS.md` / `CLAUDE.md` and your agents will hand you a viewable URL
 the moment they finish writing, and can query docs and bee state cross-project instead of
 re-reading files.
+
+### Paseo leaders
+
+When waggledance runs beside Paseo, each project can have one
+long-lived leader agent in its Paseo workspace. Turn on `[paseo]` in
+`~/.waggledance/config.toml`, opt the project into orchestration, and
+`waggledance_dispatch` with `leader: true` sends the task to that leader, or starts one.
+The waggledance agent in Paseo, the request box in the Waggle Dance Paseo plugin, and any
+external agent running `waggledance mcp` all use this path. The config block, the
+workspace rules, and the run statuses are in
+[A request for a project reaches its one Paseo leader](docs/knowledge/patterns/paseo-leader-dispatch.md).
 
 ---
 
