@@ -224,8 +224,8 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 fn paseo_listed(run: Runner) -> Result<Option<Listed>> {
     let out = run(&["plugin", "ls", "--json"])?;
-    let all: Vec<Listed> =
-        serde_json::from_str(&out).context("reading `paseo plugin ls --json`")?;
+    let all: Vec<Listed> = crate::paseo::parse_document(&out)
+        .map_err(|e| anyhow::anyhow!("reading `paseo plugin ls --json`: {e}"))?;
     Ok(all.into_iter().find(|p| p.id == PASEO_ID))
 }
 
@@ -280,11 +280,38 @@ fn paseo_remove(dst: &Path, run: Runner) -> Result<Vec<String>> {
     Ok(done)
 }
 
-fn paseo_cli(args: &[&str]) -> Result<String> {
-    let out = std::process::Command::new("paseo")
+fn paseo_unneeded_lines(config: &waggledance_core::config::PaseoConfig) -> Vec<String> {
+    let file = "~/.waggledance/config.toml";
+    let mut lines = Vec::new();
+    if config.enabled.is_some() {
+        lines.push(format!(
+            "`enabled` under [paseo] in {file} is no longer needed: Paseo support turns on when a \
+             working CLI is found; a project accepts dispatched work with `orchestration = true` \
+             in its own .waggledance.toml"
+        ));
+    }
+    if !config.binary.is_empty() {
+        lines.push(format!(
+            "`binary` under [paseo] in {file} is no longer needed: waggledance finds the Paseo \
+             CLI itself; keep it only to override that choice"
+        ));
+    }
+    if !config.leaders.is_empty() {
+        lines.push(format!(
+            "[[paseo.leaders]] in {file} is deprecated: name the leader's workspace with \
+             `workspace = \"<id>\"` under [paseo] in the project's .waggledance.toml"
+        ));
+    }
+    lines
+}
+
+fn paseo_cli(binary: &str, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new(binary)
         .args(args)
+        .env_remove("PASEO_AGENT_ID")
+        .env_remove("PASEO_AGENT_CWD")
         .output()
-        .context("running `paseo` (is Paseo installed and on PATH?)")?;
+        .with_context(|| format!("running `{binary}`"))?;
     if !out.status.success() {
         bail!(
             "paseo {} failed: {}{}",
@@ -322,7 +349,21 @@ pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
         }
         Target::Paseo => {
             let dst = waggledance_core::config::data_dir().join("paseo");
-            let mut paseo = |args: &[&str]| paseo_cli(args);
+            let config = waggledance_core::Config::load();
+            let found = crate::paseo::detect_binary(&config.paseo);
+            let Some(binary) = found.binary.clone() else {
+                bail!("{}", found.unavailable());
+            };
+            notes.push(format!("using the Paseo CLI {binary}"));
+            notes.extend(
+                found
+                    .rejected
+                    .iter()
+                    .map(|(candidate, why)| format!("skipped Paseo CLI {candidate}: {why}")),
+            );
+            notes.extend(found.notes);
+            warnings.extend(paseo_unneeded_lines(&config.paseo));
+            let mut paseo = |args: &[&str]| paseo_cli(&binary, args);
             let done = if remove {
                 paseo_remove(&dst, &mut paseo)?
             } else {
@@ -519,6 +560,47 @@ mod tests {
             true
         )
         .is_empty());
+    }
+
+    #[test]
+    fn paseo_setup_reads_plugin_ls_past_the_wrappers_log_lines() {
+        for out in [
+            include_str!("../testdata/fixtures/paseo-0.11.2/wrapper-plugin-ls.out"),
+            include_str!("../testdata/fixtures/paseo-0.11.2/npm-plugin-ls.out"),
+        ] {
+            let mut run = |_: &[&str]| -> Result<String> { Ok(out.to_string()) };
+            let listed = paseo_listed(&mut run).unwrap().unwrap();
+            assert_eq!(listed.path, "/home/thanhsmind/.waggledance/paseo");
+            assert!(listed.enabled);
+        }
+        let mut noise =
+            |_: &[&str]| -> Result<String> { Ok("23:51:21.452 › only noise\n".into()) };
+        let err = paseo_listed(&mut noise).err().unwrap().to_string();
+        assert!(err.contains("plugin ls"), "{err}");
+    }
+
+    #[test]
+    fn paseo_setup_names_global_lines_that_are_no_longer_needed() {
+        use waggledance_core::config::{PaseoConfig, PaseoLeader};
+        assert!(paseo_unneeded_lines(&PaseoConfig::default()).is_empty());
+        let old = PaseoConfig {
+            enabled: Some(true),
+            binary: "/home/u/.local/bin/paseo".into(),
+            leaders: vec![PaseoLeader {
+                project: "p".into(),
+                workspace: "wks_a".into(),
+            }],
+            ..PaseoConfig::default()
+        };
+        let lines = paseo_unneeded_lines(&old);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].contains("orchestration = true") && lines[0].contains(".waggledance.toml")
+        );
+        assert!(lines[1].contains("`binary`"));
+        assert!(
+            lines[2].contains("[[paseo.leaders]]") && lines[2].contains("workspace = \"<id>\"")
+        );
     }
 
     #[test]

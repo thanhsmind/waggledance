@@ -493,7 +493,7 @@ mod tests {
     fn rig() -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
-        config.paseo.enabled = true;
+        config.paseo.enabled = Some(true);
         let engine = Arc::new(Engine::new(SqliteStore::open_in_memory().unwrap(), config));
         for id in ["proj-1", "proj-2"] {
             let root = dir.path().join(id);

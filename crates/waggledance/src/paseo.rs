@@ -180,6 +180,222 @@ pub fn resolve_binary(configured: &str, paseo_cli: Option<OsString>) -> String {
     }
 }
 
+const DETECT_TTL: Duration = Duration::from_secs(600);
+const NPM_CLI_SUFFIX: &str = "@getpaseo/cli/bin/paseo";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detection {
+    pub binary: Option<String>,
+    pub rejected: Vec<(String, String)>,
+    pub notes: Vec<String>,
+}
+
+impl Detection {
+    pub fn unavailable(&self) -> String {
+        let tried: Vec<String> = self
+            .rejected
+            .iter()
+            .map(|(candidate, why)| format!("`{candidate}` ({why})"))
+            .collect();
+        format!(
+            "no working Paseo CLI found — tried {}; install it with `npm install -g @getpaseo/cli` \
+             or set `binary` under `[paseo]` in ~/.waggledance/config.toml",
+            tried.join("; ")
+        )
+    }
+}
+
+fn is_npm_cli(path: &Path) -> bool {
+    std::fs::canonicalize(path).is_ok_and(|p| p.ends_with(NPM_CLI_SUFFIX))
+}
+
+fn is_appimage_wrapper(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::new();
+    path.extension().is_some_and(|e| e == "AppImage")
+        || std::fs::File::open(path)
+            .and_then(|f| f.take(4096).read_to_end(&mut head))
+            .is_ok()
+            && head.starts_with(b"#!")
+            && String::from_utf8_lossy(&head).contains(".AppImage")
+}
+
+fn mise_clis(root: &Path) -> Vec<PathBuf> {
+    let version =
+        |name: &str| -> Vec<u64> { name.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    let mut found: Vec<(Vec<u64>, PathBuf)> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| {
+            (
+                version(&e.file_name().to_string_lossy()),
+                e.path().join("bin").join("paseo"),
+            )
+        })
+        .filter(|(_, p)| is_npm_cli(p))
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+pub fn candidates(
+    configured: &str,
+    path: Option<OsString>,
+    mise_root: Option<PathBuf>,
+    paseo_cli: Option<OsString>,
+) -> (Vec<String>, Vec<String>) {
+    let dirs: Vec<PathBuf> = path.iter().flat_map(std::env::split_paths).collect();
+    let npm: Vec<String> = dirs
+        .iter()
+        .map(|d| d.join("paseo"))
+        .filter(|p| is_npm_cli(p))
+        .chain(mise_root.map(|m| mise_clis(&m)).unwrap_or_default())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let mut notes = Vec::new();
+    let demoted =
+        !configured.is_empty() && !npm.is_empty() && is_appimage_wrapper(Path::new(configured));
+    if demoted {
+        notes.push(format!(
+            "configured binary {configured} is an AppImage wrapper; the npm CLI is tried first"
+        ));
+    }
+    let mut ordered = Vec::new();
+    if !configured.is_empty() && !demoted {
+        ordered.push(configured.to_string());
+    }
+    ordered.extend(npm);
+    if demoted {
+        ordered.push(configured.to_string());
+    }
+    if let Some(cli) = paseo_cli.filter(|c| Path::new(c).is_file()) {
+        ordered.push(cli.to_string_lossy().into_owned());
+    }
+    ordered.push("paseo".to_string());
+    let key = |c: &str| {
+        let found = if c.contains('/') {
+            Some(PathBuf::from(c))
+        } else {
+            dirs.iter().map(|d| d.join(c)).find(|p| p.is_file())
+        };
+        found
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .map_or_else(|| c.to_string(), |p| p.to_string_lossy().into_owned())
+    };
+    let mut seen = std::collections::HashSet::new();
+    ordered.retain(|c| seen.insert(key(c)));
+    (ordered, notes)
+}
+
+fn probe(binary: &str) -> std::result::Result<(), String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(binary)
+        .args(["ls", "-g", "--json"])
+        .env_remove("PASEO_AGENT_ID")
+        .env_remove("PASEO_AGENT_CWD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not be started: {e}"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+    }
+    let Ok(buf) = rx.recv_timeout(TIMEOUT) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "`ls -g --json` timed out after {}s",
+            TIMEOUT.as_secs()
+        ));
+    };
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("`ls -g --json` exited with {status}"));
+    }
+    parse_document::<Vec<serde_json::Value>>(&String::from_utf8_lossy(&buf))
+        .map(|_| ())
+        .map_err(|e| format!("`ls -g --json` printed no JSON list: {e}"))
+}
+
+pub fn detect(candidates: &[String], notes: Vec<String>) -> Detection {
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        match probe(candidate) {
+            Ok(()) => {
+                return Detection {
+                    binary: Some(candidate.clone()),
+                    rejected,
+                    notes,
+                }
+            }
+            Err(why) => rejected.push((candidate.clone(), why)),
+        }
+    }
+    Detection {
+        binary: None,
+        rejected,
+        notes,
+    }
+}
+
+type Detected = std::collections::HashMap<Vec<String>, (std::time::Instant, Detection)>;
+static DETECTED: std::sync::LazyLock<std::sync::Mutex<Detected>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn detect_cached(candidates: Vec<String>, notes: Vec<String>) -> Detection {
+    let cache = || DETECTED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, hit)) = cache().get(&candidates) {
+        if at.elapsed() < DETECT_TTL {
+            return hit.clone();
+        }
+    }
+    let found = detect(&candidates, notes);
+    match &found.binary {
+        Some(binary) => {
+            tracing::info!(binary, rejected = ?found.rejected, notes = ?found.notes, "Paseo CLI detected");
+            cache().insert(candidates, (std::time::Instant::now(), found.clone()));
+        }
+        None => tracing::warn!(rejected = ?found.rejected, "no working Paseo CLI found"),
+    }
+    found
+}
+
+pub fn detect_binary(config: &PaseoConfig) -> Detection {
+    let (candidates, notes) = candidates(
+        &config.binary,
+        std::env::var_os("PATH"),
+        dirs::home_dir().map(|h| h.join(".local/share/mise/installs/node")),
+        std::env::var_os("PASEO_CLI"),
+    );
+    detect_cached(candidates, notes)
+}
+
+pub fn paseo_unavailable(config: &PaseoConfig) -> Option<String> {
+    match config.enabled {
+        Some(true) => None,
+        Some(false) => Some(
+            "Paseo leader dispatch is off — `enabled = false` under `[paseo]` in \
+             ~/.waggledance/config.toml; remove that line to let waggledance detect the Paseo CLI"
+                .to_string(),
+        ),
+        None => {
+            let found = detect_binary(config);
+            found.binary.is_none().then(|| found.unavailable())
+        }
+    }
+}
+
+pub fn paseo_available(config: &PaseoConfig) -> bool {
+    paseo_unavailable(config).is_none()
+}
+
 pub fn command(binary: &str, args: &[String]) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(args)
@@ -276,22 +492,42 @@ pub fn parse_turn_end(stdout: &str) -> std::result::Result<(String, TurnEnd), St
 }
 
 pub struct PaseoCli {
-    configured: String,
+    config: PaseoConfig,
+    fixed: Option<String>,
 }
 
 impl PaseoCli {
     pub fn new(config: &PaseoConfig) -> Self {
         Self {
-            configured: config.binary.clone(),
+            config: config.clone(),
+            fixed: None,
         }
     }
 
-    fn binary(&self) -> String {
-        resolve_binary(&self.configured, std::env::var_os("PASEO_CLI"))
+    #[cfg(test)]
+    pub fn with_binary(binary: &str) -> Self {
+        Self {
+            config: PaseoConfig::default(),
+            fixed: Some(binary.to_string()),
+        }
     }
 
-    async fn exec(&self, args: &[String], timeout: Duration) -> Result<String> {
-        let binary = self.binary();
+    async fn binary(&self) -> String {
+        if let Some(binary) = &self.fixed {
+            return binary.clone();
+        }
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || {
+            detect_binary(&config)
+                .binary
+                .unwrap_or_else(|| resolve_binary(&config.binary, std::env::var_os("PASEO_CLI")))
+        })
+        .await
+        .unwrap_or_else(|_| "paseo".to_string())
+    }
+
+    async fn exec(&self, args: &[String], timeout: Duration) -> Result<(String, String)> {
+        let binary = self.binary().await;
         let command = args.first().cloned().unwrap_or_default();
         let child = self::command(&binary, args)
             .spawn()
@@ -317,20 +553,20 @@ impl PaseoCli {
                 status: output.status.to_string(),
             });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
-
-    fn unparsable(&self, command: &str, message: impl ToString) -> PaseoError {
-        PaseoError::Unparsable {
-            binary: self.binary(),
-            command: command.to_string(),
-            message: message.to_string(),
-        }
+        Ok((binary, String::from_utf8_lossy(&output.stdout).into_owned()))
     }
 
     async fn turn(&self, args: &[String], timeout: Duration) -> Result<(String, TurnEnd)> {
-        let out = self.exec(args, timeout).await?;
-        parse_turn_end(&out).map_err(|e| self.unparsable(&args[0], e))
+        let (binary, out) = self.exec(args, timeout).await?;
+        parse_turn_end(&out).map_err(|e| unparsable(&binary, &args[0], e))
+    }
+}
+
+fn unparsable(binary: &str, command: &str, message: impl ToString) -> PaseoError {
+    PaseoError::Unparsable {
+        binary: binary.to_string(),
+        command: command.to_string(),
+        message: message.to_string(),
     }
 }
 
@@ -364,26 +600,26 @@ struct TurnReport {
 #[async_trait]
 impl Paseo for PaseoCli {
     async fn leaders(&self, project_id: &str) -> Result<Vec<String>> {
-        let out = self.exec(&leaders_args(project_id), TIMEOUT).await?;
-        parse_leaders(&out).map_err(|e| self.unparsable("ls", e))
+        let (binary, out) = self.exec(&leaders_args(project_id), TIMEOUT).await?;
+        parse_leaders(&out).map_err(|e| unparsable(&binary, "ls", e))
     }
 
     async fn inspect(&self, id: &str) -> Result<AgentState> {
-        let out = self
+        let (binary, out) = self
             .exec(&["inspect".into(), id.into(), "--json".into()], TIMEOUT)
             .await?;
-        parse_inspect(&out).map_err(|e| self.unparsable("inspect", e))
+        parse_inspect(&out).map_err(|e| unparsable(&binary, "inspect", e))
     }
 
     async fn workspaces(&self) -> Result<Vec<Workspace>> {
-        let out = self
+        let (binary, out) = self
             .exec(&["workspace".into(), "ls".into(), "--json".into()], TIMEOUT)
             .await?;
-        parse_document(&out).map_err(|e| self.unparsable("workspace", e))
+        parse_document(&out).map_err(|e| unparsable(&binary, "workspace", e))
     }
 
     async fn create_workspace(&self, path: &Path) -> Result<String> {
-        let out = self
+        let (binary, out) = self
             .exec(
                 &[
                     "workspace".into(),
@@ -397,7 +633,7 @@ impl Paseo for PaseoCli {
                 TIMEOUT,
             )
             .await?;
-        last_id(&out).ok_or_else(|| self.unparsable("workspace", "no id on stdout"))
+        last_id(&out).ok_or_else(|| unparsable(&binary, "workspace", "no id on stdout"))
     }
 
     async fn run_and_wait(&self, spec: &RunSpec, timeout: Duration) -> Result<(String, TurnEnd)> {
@@ -456,7 +692,7 @@ impl Paseo for PaseoCli {
             TIMEOUT,
         )
         .await
-        .map(|out| strip_noise(&out))
+        .map(|(_, out)| strip_noise(&out))
     }
 }
 
@@ -1023,11 +1259,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_binary_errors_naming_the_binary() {
-        let config = PaseoConfig {
-            binary: "/nonexistent/waggledance-test/paseo-missing".into(),
-            ..PaseoConfig::default()
-        };
-        let err = PaseoCli::new(&config)
+        let err = PaseoCli::with_binary("/nonexistent/waggledance-test/paseo-missing")
             .workspaces()
             .await
             .unwrap_err()
@@ -1065,10 +1297,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cli = PaseoCli::new(&PaseoConfig {
-            binary: bin.to_string_lossy().into_owned(),
-            ..PaseoConfig::default()
-        });
+        let cli = PaseoCli::with_binary(&bin.to_string_lossy());
         let mut state = cli.inspect("a").await;
         for _ in 0..50 {
             match &state {
@@ -1144,6 +1373,223 @@ mod tests {
         );
         assert_eq!(resolve_binary("", Some(OsString::new())), "paseo");
         assert_eq!(resolve_binary("", None), "paseo");
+    }
+
+    #[cfg(unix)]
+    const LISTS: &str =
+        "echo \"23:51:21.452 › [desktop] app startup { version: '0.11.2' }\"\nprintf '[]\\n'";
+
+    #[cfg(unix)]
+    fn script(path: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..50 {
+            match std::process::Command::new(path).arg("settle").output() {
+                Err(e) if e.to_string().contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => break,
+            }
+        }
+        path.to_path_buf()
+    }
+
+    #[cfg(unix)]
+    fn npm_cli(prefix: &Path, body: &str) -> PathBuf {
+        let real = script(
+            &prefix.join("lib/node_modules/@getpaseo/cli/bin/paseo"),
+            body,
+        );
+        let link = prefix.join("bin/paseo");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(real, &link).unwrap();
+        link
+    }
+
+    #[cfg(unix)]
+    fn lossy(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidates_run_configured_npm_on_path_mise_newest_first_paseo_cli_then_paseo() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let on_path = npm_cli(&d.join("node"), LISTS);
+        let mise = d.join("mise");
+        let old = npm_cli(&mise.join("9.11.0"), LISTS);
+        let new = npm_cli(&mise.join("24.19.0"), LISTS);
+        let plain = script(&d.join("plain/paseo"), LISTS);
+        let configured = script(&d.join("cfg/paseo"), LISTS);
+        let wrapper = script(
+            &d.join("wrapper/paseo"),
+            "exec /opt/Paseo.AppImage --no-sandbox \"$@\"",
+        );
+        let bundled = script(&d.join("bundled/paseo"), LISTS);
+        let path = std::env::join_paths([
+            plain.parent().unwrap(),
+            on_path.parent().unwrap(),
+            new.parent().unwrap(),
+        ])
+        .unwrap();
+        let cli = || Some(bundled.clone().into_os_string());
+
+        let (got, notes) = candidates(
+            &lossy(&configured),
+            Some(path.clone()),
+            Some(mise.clone()),
+            cli(),
+        );
+        assert_eq!(
+            got,
+            vec![
+                lossy(&configured),
+                lossy(&on_path),
+                lossy(&new),
+                lossy(&old),
+                lossy(&bundled),
+                "paseo".to_string()
+            ]
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let (got, notes) = candidates(
+            &lossy(&wrapper),
+            Some(path.clone()),
+            Some(mise.clone()),
+            cli(),
+        );
+        assert_eq!(
+            got[..4],
+            [lossy(&on_path), lossy(&new), lossy(&old), lossy(&wrapper)]
+        );
+        assert!(notes[0].contains("AppImage wrapper"), "{notes:?}");
+
+        let alone = std::env::join_paths([plain.parent().unwrap()]).unwrap();
+        let gone = Some(d.join("missing").into_os_string());
+        let (got, notes) = candidates(&lossy(&wrapper), Some(alone), None, gone);
+        assert_eq!(got, vec![lossy(&wrapper), "paseo".to_string()]);
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let npm_first = std::env::join_paths([on_path.parent().unwrap()]).unwrap();
+        let (got, _) = candidates("", Some(npm_first), None, None);
+        assert_eq!(got, vec![lossy(&on_path)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_npm_cli_beats_a_working_configured_wrapper_and_non_json_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let npm = npm_cli(&d.join("node"), LISTS);
+        let wrapper = script(
+            &d.join("wrapper/paseo"),
+            &format!(": /home/u/Applications/Paseo.AppImage\n{LISTS}"),
+        );
+        let path = std::env::join_paths([npm.parent().unwrap()]).unwrap();
+        let (c, notes) = candidates(&lossy(&wrapper), Some(path), None, None);
+        let found = detect(&c, notes);
+        assert_eq!(found.binary, Some(lossy(&npm)));
+        assert!(found.rejected.is_empty(), "{found:?}");
+        assert!(found.notes[0].contains(&lossy(&wrapper)), "{found:?}");
+
+        let noisy = script(&d.join("noisy/paseo"), "echo 'not json'");
+        let found = detect(&[lossy(&noisy), lossy(&npm)], Vec::new());
+        assert_eq!(found.binary, Some(lossy(&npm)));
+        assert_eq!(found.rejected.len(), 1);
+        assert_eq!(found.rejected[0].0, lossy(&noisy));
+        assert!(found.rejected[0].1.contains("no JSON"), "{found:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_no_working_cli_the_refusal_lists_every_candidate_and_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let noisy = script(&dir.path().join("noisy/paseo"), "echo 'not json'");
+        let failing = script(&dir.path().join("failing/paseo"), "exit 3");
+        let missing = dir.path().join("missing/paseo");
+        let found = detect(
+            &[lossy(&noisy), lossy(&failing), lossy(&missing)],
+            Vec::new(),
+        );
+        assert_eq!(found.binary, None);
+        let why = found.unavailable();
+        for (path, reason) in [
+            (&noisy, "no JSON"),
+            (&failing, "exited"),
+            (&missing, "could not be started"),
+        ] {
+            assert!(why.contains(&format!("`{}` (", lossy(path))), "{why}");
+            assert!(why.contains(reason), "{why}");
+        }
+        assert!(why.contains("@getpaseo/cli"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_successful_detection_is_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let counted = script(
+            &dir.path().join("counted/paseo"),
+            &format!("[ \"$1\" = ls ] && echo x >> \"$(dirname \"$0\")/count\"\n{LISTS}"),
+        );
+        let key = vec![lossy(&counted)];
+        assert_eq!(
+            detect_cached(key.clone(), Vec::new()).binary,
+            Some(key[0].clone())
+        );
+        assert_eq!(
+            detect_cached(key.clone(), Vec::new()).binary,
+            Some(key[0].clone())
+        );
+        let count = std::fs::read_to_string(dir.path().join("counted/count")).unwrap();
+        assert_eq!(count.lines().count(), 1);
+
+        let late = script(
+            &dir.path().join("late/paseo"),
+            &format!("[ -f \"$(dirname \"$0\")/ok\" ] || exit 1\n{LISTS}"),
+        );
+        let key = vec![lossy(&late)];
+        assert_eq!(detect_cached(key.clone(), Vec::new()).binary, None);
+        std::fs::write(dir.path().join("late/ok"), "").unwrap();
+        assert_eq!(
+            detect_cached(key.clone(), Vec::new()).binary,
+            Some(key[0].clone())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paseo_is_available_when_forced_on_or_a_cli_is_detected_and_off_when_forced_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let working = script(&dir.path().join("cfg/paseo"), LISTS);
+        let config = |enabled, binary: &Path| PaseoConfig {
+            enabled,
+            binary: lossy(binary),
+            ..PaseoConfig::default()
+        };
+        let missing = dir.path().join("missing/paseo");
+        assert!(paseo_available(&config(Some(true), &missing)));
+        assert!(!paseo_available(&config(Some(false), &working)));
+        assert!(paseo_unavailable(&config(Some(false), &working))
+            .unwrap()
+            .contains("`enabled = false`"));
+        assert!(paseo_available(&config(None, &working)));
+        assert_eq!(
+            detect_binary(&config(None, &working)).binary,
+            Some(lossy(&working))
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn real_host_detects_a_paseo_cli() {
+        let found = detect_binary(&PaseoConfig::default());
+        println!("{found:?}");
+        assert!(found.binary.is_some(), "{}", found.unavailable());
     }
 
     #[test]
@@ -1271,6 +1717,20 @@ mod tests {
         assert_eq!(ids[0], "35eca12c-e112-4690-bf48-af0222f659e1");
         assert!(strip_noise(fixture!("wrapper-systemd-ls.out")).starts_with('['));
         assert!(parse_leaders(fixture!("wrapper-systemd-ls.err")).is_err());
+    }
+
+    #[test]
+    fn the_npm_cli_fixtures_parse_past_their_leading_line() {
+        assert_eq!(
+            parse_turn_end(fixture!("npm-run-blocking.out")).unwrap(),
+            (
+                "e7baf63c-e456-4359-b56e-6f4a19faab8c".to_string(),
+                TurnEnd::Permission
+            )
+        );
+        let workspaces: Vec<Workspace> = parse_document(fixture!("npm-workspace-ls.out")).unwrap();
+        assert_eq!(workspaces[0].id, "wks_02145c30b3744429");
+        assert!(workspaces.iter().all(|w| w.isolation == "local"));
     }
 
     #[test]

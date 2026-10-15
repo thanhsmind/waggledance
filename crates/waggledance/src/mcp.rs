@@ -1081,12 +1081,8 @@ fn dispatch_to_leader(
     if !engine.orchestration_allowed(project) {
         return tool_error(id, &not_opted_in(&project.id));
     }
-    if !engine.config.paseo.enabled {
-        return tool_error(
-            id,
-            "Paseo leader dispatch is off — add the lines `[paseo]` and `enabled = true` to \
-             ~/.waggledance/config.toml",
-        );
+    if let Some(why) = paseo::paseo_unavailable(&engine.config.paseo) {
+        return tool_error(id, &why);
     }
     let now = now_rfc3339();
     let run = Run {
@@ -2606,7 +2602,7 @@ mod tests {
         write(&dir, "docs/a.md", "# Project\n");
         let mut config = Config::default();
         config.terminal.enabled = terminal;
-        config.paseo.enabled = paseo_on;
+        config.paseo.enabled = Some(paseo_on);
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
         let project = engine.register(&dir, None).unwrap();
         engine
@@ -2693,7 +2689,7 @@ mod tests {
         let text = text_of(&leader_call(&engine, &project, &data_dir, "go", None));
         assert!(text.contains("~/.waggledance/config.toml"), "{text}");
         assert!(
-            text.contains("`[paseo]`") && text.contains("`enabled = true`"),
+            text.contains("`[paseo]`") && text.contains("`enabled = false`"),
             "{text}"
         );
         assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
@@ -2703,7 +2699,7 @@ mod tests {
             "waggledance_dispatch",
             json!({ "project": project.id, "task": "go", "leader": true }),
         );
-        assert!(text_of(&through_the_tool).contains("enabled = true"));
+        assert!(text_of(&through_the_tool).contains("enabled = false"));
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 
