@@ -9,10 +9,13 @@ use crate::error::{Error, Result};
 use crate::fuzzy::{self, FuzzyHit};
 use crate::git_diff::{self, ActiveBase, CommitEntry, DiffBase, GitDiffError, WorkingTreeDiff};
 use crate::indexer::{self, IndexService};
+use crate::project_settings::{self, ProjectSettings};
 use crate::render::{self, HighlightedSource, RenderService};
 use crate::repository::SqliteStore;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -20,7 +23,10 @@ pub struct Engine {
     pub store: SqliteStore,
     pub config: Config,
     render: RenderService,
+    settings_cache: Mutex<HashMap<PathBuf, CachedSettings>>,
 }
+
+type CachedSettings = (Option<SystemTime>, ProjectSettings, Vec<String>);
 
 #[derive(Debug, Clone)]
 pub struct ViewFile {
@@ -37,6 +43,7 @@ impl Engine {
             store,
             config,
             render: RenderService::new(),
+            settings_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -381,6 +388,24 @@ impl Engine {
     /// project can be opted in while the terminal family itself is off.
     pub fn orchestration_allowed(&self, project: &Project) -> bool {
         project.orchestration_enabled
+            || self.project_settings(project).0.orchestration == Some(true)
+    }
+
+    pub fn project_settings(&self, project: &Project) -> (ProjectSettings, Vec<String>) {
+        let path = project_settings::settings_path(&project.root_path);
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mut cache = self
+            .settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, settings, warnings)) = cache.get(&path) {
+            if *cached == mtime {
+                return (settings.clone(), warnings.clone());
+            }
+        }
+        let (settings, warnings) = project_settings::load(&project.root_path);
+        cache.insert(path, (mtime, settings.clone(), warnings.clone()));
+        (settings, warnings)
     }
 
     // ---- runs (D7) ----
@@ -1143,6 +1168,37 @@ mod tests {
         engine.set_orchestration_enabled(&project.id, true).unwrap();
         let reloaded = engine.get_project(&project.id).unwrap().unwrap();
         assert!(engine.orchestration_allowed(&reloaded));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn orchestration_allowed_by_the_project_file_without_the_db_flag() {
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-gate-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(project_settings::FILE_NAME);
+
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&dir, None).unwrap();
+        assert!(!engine.orchestration_allowed(&project));
+
+        std::fs::write(&file, "orchestration = true\n").unwrap();
+        assert!(engine.orchestration_allowed(&project));
+        assert!(!project.orchestration_enabled);
+
+        std::fs::write(&file, "orchestration = tru\n").unwrap();
+        let bumped = SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
+        assert!(!engine.orchestration_allowed(&project));
+        let (_, warnings) = engine.project_settings(&project);
+        assert!(warnings[0].contains("failed to parse"), "{warnings:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

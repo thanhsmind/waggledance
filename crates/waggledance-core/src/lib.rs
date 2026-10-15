@@ -20,6 +20,7 @@ pub mod link_resolver;
 pub mod notify_store;
 pub mod paths_boundary;
 pub mod process;
+pub mod project_settings;
 pub mod render;
 pub mod repository;
 pub mod short_link;
