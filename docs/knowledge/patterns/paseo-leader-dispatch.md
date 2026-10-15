@@ -263,8 +263,10 @@ waggledance tries candidates in this order and takes the first that answers
 5. `paseo` on `PATH`.
 
 A candidate that resolves to the same file as an earlier one is tried once. A successful
+<!-- bee:not-a-deferral: describes the detection cache behaviour, not a promise to act later -->
 detection is cached for 10 minutes; a failed one is not cached, so a CLI installed later
-is found on the next call. With no candidate working, a leader dispatch is refused
+is found on the next call.
+<!-- /bee:not-a-deferral --> With no candidate working, a leader dispatch is refused
 naming every rejected candidate with why, and how to install the CLI.
 
 The AppImage wrapper is demoted because its `run` printed nothing from the daemon's
