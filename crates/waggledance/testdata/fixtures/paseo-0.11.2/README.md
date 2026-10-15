@@ -1,6 +1,6 @@
 # Paseo 0.11.2 CLI captures
 
-Raw stdout (and one stderr) of the Paseo CLI, captured on 2026-10-14 against
+Raw stdout (and two stderr) of the Paseo CLI, captured on 2026-10-14 against
 Paseo 0.11.2 with throwaway agents titled `wd probe* (delete me)`, all deleted
 afterwards. Each file pins one behaviour the waggledance Paseo client in
 `crates/waggledance/src/paseo.rs` relies on. The tests in that file read every
@@ -59,6 +59,8 @@ permission.
 | `npm-run-blocking.out` | `systemd-run --user --wait --pipe ... ~/.local/share/mise/installs/node/24.19.0/bin/paseo run --json --title "wd probe4 (delete me)" ...` | systemd user scope, npm CLI | The npm CLI's blocking `run` prints a `Using workspace wks_…` line before its JSON document; `parse_turn_end` skips the line and reads the new `agentId` with `status: permission`. |
 | `npm-workspace-ls.out` | `systemd-run --user --wait --pipe ... node/24.19.0/bin/paseo workspace ls --json` | systemd user scope, npm CLI | `workspace ls` is clean JSON carrying `workspaceId`, `project`, `name`, `isolation` and `cwd`, no creation time. |
 | `npm-plugin-ls.out` | `systemd-run --user --wait --pipe ... node/24.19.0/bin/paseo plugin ls --json` | systemd user scope, npm CLI | `plugin ls` from the npm CLI is a clean JSON list naming the `waggledance` plugin. |
+| `npm-provider-ls.out` | `~/.local/share/mise/installs/node/24.19.0/bin/paseo provider ls --json`, captured on 2026-10-15 | npm CLI from a shell | A clean JSON list of providers with `status` and `enabled`; `parse_providers` keeps the `available` and `Enabled` ones in listed order, so a leader with no configured provider starts with `claude`. |
+| `npm-run-missing-provider.err` | `~/.local/share/mise/installs/node/24.19.0/bin/paseo run --json --workspace <ws> --cwd <root> --title x -- "x"` (stderr; stdout was empty), captured on 2026-10-15, exit status 1, no agent created | npm CLI from a shell | `run` without `--provider` prints, on stderr only, a JSON `error` object with `code: MISSING_PROVIDER`; `reported_error` reads its code and message from stdout or stderr so the failure names them instead of the exit status. |
 | `wrapper-plugin-ls.out` | `systemd-run --user --wait --pipe ... ~/.local/bin/paseo plugin ls --json` | systemd user scope | The AppImage wrapper's `plugin ls` starts with two `HH:MM:SS.mmm ›` log lines; `waggledance setup paseo` reads it through `parse_document` instead of failing on the clock digits. |
-| `wrapper-systemd-ls.err` | the same command (stderr) | systemd user scope | The wrapper's stderr is one `[linux-sandbox] ...` line that starts with `[` yet is not JSON; it would fool the document rule, which is why the client discards stderr. Parsing it as a list fails. |
+| `wrapper-systemd-ls.err` | the same command (stderr) | systemd user scope | The wrapper's stderr is one `[linux-sandbox] ...` line that starts with `[` yet is not JSON; it would fool the document rule, which is why the client parses documents from stdout only and reads stderr only for a JSON `error` object starting at a `{` line. Parsing it as a list fails. |
 | `workspaces-store.json` | none: written by hand after the keys of `~/.paseo/projects/workspaces.json` (read with `python3` on 2026-10-14) | synthetic ids and paths | Paseo's own store, read-only: `createdAt` orders the leader pick (`wks_fixture_b` is the oldest of three local workspaces at one root); `archivedAt` and `isPaseoOwnedWorktree` keep a workspace out of discovery. |

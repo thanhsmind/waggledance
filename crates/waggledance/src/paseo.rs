@@ -29,6 +29,15 @@ pub enum PaseoError {
         command: String,
         status: String,
     },
+    #[error("`{binary} {command}` failed with {code}: {message}")]
+    Reported {
+        binary: String,
+        command: String,
+        code: String,
+        message: String,
+    },
+    #[error("no Paseo provider is available and enabled: set [paseo] provider or enable one listed by `paseo provider ls`")]
+    NoProvider,
     #[error("`{binary} {command}` printed output that could not be parsed: {message}")]
     Unparsable {
         binary: String,
@@ -117,6 +126,7 @@ pub trait Paseo: Send + Sync {
     async fn leaders(&self, project_id: &str) -> Result<Vec<String>>;
     async fn inspect(&self, id: &str) -> Result<AgentState>;
     async fn workspaces(&self) -> Result<Vec<Workspace>>;
+    async fn providers(&self) -> Result<Vec<String>>;
     fn stored_workspaces(&self) -> Vec<StoredWorkspace>;
     async fn create_workspace(&self, path: &Path) -> Result<String>;
     async fn run_and_wait(&self, spec: &RunSpec, timeout: Duration) -> Result<(String, TurnEnd)>;
@@ -486,6 +496,27 @@ pub fn parse_leaders(stdout: &str) -> std::result::Result<Vec<String>, String> {
     Ok(agents.into_iter().map(|a| a.id).collect())
 }
 
+pub fn parse_providers(stdout: &str) -> std::result::Result<Vec<String>, String> {
+    let listed: Vec<ListedProvider> = parse_document(stdout)?;
+    Ok(listed
+        .into_iter()
+        .filter(|p| p.status == "available" && p.enabled == "Enabled")
+        .map(|p| p.provider)
+        .collect())
+}
+
+pub fn reported_error(output: &str) -> Option<(String, String)> {
+    let at = match output.starts_with('{') {
+        true => 0,
+        false => output.find("\n{")? + 1,
+    };
+    let doc: ErrorDocument = serde_json::Deserializer::from_str(&output[at..])
+        .into_iter()
+        .next()?
+        .ok()?;
+    Some((doc.error.code, doc.error.message))
+}
+
 pub fn parse_inspect(stdout: &str) -> std::result::Result<AgentState, String> {
     let i: Inspected = parse_document(stdout)?;
     Ok(AgentState {
@@ -549,6 +580,7 @@ impl PaseoCli {
         let binary = self.binary().await;
         let command = args.first().cloned().unwrap_or_default();
         let child = self::command(&binary, args)
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| PaseoError::Spawn {
                 binary: binary.clone(),
@@ -565,6 +597,17 @@ impl PaseoCli {
                 binary: binary.clone(),
                 message: e.to_string(),
             })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let reported = reported_error(&stdout)
+            .or_else(|| reported_error(&String::from_utf8_lossy(&output.stderr)));
+        if let Some((code, message)) = reported {
+            return Err(PaseoError::Reported {
+                binary,
+                command,
+                code,
+                message,
+            });
+        }
         if !output.status.success() {
             return Err(PaseoError::Failed {
                 binary,
@@ -572,7 +615,7 @@ impl PaseoCli {
                 status: output.status.to_string(),
             });
         }
-        Ok((binary, String::from_utf8_lossy(&output.stdout).into_owned()))
+        Ok((binary, stdout))
     }
 
     async fn turn(&self, args: &[String], timeout: Duration) -> Result<(String, TurnEnd)> {
@@ -592,6 +635,24 @@ fn unparsable(binary: &str, command: &str, message: impl ToString) -> PaseoError
 #[derive(Deserialize)]
 struct ListedAgent {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct ListedProvider {
+    provider: String,
+    status: String,
+    enabled: String,
+}
+
+#[derive(Deserialize)]
+struct ErrorDocument {
+    error: ErrorBody,
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    code: String,
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -635,6 +696,13 @@ impl Paseo for PaseoCli {
             .exec(&["workspace".into(), "ls".into(), "--json".into()], TIMEOUT)
             .await?;
         parse_document(&out).map_err(|e| unparsable(&binary, "workspace", e))
+    }
+
+    async fn providers(&self) -> Result<Vec<String>> {
+        let (binary, out) = self
+            .exec(&["provider".into(), "ls".into(), "--json".into()], TIMEOUT)
+            .await?;
+        parse_providers(&out).map_err(|e| unparsable(&binary, "provider", e))
     }
 
     fn stored_workspaces(&self) -> Vec<StoredWorkspace> {
@@ -840,6 +908,20 @@ pub async fn resolve_leader(
             return Ok(Leader::Existing { id, busy });
         }
     }
+    let either = |file: &Option<String>, global: &str| {
+        file.clone()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| global.to_string())
+    };
+    let mut provider = either(&settings.provider, &config.provider);
+    if provider.is_empty() {
+        provider = paseo
+            .providers()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(PaseoError::NoProvider)?;
+    }
     let configured = settings
         .workspace
         .clone()
@@ -854,18 +936,13 @@ pub async fn resolve_leader(
         Some(found) => found,
         None => pick_workspace(paseo, &project.root_path).await?,
     };
-    let either = |file: &Option<String>, global: &str| {
-        file.clone()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| global.to_string())
-    };
     Ok(Leader::Start(Start {
         workspace,
         cwd: project.root_path.clone(),
         title: format!("{} leader", project.name),
         labels: vec![ROLE_LABEL.to_string(), project_label(&project.id)],
         reason,
-        provider: either(&settings.provider, &config.provider),
+        provider,
         mode: either(&settings.mode, &config.mode),
         thinking: either(&settings.thinking, &config.thinking),
     }))
@@ -908,6 +985,7 @@ pub mod fake {
         Leaders(String),
         Inspect(String),
         Workspaces,
+        Providers,
         CreateWorkspace(PathBuf),
         Run(RunSpec),
         SendAndWait(String, String),
@@ -922,6 +1000,7 @@ pub mod fake {
         pub agents: HashMap<String, AgentState>,
         pub workspaces: Vec<Workspace>,
         pub workspaces_fail: bool,
+        pub no_providers: bool,
         pub store: Vec<StoredWorkspace>,
         pub logs: HashMap<String, String>,
         pub turn_ends: VecDeque<TurnEnd>,
@@ -1036,6 +1115,14 @@ pub mod fake {
 
         fn stored_workspaces(&self) -> Vec<StoredWorkspace> {
             self.state.lock().unwrap().store.clone()
+        }
+
+        async fn providers(&self) -> Result<Vec<String>> {
+            self.record(Call::Providers);
+            if self.state.lock().unwrap().no_providers {
+                return Ok(Vec::new());
+            }
+            Ok(vec!["claude".into(), "codex".into()])
         }
 
         async fn create_workspace(&self, path: &Path) -> Result<String> {
@@ -1278,6 +1365,43 @@ mod tests {
             ("claude", "default")
         );
         assert!(!fake.calls().contains(&Call::Workspaces));
+        assert!(!fake.calls().contains(&Call::Providers));
+    }
+
+    #[tokio::test]
+    async fn without_a_configured_provider_the_first_available_one_starts_the_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakePaseo::default();
+        fake.add_workspace("wks_a", "local", dir.path());
+        let s = start(
+            resolve_leader(
+                &fake,
+                &PaseoConfig::default(),
+                &ProjectPaseo::default(),
+                &project(dir.path()),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(s.spec("t").provider, "claude");
+        fake.state.lock().unwrap().no_providers = true;
+        let err = resolve_leader(
+            &fake,
+            &PaseoConfig::default(),
+            &ProjectPaseo::default(),
+            &project(dir.path()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PaseoError::NoProvider), "{err}");
+        assert!(err.to_string().contains("paseo provider ls"), "{err}");
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|c| matches!(c, Call::Workspaces))
+                .count(),
+            1
+        );
     }
 
     fn store_fixture() -> Vec<StoredWorkspace> {
@@ -1467,6 +1591,7 @@ mod tests {
                 "  inspect*) printf '{\"Status\":\"running\",\"Archived\":false,\"PendingPermissions\":[{}],\"UpdatedAt\":\"2026-10-14T14:04:56.399Z\"}' ;;\n",
                 "  'workspace ls') printf '[{\"workspaceId\":\"wks_1\",\"isolation\":\"local\",\"cwd\":\"/x\"}]' ;;\n",
                 "  'workspace create') echo wks_new ;;\n",
+                "  'provider ls') printf '[{\"provider\":\"pi\",\"status\":\"available\",\"enabled\":\"Enabled\"}]' ;;\n",
                 "  run*) printf '{\\n  \"agentId\": \"agent-9\",\\n  \"status\": \"completed\"\\n}\\n' ;;\n",
                 "  wait*) printf '{\"agentId\":\"a\",\"status\":\"idle\",\"message\":\"Agent is idle.\"}' ;;\n",
                 "  logs*) printf '[User] do it\\n12:00:00 done\\n' ;;\n",
@@ -1503,6 +1628,7 @@ mod tests {
             }
         );
         assert_eq!(cli.workspaces().await.unwrap()[0].id, "wks_1");
+        assert_eq!(cli.providers().await.unwrap(), vec!["pi"]);
         assert_eq!(
             cli.create_workspace(Path::new("/x")).await.unwrap(),
             "wks_new"
@@ -1911,6 +2037,51 @@ mod tests {
         let workspaces: Vec<Workspace> = parse_document(fixture!("npm-workspace-ls.out")).unwrap();
         assert_eq!(workspaces[0].id, "wks_02145c30b3744429");
         assert!(workspaces.iter().all(|w| w.isolation == "local"));
+    }
+
+    #[test]
+    fn provider_ls_keeps_available_enabled_providers_in_listed_order() {
+        assert_eq!(
+            parse_providers(fixture!("npm-provider-ls.out")).unwrap(),
+            vec!["claude", "codex", "pi", "antigravity"]
+        );
+    }
+
+    #[test]
+    fn a_json_error_object_names_its_code_and_message() {
+        assert_eq!(
+            reported_error(fixture!("npm-run-missing-provider.err")),
+            Some(("MISSING_PROVIDER".into(), "Provider is required".into()))
+        );
+        for out in [
+            fixture!("npm-run-blocking.out"),
+            fixture!("npm-provider-ls.out"),
+            fixture!("inspect-running.out"),
+            fixture!("wrapper-systemd-ls.err"),
+            fixture!("run-blocking.out"),
+        ] {
+            assert_eq!(reported_error(out), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_command_surfaces_the_paseo_error_instead_of_its_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/fixtures/paseo-0.11.2/npm-run-missing-provider.err");
+        let bin = script(
+            &dir.path().join("paseo"),
+            &format!("cat '{}' >&2\nexit 1", fixture.display()),
+        );
+        let err = PaseoCli::with_binary(&lossy(&bin))
+            .run_and_wait(&spec("", "", "", "t"), Duration::from_secs(5))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MISSING_PROVIDER"), "{err}");
+        assert!(err.contains("Provider is required"), "{err}");
+        assert!(!err.contains("exit status"), "{err}");
     }
 
     #[test]
