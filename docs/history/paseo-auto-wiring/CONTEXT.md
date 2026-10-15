@@ -31,6 +31,14 @@ thêm vào chứ. Config nếu cần thì ở ngay trong project dễ edit»
 | D3 | Several local workspaces at one root: the leader's existing workspace wins, else the oldest local workspace at the root; `.waggledance.toml` may name one. The two-workspace refusal (`paseo-leader-dispatch` D8) is removed. | Owner chose automatic choice over refusal. |
 | D4 | The global `[paseo]` block is optional: Paseo support turns on when a working CLI is found; the binary is detected (npm `@getpaseo/cli`, then `$PASEO_CLI`, then the AppImage wrapper), each candidate accepted only after a JSON `ls` parses; the global block only overrides. | The configured AppImage wrapper's `run` printed nothing from systemd while the npm CLI worked (2026-10-14, run-a07b58ecc3051860 lost). |
 
+### Added at the plan-step hat wave (agent-decided under gate bypass full)
+
+| ID | Decision | Rationale |
+|----|----------|-----------|
+| D5 | `orchestration = true` in the file has exactly the scope of the settings-page opt-in, triggers included (DB flag OR file flag, mtime-cached read). Accepted, documented risk: whoever can change the checkout can opt it in. The refusal names the settings page and the file path, and reports a file that fails to parse. | One meaning for the shared opt-in; the owner chose in-repo consent. |
+| D6 | Discovery registers a root only when isolation is local, it is a git repo whose `.git` is a directory, it is not `$HOME`, `/` or under `/tmp`, it is not archived, and no registered root contains it or is contained by it. Indexing runs off the delivery task; discovery runs at start and every 5 minutes inside the delivery task. | `register` indexes synchronously and nothing unregisters. |
+| D7 | Pick for a new leader: file workspace, else deprecated `[[paseo.leaders]]`, else oldest `createdAt` (Paseo store, read-only), else lowest id; the dispatch reply and log name the workspace and reason. A configured binary that is an AppImage wrapper is demoted below a detected npm CLI; only successful detections are cached; `setup paseo` prints the chosen CLI, the rejected candidates and now-unneeded global lines. | Pinned-first was not asked for; the owner's leftover wrapper line would otherwise bring the incident back. |
+
 ### Agent's Discretion
 
 How often discovery runs, how "oldest" is read, the exact `.waggledance.toml`

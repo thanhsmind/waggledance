@@ -10,6 +10,7 @@ use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::notify_store::NotifyStore;
 use waggledance_core::Engine;
 
+use crate::discovery::{self, Bounds};
 use crate::orchestrate::{self, PASEO_PANE_PREFIX};
 use crate::paseo::{self, Leader, LeaderLock, Paseo, PaseoError, TurnEnd};
 
@@ -31,11 +32,14 @@ pub struct Delivery {
     state: Arc<Mutex<State>>,
     backoff: [Duration; 4],
     permission_poll: Duration,
+    bounds: Bounds,
 }
 
 #[derive(Default)]
 struct State {
     recovered: bool,
+    discovering: bool,
+    headers: HashMap<String, String>,
     busy: HashSet<String>,
     held: HashSet<String>,
     not_before: HashMap<String, Instant>,
@@ -97,17 +101,34 @@ impl Delivery {
             state: Arc::default(),
             backoff: [10, 30, 60, 300].map(Duration::from_secs),
             permission_poll: Duration::from_secs(10),
+            bounds: Bounds::host(),
         }
     }
 
     pub async fn run(self) {
         let mut deliveries = JoinSet::new();
         let mut ticks = tokio::time::interval(TICK);
+        let mut discoveries = tokio::time::interval(discovery::EVERY);
         loop {
-            ticks.tick().await;
-            while deliveries.try_join_next().is_some() {}
-            self.tick(&mut deliveries).await;
+            tokio::select! {
+                _ = ticks.tick() => {
+                    while deliveries.try_join_next().is_some() {}
+                    self.tick(&mut deliveries).await;
+                }
+                _ = discoveries.tick() => self.discover(&mut deliveries),
+            }
         }
+    }
+
+    fn discover(&self, tasks: &mut JoinSet<()>) {
+        if std::mem::replace(&mut self.state.lock().unwrap().discovering, true) {
+            return;
+        }
+        let this = self.clone();
+        tasks.spawn(async move {
+            discovery::discover(this.paseo.as_ref(), &this.engine, &this.bounds).await;
+            this.state.lock().unwrap().discovering = false;
+        });
     }
 
     async fn tick(&self, deliveries: &mut JoinSet<()>) {
@@ -245,10 +266,17 @@ impl Delivery {
         let config = &self.engine.config.paseo;
         let timeout = Duration::from_secs(config.turn_timeout_secs);
         let deadline = Instant::now() + timeout;
-        let leader = match paseo::resolve_leader(self.paseo.as_ref(), config, &project).await {
-            Ok(leader) => leader,
-            Err(e) => return self.presend_failed(&name, run, &e.to_string()),
-        };
+        let (settings, warnings) = self.engine.project_settings(&project);
+        for warning in warnings {
+            tracing::warn!("delivery for {name}: {warning}");
+        }
+        let leader =
+            match paseo::resolve_leader(self.paseo.as_ref(), config, &settings.paseo, &project)
+                .await
+            {
+                Ok(leader) => leader,
+                Err(e) => return self.presend_failed(&name, run, &e.to_string()),
+            };
         let (agent, outcome) = match leader {
             Leader::Existing { busy: true, .. } => {
                 self.set_status(&run.id, "queued");
@@ -261,6 +289,19 @@ impl Delivery {
                 (Some(id), outcome)
             }
             Leader::Start(start) => {
+                tracing::info!(
+                    run = %run.id,
+                    workspace = %start.workspace,
+                    reason = start.reason,
+                    "delivery starts the {name} leader"
+                );
+                self.state.lock().unwrap().headers.insert(
+                    run.id.clone(),
+                    format!(
+                        "[waggledance] leader started in Paseo workspace {} ({})",
+                        start.workspace, start.reason
+                    ),
+                );
                 match self
                     .paseo
                     .run_and_wait(&start.spec(&run.task), timeout)
@@ -391,7 +432,9 @@ impl Delivery {
         leader: Option<&str>,
     ) {
         if let Some(text) = transcript {
-            if let Err(e) = self.engine.set_run_final_transcript(&run.id, text) {
+            let header = self.state.lock().unwrap().headers.remove(&run.id);
+            let text = header.map_or_else(|| text.to_string(), |h| format!("{h}\n\n{text}"));
+            if let Err(e) = self.engine.set_run_final_transcript(&run.id, &text) {
                 tracing::warn!("delivery could not store run {} transcript: {e}", run.id);
             }
         }
@@ -493,7 +536,7 @@ mod tests {
     fn rig() -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
-        config.paseo.enabled = true;
+        config.paseo.enabled = Some(true);
         let engine = Arc::new(Engine::new(SqliteStore::open_in_memory().unwrap(), config));
         for id in ["proj-1", "proj-2"] {
             let root = dir.path().join(id);
@@ -695,6 +738,40 @@ mod tests {
         let run = r.engine.get_run("run-1").unwrap().unwrap();
         assert_eq!(run.status, "done");
         assert_eq!(run.pane_id, "paseo:agent-1");
+        assert!(r
+            .transcript("run-1")
+            .starts_with("[waggledance] leader started in Paseo workspace wks (lowest-id)"));
+    }
+
+    #[tokio::test]
+    async fn delivery_discovers_paseo_workspaces_when_it_starts() {
+        let mut r = rig();
+        r.delivery.bounds = Bounds {
+            home: None,
+            tmp: PathBuf::from("/nonexistent-tmp"),
+        };
+        let repo = std::fs::canonicalize(r._dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        r.fake.add_workspace("wks_repo", "local", &repo);
+        let task = tokio::spawn(r.delivery.clone().run());
+        let mut found = false;
+        for _ in 0..200 {
+            found = r
+                .engine
+                .list_projects()
+                .unwrap()
+                .iter()
+                .any(|p| p.root_path == repo);
+            if found {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert!(
+            found,
+            "the delivery task registers a Paseo workspace root at start"
+        );
     }
 
     #[tokio::test]
@@ -763,9 +840,7 @@ mod tests {
     #[tokio::test]
     async fn delivery_requeues_a_pre_send_failure_and_loses_it_on_the_fifth() {
         let r = rig();
-        let root = r.engine.get_project("proj-1").unwrap().unwrap().root_path;
-        r.fake.add_workspace("wks_a", "local", &root);
-        r.fake.add_workspace("wks_b", "local", &root);
+        r.fake.state.lock().unwrap().workspaces_fail = true;
         r.queue("proj-1", "run-1", "one", Some("caller"));
         r.fake.add_leader("proj-9", "caller", "idle", false);
         for attempt in 1..5 {
@@ -775,7 +850,7 @@ mod tests {
         }
         r.tick().await;
         assert_eq!(r.status("run-1"), "lost");
-        assert!(r.transcript("run-1").contains("wks_a"));
+        assert!(r.transcript("run-1").contains("`fake workspace` exited"));
         assert!(r
             .fake
             .calls()
@@ -791,9 +866,7 @@ mod tests {
     async fn delivery_waits_out_the_backoff_before_a_retry() {
         let mut r = rig();
         r.delivery.backoff = [Duration::from_secs(600); 4];
-        let root = r.engine.get_project("proj-1").unwrap().unwrap().root_path;
-        r.fake.add_workspace("wks_a", "local", &root);
-        r.fake.add_workspace("wks_b", "local", &root);
+        r.fake.state.lock().unwrap().workspaces_fail = true;
         r.queue("proj-1", "run-1", "one", None);
         r.tick().await;
         r.tick().await;

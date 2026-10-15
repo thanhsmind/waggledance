@@ -22,7 +22,7 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PaseoConfig {
-    pub enabled: bool,
+    pub enabled: Option<bool>,
     pub binary: String,
     pub provider: String,
     pub mode: String,
@@ -34,7 +34,7 @@ pub struct PaseoConfig {
 impl Default for PaseoConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             binary: String::new(),
             provider: String::new(),
             mode: String::new(),
@@ -905,10 +905,10 @@ mod tests {
     }
 
     #[test]
-    fn paseo_config_defaults_off_and_empty_and_matches_leaders_by_id_or_name() {
+    fn paseo_config_defaults_to_auto_and_empty_and_matches_leaders_by_id_or_name() {
         let c = Config::load_from(Path::new("/nonexistent/waggledance/config.toml"));
         assert_eq!(c.paseo, PaseoConfig::default());
-        assert!(!c.paseo.enabled);
+        assert_eq!(c.paseo.enabled, None);
         assert!(c.paseo.binary.is_empty());
         assert_eq!(c.paseo.turn_timeout_secs, 3600);
         assert!(
@@ -919,8 +919,13 @@ mod tests {
             "[paseo]\nenabled = true\nbinary = \"/opt/paseo\"\n\n[[paseo.leaders]]\nproject = \"waggledance\"\nworkspace = \"wks_a\"\n\n[[paseo.leaders]]\nproject = \"p-2\"\nworkspace = \"wks_b\"\n",
         )
         .unwrap();
-        assert!(parsed.paseo.enabled);
+        assert_eq!(parsed.paseo.enabled, Some(true));
         assert_eq!(parsed.paseo.binary, "/opt/paseo");
+        let off: Config = toml::from_str("[paseo]\nenabled = false\n").unwrap();
+        assert_eq!(off.paseo.enabled, Some(false));
+        let saved = toml::to_string(&c).unwrap();
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.paseo.enabled, None);
         assert_eq!(parsed.paseo.turn_timeout_secs, 3600);
         let tuned: Config = toml::from_str("[paseo]\nturn_timeout_secs = 90\n").unwrap();
         assert_eq!(tuned.paseo.turn_timeout_secs, 90);

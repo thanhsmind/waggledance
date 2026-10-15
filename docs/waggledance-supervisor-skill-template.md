@@ -154,8 +154,7 @@ either — ask the human which mode, rather than guessing.
 
 ## Leader mode — when the target project runs in Paseo
 
-When the host's waggledance config has `[paseo]` with `enabled = true` and the target
-project's lead lives in Paseo, dispatch with `{project, task, leader: true}` instead of
+When the target project's lead lives in Paseo, dispatch with `{project, task, leader: true}` instead of
 `{project, task, preset}`. Everything else in both procedures holds unchanged: the mode
 gate, the correlation id, the provenance line as line 1, the spec body, and the
 file-and-stop or execute-to-completion contract.
@@ -163,8 +162,9 @@ file-and-stop or execute-to-completion contract.
 - Always pass `request_id` equal to the correlation id. A re-send after a timeout then
   returns the original run with `duplicate: true` and sends nothing again.
 - waggledance finds the project's one long-lived leader by its labels, or starts one in
-  the project's configured Paseo workspace. Never name a workspace, an agent id, a
-  provider, or a working directory — config owns them.
+  a Paseo workspace at the project root that waggledance picks itself. Never name a
+  workspace, an agent id, a provider, or a working directory — waggledance and the
+  project's `.waggledance.toml` own them.
 - The leader takes the task as a new message. That is reuse by design, not a competing
   run, so step 2's live-lead check does not apply. A busy leader is not refused: the
   run starts `queued` and the waggledance daemon delivers it, in order, once the leader
@@ -187,10 +187,12 @@ mode unless noted. Recognize each one for what it is — most are not failures.
 - **Project not opted in.** `waggledance_dispatch` refuses with:
 
   > project `<id>` has not opted into orchestrator dispatch — enable it from the
-  > project's settings page
+  > project's settings page, or set `orchestration = true` in `<root>/.waggledance.toml`
 
-  This is not a bug and not retryable from here — the target project's owner must flip
-  its orchestration opt-in first. Surface it to the human; do not work around it.
+  This is not a bug and not retryable from here — the target project's owner must opt
+  it in first, from its settings page or by committing `orchestration = true` in that
+  repo's `.waggledance.toml`. A file that failed to parse is named after the refusal.
+  Surface it to the human; do not write that file yourself.
 
 - **Preset label does not resolve.** The dispatch call refuses, naming the label that
   was searched for and the project whose preset registry (global, then that project's
@@ -203,13 +205,10 @@ mode unless noted. Recognize each one for what it is — most are not failures.
   target repo's workspace needs a focused pane before a lead can open there — it is not
   something this skill can route around by picking a different project.
 
-- **Paseo leader dispatch is off (leader mode).** The refusal names
-  `~/.waggledance/config.toml` and the lines `[paseo]` and `enabled = true`. Surface it to
-  the human; only the host's owner turns it on.
-
-- **More than one Paseo workspace at the project root (leader mode).** The run ends
-  `lost`, and its text names every matching workspace id and the `[[paseo.leaders]]` entry that picks one. Surface it
-  to the human; never pick a workspace yourself.
+- **Paseo leader dispatch is unavailable (leader mode).** Either no working Paseo CLI
+  was found — the refusal names every candidate tried and how to install the CLI — or
+  the host turned Paseo off with `enabled = false`. Surface it to the human; only the
+  host's owner fixes it.
 
 - **A lead is already working that repo.** Not an MCP error — this is what step 2's
   `waggledance_ask_state` check is for, in both modes. Seeing a live lead means: do not

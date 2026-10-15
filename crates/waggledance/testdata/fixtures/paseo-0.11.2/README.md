@@ -18,6 +18,12 @@ directory, `paseo-<version>/`, rather than an edit here.
   `$PASEO_CLI` is the bundled CLI inside the mounted AppImage.
 - **Systemd user scope**: run through `systemd-run --user`, the environment
   the waggledance daemon runs in, with none of the `PASEO_AGENT_*` variables.
+- **Systemd user scope, npm CLI**: the same scope running the npm package
+  `@getpaseo/cli` 0.10.3 (`~/.local/share/mise/installs/node/24.19.0/bin/paseo`)
+  against the Paseo 0.11.2 daemon, captured on 2026-10-14 with the throwaway
+  agent `wd probe4 (delete me)`, deleted afterwards. The `npm-*` files come
+  from here and `wrapper-plugin-ls.out` from the AppImage wrapper in the same
+  session.
 
 Most captures came from the probe script `probe.sh` (kept in the bee cache,
 not committed), run inside a Paseo agent. It used `"$PASEO_CLI"` as `$CLI`,
@@ -50,4 +56,9 @@ permission.
 | `inspect-pending.out` | `"$CLI" inspect <ID3> --json`, 25 s into that send | inside a Paseo agent | `PendingPermissions` lists one entry with `tool: Write`; `parse_inspect` yields it. |
 | `permit-ls.out` | `"$CLI" permit ls --json` | inside a Paseo agent | The global permission list names the same permission (`name: Write`). |
 | `wrapper-systemd-ls.out` | `systemd-run --user --wait --pipe --quiet -p WorkingDirectory=/tmp ~/.local/bin/paseo ls -g --json` (stdout) | systemd user scope | The PATH wrapper works from the daemon's environment: two single-line startup logs, then the JSON list. `parse_leaders` reads five agent ids. |
+| `npm-run-blocking.out` | `systemd-run --user --wait --pipe ... ~/.local/share/mise/installs/node/24.19.0/bin/paseo run --json --title "wd probe4 (delete me)" ...` | systemd user scope, npm CLI | The npm CLI's blocking `run` prints a `Using workspace wks_…` line before its JSON document; `parse_turn_end` skips the line and reads the new `agentId` with `status: permission`. |
+| `npm-workspace-ls.out` | `systemd-run --user --wait --pipe ... node/24.19.0/bin/paseo workspace ls --json` | systemd user scope, npm CLI | `workspace ls` is clean JSON carrying `workspaceId`, `project`, `name`, `isolation` and `cwd`, no creation time. |
+| `npm-plugin-ls.out` | `systemd-run --user --wait --pipe ... node/24.19.0/bin/paseo plugin ls --json` | systemd user scope, npm CLI | `plugin ls` from the npm CLI is a clean JSON list naming the `waggledance` plugin. |
+| `wrapper-plugin-ls.out` | `systemd-run --user --wait --pipe ... ~/.local/bin/paseo plugin ls --json` | systemd user scope | The AppImage wrapper's `plugin ls` starts with two `HH:MM:SS.mmm ›` log lines; `waggledance setup paseo` reads it through `parse_document` instead of failing on the clock digits. |
 | `wrapper-systemd-ls.err` | the same command (stderr) | systemd user scope | The wrapper's stderr is one `[linux-sandbox] ...` line that starts with `[` yet is not JSON; it would fool the document rule, which is why the client discards stderr. Parsing it as a list fails. |
+| `workspaces-store.json` | none: written by hand after the keys of `~/.paseo/projects/workspaces.json` (read with `python3` on 2026-10-14) | synthetic ids and paths | Paseo's own store, read-only: `createdAt` orders the leader pick (`wks_fixture_b` is the oldest of three local workspaces at one root); `archivedAt` and `isPaseoOwnedWorktree` keep a workspace out of discovery. |

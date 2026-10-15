@@ -984,7 +984,7 @@ fn handle_dispatch(
         );
     }
     if !engine.orchestration_allowed(&project) {
-        return tool_error(id, &not_opted_in(project_id));
+        return tool_error(id, &not_opted_in(engine, &project));
     }
 
     // Resolved before any herdr call so an unresolvable label never touches
@@ -1037,11 +1037,19 @@ fn handle_dispatch(
     }
 }
 
-fn not_opted_in(project_id: &str) -> String {
-    format!(
-        "project {project_id} has not opted into orchestrator dispatch — enable it from the \
-         project's settings page"
-    )
+fn not_opted_in(engine: &Engine, project: &Project) -> String {
+    let file = waggledance_core::project_settings::settings_path(&project.root_path);
+    let mut text = format!(
+        "project {} has not opted into orchestrator dispatch — enable it from the project's \
+         settings page, or set `orchestration = true` in {}",
+        project.id,
+        file.display()
+    );
+    for warning in engine.project_settings(project).1 {
+        text.push_str("; ");
+        text.push_str(&warning);
+    }
+    text
 }
 
 const DELIVERY_PAUSED: &str =
@@ -1079,14 +1087,10 @@ fn dispatch_to_leader(
     data_dir: &Path,
 ) -> Value {
     if !engine.orchestration_allowed(project) {
-        return tool_error(id, &not_opted_in(&project.id));
+        return tool_error(id, &not_opted_in(engine, project));
     }
-    if !engine.config.paseo.enabled {
-        return tool_error(
-            id,
-            "Paseo leader dispatch is off — add the lines `[paseo]` and `enabled = true` to \
-             ~/.waggledance/config.toml",
-        );
+    if let Some(why) = paseo::paseo_unavailable(&engine.config.paseo) {
+        return tool_error(id, &why);
     }
     let now = now_rfc3339();
     let run = Run {
@@ -2162,6 +2166,45 @@ mod tests {
             text.contains("has not opted into orchestrator dispatch"),
             "{text}"
         );
+        assert!(text.contains("settings page"), "{text}");
+        let file = pa.root_path.join(".waggledance.toml");
+        assert!(file.is_absolute());
+        assert!(
+            text.contains(&format!("`orchestration = true` in {}", file.display())),
+            "{text}"
+        );
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_refusal_reports_a_project_file_that_fails_to_parse() {
+        let (engine, pa) = dispatch_engine("dispatch-bad-settings-file");
+        write(&pa.root_path, ".waggledance.toml", "orchestration = tru\n");
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "pane_id": "w1:p1" }),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("has not opted into"), "{text}");
+        assert!(text.contains("failed to parse"), "{text}");
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_accepts_the_project_file_opt_in() {
+        let (engine, pa) = dispatch_engine("dispatch-file-opt-in");
+        write(&pa.root_path, ".waggledance.toml", "orchestration = true\n");
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "preset": "nope" }),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("has not opted into"), "{text}");
+        assert!(text.contains("unknown agent preset: nope"), "{text}");
 
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
@@ -2606,7 +2649,7 @@ mod tests {
         write(&dir, "docs/a.md", "# Project\n");
         let mut config = Config::default();
         config.terminal.enabled = terminal;
-        config.paseo.enabled = paseo_on;
+        config.paseo.enabled = Some(paseo_on);
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
         let project = engine.register(&dir, None).unwrap();
         engine
@@ -2693,7 +2736,7 @@ mod tests {
         let text = text_of(&leader_call(&engine, &project, &data_dir, "go", None));
         assert!(text.contains("~/.waggledance/config.toml"), "{text}");
         assert!(
-            text.contains("`[paseo]`") && text.contains("`enabled = true`"),
+            text.contains("`[paseo]`") && text.contains("`enabled = false`"),
             "{text}"
         );
         assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
@@ -2703,7 +2746,7 @@ mod tests {
             "waggledance_dispatch",
             json!({ "project": project.id, "task": "go", "leader": true }),
         );
-        assert!(text_of(&through_the_tool).contains("enabled = true"));
+        assert!(text_of(&through_the_tool).contains("enabled = false"));
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 

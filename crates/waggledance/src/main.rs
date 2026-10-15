@@ -10,6 +10,7 @@
 
 mod cli;
 mod delivery;
+mod discovery;
 mod doctor;
 mod guide;
 mod herdr;
@@ -232,7 +233,11 @@ impl TerminalBackground {
             herdr.clone(),
             engine.clone(),
         );
-        self.reconcile_delivery(engine.clone().filter(|e| e.config.paseo.enabled));
+        self.reconcile_delivery(
+            engine
+                .clone()
+                .filter(|e| paseo::paseo_available(&e.config.paseo)),
+        );
         self.reconcile_notify(cfg.notify_enabled, herdr, notify_store, telegram, engine);
     }
 
@@ -1038,9 +1043,11 @@ mod terminal_background_tests {
     }
 
     fn engine() -> Arc<waggledance_core::Engine> {
+        let mut config = waggledance_core::Config::default();
+        config.paseo.enabled = Some(false);
         Arc::new(waggledance_core::Engine::new(
             waggledance_core::SqliteStore::open_in_memory().unwrap(),
-            waggledance_core::Config::default(),
+            config,
         ))
     }
 
@@ -1094,7 +1101,7 @@ mod terminal_background_tests {
         let bg = TerminalBackground::new();
         let fake = Arc::new(FakeHerdr::new());
         let mut config = waggledance_core::Config::default();
-        config.paseo.enabled = true;
+        config.paseo.enabled = Some(true);
         let paseo_engine = Arc::new(waggledance_core::Engine::new(
             waggledance_core::SqliteStore::open_in_memory().unwrap(),
             config,

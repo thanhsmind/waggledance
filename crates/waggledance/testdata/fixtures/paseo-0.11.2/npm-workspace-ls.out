@@ -1,0 +1,58 @@
+[
+  {
+    "workspaceId": "wks_02145c30b3744429",
+    "project": "anphabe-bi-dashboard",
+    "name": "Work on Anphabe BI dashboard",
+    "isolation": "local",
+    "cwd": "/home/thanhsmind/Projects/anphabe/anphabe-bi-dashboard"
+  },
+  {
+    "workspaceId": "wks_24160b4c459549f0",
+    "project": "goglbe-tools",
+    "name": "Make MCP reusable across later parts",
+    "isolation": "local",
+    "cwd": "/home/thanhsmind/Projects/goglbe/goglbe-tools"
+  },
+  {
+    "workspaceId": "wks_25538655d2f24639",
+    "project": "a-blog",
+    "name": "Collab comment website",
+    "isolation": "local",
+    "cwd": "/home/thanhsmind/Projects/anphabe/a-blog"
+  },
+  {
+    "workspaceId": "wks_261e22b3c36818a7",
+    "project": "happyfarm",
+    "name": "Xây dựng lại Happy Farm bằng Three.js",
+    "isolation": "local",
+    "cwd": "/home/thanhsmind/Projects/goglbe/happyfarm"
+  },
+  {
+    "workspaceId": "wks_5e431ecff91f4870",
+    "project": "anphabe-goglbe",
+    "name": "Add iframe URL viewer with comments and screenshots",
+    "isolation": "local",
+    "cwd": "/home/thanhsmind/Projects/anphabe/anphabe-goglbe"
+  },
+  {
+    "workspaceId": "wks_79b0ae8436f6ef1a",
+    "project": "anphabe-goglbe",
+    "name": "Add visual feedback feature",
+    "isolation": "local",
+    "cwd": "/home/thanhsmind/Projects/anphabe/anphabe-goglbe"
+  },
+  {
+    "workspaceId": "wks_8c21fe31344c5edc",
+    "project": "beehive",
+    "name": "Compare Paseo and herdr worker kill tests",
+    "isolation": "local",
+    "cwd": "/home/thanhsmind/Projects/goglbe/beehive"
+  },
+  {
+    "workspaceId": "wks_e75630b751320215",
+    "project": "waggledance",
+    "name": "Install beehive via curl script",
+    "isolation": "local",
+    "cwd": "/home/thanhsmind/Projects/goglbe/waggledance"
+  }
+]

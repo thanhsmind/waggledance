@@ -1,0 +1,15 @@
+[
+  {
+    "id": "waggledance",
+    "path": "/home/thanhsmind/.waggledance/paseo",
+    "enabled": true,
+    "status": "disabled",
+    "description": "Waggle Dance in Paseo: what waits on you, what is in progress, and the live agents (read-only)",
+    "installation": {
+      "identity": {
+        "kind": "directory",
+        "path": "/home/thanhsmind/.waggledance/paseo"
+      }
+    }
+  }
+]
