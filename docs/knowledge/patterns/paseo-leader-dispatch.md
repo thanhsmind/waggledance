@@ -1,13 +1,13 @@
 ---
 type: bee.pattern
 title: A request for a project reaches its one Paseo leader through waggledance_dispatch
-description: "Practice: with [paseo] enabled and the project opted into orchestration, waggledance_dispatch with leader: true queues the task for the project's labelled Paseo leader; the daemon delivers it once, in order, only while the leader is idle, marks it done when Paseo reports that turn completed, and tells the caller."
-timestamp: 2026-10-14
+description: "Practice: with a working Paseo CLI found and the project opted into orchestration (its .waggledance.toml or its settings page), waggledance_dispatch with leader: true queues the task for the project's labelled Paseo leader; the daemon delivers it once, in order, only while the leader is idle, marks it done when Paseo reports that turn completed, and tells the caller."
+timestamp: 2026-10-15
 bee:
   id: paseo-leader-dispatch
   lifecycle: active
   areas: [orchestration]
-  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md]
+  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md]
   polarity: practice
   signature: request for a project running in Paseo
 ---
@@ -15,40 +15,83 @@ bee:
 # A request for a project reaches its one Paseo leader through waggledance_dispatch
 
 Locked by paseo-leader-dispatch D1/D2/D3/D4/D5/D6/D8/D9/D10
-(`docs/history/paseo-leader-dispatch/CONTEXT.md`) and
-leader-delivery D1/D2/D3/D4/D5/D6/D7/D8 (`docs/history/leader-delivery/CONTEXT.md`). Leader-delivery D3
-supersedes paseo-leader-dispatch D7: a busy leader no longer refuses a request.
+(`docs/history/paseo-leader-dispatch/CONTEXT.md`),
+leader-delivery D1/D2/D3/D4/D5/D6/D7/D8 (`docs/history/leader-delivery/CONTEXT.md`), and
+paseo-auto-wiring D1/D2/D3/D4/D5/D6/D7 (`docs/history/paseo-auto-wiring/CONTEXT.md`).
+Leader-delivery D3 supersedes paseo-leader-dispatch D7: a busy leader no longer refuses a
+request. Paseo-auto-wiring D3 removes paseo-leader-dispatch D8's two-workspace refusal,
+and paseo-auto-wiring D4 makes the global `[paseo]` block optional.
 
 ## Turn it on
 
-Add this block to `~/.waggledance/config.toml` on the host that runs the daemon:
+Nothing goes in `~/.waggledance/config.toml`, and nothing is written by hand per
+workspace (paseo-auto-wiring D1/D4). Three things turn a project's leader path on:
+
+1. **A working Paseo CLI.** waggledance finds it itself; see
+   [Which paseo binary runs](#which-paseo-binary-runs). Paseo support is on as soon as
+   one candidate answers `ls -g --json` with a JSON list.
+2. **The project is registered.** The daemon registers every Paseo workspace root it
+   finds; see [Workspace discovery](#workspace-discovery).
+3. **The project opts in.** Commit a `.waggledance.toml` with `orchestration = true` at
+   the repo root, or turn orchestration on from the project's settings page (D2). A
+   project that is not opted in is refused before anything is stored.
+
+The waggledance daemon (`waggledance serve`) must be running. It discovers workspaces
+and delivers queued requests; `waggledance mcp` only accepts them.
+
+### .waggledance.toml
+
+The per-project settings file sits at the repo root and is committed with the code
+(paseo-auto-wiring D2). Every key is optional:
 
 ```toml
-[paseo]
-enabled = true
+orchestration = true
 
-[[paseo.leaders]]
-project = "waggledance"
+[paseo]
 workspace = "wks_0123456789ab"
+provider = "claude"
+mode = "bypassPermissions"
+thinking = "high"
 ```
 
-- `[paseo] enabled = true` is required. Without it, a leader dispatch is refused with a
-  message that names the config file and the lines `[paseo]` and `enabled = true`.
-- `[[paseo.leaders]]` is optional and repeatable. `project` matches a project's id or
-  its name. `workspace` is a Paseo workspace id. An entry with an empty `workspace` is
-  ignored.
+- `orchestration` — `true` opts the project into dispatched work with exactly the scope
+  of the settings-page opt-in, triggers included: the project is opted in when either
+  the settings page or the file says so (D5). Absent or `false` leaves the settings page
+  as the only switch.
+- `[paseo] workspace` — the Paseo workspace id a new leader starts in. It wins over
+  every other rule in [Workspace resolution](#workspace-resolution).
+- `[paseo] provider`, `mode`, `thinking` — passed to `paseo run` for a new leader. A
+  value set here wins over the same key in the global `[paseo]` block; an unset one
+  falls back to it, and both unset leaves the choice to Paseo.
+
+The file is re-read when its modification time changes. A file that fails to parse is
+ignored as a whole, and the not-opted-in refusal names the settings page, the file path,
+and the parse error. An unknown key is ignored with a warning; the rest of the file
+still counts.
+
+**Accepted risk (D5):** anyone who can change a repo checkout can opt that project into
+dispatched work by writing this file. The owner chose in-repo consent; there is no
+second confirmation on the host.
+
+### The global [paseo] block
+
+The `[paseo]` block in `~/.waggledance/config.toml` is optional and only overrides (D4):
+
+- `enabled = false` turns Paseo support off, and a leader dispatch is refused naming
+  that line. `enabled = true` is no longer needed.
+- `binary` names a `paseo` CLI to try first; see
+  [Which paseo binary runs](#which-paseo-binary-runs).
 - `turn_timeout_secs` defaults to `3600`. It bounds how long one delivery waits for the
   leader's turn to end.
-- `provider`, `mode`, and `thinking` default to empty, which leaves the choice to Paseo's
-  own defaults. Each one is passed to `paseo run` only when set.
-- `binary` picks the `paseo` CLI. See [Which paseo binary runs](#which-paseo-binary-runs).
+- `provider`, `mode`, and `thinking` are host-wide defaults beneath the project file's.
+- `[[paseo.leaders]]` (`project`, `workspace`) is a deprecated fallback kept for hosts
+  that already carry it. Use `[paseo] workspace` in the project's `.waggledance.toml`.
 
-The project must also be opted into orchestration from its settings page. A project that
-is not opted in is refused before anything is stored. `terminal.enabled` does not gate
-the leader path, and the leader path never talks to herdr.
+`waggledance setup paseo` prints the CLI it chose, every rejected candidate with why,
+and a warning for each global line that is no longer needed.
 
-The waggledance daemon (`waggledance serve`) must be running. It delivers queued
-requests; `waggledance mcp` only accepts them.
+`terminal.enabled` does not gate the leader path, and the leader path never talks to
+herdr.
 
 ## Dispatch
 
@@ -58,7 +101,7 @@ sent unchanged. `request_id` is optional; pass one on every call.
 
 1. If a run of this project already carries the same `request_id`, the call returns
    `{run_id, status, duplicate: true}` for that run and sends nothing (D1).
-2. The orchestration opt-in and `[paseo] enabled` are checked, in that order.
+2. The orchestration opt-in and Paseo availability are checked, in that order.
 3. The request is stored as a run with status `queued`, pane id `paseo:pending`, and the
    caller's `PASEO_AGENT_ID` when the dispatch came from a Paseo agent. No `paseo`
    command runs inside the call.
@@ -84,7 +127,7 @@ The same `request_id` in another project is a new request.
 
 ## Delivery
 
-The daemon runs the delivery loop whenever `[paseo] enabled` is set, and writes the
+The daemon runs the delivery loop when it finds Paseo available, and writes the
 heartbeat on every tick. For each project it delivers at most one request at a time,
 oldest first, holding the per-project lock file in `<data dir>/paseo-locks/` for the
 whole delivery so two deliveries cannot start two leaders (D3).
@@ -124,8 +167,7 @@ that line, not by time.
 
 - **Before the send.** A failure to resolve the leader, a missing binary, or an
   unreachable Paseo puts the run back to `queued` with backoff (10 s, 30 s, 1 min, 5 min).
-  The fifth failure marks it `lost` with the error (D6). Two matching workspaces with no
-  `[[paseo.leaders]]` entry fail this way, and the `lost` run carries the refusal text.
+  The fifth failure marks it `lost` with the error (D6).
 - **After the send.** A timeout marks the run `lost` "the leader may still be
   finishing", and the project's queue holds until its leader is idle. Killing a blocking
   send does not end the leader's turn, so the task is never sent again (D6). Only a
@@ -171,33 +213,62 @@ The notice text:
 A caller that is a Paseo agent can wait for this notice instead of polling
 `waggledance_await`. The Paseo plugin's request box is not a Paseo agent; it polls.
 
+## Workspace discovery
+
+The daemon registers every Paseo workspace root as a waggledance project
+(paseo-auto-wiring D1). Discovery runs inside the delivery task when it starts and every
+5 minutes after. It reads `paseo workspace ls --json` and Paseo's own store,
+`~/.paseo/projects/workspaces.json`, read only.
+
+A workspace root is registered only when all of these hold (D6):
+
+- its `isolation` is `local`, and it is neither archived nor a Paseo-owned worktree;
+- it is a git repo whose `.git` is a directory, so a git worktree is skipped;
+- it is not `$HOME`, not `/`, and not under `/tmp`;
+- no registered project's root contains it or sits inside it.
+
+A discovered project is not opted in. It receives dispatched work only once its
+`.waggledance.toml` or its settings page turns orchestration on (D2).
+
 ## Workspace resolution
 
-A workspace is resolved only when a new leader starts. The first rule that matches wins:
+A workspace is resolved only when a new leader starts; an existing leader is always
+reused first. The first rule that matches wins (paseo-auto-wiring D3/D7):
 
-1. A `[[paseo.leaders]]` entry whose `project` equals the project's id or name.
-2. The single workspace from `paseo workspace ls --json` whose `isolation` is `local`
-   and whose real cwd path equals the project root's real path.
-3. With no match, a new workspace from `paseo workspace create --path <project root>
-   --isolation local`.
+1. `[paseo] workspace` in the project's `.waggledance.toml` — reason `file`.
+2. A deprecated `[[paseo.leaders]]` entry whose `project` equals the project's id or
+   name — reason `deprecated-entry`.
+3. Among the workspaces from `paseo workspace ls --json` whose `isolation` is `local`
+   and whose real cwd equals the project root's real path: the oldest by `createdAt` in
+   Paseo's store — reason `oldest`; with no `createdAt` known, the lowest workspace id —
+   reason `lowest-id`.
+4. With no match, a new workspace from `paseo workspace create --path <project root>
+   --isolation local` — reason `created`.
 
-More than one match in rule 2 with no `[[paseo.leaders]]` entry is refused. The
-refusal names every matching workspace id and the `[[paseo.leaders]]` lines to add.
-waggledance never guesses between two workspaces.
+Several workspaces at one root are never refused. The run's transcript opens with
+`[waggledance] leader started in Paseo workspace <id> (<reason>)`.
 
 ## Which paseo binary runs
 
-The binary is chosen on every call, first match wins:
+waggledance tries candidates in this order and takes the first that answers
+`paseo ls -g --json` with a JSON list (paseo-auto-wiring D4/D7):
 
-1. `[paseo] binary` when it is not empty.
-2. `$PASEO_CLI` when it is set and names an existing file.
-3. `paseo` on `PATH`.
+1. `[paseo] binary`, when it is set and is not an AppImage wrapper.
+2. The npm CLI (`@getpaseo/cli`) on `PATH`, then under
+   `~/.local/share/mise/installs/node/<version>/bin/`, newest version first.
+3. `[paseo] binary` when it is an AppImage wrapper and an npm CLI was found — demoted
+   below the npm CLI.
+4. `$PASEO_CLI`, when it names an existing file. Paseo sets it to its bundled CLI inside
+   every agent it runs.
+5. `paseo` on `PATH`.
 
-Paseo sets `$PASEO_CLI` to its bundled CLI inside every agent it runs. The
-`~/.local/bin/paseo` wrapper that launches the Paseo AppImage, run from inside an agent,
-prints only startup logs and creates no agent; from the daemon's systemd scope it works.
-So `waggledance mcp` started by a Paseo agent uses the bundled CLI, and the daemon falls
-back to `paseo`.
+A candidate that resolves to the same file as an earlier one is tried once. A successful
+detection is cached for 10 minutes; a failed one is not cached, so a CLI installed later
+is found on the next call. With no candidate working, a leader dispatch is refused
+naming every rejected candidate with why, and how to install the CLI.
+
+The AppImage wrapper is demoted because its `run` printed nothing from the daemon's
+systemd scope while the npm CLI worked (paseo-auto-wiring D4).
 
 Every `paseo` child process drops `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` and keeps every
 other variable, `PASEO_HOME` included. With those two set, a new agent becomes a child of
@@ -224,13 +295,19 @@ Three sources reach the same door, and each one names the project itself:
 
 ## Pointers
 
-- `crates/waggledance-core/src/config.rs` — `PaseoConfig` (`turn_timeout_secs`),
-  `PaseoLeader`, `workspace_for`.
+- `crates/waggledance-core/src/config.rs` — `PaseoConfig` (`enabled`,
+  `turn_timeout_secs`), `PaseoLeader`, `workspace_for`.
+- `crates/waggledance-core/src/project_settings.rs` — `.waggledance.toml`: keys, parse,
+  warnings. `Engine::orchestration_allowed` and `Engine::project_settings` in
+  `crates/waggledance-core/src/engine.rs` combine it with the settings-page flag.
+- `crates/waggledance/src/discovery.rs` — workspace discovery and its filters.
+- `crates/waggledance/src/setup.rs` — `waggledance setup paseo` and its leftover-line
+  warnings.
 - `crates/waggledance-core/src/repository.rs` — runs migration 5: `request_id`,
   `caller`, `attempts`, the queue and claim functions.
-- `crates/waggledance/src/paseo.rs` — the `paseo` CLI client, `resolve_binary`, the
-  environment scrub, `TurnEnd`, labels, lock, `resolve_leader`, and
-  `delivery_heartbeat_path`.
+- `crates/waggledance/src/paseo.rs` — the `paseo` CLI client, `candidates`, `detect`,
+  `paseo_available`, the environment scrub, `TurnEnd`, labels, lock, `resolve_leader`,
+  `pick_workspace`, and `delivery_heartbeat_path`.
 - `crates/waggledance/src/mcp.rs` — `request_id`, `dispatch_to_leader`, and the paused
   warning.
 - `crates/waggledance/src/delivery.rs` — the delivery loop, restart recovery, and caller
