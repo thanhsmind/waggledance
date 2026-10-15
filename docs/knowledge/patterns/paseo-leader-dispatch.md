@@ -62,7 +62,12 @@ thinking = "high"
   every other rule in [Workspace resolution](#workspace-resolution).
 - `[paseo] provider`, `mode`, `thinking` — passed to `paseo run` for a new leader. A
   value set here wins over the same key in the global `[paseo]` block; an unset one
-  falls back to it, and both unset leaves the choice to Paseo.
+  falls back to it. `mode` and `thinking` unset are left to Paseo. `provider` is never
+  left unset, because `paseo run` refuses without one (`MISSING_PROVIDER`): with no
+  provider set anywhere, waggledance uses the first provider `paseo provider ls --json`
+  reports as available and enabled, and Paseo picks that provider's default model
+  (paseo-auto-wiring D8). Paseo reports such CLI errors as a JSON `error` object on
+  stderr; waggledance shows its code and message.
 
 The file is re-read when its modification time changes. A file that fails to parse is
 ignored as a whole, and the not-opted-in refusal names the settings page, the file path,

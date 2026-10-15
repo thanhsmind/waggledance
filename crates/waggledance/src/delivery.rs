@@ -863,6 +863,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_requeues_when_no_provider_is_available_and_never_runs() {
+        let r = rig();
+        r.fake.state.lock().unwrap().no_providers = true;
+        r.queue("proj-1", "run-1", "one", None);
+        r.tick().await;
+        assert_eq!(r.status("run-1"), "queued");
+        assert_eq!(r.engine.run_attempts("run-1").unwrap(), Some(1));
+        assert!(r.fake.calls().iter().all(|c| !matches!(c, Call::Run(_))));
+    }
+
+    #[tokio::test]
     async fn delivery_waits_out_the_backoff_before_a_retry() {
         let mut r = rig();
         r.delivery.backoff = [Duration::from_secs(600); 4];
