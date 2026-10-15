@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use waggledance_core::config::PaseoConfig;
 use waggledance_core::domain::Project;
+use waggledance_core::project_settings::ProjectPaseo;
 
 pub const ROLE_LABEL: &str = "waggledance.role=leader";
 pub const PROJECT_LABEL_KEY: &str = "waggledance.project";
@@ -34,12 +35,6 @@ pub enum PaseoError {
         command: String,
         message: String,
     },
-    #[error(
-        "project {project} has more than one local Paseo workspace at its root ({ids}); \
-         name one with `[[paseo.leaders]]` project = \"{project}\" and workspace = \"<id>\" \
-         in ~/.waggledance/config.toml"
-    )]
-    AmbiguousWorkspace { project: String, ids: String },
     #[error("paseo leader lock failed: {0}")]
     Lock(String),
     #[error("paseo prompt file failed: {0}")]
@@ -82,6 +77,29 @@ pub struct Workspace {
     pub cwd: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StoredWorkspace {
+    pub workspace_id: String,
+    pub created_at: Option<String>,
+    pub archived_at: Option<String>,
+    pub is_paseo_owned_worktree: bool,
+}
+
+pub fn store_path(paseo_home: Option<OsString>) -> Option<PathBuf> {
+    paseo_home
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".paseo")))
+        .map(|home| home.join("projects").join("workspaces.json"))
+}
+
+pub fn read_store(path: &Path) -> Vec<StoredWorkspace> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSpec {
     pub workspace: String,
@@ -99,6 +117,7 @@ pub trait Paseo: Send + Sync {
     async fn leaders(&self, project_id: &str) -> Result<Vec<String>>;
     async fn inspect(&self, id: &str) -> Result<AgentState>;
     async fn workspaces(&self) -> Result<Vec<Workspace>>;
+    fn stored_workspaces(&self) -> Vec<StoredWorkspace>;
     async fn create_workspace(&self, path: &Path) -> Result<String>;
     async fn run_and_wait(&self, spec: &RunSpec, timeout: Duration) -> Result<(String, TurnEnd)>;
     async fn send_and_wait(&self, id: &str, text: &str, timeout: Duration) -> Result<TurnEnd>;
@@ -618,6 +637,12 @@ impl Paseo for PaseoCli {
         parse_document(&out).map_err(|e| unparsable(&binary, "workspace", e))
     }
 
+    fn stored_workspaces(&self) -> Vec<StoredWorkspace> {
+        store_path(std::env::var_os("PASEO_HOME"))
+            .map(|p| read_store(&p))
+            .unwrap_or_default()
+    }
+
     async fn create_workspace(&self, path: &Path) -> Result<String> {
         let (binary, out) = self
             .exec(
@@ -777,6 +802,7 @@ pub struct Start {
     pub cwd: PathBuf,
     pub title: String,
     pub labels: Vec<String>,
+    pub reason: &'static str,
     provider: String,
     mode: String,
     thinking: String,
@@ -804,6 +830,7 @@ fn realpath(path: &Path) -> PathBuf {
 pub async fn resolve_leader(
     paseo: &dyn Paseo,
     config: &PaseoConfig,
+    settings: &ProjectPaseo,
     project: &Project,
 ) -> Result<Leader> {
     for id in paseo.leaders(&project.id).await? {
@@ -813,38 +840,61 @@ pub async fn resolve_leader(
             return Ok(Leader::Existing { id, busy });
         }
     }
-    let workspace = match config.workspace_for(&project.id, &project.name) {
-        Some(w) => w.to_string(),
-        None => {
-            let root = realpath(&project.root_path);
-            let matches: Vec<String> = paseo
-                .workspaces()
-                .await?
-                .into_iter()
-                .filter(|w| w.isolation == "local" && realpath(Path::new(&w.cwd)) == root)
-                .map(|w| w.id)
-                .collect();
-            match matches.as_slice() {
-                [] => paseo.create_workspace(&project.root_path).await?,
-                [one] => one.clone(),
-                _ => {
-                    return Err(PaseoError::AmbiguousWorkspace {
-                        project: project.name.clone(),
-                        ids: matches.join(", "),
-                    })
-                }
-            }
-        }
+    let configured = settings
+        .workspace
+        .clone()
+        .filter(|w| !w.is_empty())
+        .map(|w| (w, "file"))
+        .or_else(|| {
+            config
+                .workspace_for(&project.id, &project.name)
+                .map(|w| (w.to_string(), "deprecated-entry"))
+        });
+    let (workspace, reason) = match configured {
+        Some(found) => found,
+        None => pick_workspace(paseo, &project.root_path).await?,
+    };
+    let either = |file: &Option<String>, global: &str| {
+        file.clone()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| global.to_string())
     };
     Ok(Leader::Start(Start {
         workspace,
         cwd: project.root_path.clone(),
         title: format!("{} leader", project.name),
         labels: vec![ROLE_LABEL.to_string(), project_label(&project.id)],
-        provider: config.provider.clone(),
-        mode: config.mode.clone(),
-        thinking: config.thinking.clone(),
+        reason,
+        provider: either(&settings.provider, &config.provider),
+        mode: either(&settings.mode, &config.mode),
+        thinking: either(&settings.thinking, &config.thinking),
     }))
+}
+
+async fn pick_workspace(paseo: &dyn Paseo, root: &Path) -> Result<(String, &'static str)> {
+    let real = realpath(root);
+    let created: std::collections::HashMap<String, String> = paseo
+        .stored_workspaces()
+        .into_iter()
+        .filter_map(|w| Some((w.workspace_id, w.created_at?)))
+        .collect();
+    let picked = paseo
+        .workspaces()
+        .await?
+        .into_iter()
+        .filter(|w| w.isolation == "local" && realpath(Path::new(&w.cwd)) == real)
+        .map(|w| (created.get(&w.id).cloned(), w.id))
+        .min_by(|a, b| match (&a.0, &b.0) {
+            (Some(x), Some(y)) => x.cmp(y).then_with(|| a.1.cmp(&b.1)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.1.cmp(&b.1),
+        });
+    Ok(match picked {
+        Some((Some(_), id)) => (id, "oldest"),
+        Some((None, id)) => (id, "lowest-id"),
+        None => (paseo.create_workspace(root).await?, "created"),
+    })
 }
 
 #[cfg(test)]
@@ -871,6 +921,8 @@ pub mod fake {
         pub leaders: HashMap<String, Vec<String>>,
         pub agents: HashMap<String, AgentState>,
         pub workspaces: Vec<Workspace>,
+        pub workspaces_fail: bool,
+        pub store: Vec<StoredWorkspace>,
         pub logs: HashMap<String, String>,
         pub turn_ends: VecDeque<TurnEnd>,
         pub calls: Vec<Call>,
@@ -971,7 +1023,19 @@ pub mod fake {
 
         async fn workspaces(&self) -> Result<Vec<Workspace>> {
             self.record(Call::Workspaces);
-            Ok(self.state.lock().unwrap().workspaces.clone())
+            let s = self.state.lock().unwrap();
+            if s.workspaces_fail {
+                return Err(PaseoError::Failed {
+                    binary: "fake".into(),
+                    command: "workspace".into(),
+                    status: "exit status: 1".into(),
+                });
+            }
+            Ok(s.workspaces.clone())
+        }
+
+        fn stored_workspaces(&self) -> Vec<StoredWorkspace> {
+            self.state.lock().unwrap().store.clone()
         }
 
         async fn create_workspace(&self, path: &Path) -> Result<String> {
@@ -1058,16 +1122,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake = FakePaseo::default();
         fake.add_leader("proj-1", "a-idle", "idle", false);
-        let got = resolve_leader(&fake, &PaseoConfig::default(), &project(dir.path()))
-            .await
-            .unwrap();
+        let got = resolve_leader(
+            &fake,
+            &PaseoConfig::default(),
+            &ProjectPaseo::default(),
+            &project(dir.path()),
+        )
+        .await
+        .unwrap();
         assert!(matches!(got, Leader::Existing { ref id, busy: false } if id == "a-idle"));
 
         let fake = FakePaseo::default();
         fake.add_leader("proj-1", "a-init", "initializing", false);
-        let got = resolve_leader(&fake, &PaseoConfig::default(), &project(dir.path()))
-            .await
-            .unwrap();
+        let got = resolve_leader(
+            &fake,
+            &PaseoConfig::default(),
+            &ProjectPaseo::default(),
+            &project(dir.path()),
+        )
+        .await
+        .unwrap();
         assert!(matches!(got, Leader::Existing { ref id, busy: true } if id == "a-init"));
     }
 
@@ -1078,9 +1152,14 @@ mod tests {
         fake.add_leader("proj-1", "old", "idle", true);
         fake.add_workspace("wks_root", "local", dir.path());
         let s = start(
-            resolve_leader(&fake, &PaseoConfig::default(), &project(dir.path()))
-                .await
-                .unwrap(),
+            resolve_leader(
+                &fake,
+                &PaseoConfig::default(),
+                &ProjectPaseo::default(),
+                &project(dir.path()),
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(s.workspace, "wks_root");
         assert_eq!(s.title, "proj leader");
@@ -1107,31 +1186,122 @@ mod tests {
             ..PaseoConfig::default()
         };
         let s = start(
-            resolve_leader(&fake, &config, &project(dir.path()))
-                .await
-                .unwrap(),
+            resolve_leader(
+                &fake,
+                &config,
+                &ProjectPaseo::default(),
+                &project(dir.path()),
+            )
+            .await
+            .unwrap(),
         );
-        assert_eq!(s.workspace, "wks_cfg");
+        assert_eq!(
+            (s.workspace.as_str(), s.reason),
+            ("wks_cfg", "deprecated-entry")
+        );
         assert!(!fake.calls().contains(&Call::Workspaces));
     }
 
     #[tokio::test]
-    async fn two_root_workspaces_with_no_config_entry_refuse_naming_both() {
+    async fn several_root_workspaces_pick_the_oldest_from_the_store_without_refusing() {
         let dir = tempfile::tempdir().unwrap();
         let fake = FakePaseo::default();
-        fake.add_workspace("wks_a", "local", dir.path());
-        fake.add_workspace("wks_wt", "worktree", dir.path());
-        fake.add_workspace("wks_b", "local", &dir.path().join("."));
-        let err = resolve_leader(&fake, &PaseoConfig::default(), &project(dir.path()))
+        for id in ["wks_fixture_a", "wks_fixture_b", "wks_fixture_c"] {
+            fake.add_workspace(id, "local", dir.path());
+        }
+        fake.add_workspace("wks_fixture_wt", "worktree", dir.path());
+        fake.state.lock().unwrap().store = store_fixture();
+        let s = start(
+            resolve_leader(
+                &fake,
+                &PaseoConfig::default(),
+                &ProjectPaseo::default(),
+                &project(dir.path()),
+            )
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("wks_a") && err.contains("wks_b"), "{err}");
-        assert!(!err.contains("wks_wt"), "{err}");
-        assert!(
-            err.contains("[[paseo.leaders]]") && err.contains("workspace"),
-            "{err}"
+            .unwrap(),
         );
+        assert_eq!(
+            (s.workspace.as_str(), s.reason),
+            ("wks_fixture_b", "oldest")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_store_the_lowest_id_at_the_root_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakePaseo::default();
+        fake.add_workspace("wks_b", "local", dir.path());
+        fake.add_workspace("wks_a", "local", &dir.path().join("."));
+        let s = start(
+            resolve_leader(
+                &fake,
+                &PaseoConfig::default(),
+                &ProjectPaseo::default(),
+                &project(dir.path()),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!((s.workspace.as_str(), s.reason), ("wks_a", "lowest-id"));
+    }
+
+    #[tokio::test]
+    async fn the_project_file_workspace_and_model_override_the_pick_and_the_global_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakePaseo::default();
+        fake.add_workspace("wks_fixture_b", "local", dir.path());
+        fake.state.lock().unwrap().store = store_fixture();
+        let config = PaseoConfig {
+            provider: "codex".into(),
+            mode: "default".into(),
+            leaders: vec![PaseoLeader {
+                project: "proj".into(),
+                workspace: "wks_cfg".into(),
+            }],
+            ..PaseoConfig::default()
+        };
+        let settings = ProjectPaseo {
+            workspace: Some("wks_file".into()),
+            provider: Some("claude".into()),
+            ..ProjectPaseo::default()
+        };
+        let s = start(
+            resolve_leader(&fake, &config, &settings, &project(dir.path()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!((s.workspace.as_str(), s.reason), ("wks_file", "file"));
+        let spec = s.spec("t");
+        assert_eq!(
+            (spec.provider.as_str(), spec.mode.as_str()),
+            ("claude", "default")
+        );
+        assert!(!fake.calls().contains(&Call::Workspaces));
+    }
+
+    fn store_fixture() -> Vec<StoredWorkspace> {
+        read_store(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/fixtures/paseo-0.11.2/workspaces-store.json"),
+        )
+    }
+
+    #[test]
+    fn the_store_lives_under_paseo_home_and_parses_the_fixture() {
+        assert_eq!(
+            store_path(Some("/srv/ph".into())),
+            Some(PathBuf::from("/srv/ph/projects/workspaces.json"))
+        );
+        let store = store_fixture();
+        assert_eq!(store.len(), 5);
+        assert!(store
+            .iter()
+            .any(|w| w.workspace_id == "wks_fixture_archived" && w.archived_at.is_some()));
+        assert!(store
+            .iter()
+            .any(|w| w.workspace_id == "wks_fixture_owned" && w.is_paseo_owned_worktree));
+        assert!(read_store(Path::new("/nonexistent/workspaces.json")).is_empty());
     }
 
     #[tokio::test]
@@ -1141,9 +1311,14 @@ mod tests {
         let fake = FakePaseo::default();
         fake.add_workspace("wks_other", "local", other.path());
         let s = start(
-            resolve_leader(&fake, &PaseoConfig::default(), &project(dir.path()))
-                .await
-                .unwrap(),
+            resolve_leader(
+                &fake,
+                &PaseoConfig::default(),
+                &ProjectPaseo::default(),
+                &project(dir.path()),
+            )
+            .await
+            .unwrap(),
         );
         assert!(fake
             .calls()
@@ -1179,9 +1354,14 @@ mod tests {
             let root = dir.path().to_path_buf();
             handles.push(tokio::spawn(async move {
                 let _lock = LeaderLock::acquire(&root, "proj-1").await.unwrap();
-                let leader = resolve_leader(&*fake, &PaseoConfig::default(), &project(&root))
-                    .await
-                    .unwrap();
+                let leader = resolve_leader(
+                    &*fake,
+                    &PaseoConfig::default(),
+                    &ProjectPaseo::default(),
+                    &project(&root),
+                )
+                .await
+                .unwrap();
                 if let Leader::Start(s) = leader {
                     fake.run_and_wait(&s.spec("task"), Duration::from_secs(1))
                         .await

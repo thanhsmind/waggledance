@@ -10,6 +10,7 @@
 
 mod cli;
 mod delivery;
+mod discovery;
 mod doctor;
 mod guide;
 mod herdr;

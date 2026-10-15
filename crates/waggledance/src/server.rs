@@ -7508,10 +7508,9 @@ mod bee_route_tests {
     }
 
     fn build_state() -> AppState {
-        let engine = Arc::new(Engine::new(
-            SqliteStore::open_in_memory().unwrap(),
-            Config::default(),
-        ));
+        let mut config = Config::default();
+        config.paseo.enabled = Some(false);
+        let engine = Arc::new(Engine::new(SqliteStore::open_in_memory().unwrap(), config));
         let (reload_tx, _) = broadcast::channel(4);
         AppState {
             engine,
