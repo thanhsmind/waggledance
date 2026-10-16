@@ -2,12 +2,12 @@
 type: bee.pattern
 title: A request for a project reaches its one Paseo leader through waggledance_dispatch
 description: "Practice: with a working Paseo CLI found and the project opted into orchestration (its .waggledance.toml or its settings page), waggledance_dispatch with leader: true queues the task for the project's labelled Paseo leader; the daemon delivers it once, in order, only while the leader is idle, marks it done when Paseo reports that turn completed, and tells the caller."
-timestamp: 2026-10-15
+timestamp: 2026-10-16
 bee:
   id: paseo-leader-dispatch
   lifecycle: active
   areas: [orchestration]
-  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md]
+  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md]
   polarity: practice
   signature: request for a project running in Paseo
 ---
@@ -161,8 +161,14 @@ waggledance never infers done from an idle status or from log text.
 | Paseo answer | Run status |
 |--------------|------------|
 | the blocking call returns `completed` | `done` |
-| the blocking call returns `permission` | `blocked`; once no permission is pending and the leader is idle, `done` |
+| the blocking call returns `permission` | `blocked`; once no permission is pending, `paseo wait` decides: `idle` → `done`, `permission` → `blocked` again |
 | `turn_timeout_secs` passes, or any other status | `lost`, "the leader may still be finishing" |
+
+The `idle` that `paseo wait` reports after a permission is a turn end, not a guess from
+idle state. After `permit allow`, the agent stays `running`, and `wait` blocks until the
+turn ends. When the same turn asks for a second permission, `wait` reports `permission`
+instead (piggery-lessons D5). The fixtures `inspect-after-allow.out`,
+`wait-after-allow.out` and `wait-second-permission.out` pin all three answers.
 
 The transcript of a `done` run is the leader's text after the last `[User] <first line of
 the task>` in `paseo logs`. Paseo 0.11.2 ignores `logs --since`, so the reply is found by
@@ -196,6 +202,13 @@ they run no `paseo` command.
 | `done` | the turn ended; the transcript is the leader's reply |
 | `lost` | the turn's end was not seen; the transcript says why |
 
+The board shows a leader that needs the human (piggery-lessons D6). A leader run that
+is `blocked`, or `lost` within the last hour, is a leader wait. `GET /api/board` lists
+these waits as `leader_waiting: [{project_id, project_name, run_id, status, since,
+url}]`, newest first, and the project's home rail row shows one pill:
+"Leader waiting — permission" or "Leader lost — may still be finishing". When both kinds
+are present, the blocked pill is the one shown. Both read the runs table only.
+
 ## Caller notices
 
 When a run becomes `done`, `lost`, or `blocked`, waggledance tells the caller without
@@ -204,9 +217,21 @@ being asked (D4):
 - through the existing notify path, and
 - when the run has a caller that is not the leader itself, with one `paseo send
   --no-wait` to that agent. The notice goes out only while the caller is idle (D5),
-  after the status is written, and is retried for up to an hour. Notices for one caller
-  are combined into a single message per tick, followed by 30 seconds of quiet, because
-  Paseo still reports a just-messaged agent as idle for a few seconds.
+  and is retried for up to an hour. Notices for one caller are combined into a single
+  message per tick, followed by 30 seconds of quiet, because Paseo still reports a
+  just-messaged agent as idle for a few seconds.
+
+The notice is stored on its run row, not held in memory (piggery-lessons D7):
+
+- The row's `notice`, `notice_state` and `notice_until` columns hold it (runs
+  migration 6).
+- The run's status, final transcript and notice are written in one statement.
+- A notice is `pending` until it is sent (`sent`) or its hour runs out (`dropped`), so
+  a daemon restart keeps it and an expired one leaves a record.
+- A newer notice for the same run replaces one that is still pending. A `blocked`
+  notice that was not delivered before the run ended is therefore superseded by the
+  `done` notice.
+- Only the 30-second quiet per caller stays in memory.
 
 The notice text:
 
@@ -311,7 +336,12 @@ Three sources reach the same door, and each one names the project itself:
 - `crates/waggledance/src/setup.rs` — `waggledance setup paseo` and its leftover-line
   warnings.
 - `crates/waggledance-core/src/repository.rs` — runs migration 5: `request_id`,
-  `caller`, `attempts`, the queue and claim functions.
+  `caller`, `attempts`, the queue and claim functions. Migration 6 and its functions:
+  `notice`, `notice_state`, `notice_until`, `finish_run`, `pending_notices`,
+  `set_notice_state` and `list_leader_waits`.
+- `crates/waggledance/src/server.rs` — `api_board` with `leader_waiting`, and
+  `leader_waits_by_project` for the home rail. `views.rs` holds `proj_row_bee` and
+  `leader_wait_label`.
 - `crates/waggledance/src/paseo.rs` — the `paseo` CLI client, `candidates`, `detect`,
   `paseo_available`, the environment scrub, `TurnEnd`, labels, lock, `resolve_leader`,
   `pick_workspace`, and `delivery_heartbeat_path`.
