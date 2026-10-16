@@ -229,9 +229,11 @@ trống thật.**
   - *Hai hệ mail song song:* tránh được, vì không tích hợp piggery.
   - *Một máy với LAN/điện thoại:* đây là lý do H3 bị loại.
   - *Daemon thứ ba:* bị loại, xem mục trên.
-- **Các digest gửi đi chưa về kịp:** hai digest đọc piggery và repo qua agent
-  phụ không trả kết quả trước khi bản này được viết. Mọi bằng chứng ở trên do
-  phiên chính tự đọc trực tiếp.
+- **Nguồn bằng chứng:** mọi bằng chứng ở trên do phiên chính tự đọc trực tiếp.
+  Digest piggery do agent phụ đọc về sau cùng khớp: timer theo
+  `internal/.../watch.go:13-15`, notify theo `notify.go:144-149`, `--no-start`
+  theo `cli/cli.go:97-106`. Digest đọc repo này bị dừng trước khi xong và không
+  được dùng.
 
 ## Source Pack
 
