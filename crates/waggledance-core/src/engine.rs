@@ -513,6 +513,10 @@ impl Engine {
         self.store.list_inflight_paseo_runs()
     }
 
+    pub fn list_leader_waits(&self, lost_since: &str) -> Result<Vec<Run>> {
+        self.store.list_leader_waits(lost_since)
+    }
+
     pub fn list_files(&self, project_id: &str) -> Result<Vec<IndexedFile>> {
         self.store.list_files(project_id)
     }

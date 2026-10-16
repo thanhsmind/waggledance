@@ -258,6 +258,19 @@ impl SqliteStore {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    pub fn list_leader_waits(&self, lost_since: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs
+             WHERE pane_id LIKE 'paseo:%'
+               AND (status='blocked' OR (status='lost' AND updated_at >= ?1))
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![lost_since], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Update a run's status (and its `updated_at` stamp). `baseline`/`marker`
     /// are optionally replaced too, for a re-send against the same run row.
     pub fn update_run_status(
@@ -1441,6 +1454,58 @@ mod tests {
             vec!["r-paseo"]
         );
         assert!(s.list_unattended_working_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn leader_waits_are_blocked_paseo_runs_and_only_recent_lost_ones() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for (id, pane, status, updated_at) in [
+            (
+                "r-blocked",
+                "paseo:agent-1",
+                "blocked",
+                "2026-10-16T09:00:00Z",
+            ),
+            (
+                "r-lost-inside",
+                "paseo:agent-2",
+                "lost",
+                "2026-10-16T10:30:00Z",
+            ),
+            (
+                "r-lost-outside",
+                "paseo:agent-3",
+                "lost",
+                "2026-10-16T08:00:00Z",
+            ),
+            (
+                "r-working",
+                "paseo:agent-4",
+                "working",
+                "2026-10-16T10:40:00Z",
+            ),
+            (
+                "r-herdr-blocked",
+                "w1:p1",
+                "blocked",
+                "2026-10-16T10:40:00Z",
+            ),
+        ] {
+            let mut run = sample_run();
+            run.id = id.into();
+            run.pane_id = pane.into();
+            run.status = status.into();
+            run.updated_at = updated_at.into();
+            s.insert_run(&run, None).unwrap();
+        }
+        let waits = s.list_leader_waits("2026-10-16T10:00:00Z").unwrap();
+        assert_eq!(
+            waits.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-lost-inside", "r-blocked"],
+            "blocked always counts, lost only inside the window, and neither a working nor a \
+             herdr-pane run is a leader wait: {waits:?}"
+        );
     }
 
     /// A database whose `runs` table predates the `feature` column: SCHEMA's
