@@ -135,6 +135,16 @@ context before planning or executing.
 <!-- /rule -->
 - Write "done", "green", or "fixed" only beside fresh command output
   in the same message, naming the command or path first.
+- Report the whole proof, never the flattering half: name what was
+  skipped, filtered, or narrowed beside what passed. Freshness is not
+  completeness — a scoped-green cap that quotes the suite it ran and
+  omits the one it never ran satisfies the rule above and is still a
+  misleading report.
+- Cheapest proof first. Before an expensive wave or a long run, run the
+  short check that would catch a broken environment, and stop on its
+  red rather than paying for the long one. A run narrowed by a flag or
+  a filter says so wherever its result is reported — a narrowed check
+  is never quoted as the whole one.
 - Evidence is what the build already emits — red test output, a diff,
   a stack trace. Never author an artifact whose only purpose is to be
   deleted as proof.
@@ -195,7 +205,9 @@ not: a Task-tool subagent inherits the session's OS cwd, so dispatching an
 execution worker while cwd is main cannot write into the feature's
 worktree and dies on the write guard. Move the session into the worktree
 (EnterWorktree, or a session/pane opened at the worktree path) before
-dispatching execution workers.
+dispatching execution workers. Follow the `instruction` line bee prints
+on `worktree new`, `enter`, `exit` and `merge`; leave with `bee worktree exit`;
+never `cd` to main inside a shell call to merge.
 
 File overlap with an in-flight cell or live worktree is triage data,
 never a user question: take disjoint items first, split scope to the
@@ -292,14 +304,47 @@ one type per file, linked where types meet.
   cell id rides the last line of the body as a trailer (`cell: <id>`),
   and the diff carries the numbers.
 <!-- /rule -->
+<!-- rule: agents-no-code-comments -->
+- No comment in code, in any language: not `//`, not `///` or `//!`,
+  not `/* */`, not `#`. The why a comment used to carry has two homes
+  and no third — a `docs/knowledge` concept whose Pointers name the
+  file, or a `bee decisions log` entry; a public item's description
+  lives in the owning concept; a workaround is fixed, or filed with
+  `bee backlog add` and cited from the concept, never from the code.
+  Three exceptions only: a `#!` line, a `SAFETY:` line on an unsafe
+  block, and a license header at the top of a file. Where
+  `no_code_comments` is on, the write guard refuses the write, and the
+  comment baseline reds the suite on any count that rises.
+<!-- /rule -->
+<!-- rule: agents-bee-defect-report -->
+- When bee itself is at fault — a crash, a typed error on correct
+  input, a wrong result, or a guard refusing work that is approved and
+  correct — run `bee report issue --title --symptom --evidence
+  --root-cause --command`, and add bee's exact output with `--output`.
+  It files a scrubbed issue upstream on its own; add `--dry-run` first
+  when unsure. One report per defect, never one per retry. After
+  filing, tell the human the issue link in one line. On a gh error,
+  tell the human once to run `gh auth login`, then keep working. Never
+  patch, rebuild or hand-edit bee in this repo. Not a bee defect: a
+  deny that names its remedy, a gate waiting for approval, or your own
+  mistake — that one is `bee mailbox reflect`.
+<!-- /rule -->
 - Write a mistake down the MOMENT you notice it, never composed from
   memory at the end: `bee mailbox reflect --wrong "<what went wrong>"
-  --better "<what would have been better>"`. Name a concrete thing in
+  --better "<what would have been better>" --fix-at
+  <architecture|check|doctrine|none>`. Name a concrete thing in
   the first part — a file, a command, or something you saw — never
-  "the approach". A cap answers the same question for its own cell
-  (`--mistake "<wrong> — <better>"`, or `--no-mistakes` when it hit
-  none), and `bee close` refuses a feature whose capped cells never
-  answered: silence and a clean run must not read alike.
+  "the approach". The layer is required and names what stops the
+  mistake coming back: `architecture` — a code change makes the
+  mistake impossible; `check` — a test, hook, guard or doctor row
+  catches it; `doctrine` — only prose can carry it; `none` — a one-off
+  nobody would guard. Pick the strongest layer someone would actually
+  build now: a known and accepted state is `doctrine`, and a mistake
+  nobody would guard against is `none`. A cap answers the same
+  question for its own cell (`--mistake "<wrong> — <better>" --fix-at
+  <layer>`, or `--no-mistakes` when it hit none), and `bee close`
+  refuses a feature whose capped cells never answered: silence and a
+  clean run must not read alike.
 - Before ending substantial work: cap or release every claimed cell,
   release reservations, leave `.bee/state.json` honest, run
   `commands.test` over what changed when one is recorded, and name the
@@ -322,7 +367,9 @@ references, loaded when routing work: lanes and gate wording; § Gate
 bypass mode; § Progress ticks; § Judgment contract; § Goal-check
 judge tier; § Concurrency law in full; § Delegation contract;
 § Hat wave (the plan-step consult, single home); § Blind lanes and
-convergence; worktrees; plus the worker contract
+convergence; the class-bound playbook each route class cites
+(`bee-planning/references/planning-reference.md`, "Playbooks");
+worktrees; plus the worker contract
 in `bee-swarming` ("Execute") — including native-Codex subagent tending on
 a Codex runtime — the capture discipline in
 `bee-capturing` ("Capture the moment it settles"), and the question
