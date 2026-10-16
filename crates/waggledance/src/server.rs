@@ -1078,6 +1078,10 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 String,
                 &waggledance_core::bee::BeeProjectRollup,
             > = rollups.iter().map(|(p, r)| (p.id.clone(), r)).collect();
+            let leader_waits = leader_waits_by_project(
+                &st.engine,
+                with_counts.iter().map(|(p, _, _)| p.id.as_str()),
+            );
             // home-terminal-parity-2: the same configured D8 preset labels
             // `terminal_page_inner` already threads into `terminal_page`, so
             // the Terminals tab's own create controls offer the same set.
@@ -1094,6 +1098,7 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 terminals_herdr_ok,
                 &terminals_presets,
                 &bee_by_project,
+                &leader_waits,
             ))
             .into_response()
         }
@@ -1301,16 +1306,70 @@ async fn api_projects(State(st): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_board(State(st): State<AppState>) -> impl IntoResponse {
-    let bee_projects: Vec<waggledance_core::domain::Project> = st
-        .engine
-        .list_projects()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(is_bee_project)
+    let projects: Vec<waggledance_core::domain::Project> =
+        st.engine.list_projects().unwrap_or_default();
+    let bee_projects: Vec<waggledance_core::domain::Project> = projects
+        .iter()
+        .filter(|p| is_bee_project(p))
+        .cloned()
         .collect();
     let rollups = cross_project_rollup(st.bee_cache.clone(), bee_projects).await;
     let refs: Vec<_> = rollups.iter().map(|(p, r)| (p, r)).collect();
-    Json(views::bee_board_json(&refs))
+    let mut value = views::bee_board_json(&refs);
+    let by_id: std::collections::HashMap<&str, &waggledance_core::domain::Project> =
+        projects.iter().map(|p| (p.id.as_str(), p)).collect();
+    value["leader_waiting"] = leader_waiting_json(&leader_wait_runs(&st.engine), &by_id);
+    Json(value)
+}
+
+fn leader_waiting_json(
+    runs: &[waggledance_core::domain::Run],
+    projects: &std::collections::HashMap<&str, &waggledance_core::domain::Project>,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        runs.iter()
+            .filter_map(|run| {
+                let project = projects.get(run.project_id.as_str())?;
+                Some(json!({
+                    "project_id": project.id,
+                    "project_name": project.name,
+                    "run_id": run.id,
+                    "status": run.status,
+                    "since": run.updated_at,
+                    "url": format!("/p/{}/", project.id),
+                }))
+            })
+            .collect(),
+    )
+}
+
+const LEADER_LOST_WINDOW: time::Duration = time::Duration::hours(1);
+
+fn leader_wait_runs(engine: &waggledance_core::Engine) -> Vec<waggledance_core::domain::Run> {
+    let lost_since = (time::OffsetDateTime::now_utc() - LEADER_LOST_WINDOW)
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    engine.list_leader_waits(&lost_since).unwrap_or_default()
+}
+
+fn leader_waits_by_project<'a>(
+    engine: &waggledance_core::Engine,
+    project_ids: impl Iterator<Item = &'a str>,
+) -> views::LeaderWaitsByProject {
+    let registered: std::collections::HashSet<&str> = project_ids.collect();
+    let mut by_project: views::LeaderWaitsByProject = std::collections::HashMap::new();
+    for run in leader_wait_runs(engine) {
+        if registered.contains(run.project_id.as_str()) {
+            by_project
+                .entry(run.project_id.clone())
+                .or_default()
+                .push(views::LeaderWait {
+                    status: run.status.clone(),
+                    since: run.updated_at.clone(),
+                });
+        }
+    }
+    by_project
 }
 
 /// One project's public API summary. Deliberately omits the absolute
@@ -8706,6 +8765,92 @@ mod bee_route_tests {
         assert!(!body.contains("root_path"), "{body}");
         assert!(!body.contains(root.to_str().unwrap()), "{body}");
         assert!(!body.contains(sibling.to_str().unwrap()), "{body}");
+    }
+
+    #[tokio::test]
+    async fn api_board_lists_leader_waits_for_blocked_and_recent_lost_paseo_runs() {
+        let root = fresh_root("api-board-leader-waits");
+        write(
+            &root,
+            ".bee/lanes/wait-feat.json",
+            &lane_json(
+                "wait-feat",
+                "swarming",
+                "standard",
+                "keep going",
+                None,
+                None,
+            ),
+        );
+        let st = build_state();
+        let project = register(&st, &root, "api-board-leader-waits");
+        for (id, pane, status, updated_at) in [
+            ("run-blocked", "paseo:a", "blocked", rfc3339_minutes_ago(30)),
+            ("run-lost", "paseo:b", "lost", rfc3339_minutes_ago(10)),
+            ("run-working", "paseo:c", "working", rfc3339_minutes_ago(5)),
+            (
+                "run-stale-lost",
+                "paseo:d",
+                "lost",
+                rfc3339_minutes_ago(120),
+            ),
+            (
+                "run-herdr-blocked",
+                "w1:p1",
+                "blocked",
+                rfc3339_minutes_ago(5),
+            ),
+        ] {
+            st.engine
+                .insert_run(
+                    &waggledance_core::domain::Run {
+                        id: id.into(),
+                        project_id: project.id.clone(),
+                        pane_id: pane.into(),
+                        preset_label: Some("claude".into()),
+                        task: "lead the run".into(),
+                        baseline: String::new(),
+                        marker: "HERDR_DONE_abc123".into(),
+                        status: status.into(),
+                        created_at: updated_at.clone(),
+                        updated_at,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+
+        let resp = get(router(st), "/api/board").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        let waits = v["leader_waiting"]
+            .as_array()
+            .expect("leader_waiting array");
+        let ids: Vec<&str> = waits
+            .iter()
+            .map(|w| w["run_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["run-lost", "run-blocked"],
+            "only the blocked run and the freshly lost one are leader waits, newest first: {body}"
+        );
+        assert_eq!(waits[0]["project_id"], project.id.as_str());
+        assert_eq!(waits[0]["project_name"], "api-board-leader-waits");
+        assert_eq!(waits[0]["status"], "lost");
+        assert!(
+            waits[0]["since"].as_str().unwrap().starts_with("20"),
+            "{body}"
+        );
+        assert_eq!(waits[0]["url"], format!("/p/{}/", project.id));
+        assert_eq!(waits[1]["status"], "blocked");
+
+        assert!(v["in_progress"].is_array(), "{body}");
+        assert!(v["ready_to_merge"].is_array(), "{body}");
+        assert!(!body.contains(root.to_str().unwrap()), "{body}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// (console-theme-kanban ctk-8, widened by bee-agent-activity R1 —

@@ -1986,6 +1986,27 @@ mod tests {
     }
 
     #[test]
+    fn the_after_permission_wait_ends_at_the_turn_not_the_allow() {
+        let allowed = parse_inspect(fixture!("inspect-after-allow.out")).unwrap();
+        assert_eq!(allowed.status, "running");
+        assert_eq!(allowed.pending_permissions, 0);
+        assert!(allowed.permissions.is_empty());
+        match parse_turn_end(fixture!("wait-after-allow.out")).unwrap().1 {
+            TurnEnd::Other { status, message } => {
+                assert_eq!(status, "idle");
+                assert!(message.contains("PERM-DONE"), "{message}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+        assert_eq!(
+            parse_turn_end(fixture!("wait-second-permission.out"))
+                .unwrap()
+                .1,
+            TurnEnd::Permission
+        );
+    }
+
+    #[test]
     fn inspect_fixtures_name_status_and_pending_permissions() {
         let pending = parse_inspect(fixture!("inspect-pending.out")).unwrap();
         assert_eq!(pending.status, "running");

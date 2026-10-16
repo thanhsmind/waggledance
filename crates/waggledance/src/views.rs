@@ -243,6 +243,7 @@ pub fn home_page(
     // A project with no `.bee/` (or with the roll-up read skipped entirely) is
     // simply absent from the map and its row stays exactly as it was.
     bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
+    leader_waits: &LeaderWaitsByProject,
 ) -> String {
     // console-theme-kanban (ctk-12), retargeting homepage-tabs edge (b):
     // this line used to force the Projects tab, because that was the only
@@ -292,6 +293,7 @@ pub fn home_page(
                     // button is what is current here.
                     None,
                     bee_by_project,
+                    leader_waits,
                 ),
                 // D1 (backlog-groom-2): an empty `cross_features_html`
                 // (D9 — no registered project carries a `.bee` board) used
@@ -345,6 +347,7 @@ pub fn home_page(
                     effective_pane(terminals_panes, terminals_selected_pane)
                         .map(|p| p.view.pane_id.as_str()),
                     bee_by_project,
+                    leader_waits,
                 ),
                 body = terminals_tab(
                     terminals_panes,
@@ -1138,6 +1141,7 @@ fn project_sidebar(
     // doing, and does it want me" belongs on the row rather than in the
     // feature-column section beside it.
     bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
+    leader_waits: &LeaderWaitsByProject,
 ) -> String {
     let listing = if projects.is_empty() {
         "<p class=\"fg-empty\">Chưa có project nào trong Waggle Dance. Đăng ký: <code>waggledance register &lt;dir&gt;</code> hoặc gọi MCP <code>waggledance_view_file</code>.</p>".to_string()
@@ -1213,7 +1217,10 @@ fn project_sidebar(
                     // registered project with its own `.bee/`, so it reads
                     // its own row's line here rather than borrowing its
                     // parent's.
-                    proj_row_bee(bee_by_project.get(&bp.id).copied()),
+                    proj_row_bee(
+                        bee_by_project.get(&bp.id).copied(),
+                        leader_waits.get(&bp.id).map(Vec::as_slice).unwrap_or(&[]),
+                    ),
                     project_badges(&bp.id, bpanes),
                 );
                 // D1/D1a/D2/D3/D5: a sibling of `proj-row__link`, never
@@ -1254,7 +1261,10 @@ fn project_sidebar(
                 // badge block — what the project is DOING is what the
                 // reader came to this rail for; the agents running there
                 // annotate it.
-                proj_row_bee(bee_by_project.get(&p.id).copied()),
+                proj_row_bee(
+                    bee_by_project.get(&p.id).copied(),
+                    leader_waits.get(&p.id).map(Vec::as_slice).unwrap_or(&[]),
+                ),
                 project_badges(&p.id, panes),
             );
             // The summary is the name line and nothing else: the dot, the
@@ -1576,6 +1586,16 @@ fn proj_row_meta(count: usize, last_seen_at: &str) -> String {
 /// side of its own.
 const RAIL_WAIT_LABEL: &str = "Waiting on you";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderWait {
+    pub status: String,
+    pub since: String,
+}
+
+pub type LeaderWaitsByProject = std::collections::HashMap<String, Vec<LeaderWait>>;
+
+pub const LEADER_WAIT_BLOCKED: &str = "Leader waiting — permission";
+const LEADER_WAIT_LOST: &str = "Leader lost — may still be finishing";
 /// (board-visibility bv-6) How much of a recorded subject the rail pill
 /// spends on screen. The rail is a 259px column (`app.css`, ctk-13) and this
 /// row must stay ONE line, so a subject that is free text of any length gets
@@ -1665,7 +1685,41 @@ fn bee_rail_wait_clip(subject: &str, max_chars: usize) -> String {
 /// one flex line under the name, and the modifier classes are style hooks
 /// that need no rule to render correctly. The wait says its own word, so it
 /// never depends on colour to be read.
-fn proj_row_bee(rollup: Option<&BeeProjectRollup>) -> String {
+fn proj_row_bee(rollup: Option<&BeeProjectRollup>, leader_waits: &[LeaderWait]) -> String {
+    let mut pills = proj_row_bee_pills(rollup);
+    if let Some(wait) = leader_wait(leader_waits) {
+        pills.push_str(&format!(
+            r#"<span class="proj-row__badge proj-row__badge--leader-wait" title="{since}">{label}</span>"#,
+            label = wait.label,
+            since = esc(&wait.since),
+        ));
+    }
+    if pills.is_empty() {
+        return String::new();
+    }
+    format!(r#"<div class="proj-row__badges proj-row__badges--bee">{pills}</div>"#)
+}
+
+struct LeaderWaitPill<'a> {
+    label: &'static str,
+    since: &'a str,
+}
+
+fn leader_wait(waits: &[LeaderWait]) -> Option<LeaderWaitPill<'_>> {
+    if let Some(w) = waits.iter().find(|w| w.status == "blocked") {
+        return Some(LeaderWaitPill {
+            label: LEADER_WAIT_BLOCKED,
+            since: &w.since,
+        });
+    }
+    let w = waits.iter().find(|w| w.status == "lost")?;
+    Some(LeaderWaitPill {
+        label: LEADER_WAIT_LOST,
+        since: &w.since,
+    })
+}
+
+fn proj_row_bee_pills(rollup: Option<&BeeProjectRollup>) -> String {
     let Some(rollup) = rollup else {
         return String::new();
     };
@@ -1726,7 +1780,7 @@ fn proj_row_bee(rollup: Option<&BeeProjectRollup>) -> String {
             )),
         }
     }
-    format!(r#"<div class="proj-row__badges proj-row__badges--bee">{pills}</div>"#)
+    pills
 }
 
 /// A rail row's actions menu -- a native `<details>`, so it opens and
@@ -11724,6 +11778,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
@@ -11753,6 +11808,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -11787,6 +11843,7 @@ mod tests {
                 None,
                 true,
                 &[],
+                &std::collections::HashMap::new(),
                 &std::collections::HashMap::new(),
             );
             assert!(
@@ -11850,6 +11907,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let select = body
@@ -11969,6 +12027,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         for hook in [
             "data-new-task-open",
@@ -12017,6 +12076,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             home_html.contains("data-agent-drawer-homepage"),
@@ -12060,6 +12120,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -12215,6 +12276,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         // The board itself is still here — the rail joined the Kanban tab,
@@ -12333,6 +12395,7 @@ mod tests {
             true,
             &[],
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         let shell_at = body
@@ -12388,6 +12451,7 @@ mod tests {
             None,
             &[],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -12482,7 +12546,16 @@ mod tests {
         .collect();
         let projects = vec![(busy, 3, Vec::new()), (idle, 0, Vec::new())];
 
-        let rail = project_sidebar(&projects, false, &[], None, &[], None, &bee_by_project);
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &bee_by_project,
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             rail.contains(
@@ -12554,6 +12627,7 @@ mod tests {
             true,
             &[],
             &bee_by_project,
+            &std::collections::HashMap::new(),
         );
         assert!(
             page.contains(
@@ -12644,7 +12718,16 @@ mod tests {
             .zip(rollups.iter())
             .collect();
 
-        let rail = project_sidebar(&projects, false, &[], None, &[], None, &bee_by_project);
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &bee_by_project,
+            &std::collections::HashMap::new(),
+        );
 
         // A sentence a human wrote wins the pill: the label still leads it,
         // the clipped text follows in the row's own free-text span, and the
@@ -12692,6 +12775,111 @@ mod tests {
         for r in roots {
             let _ = std::fs::remove_dir_all(r);
         }
+    }
+
+    #[test]
+    fn a_leader_wait_renders_one_pill_on_its_projects_rail_row() {
+        let project = |id: &str| {
+            let mut p = sample_project();
+            p.id = id.into();
+            p.name = id.into();
+            p
+        };
+        let projects = vec![
+            (project("blocked"), 0, Vec::new()),
+            (project("lost"), 0, Vec::new()),
+            (project("both"), 0, Vec::new()),
+            (project("quiet"), 0, Vec::new()),
+        ];
+        let mut leader_waits: LeaderWaitsByProject = std::collections::HashMap::new();
+        leader_waits.insert(
+            "blocked".into(),
+            vec![LeaderWait {
+                status: "blocked".into(),
+                since: "2026-10-16T10:00:00Z".into(),
+            }],
+        );
+        leader_waits.insert(
+            "lost".into(),
+            vec![LeaderWait {
+                status: "lost".into(),
+                since: "2026-10-16T10:30:00Z".into(),
+            }],
+        );
+        leader_waits.insert(
+            "both".into(),
+            vec![
+                LeaderWait {
+                    status: "lost".into(),
+                    since: "2026-10-16T10:30:00Z".into(),
+                },
+                LeaderWait {
+                    status: "blocked".into(),
+                    since: "2026-10-16T10:00:00Z".into(),
+                },
+            ],
+        );
+
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &leader_waits,
+        );
+
+        assert_eq!(
+            rail.matches(LEADER_WAIT_BLOCKED).count(),
+            2,
+            "the blocked project and the both-waits project each carry the permission pill, \
+             with no bee roll-up to lean on: {rail}"
+        );
+        assert_eq!(
+            rail.matches(LEADER_WAIT_LOST).count(),
+            1,
+            "the lost project carries the lost pill, and the both-waits project does not -- \
+             blocked wins: {rail}"
+        );
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--leader-wait" title="2026-10-16T10:00:00Z">Leader waiting — permission</span>"#
+            ),
+            "the pill wears the row's own badge vocabulary and keeps the run's own timestamp \
+             reachable: {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badge--leader-wait").count(),
+            3,
+            "one pill per project that has a leader wait, and none for the quiet project: {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badges--bee").count(),
+            3,
+            "the quiet project renders no badge block at all, not an empty one: {rail}"
+        );
+
+        let page = home_page(
+            &projects,
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Kanban,
+            &[],
+            None,
+            true,
+            &[],
+            &std::collections::HashMap::new(),
+            &leader_waits,
+        );
+        assert!(
+            page.contains(LEADER_WAIT_BLOCKED) && page.contains(LEADER_WAIT_LOST),
+            "the whole path, not the helper alone: the board's own rail must carry both pills: \
+             {page}"
+        );
     }
 
     /// board-visibility bv-6: the rail is a 259px column and its row stays
@@ -12746,6 +12934,7 @@ mod tests {
             &[pane],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -12785,6 +12974,7 @@ mod tests {
             &[plain],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             quiet.contains(r#"<span class="pinned-row__meta">· agent</span>"#),
@@ -12815,6 +13005,7 @@ mod tests {
             Some("does-not-exist"),
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -12884,6 +13075,7 @@ mod tests {
             &[],
             None,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
 
         assert!(
@@ -12927,6 +13119,7 @@ mod tests {
             None,
             &pinned,
             Some("w1:p2"),
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert_eq!(
@@ -13041,6 +13234,7 @@ mod tests {
             None,
             &[],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
 
@@ -13217,6 +13411,7 @@ mod tests {
             None,
             &[],
             None,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(
@@ -14653,6 +14848,7 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert!(

@@ -456,6 +456,30 @@ impl Engine {
         self.store.set_run_final_transcript(id, transcript)
     }
 
+    pub fn finish_run(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: &str,
+        transcript: Option<&str>,
+        notice: Option<(&str, &str)>,
+    ) -> Result<()> {
+        self.store
+            .finish_run(id, status, updated_at, transcript, notice)
+    }
+
+    pub fn pending_notices(&self) -> Result<Vec<(String, String, String, String)>> {
+        self.store.pending_notices()
+    }
+
+    pub fn set_notice_state(&self, run_id: &str, state: &str) -> Result<()> {
+        self.store.set_notice_state(run_id, state)
+    }
+
+    pub fn run_notice_state(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_notice_state(id)
+    }
+
     /// The transcript a finished run ended with — `None` while it is still
     /// working, and for rows written before the column existed.
     pub fn run_final_transcript(&self, id: &str) -> Result<Option<String>> {
@@ -511,6 +535,10 @@ impl Engine {
 
     pub fn list_inflight_paseo_runs(&self) -> Result<Vec<Run>> {
         self.store.list_inflight_paseo_runs()
+    }
+
+    pub fn list_leader_waits(&self, lost_since: &str) -> Result<Vec<Run>> {
+        self.store.list_leader_waits(lost_since)
     }
 
     pub fn list_files(&self, project_id: &str) -> Result<Vec<IndexedFile>> {
@@ -1150,6 +1178,30 @@ mod tests {
         assert_eq!(
             engine.run_final_transcript("r1").unwrap().as_deref(),
             Some("final delta")
+        );
+
+        engine
+            .finish_run(
+                "r1",
+                "done",
+                "2026-08-16T00:06:00Z",
+                Some("final delta"),
+                Some(("notice text", "2026-08-16T01:00:00Z")),
+            )
+            .unwrap();
+        assert_eq!(engine.get_run("r1").unwrap().unwrap().status, "done");
+        assert_eq!(
+            engine.get_run("r1").unwrap().unwrap().updated_at,
+            "2026-08-16T00:06:00Z"
+        );
+        assert!(
+            engine.pending_notices().unwrap().is_empty(),
+            "a run with no caller owes nobody a notice"
+        );
+        engine.set_notice_state("r1", "dropped").unwrap();
+        assert_eq!(
+            engine.run_notice_state("r1").unwrap().as_deref(),
+            Some("dropped")
         );
 
         std::fs::remove_dir_all(&dir).ok();

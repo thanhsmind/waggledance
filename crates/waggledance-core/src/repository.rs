@@ -258,6 +258,19 @@ impl SqliteStore {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    pub fn list_leader_waits(&self, lost_since: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs
+             WHERE pane_id LIKE 'paseo:%'
+               AND (status='blocked' OR (status='lost' AND updated_at >= ?1))
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![lost_since], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Update a run's status (and its `updated_at` stamp). `baseline`/`marker`
     /// are optionally replaced too, for a re-send against the same run row.
     pub fn update_run_status(
@@ -402,6 +415,71 @@ impl SqliteStore {
     pub fn run_final_transcript(&self, id: &str) -> Result<Option<String>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare("SELECT final_transcript FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
+    }
+
+    pub fn finish_run(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: &str,
+        transcript: Option<&str>,
+        notice: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET status=?2, updated_at=?3,
+               final_transcript=COALESCE(?4, final_transcript),
+               notice=COALESCE(?5, notice),
+               notice_state=CASE WHEN ?5 IS NULL THEN notice_state ELSE 'pending' END,
+               notice_until=COALESCE(?6, notice_until)
+             WHERE id=?1",
+            params![
+                id,
+                status,
+                updated_at,
+                transcript,
+                notice.map(|(text, _)| text),
+                notice.map(|(_, until)| until),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_notices(&self) -> Result<Vec<(String, String, String, String)>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id, caller, notice, notice_until FROM runs
+             WHERE notice_state='pending' AND caller IS NOT NULL AND notice IS NOT NULL
+             ORDER BY updated_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn set_notice_state(&self, run_id: &str, state: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET notice_state=?2 WHERE id=?1",
+            params![run_id, state],
+        )?;
+        Ok(())
+    }
+
+    pub fn run_notice_state(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT notice_state FROM runs WHERE id=?1")?;
         let mut rows = stmt.query(params![id])?;
         Ok(rows
             .next()?
@@ -671,10 +749,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (3, migration_3_runs_feature),
     (4, migration_4_runs_final_transcript),
     (5, migration_5_runs_request),
+    (6, migration_6_runs_notice),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -776,6 +855,19 @@ fn migration_5_runs_request(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migration_6_runs_notice(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "runs", "notice")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN notice TEXT", [])?;
+    }
+    if !has_column(conn, "runs", "notice_state")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN notice_state TEXT", [])?;
+    }
+    if !has_column(conn, "runs", "notice_until")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN notice_until TEXT", [])?;
+    }
+    Ok(())
+}
+
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
@@ -865,7 +957,10 @@ CREATE TABLE IF NOT EXISTS runs (
     final_transcript TEXT,
     request_id TEXT,
     caller TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0,
+    notice TEXT,
+    notice_state TEXT,
+    notice_until TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
 "#;
@@ -1443,6 +1538,58 @@ mod tests {
         assert!(s.list_unattended_working_runs().unwrap().is_empty());
     }
 
+    #[test]
+    fn leader_waits_are_blocked_paseo_runs_and_only_recent_lost_ones() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for (id, pane, status, updated_at) in [
+            (
+                "r-blocked",
+                "paseo:agent-1",
+                "blocked",
+                "2026-10-16T09:00:00Z",
+            ),
+            (
+                "r-lost-inside",
+                "paseo:agent-2",
+                "lost",
+                "2026-10-16T10:30:00Z",
+            ),
+            (
+                "r-lost-outside",
+                "paseo:agent-3",
+                "lost",
+                "2026-10-16T08:00:00Z",
+            ),
+            (
+                "r-working",
+                "paseo:agent-4",
+                "working",
+                "2026-10-16T10:40:00Z",
+            ),
+            (
+                "r-herdr-blocked",
+                "w1:p1",
+                "blocked",
+                "2026-10-16T10:40:00Z",
+            ),
+        ] {
+            let mut run = sample_run();
+            run.id = id.into();
+            run.pane_id = pane.into();
+            run.status = status.into();
+            run.updated_at = updated_at.into();
+            s.insert_run(&run, None).unwrap();
+        }
+        let waits = s.list_leader_waits("2026-10-16T10:00:00Z").unwrap();
+        assert_eq!(
+            waits.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-lost-inside", "r-blocked"],
+            "blocked always counts, lost only inside the window, and neither a working nor a \
+             herdr-pane run is a leader wait: {waits:?}"
+        );
+    }
+
     /// A database whose `runs` table predates the `feature` column: SCHEMA's
     /// `CREATE TABLE IF NOT EXISTS` leaves it exactly as it was, so the
     /// migration step is the only thing that can add the column. The old row
@@ -1657,6 +1804,116 @@ mod tests {
         );
         assert_eq!(s.run_attempts("r-old").unwrap(), Some(0));
         assert_eq!(s.run_caller("r-old").unwrap(), None);
+    }
+
+    #[test]
+    fn migrate_adds_the_runs_notice_columns_to_a_v5_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 feature TEXT,
+                 final_transcript TEXT,
+                 request_id TEXT,
+                 caller TEXT,
+                 attempts INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO runs VALUES('r-old','p1','paseo:a1',NULL,'t','','m','done','t','t',NULL,'fin','req-1','caller',0);
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            for column in ["notice", "notice_state", "notice_until"] {
+                assert!(has_column(&c, "runs", column).unwrap(), "{column}");
+            }
+            super::migrate(&c).unwrap();
+            super::migration_6_runs_notice(&c).unwrap();
+        }
+        assert_eq!(s.get_run("r-old").unwrap().unwrap().status, "done");
+        assert_eq!(s.run_caller("r-old").unwrap().as_deref(), Some("caller"));
+        assert!(
+            s.pending_notices().unwrap().is_empty(),
+            "a row written before the columns existed owes no notice"
+        );
+    }
+
+    #[test]
+    fn a_finished_run_keeps_its_caller_notice_until_it_is_sent_or_dropped() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        s.insert_run_with_request(&sample_run(), None, None, Some("caller"))
+            .unwrap();
+
+        assert!(s.pending_notices().unwrap().is_empty());
+        s.finish_run(
+            "r1",
+            "done",
+            "2026-10-16T11:00:00Z",
+            Some("the reply"),
+            Some(("notice one", "2026-10-16T12:00:00Z")),
+        )
+        .unwrap();
+
+        let run = s.get_run("r1").unwrap().unwrap();
+        assert_eq!(run.status, "done");
+        assert_eq!(run.updated_at, "2026-10-16T11:00:00Z");
+        assert_eq!(
+            s.run_final_transcript("r1").unwrap().as_deref(),
+            Some("the reply")
+        );
+        assert_eq!(
+            s.pending_notices().unwrap(),
+            vec![(
+                "r1".to_string(),
+                "caller".to_string(),
+                "notice one".to_string(),
+                "2026-10-16T12:00:00Z".to_string()
+            )]
+        );
+
+        s.set_notice_state("r1", "sent").unwrap();
+        assert!(s.pending_notices().unwrap().is_empty());
+
+        s.set_notice_state("r1", "pending").unwrap();
+        s.finish_run(
+            "r1",
+            "blocked",
+            "2026-10-16T11:05:00Z",
+            None,
+            Some(("notice two", "2026-10-16T12:00:00Z")),
+        )
+        .unwrap();
+        assert_eq!(
+            s.pending_notices()
+                .unwrap()
+                .iter()
+                .map(|n| n.2.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notice two"],
+            "a newer notice replaces the one still pending for the same run"
+        );
+        assert_eq!(
+            s.run_final_transcript("r1").unwrap().as_deref(),
+            Some("the reply"),
+            "a finish with no transcript leaves the stored one alone"
+        );
     }
 
     #[test]
