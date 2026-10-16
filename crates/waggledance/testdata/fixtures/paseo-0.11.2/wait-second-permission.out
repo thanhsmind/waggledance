@@ -1,0 +1,5 @@
+{
+  "agentId": "<ID3>",
+  "status": "permission",
+  "message": "Agent is waiting for permission: tool"
+}

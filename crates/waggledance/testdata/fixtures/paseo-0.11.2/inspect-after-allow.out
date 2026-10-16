@@ -1,0 +1,51 @@
+{
+  "Id": "<ID3>",
+  "Name": "wd probe5 (delete me)",
+  "Provider": "claude",
+  "Model": "claude-haiku-5-5",
+  "Thinking": "auto",
+  "Status": "running",
+  "Archived": false,
+  "ArchivedAt": null,
+  "Mode": "default",
+  "Cwd": "/tmp/wd-probe5",
+  "CreatedAt": "2026-10-16T10:21:51.920Z",
+  "UpdatedAt": "2026-10-16T10:22:04.175Z",
+  "LastUsage": {
+    "InputTokens": 0,
+    "OutputTokens": 0,
+    "CachedTokens": 0,
+    "CostUsd": 0
+  },
+  "Capabilities": {
+    "Streaming": true,
+    "Persistence": true,
+    "DynamicModes": true,
+    "McpServers": true
+  },
+  "AvailableModes": [
+    {
+      "id": "plan",
+      "label": "Plan Mode"
+    },
+    {
+      "id": "default",
+      "label": "Always Ask"
+    },
+    {
+      "id": "acceptEdits",
+      "label": "Accept File Edits"
+    },
+    {
+      "id": "auto",
+      "label": "Auto mode"
+    },
+    {
+      "id": "bypassPermissions",
+      "label": "Bypass"
+    }
+  ],
+  "PendingPermissions": [],
+  "Worktree": null,
+  "ParentAgentId": null
+}

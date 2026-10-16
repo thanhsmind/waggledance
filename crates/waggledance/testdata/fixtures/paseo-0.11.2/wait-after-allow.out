@@ -1,0 +1,5 @@
+{
+  "agentId": "<ID3>",
+  "status": "idle",
+  "message": "Agent is idle.\nLast 5 activity items:\n[User] Use your Write tool to create a file named perm.txt containing the word hi in the current directory, then run the shell command `sleep 20`, then reply with exactly PERM-DONE.\n[Write] /tmp/wd-probe5/perm.txt\n[Shell] sleep 20\n[Task notification] Sleep for 20 seconds\nPERM-DONE"
+}
