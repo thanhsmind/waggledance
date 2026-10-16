@@ -24,14 +24,14 @@ của lần đánh giá này: `docs/history/piggery-lessons/CONTEXT.md`.
   project. Trên máy này piggery không được cài, và mỗi project chỉ có một leader.
 - **Confidence: 80%.** Chắc ở phần Local (đọc code và fixture). Kém chắc ở hành
   vi của `paseo wait` sau khi một quyền được duyệt, vì chưa có capture (đó chính
-  là PBI 1).
+  là PBI 1). Probe sau đó đã capture hành vi này; xem cập nhật ở H1.
 - **Suggested next step: bee-shaping**, từng PBI một khi được triage.
 
 ## Bảng kết luận
 
 | # | Giả thuyết | Kết luận | Bằng chứng chính |
 |---|---|---|---|
-| 1 | Còn quy tắc piggery mà delivery chưa tuân và đang trả giá | **Đúng và đáng làm** (2 chỗ) | `delivery.rs:359` coi `idle` là done; `delivery.rs:450-503` giữ notice trong bộ nhớ |
+| 1 | Còn quy tắc piggery mà delivery chưa tuân và đang trả giá | **Đúng và đáng làm** (2 chỗ) | nhánh `delivery.rs:359` chưa có capture (probe sau đó cho thấy logic đúng); `delivery.rs:450-503` giữ notice trong bộ nhớ |
 | 2 | Dispatch qua gate của đội thay vì Paseo leader | **Không đáng** | `paseo.rs:904-909`: một leader cho mỗi project; D3 của leader-delivery đã có queue cho leader bận |
 | 3 | Board đọc `piggery ps --view` / `tail --view` | **Sai tiền đề** | `command -v piggery` rỗng, không có `~/.piggery`; piggery chỉ chạy trên một máy |
 | 4 | Notify kinds của piggery chính xác hơn cho cột "Waiting on you" | **Sai tiền đề, nhưng lộ ra một khoảng trống thật** | `server.rs:3496` board chỉ quét run `working`; run leader `blocked` không lên board |
@@ -98,6 +98,13 @@ của lần đánh giá này: `docs/history/piggery-lessons/CONTEXT.md`.
   trước khi turn sau permission thật sự chạy tiếp, run bị đánh dấu `done` với
   câu trả lời rỗng, caller được báo xong, và task tiếp theo trong queue được gửi
   vào một leader vẫn đang dở việc.
+  **Cập nhật 2026-10-16, sau probe:** nỗi lo này bị bác. Probe trên Paseo 0.11.2
+  (`docs/history/piggery-lessons/CONTEXT.md` D5) cho thấy sau `permit allow`,
+  agent vẫn ở trạng thái `running`, còn `wait` chặn khoảng 24 s cho tới khi turn
+  kết thúc rồi mới báo `idle`. Khi turn xin thêm một quyền thứ hai, `wait` báo
+  `permission`. Vì vậy `idle` ở nhánh này chính là turn end và logic đúng. Khoảng
+  trống thật chỉ còn ở luật 9: thiếu capture. PBI 1 vì thế chỉ thêm capture và
+  test, không đổi logic.
 - *Luật 4: trạng thái không nằm trong bảng.* Notice gửi trực tiếp cho Paseo agent
   đã gọi (D4) chỉ nằm trong `state.notices`, một `Vec` trong bộ nhớ
   (`delivery.rs:450-454`). Notice bị bỏ sau một giờ, chỉ để lại một dòng
@@ -197,7 +204,7 @@ trống thật.**
 
 | Hạng | PBI | Giá trị | Chi phí | Vì sao |
 |---|---|---|---|---|
-| 1 | `p-929bf879` — Đánh dấu done sau permission chỉ bằng tín hiệu turn end đã capture | Cao: một done sai làm queue gửi task vào leader đang dở việc | Thấp: một capture và một nhánh trong `blocked_then_done` | Luật 3 + 9; chữ của leader-delivery D2 |
+| 1 | `p-929bf879` — Đánh dấu done sau permission chỉ bằng tín hiệu turn end đã capture | Ban đầu cao; sau probe chỉ còn khóa hành vi đúng hiện có bằng test | Thấp: ba capture và test, không đổi logic | Luật 9 (luật 3 đã được tuân, theo probe) |
 | 2 | `p-4cae7502` — Hiện run leader `blocked`/`lost` trong "Waiting on you" | Cao: hôm nay một leader chờ quyền là vô hình trên board và trên điện thoại | Thấp–vừa: một truy vấn trên `runs` cùng một pill/hàng trên board | H4; dữ liệu đã có |
 | 3 | `p-f6975647` — Lưu notice cho caller trong store, không trong bộ nhớ | Vừa: D4 hiện có thể lặng lẽ không báo | Vừa: một bảng hoặc cột và đường flush đọc từ store | Luật 4; gộp luôn việc ghi transcript + status trong một transaction |
 
@@ -221,8 +228,8 @@ trống thật.**
 
 ## Risks, Unknowns, Follow-Ups
 
-- **Chưa biết:** `paseo wait` trả gì khi turn sau permission còn đang chạy so
-  với khi turn đã xong. PBI 1 phải capture điều đó trước khi sửa (luật 9).
+- **Đã trả lời (2026-10-16):** `paseo wait` chặn tới khi turn sau permission
+  kết thúc, và báo `permission` nếu turn xin thêm quyền. Xem cập nhật ở H1.
 - **Đụng quyết định khóa:** PBI 1 đưa code về đúng chữ của `leader-delivery` D2,
   không đổi D2. Không PBI nào đụng D6 (restart → lost).
 - **Rủi ro được nêu trong spec:**
