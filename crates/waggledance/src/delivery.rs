@@ -43,14 +43,30 @@ struct State {
     busy: HashSet<String>,
     held: HashSet<String>,
     not_before: HashMap<String, Instant>,
-    notices: Vec<Notice>,
     quiet_until: HashMap<String, Instant>,
 }
 
 struct Notice {
-    caller: String,
+    run_id: String,
     text: String,
-    until: Instant,
+}
+
+fn notice_until() -> String {
+    let until =
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(NOTICE_WINDOW.as_secs() as i64);
+    until
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+fn notice_expired(until: &str) -> bool {
+    match time::OffsetDateTime::parse(until, &time::format_description::well_known::Rfc3339) {
+        Ok(at) => at <= time::OffsetDateTime::now_utc(),
+        Err(e) => {
+            tracing::warn!("delivery could not read notice expiry {until}: {e}");
+            false
+        }
+    }
 }
 
 fn pane(agent: Option<&str>) -> String {
@@ -431,41 +447,51 @@ impl Delivery {
         transcript: Option<&str>,
         leader: Option<&str>,
     ) {
-        if let Some(text) = transcript {
+        let transcript = transcript.map(|text| {
             let header = self.state.lock().unwrap().headers.remove(&run.id);
-            let text = header.map_or_else(|| text.to_string(), |h| format!("{h}\n\n{text}"));
-            if let Err(e) = self.engine.set_run_final_transcript(&run.id, &text) {
-                tracing::warn!("delivery could not store run {} transcript: {e}", run.id);
-            }
-        }
-        self.set_status(&run.id, status);
+            header.map_or_else(|| text.to_string(), |h| format!("{h}\n\n{text}"))
+        });
         let store = self.notify.lock().unwrap().clone();
         if let Some(store) = store {
             orchestrate::enqueue_run_notice(&store, run, status);
         }
         let caller = match self.engine.run_caller(&run.id) {
-            Ok(Some(caller)) if Some(caller.as_str()) != leader => caller,
-            _ => return,
+            Ok(Some(caller)) if Some(caller.as_str()) != leader => Some(caller),
+            _ => None,
         };
-        self.state.lock().unwrap().notices.push(Notice {
-            caller,
-            text: notice_text(name, &run.id, status),
-            until: Instant::now() + NOTICE_WINDOW,
-        });
+        let until = notice_until();
+        let notice = caller.map(|_| (notice_text(name, &run.id, status), until));
+        let notice = notice
+            .as_ref()
+            .map(|(text, until)| (text.as_str(), until.as_str()));
+        if let Err(e) = self.engine.finish_run(
+            &run.id,
+            status,
+            &now_rfc3339(),
+            transcript.as_deref(),
+            notice,
+        ) {
+            tracing::warn!("delivery could not end run {}: {e}", run.id);
+        }
     }
 
     async fn flush_notices(&self) {
-        let pending = std::mem::take(&mut self.state.lock().unwrap().notices);
-        let mut keep = Vec::new();
+        let pending = self.engine.pending_notices().unwrap_or_else(|e| {
+            tracing::warn!("delivery could not read pending notices: {e}");
+            Vec::new()
+        });
         let mut batches: Vec<(String, Vec<Notice>)> = Vec::new();
-        for notice in pending {
-            if Instant::now() >= notice.until {
-                tracing::warn!("delivery dropped a notice to {} after 1h", notice.caller);
+        for (run_id, caller, text, until) in pending {
+            if notice_expired(&until) {
+                tracing::warn!("delivery dropped a notice to {caller} after 1h");
+                if let Err(e) = self.engine.set_notice_state(&run_id, "dropped") {
+                    tracing::warn!("delivery could not mark run {run_id}'s notice dropped: {e}");
+                }
                 continue;
             }
-            match batches.iter_mut().find(|(c, _)| *c == notice.caller) {
-                Some((_, batch)) => batch.push(notice),
-                None => batches.push((notice.caller.clone(), vec![notice])),
+            match batches.iter_mut().find(|(c, _)| *c == caller) {
+                Some((_, batch)) => batch.push(Notice { run_id, text }),
+                None => batches.push((caller, vec![Notice { run_id, text }])),
             }
         }
         for (caller, batch) in batches {
@@ -491,16 +517,20 @@ impl Delivery {
                             .unwrap()
                             .quiet_until
                             .insert(caller, Instant::now() + NOTICE_GAP);
+                        for notice in &batch {
+                            if let Err(e) = self.engine.set_notice_state(&notice.run_id, "sent") {
+                                tracing::warn!(
+                                    "delivery could not mark run {}'s notice sent: {e}",
+                                    notice.run_id
+                                );
+                            }
+                        }
                         continue;
                     }
                     Err(e) => tracing::warn!("delivery could not notify caller {caller}: {e}"),
                 }
             }
-            keep.extend(batch);
         }
-        let mut s = self.state.lock().unwrap();
-        keep.append(&mut s.notices);
-        s.notices = keep;
     }
 
     fn set_status(&self, run_id: &str, status: &str) {
@@ -632,6 +662,10 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        fn notice_state(&self, id: &str) -> Option<String> {
+            self.engine.run_notice_state(id).unwrap()
         }
 
         fn set_logs(&self, id: &str, logs: &str) {
@@ -807,10 +841,12 @@ mod tests {
         r.tick().await;
         let notices = r.notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
-        assert!(notices[0]
-            .1
-            .contains("waiting for a permission in its Paseo chat (run run-1)"));
-        assert!(notices[0].1.contains("finished run run-1 (done)"));
+        assert!(
+            notices[0].1.contains("finished run run-1 (done)"),
+            "the blocked notice is replaced by the newer done one: {notices:?}"
+        );
+        assert!(!notices[0].1.contains("waiting for a permission"));
+        assert_eq!(r.notice_state("run-1").as_deref(), Some("sent"));
     }
 
     #[tokio::test]
@@ -860,6 +896,7 @@ mod tests {
         let notices = r.notices();
         assert_eq!(notices.len(), 1);
         assert!(notices[0].1.contains("(lost)"));
+        assert_eq!(r.notice_state("run-1").as_deref(), Some("sent"));
     }
 
     #[tokio::test]
@@ -910,6 +947,7 @@ mod tests {
         r.tick().await;
         assert_eq!(r.sends_to("lead"), vec!["one"]);
         assert_eq!(r.notices().len(), 1);
+        assert_eq!(r.notice_state("run-sent").as_deref(), Some("sent"));
     }
 
     #[tokio::test]
@@ -961,6 +999,53 @@ mod tests {
             .map(|n| n.kind)
             .collect();
         assert_eq!(kinds, vec!["done"]);
+    }
+
+    #[tokio::test]
+    async fn a_pending_notice_survives_a_restart_and_sends_on_the_first_idle_tick() {
+        let mut r = rig();
+        r.fake.add_leader("proj-1", "lead", "idle", false);
+        r.fake.add_leader("proj-9", "caller", "running", false);
+        r.queue("proj-1", "run-1", "one", Some("caller"));
+        r.tick().await;
+        assert_eq!(r.status("run-1"), "done");
+        assert_eq!(r.notice_state("run-1").as_deref(), Some("pending"));
+        assert!(r.notices().is_empty());
+
+        let dir = r.delivery.data_dir.clone();
+        r.delivery = Delivery::new(r.fake.clone(), r.engine.clone(), dir, Arc::default());
+        r.fake.set_status("caller", "idle");
+        r.tick().await;
+        assert_eq!(
+            r.notices().len(),
+            1,
+            "the restarted delivery sends the stored notice"
+        );
+        assert!(r.notices()[0].1.contains("finished run run-1 (done)"));
+        assert_eq!(r.notice_state("run-1").as_deref(), Some("sent"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_notice_is_dropped_and_never_sent() {
+        let r = rig();
+        r.fake.add_leader("proj-1", "lead", "idle", false);
+        r.fake.add_leader("proj-9", "caller", "idle", false);
+        r.queue("proj-1", "run-1", "one", Some("caller"));
+        r.engine
+            .finish_run(
+                "run-1",
+                "done",
+                "2026-10-16T11:00:00Z",
+                Some("the reply"),
+                Some(("a stale notice", "2020-01-01T00:00:00Z")),
+            )
+            .unwrap();
+        r.tick().await;
+        assert!(
+            r.notices().is_empty(),
+            "an expired notice is never delivered"
+        );
+        assert_eq!(r.notice_state("run-1").as_deref(), Some("dropped"));
     }
 
     #[test]
