@@ -10,6 +10,7 @@ use waggledance_core::domain::Project;
 use waggledance_core::project_settings::ProjectPaseo;
 
 pub const ROLE_LABEL: &str = "waggledance.role=leader";
+pub const VIA_LABEL: &str = "waggledance.via=supervisor";
 pub const PROJECT_LABEL_KEY: &str = "waggledance.project";
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -154,6 +155,46 @@ pub fn leaders_args(project_id: &str) -> Vec<String> {
         project_label(project_id),
         "--json".into(),
     ]
+}
+
+pub fn role_leaders_args() -> Vec<String> {
+    vec![
+        "ls".into(),
+        "-g".into(),
+        "--label".into(),
+        ROLE_LABEL.into(),
+        "--json".into(),
+    ]
+}
+
+pub fn via_leaders_args() -> Vec<String> {
+    let mut args = role_leaders_args();
+    args.splice(4..4, ["--label".to_string(), VIA_LABEL.to_string()]);
+    args
+}
+
+pub fn created_age_secs(created: &str) -> Option<u64> {
+    let created = created.trim();
+    if created == "just now" {
+        return Some(0);
+    }
+    let mut words = created.split_whitespace();
+    let count: u64 = words.next()?.parse().ok()?;
+    let unit = words.next()?.trim_end_matches('s');
+    if words.next()? != "ago" {
+        return None;
+    }
+    let secs = match unit {
+        "second" => 1,
+        "minute" => 60,
+        "hour" => 3_600,
+        "day" => 86_400,
+        "week" => 604_800,
+        "month" => 2_592_000,
+        "year" => 31_536_000,
+        _ => return None,
+    };
+    Some(count * secs)
 }
 
 pub fn run_args(spec: &RunSpec) -> Vec<String> {
@@ -491,9 +532,12 @@ pub fn last_id(stdout: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+pub fn parse_listed(stdout: &str) -> std::result::Result<Vec<ListedAgent>, String> {
+    parse_document(stdout)
+}
+
 pub fn parse_leaders(stdout: &str) -> std::result::Result<Vec<String>, String> {
-    let agents: Vec<ListedAgent> = parse_document(stdout)?;
-    Ok(agents.into_iter().map(|a| a.id).collect())
+    Ok(parse_listed(stdout)?.into_iter().map(|a| a.id).collect())
 }
 
 pub fn parse_providers(stdout: &str) -> std::result::Result<Vec<String>, String> {
@@ -618,6 +662,11 @@ impl PaseoCli {
         Ok((binary, stdout))
     }
 
+    pub async fn list_labelled(&self, args: &[String]) -> Result<Vec<ListedAgent>> {
+        let (binary, out) = self.exec(args, TIMEOUT).await?;
+        parse_listed(&out).map_err(|e| unparsable(&binary, "ls", e))
+    }
+
     async fn turn(&self, args: &[String], timeout: Duration) -> Result<(String, TurnEnd)> {
         let (binary, out) = self.exec(args, timeout).await?;
         parse_turn_end(&out).map_err(|e| unparsable(&binary, &args[0], e))
@@ -632,9 +681,15 @@ fn unparsable(binary: &str, command: &str, message: impl ToString) -> PaseoError
     }
 }
 
-#[derive(Deserialize)]
-struct ListedAgent {
-    id: String,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedAgent {
+    pub id: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub created: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2044,6 +2099,57 @@ mod tests {
         assert_eq!(ids[0], "35eca12c-e112-4690-bf48-af0222f659e1");
         assert!(strip_noise(fixture!("wrapper-systemd-ls.out")).starts_with('['));
         assert!(parse_leaders(fixture!("wrapper-systemd-ls.err")).is_err());
+    }
+
+    #[test]
+    fn parse_listed_keeps_cwd_status_and_created_and_reads_the_empty_label_list() {
+        let agents = parse_listed(fixture!("wrapper-systemd-ls.out")).unwrap();
+        assert_eq!(agents.len(), 5);
+        assert_eq!(agents[0].id, "35eca12c-e112-4690-bf48-af0222f659e1");
+        assert_eq!(agents[0].cwd, "~/Projects/goglbe/waggledance");
+        assert_eq!(agents[0].status, "running");
+        assert_eq!(agents[0].created.as_deref(), Some("1 hours ago"));
+        let labelled = fixture!("ls-label-leader.out");
+        assert!(
+            labelled.lines().count() > 1,
+            "the capture keeps its noise lines"
+        );
+        assert!(parse_listed(labelled).unwrap().is_empty());
+        let sparse = parse_listed(r#"[{"id": "a"}]"#).unwrap();
+        assert_eq!(
+            (sparse[0].cwd.as_str(), sparse[0].status.as_str()),
+            ("", "")
+        );
+        assert_eq!(sparse[0].created, None);
+    }
+
+    #[test]
+    fn leaders_lists_filter_by_role_then_by_role_and_via() {
+        assert_eq!(
+            role_leaders_args(),
+            ["ls", "-g", "--label", "waggledance.role=leader", "--json"]
+        );
+        assert_eq!(
+            via_leaders_args(),
+            [
+                "ls",
+                "-g",
+                "--label",
+                "waggledance.role=leader",
+                "--label",
+                "waggledance.via=supervisor",
+                "--json"
+            ]
+        );
+    }
+
+    #[test]
+    fn paseo_created_ages_order_older_agents_larger() {
+        assert_eq!(created_age_secs("1 hours ago"), Some(3_600));
+        assert_eq!(created_age_secs("36 minutes ago"), Some(2_160));
+        assert_eq!(created_age_secs("2 days ago"), Some(172_800));
+        assert_eq!(created_age_secs("just now"), Some(0));
+        assert_eq!(created_age_secs("2026-10-17T10:00:00Z"), None);
     }
 
     #[test]

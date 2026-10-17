@@ -225,7 +225,14 @@ fn ask_state_schema() -> Value {
     is ABSENT when the terminal surface is switched off, `null` beside a `panes_error` \
     reason when herdr cannot be read — the bee state is complete either way — and an \
     array otherwise. Seeing a pane grants nothing: dispatching still requires the \
-    project's own orchestration opt-in.",
+    project's own orchestration opt-in. `leaders` lists the Paseo agents labelled \
+    waggledance.role=leader whose cwd sits in the project's root or one of its worktrees, \
+    oldest first: {agent_id, status, cwd, created, via, labels, waiting_on, \
+    last_daemon_run}, where `via` is `supervisor` for a leader carrying \
+    waggledance.via=supervisor and `daemon` otherwise. `leaders` is ABSENT when \
+    `[paseo] enabled = false`, `null` beside a `leaders_error` reason when Paseo cannot \
+    be read, and an array (possibly empty) beside `leaders_skipped`, the count of \
+    leaders under no registered project, otherwise.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -557,8 +564,17 @@ fn handle_ask_state(
             let rollup = rollups.pop().expect("one root in, one rollup out");
             let snapshot = &rollup.snapshot;
             let fleet = read_fleet_panes(engine, orchestration);
+            let leaders = read_leaders(&engine.config.paseo);
+            let mut claims: Vec<LeaderClaim> = engine
+                .list_projects()
+                .unwrap_or_default()
+                .iter()
+                .map(|other| (canonical(&other.root_path), other.id.clone()))
+                .collect();
+            claims.extend(worktree_claims(&p, &rollup));
             let mut digest = ask_state_digest(&p.id, snapshot);
             attach_panes(&mut digest, &p, &rollup, &fleet);
+            attach_leaders(&mut digest, engine, &p, &rollup, &claims, &leaders);
             let text = if !snapshot.present {
                 format!("{}: no .bee/ directory (absent)", p.id)
             } else {
@@ -595,12 +611,24 @@ fn handle_ask_state(
             // D4: one fleet read for the whole rollup, filtered per project
             // below — never one herdr call per project.
             let fleet = read_fleet_panes(engine, orchestration);
+            let leaders = read_leaders(&engine.config.paseo);
+            let claims: Vec<LeaderClaim> = projects
+                .iter()
+                .map(|p| (canonical(&p.root_path), p.id.clone()))
+                .chain(
+                    projects
+                        .iter()
+                        .zip(rollups.iter())
+                        .flat_map(|(p, rollup)| worktree_claims(p, rollup)),
+                )
+                .collect();
             let digests: Vec<Value> = projects
                 .iter()
                 .zip(rollups.iter())
                 .map(|(p, rollup)| {
                     let mut digest = ask_state_digest(&p.id, &rollup.snapshot);
                     attach_panes(&mut digest, p, rollup, &fleet);
+                    attach_leaders(&mut digest, engine, p, rollup, &claims, &leaders);
                     digest
                 })
                 .collect();
@@ -800,6 +828,160 @@ fn attach_panes(
             );
         }
     }
+}
+
+enum LeadersRead {
+    Off,
+    Unreachable(String),
+    Listed {
+        all: Vec<paseo::ListedAgent>,
+        via: std::collections::HashSet<String>,
+    },
+}
+
+type LeaderClaim = (std::path::PathBuf, String);
+
+fn read_leaders(config: &waggledance_core::config::PaseoConfig) -> LeadersRead {
+    if config.enabled == Some(false) {
+        return LeadersRead::Off;
+    }
+    if let Some(reason) = paseo::paseo_unavailable(config) {
+        return LeadersRead::Unreachable(reason);
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return LeadersRead::Unreachable(format!("failed to start the Paseo read runtime: {e}"))
+        }
+    };
+    let cli = paseo::PaseoCli::new(config);
+    runtime
+        .block_on(async {
+            let all = cli.list_labelled(&paseo::role_leaders_args()).await?;
+            let via = cli.list_labelled(&paseo::via_leaders_args()).await?;
+            Ok::<_, paseo::PaseoError>(LeadersRead::Listed {
+                all,
+                via: via.into_iter().map(|a| a.id).collect(),
+            })
+        })
+        .unwrap_or_else(|e| LeadersRead::Unreachable(e.to_string()))
+}
+
+fn canonical(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn agent_cwd(cwd: &str) -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    match cwd.strip_prefix('~') {
+        Some(rest) => canonical(&home.join(rest.trim_start_matches('/'))),
+        None => canonical(Path::new(cwd)),
+    }
+}
+
+fn worktree_claims(
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+) -> Vec<LeaderClaim> {
+    let Some(parent) = project.root_path.parent() else {
+        return Vec::new();
+    };
+    rollup
+        .snapshot
+        .worktrees
+        .iter()
+        .map(|w| (canonical(&parent.join(&w.id)), project.id.clone()))
+        .collect()
+}
+
+fn leader_owner<'a>(cwd: &Path, claims: &'a [LeaderClaim]) -> Option<&'a str> {
+    claims
+        .iter()
+        .filter(|(root, _)| cwd.starts_with(root))
+        .max_by_key(|(root, _)| root.components().count())
+        .map(|(_, id)| id.as_str())
+}
+
+fn attach_leaders(
+    digest: &mut Value,
+    engine: &Engine,
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+    claims: &[LeaderClaim],
+    leaders: &LeadersRead,
+) {
+    let Some(object) = digest.as_object_mut() else {
+        return;
+    };
+    let (all, via) = match leaders {
+        LeadersRead::Off => return,
+        LeadersRead::Unreachable(reason) => {
+            object.insert("leaders".to_string(), Value::Null);
+            object.insert("leaders_error".to_string(), json!(reason));
+            return;
+        }
+        LeadersRead::Listed { all, via } => (all, via),
+    };
+    let mut skipped = 0usize;
+    let mut mine: Vec<(&paseo::ListedAgent, std::path::PathBuf)> = Vec::new();
+    for agent in all {
+        let cwd = agent_cwd(&agent.cwd);
+        match leader_owner(&cwd, claims) {
+            None => skipped += 1,
+            Some(owner) if owner == project.id => mine.push((agent, cwd)),
+            Some(_) => {}
+        }
+    }
+    mine.sort_by_key(|(agent, _)| {
+        std::cmp::Reverse(agent.created.as_deref().and_then(paseo::created_age_secs))
+    });
+    let last_daemon_run = if mine.is_empty() {
+        Value::Null
+    } else {
+        engine
+            .list_runs(&project.id, 20)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|r| r.pane_id.starts_with("paseo:"))
+            .map_or(
+                Value::Null,
+                |r| json!({ "run_id": r.id, "status": r.status }),
+            )
+    };
+    let waiting_on = rollup
+        .snapshot
+        .state
+        .as_ref()
+        .and_then(|s| s.waiting_on.as_ref())
+        .map_or(
+            Value::Null,
+            |w| json!({ "kind": w.kind, "subject": w.subject }),
+        );
+    let entries: Vec<Value> = mine
+        .into_iter()
+        .map(|(agent, cwd)| {
+            let supervised = via.contains(&agent.id);
+            json!({
+                "agent_id": agent.id,
+                "status": agent.status,
+                "cwd": cwd.display().to_string(),
+                "created": agent.created,
+                "via": if supervised { "supervisor" } else { "daemon" },
+                "labels": {
+                    "waggledance.role": "leader",
+                    "waggledance.project": project.id,
+                    "waggledance.via": supervised.then_some("supervisor")
+                },
+                "waiting_on": waiting_on,
+                "last_daemon_run": last_daemon_run
+            })
+        })
+        .collect();
+    object.insert("leaders".to_string(), Value::Array(entries));
+    object.insert("leaders_skipped".to_string(), json!(skipped));
 }
 
 /// The human-readable half of the tool result.
@@ -1462,7 +1644,9 @@ mod tests {
             "# Project B\nA grapefruit smoothie recipe for summer.",
         );
 
-        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let mut config = Config::default();
+        config.paseo.enabled = Some(false);
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
         let pa = engine.register(&dir_a, None).unwrap();
         let pb = engine.register(&dir_b, None).unwrap();
         (engine, pa, pb)
@@ -1987,6 +2171,238 @@ mod tests {
         assert_eq!(digest["phase"], "execution");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn listed(id: &str, cwd: &str, created: &str) -> paseo::ListedAgent {
+        paseo::ListedAgent {
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+            status: "idle".to_string(),
+            created: Some(created.to_string()),
+        }
+    }
+
+    fn leaders_project(tag: &str) -> (Engine, Project, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("wd-leaders-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("widgets");
+        let worktree = base.join("widgets--wt--polish");
+        write(&root, "docs/a.md", "# Project");
+        write(&worktree, "src/lib.rs", "");
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&root, None).unwrap();
+        (engine, project, base)
+    }
+
+    fn with_worktree(
+        mut rollup: waggledance_core::bee::BeeProjectRollup,
+        id: &str,
+    ) -> waggledance_core::bee::BeeProjectRollup {
+        rollup.snapshot.worktrees.push(
+            serde_json::from_value(json!({
+                "id": id, "resolved": false, "unresolved_reason": null, "feature": null,
+                "phase": null, "mode": null, "branch": null, "created_at": null,
+                "live": false, "heartbeat_age_minutes": null, "merged_pending": false
+            }))
+            .unwrap(),
+        );
+        rollup
+    }
+
+    #[test]
+    fn leaders_map_root_and_worktree_cwds_oldest_first_and_count_the_homeless() {
+        let (engine, project, base) = leaders_project("map");
+        write(
+            &project.root_path,
+            ".bee/state.json",
+            r#"{"feature": "widget-polish", "waiting_on": {"kind": "gate", "subject": "approve plan"}}"#,
+        );
+        let mut daemon_run = seeded_run(&project.id, "run-paseo");
+        daemon_run.pane_id = "paseo:abc".to_string();
+        daemon_run.status = "done".to_string();
+        engine.insert_run(&daemon_run, None).unwrap();
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = with_worktree(rollups.pop().unwrap(), "widgets--wt--polish");
+        let mut claims = vec![(canonical(&project.root_path), project.id.clone())];
+        claims.extend(worktree_claims(&project, &rollup));
+        let root = project.root_path.display().to_string();
+        let worktree = base.join("widgets--wt--polish/src").display().to_string();
+        let read = LeadersRead::Listed {
+            all: vec![
+                listed("young", &root, "2 hours ago"),
+                listed("old", &worktree, "3 days ago"),
+                listed(
+                    "homeless",
+                    "/nonexistent/wd-leaders/elsewhere",
+                    "1 days ago",
+                ),
+            ],
+            via: ["young".to_string()].into_iter().collect(),
+        };
+        let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
+        attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
+
+        let leaders = digest["leaders"]
+            .as_array()
+            .expect("a list when Paseo answered");
+        let ids: Vec<&str> = leaders
+            .iter()
+            .map(|l| l["agent_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["old", "young"], "{digest}");
+        assert_eq!(digest["leaders_skipped"], 1, "{digest}");
+        assert_eq!(leaders[0]["via"], "daemon");
+        assert!(leaders[0]["labels"]["waggledance.via"].is_null());
+        assert_eq!(leaders[1]["via"], "supervisor");
+        assert_eq!(leaders[1]["labels"]["waggledance.via"], "supervisor");
+        assert_eq!(leaders[1]["labels"]["waggledance.role"], "leader");
+        assert_eq!(
+            leaders[1]["labels"]["waggledance.project"],
+            json!(project.id)
+        );
+        assert_eq!(
+            leaders[1]["cwd"],
+            json!(canonical(&project.root_path).display().to_string())
+        );
+        assert_eq!(
+            leaders[1]["waiting_on"],
+            json!({ "kind": "gate", "subject": "approve plan" })
+        );
+        assert_eq!(
+            leaders[0]["last_daemon_run"],
+            json!({ "run_id": "run-paseo", "status": "done" })
+        );
+        assert_eq!(leaders[0]["created"], "3 days ago");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn leaders_go_to_the_deeper_root_and_tilde_cwds_expand_to_home() {
+        let claims = vec![
+            (std::path::PathBuf::from("/srv/outer"), "outer".to_string()),
+            (
+                std::path::PathBuf::from("/srv/outer/inner"),
+                "inner".to_string(),
+            ),
+        ];
+        assert_eq!(
+            leader_owner(Path::new("/srv/outer/inner/src"), &claims),
+            Some("inner")
+        );
+        assert_eq!(
+            leader_owner(Path::new("/srv/outer/docs"), &claims),
+            Some("outer")
+        );
+        assert_eq!(leader_owner(Path::new("/srv/outerwear"), &claims), None);
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            agent_cwd("~/wd-leaders-no-such-dir"),
+            home.join("wd-leaders-no-such-dir")
+        );
+    }
+
+    #[test]
+    fn leaders_of_another_project_are_neither_listed_nor_skipped() {
+        let (engine, project, base) = leaders_project("other");
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = rollups.pop().unwrap();
+        let claims = vec![
+            (canonical(&project.root_path), project.id.clone()),
+            (
+                std::path::PathBuf::from("/srv/elsewhere"),
+                "elsewhere".to_string(),
+            ),
+        ];
+        let read = LeadersRead::Listed {
+            all: vec![listed("theirs", "/srv/elsewhere", "1 hours ago")],
+            via: Default::default(),
+        };
+        let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
+        attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
+        assert_eq!(digest["leaders"], json!([]), "{digest}");
+        assert_eq!(digest["leaders_skipped"], 0, "{digest}");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn unreachable_paseo_nulls_leaders_with_a_reason_and_keeps_every_key() {
+        let (engine, project, base) = leaders_project("down");
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = rollups.pop().unwrap();
+        let before = ask_state_digest(&project.id, &rollup.snapshot);
+        let mut digest = before.clone();
+        attach_leaders(
+            &mut digest,
+            &engine,
+            &project,
+            &rollup,
+            &[],
+            &LeadersRead::Unreachable("`paseo ls` timed out after 15s".to_string()),
+        );
+        assert!(digest["leaders"].is_null(), "{digest}");
+        assert_eq!(digest["leaders_error"], "`paseo ls` timed out after 15s");
+        for (key, value) in before.as_object().unwrap() {
+            assert_eq!(&digest[key], value, "{key} changed");
+        }
+        assert!(digest.get("leaders_skipped").is_none(), "{digest}");
+
+        let mut off = before.clone();
+        attach_leaders(&mut off, &engine, &project, &rollup, &[], &LeadersRead::Off);
+        assert_eq!(off, before);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn paseo_switched_off_leaves_no_leaders_key_in_either_form() {
+        let (engine, pa, pb) = two_project_engine("ask-state-leaders-off");
+        assert_eq!(engine.config.paseo.enabled, Some(false));
+        assert!(matches!(
+            read_leaders(&engine.config.paseo),
+            LeadersRead::Off
+        ));
+        let one = call_tool(
+            &engine,
+            "waggledance_ask_state",
+            json!({ "project": pa.id }),
+        );
+        let digest = &one["result"]["structuredContent"]["project"];
+        assert!(digest.get("leaders").is_none(), "{digest}");
+        assert!(digest.get("leaders_error").is_none(), "{digest}");
+        let all = call_tool(&engine, "waggledance_ask_state", json!({}));
+        for entry in all["result"]["structuredContent"]["projects"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(entry.get("leaders").is_none(), "{entry}");
+        }
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+        std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    #[test]
+    fn ask_state_description_names_leaders_via_and_the_three_absence_states() {
+        let description = ask_state_schema()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for promised in [
+            "leaders",
+            "via",
+            "leaders_error",
+            "leaders_skipped",
+            "enabled = false",
+            "`null`",
+            "possibly empty",
+        ] {
+            assert!(
+                description.contains(promised),
+                "{promised:?}: {description}"
+            );
+        }
     }
 
     #[test]
