@@ -508,6 +508,20 @@ pub fn read_hook_token(data_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+pub fn ensure_hook_token(data_dir: &Path) -> Result<bool> {
+    let path = hook_token_path(data_dir);
+    if path.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(data_dir)?;
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    write_owner_only(&path, format!("{token}\n").as_bytes())?;
+    Ok(true)
+}
+
 /// `<data_dir>/telegram.token`, or `override_dir/telegram.token` when given
 /// — mirrors `config_path_override` so a route-level test never touches the
 /// real `~/.waggledance`.
@@ -573,7 +587,7 @@ fn random_temp_suffix() -> String {
 }
 
 #[cfg(unix)]
-fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -586,7 +600,7 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 #[cfg(not(unix))]
-fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .write(true)

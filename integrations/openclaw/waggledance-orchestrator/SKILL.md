@@ -82,16 +82,65 @@ Preview markdown file in browser via Waggledance:
 wd-bridge.py open docs/decisions/0012-model-tiers-config.md --project-root /home/thanhsmind/Projects/goglbe/beehive
 ```
 
+### 8. `handoff` — give a task to the waggledance supervisor
+
+This is the default way to get work done in a project. The supervisor (one Paseo agent for every project) picks the project, opens or reuses its leader, and reports back on Telegram.
+```bash
+wd-bridge.py handoff --task "Thêm nút xuất CSV cho trang báo cáo"
+wd-bridge.py handoff --task-file /tmp/spec.md
+wd-bridge.py handoff --task "..." --corr t-1a2b3c
+wd-bridge.py handoff --task probe --dry-run
+```
+It runs `waggledance supervisor ensure --json` (finds the supervisor, or starts it), mints a correlation id `t-<6 hex>` when `--corr` is absent, and sends `[handoff <corr>] <task>` with `paseo send <supervisor_id> --no-wait`. It prints `{"supervisor_id": ..., "corr": ..., "sent": true}`. Keep the `corr`: every later message about this task carries it. `--dry-run` prints the two commands and runs nothing.
+
+### 9. `reply`, `redo`, `accept` — relay the user's answer
+```bash
+wd-bridge.py reply --corr t-1a2b3c --text "Dùng định dạng ngày dd/mm/yyyy"
+wd-bridge.py redo --corr t-1a2b3c --text "Nút phải nằm bên phải"
+wd-bridge.py accept --corr t-1a2b3c
+```
+Each sends one message to the supervisor the same way `handoff` does, and accepts `--dry-run` too.
+
+### Message shapes
+
+What this skill sends to the supervisor, exactly:
+
+| Command | Message |
+|---|---|
+| `handoff` | `[handoff <corr>] <task>` |
+| `reply` | `[reply <corr>] <text>` |
+| `redo` | `[redo <corr>] <text>` |
+| `accept` | `[accept <corr>]` |
+
+What comes back: the supervisor posts to this gateway's hook and the line reaches the user on Telegram as `[waggledance#<corr>] <project> — <kind>: <text>`, where the kind is a result (kết quả), a question (câu hỏi), waiting on a permission (đang chờ quyền), an error (lỗi), closed (đã đóng) or progress (tiến độ). Forward it to the user verbatim; never rephrase or translate it.
+
+### Reading the user's answer
+
+- A bare `ok` or `được` from the user means `accept` of the newest open `corr` — the newest `[waggledance#<corr>]` result not yet accepted.
+- A sentence that answers a question means `reply` with that question's `corr` and the user's words as `--text`.
+- A request to change or do again what was delivered means `redo` with its `corr`.
+- When a sentence could answer either of two open questions, ask the user which one, naming both tags.
+
+### When `handoff` fails
+
+`handoff`, `reply`, `redo` and `accept` exit non-zero with one line naming Paseo or waggledance. Then tell the user that Paseo or waggledance is down and the task did not go through. Never say the task was handed off unless the command printed `"sent": true`.
+
+### Known limit
+
+Two `handoff` calls racing while no supervisor exists may start two supervisors: `ensure` takes no lock. The next `ensure` returns the oldest one, so later messages all reach the same supervisor.
+
 ---
 
 ## Orchestrator Rules & Safety
 
-1. **Check Live Leads Before Dispatch**:
+1. **Prefer `handoff` for new work**:
+   Hand tasks to the supervisor with `handoff`; it checks live leaders itself. Use `dispatch` only when the user asks for a specific preset or pane.
+2. **Check Live Leads Before Dispatch**:
    Always run `wd-bridge.py state --project <target>` before spawning. If a lead agent is already actively working or swarming, reuse or inform the user rather than spawning a competing run.
-2. **Provenance Tracking**:
+3. **Provenance Tracking**:
    Every spec drop should begin with the provenance header:
    ```text
    spec-drop <corr-id> from waggledance@<sha>
    ```
-3. **Respect Workspace Boundaries**:
+4. **Respect Workspace Boundaries**:
    This skill operates as the orchestrator seat. It monitors, queries state, and dispatches to project leads. It does not directly modify source code in target repositories or merge branches without user consent.

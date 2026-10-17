@@ -83,7 +83,7 @@ pub enum Command {
     },
     /// Run the MCP server over stdio (used by Claude Code).
     Mcp,
-    /// Install (or --remove) the pi extension or the Paseo plugin.
+    /// Install (or --remove) the pi extension, the Paseo plugin, or the OpenClaw bridge.
     Setup {
         #[arg(value_enum)]
         target: crate::setup::Target,
