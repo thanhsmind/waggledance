@@ -127,7 +127,7 @@ What comes back: the supervisor posts to this gateway's hook and the line reache
 
 ### Known limit
 
-Two `handoff` calls racing while no supervisor exists may start two supervisors: `ensure` takes no lock. The next `ensure` returns the oldest one, so later messages all reach the same supervisor.
+Two `handoff` calls racing while no supervisor exists may start two supervisors: `ensure` takes no lock. After the race the next `ensure` returns the supervisor `paseo ls` lists first, which is the newest, so later messages all reach one consistent supervisor.
 
 ---
 
