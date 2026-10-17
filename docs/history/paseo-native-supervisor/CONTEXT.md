@@ -102,5 +102,5 @@ Exact JSON shape inside `leaders`; where the hook token file lives under `~/.wag
 ## Handoff Note
 
 CONTEXT.md is the source of truth. Decision IDs are stable. Planning reads locked
-decisions, code context, canonical references, and deferred-to-planning questions.
+decisions, code context, canonical references, and the questions planning resolved.
 Planning's Gate 2 shape stage and reviewing use locked decisions for coverage and UAT.

@@ -107,7 +107,7 @@ $ cat ~/.waggledance/supervisor/ledger.md
 
 Why it failed: the bridge runs `waggledance` from `PATH`, which resolves to
 `~/.local/bin/waggledance`, built 2026-10-06 and missing `supervisor`. The
-supervisor agent would fail the same way later on:
+supervisor agent would fail the same way at its first report:
 
 - its `waggledance supervisor report` Bash call goes through the same `PATH`:
   `~/.local/bin/waggledance supervisor report --help` prints

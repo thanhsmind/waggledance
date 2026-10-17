@@ -190,8 +190,8 @@ On each beat:
 1. Re-read the map.
 2. For any leader running for over an hour, report `kind=progress` saying how long
    it has run and on which task.
-3. Retry every `report-failed` line that has no later `report-retried` line for the
-   same corr and kind; append `report-retried` when it succeeds.
+3. Retry every `report-failed` line that has no `report-retried` line after it for
+   the same corr and kind; append `report-retried` when it succeeds.
 
 ## What you never do
 
