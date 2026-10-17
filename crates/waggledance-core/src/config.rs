@@ -79,6 +79,7 @@ impl Default for SupervisorConfig {
 pub struct OpenClawConfig {
     pub home: String,
     pub hook_url: String,
+    pub agent_id: String,
     pub telegram_to: String,
     pub hook_model: String,
     pub hook_thinking: String,
@@ -89,6 +90,7 @@ impl Default for OpenClawConfig {
         Self {
             home: "~/aicoworker/openclaw".into(),
             hook_url: "http://127.0.0.1:18789/hooks/agent".into(),
+            agent_id: String::new(),
             telegram_to: String::new(),
             hook_model: String::new(),
             hook_thinking: "low".into(),
@@ -1271,6 +1273,7 @@ mod tests {
         assert_eq!(c.supervisor.title, "waggledance supervisor");
         assert_eq!(c.openclaw.home, "~/aicoworker/openclaw");
         assert_eq!(c.openclaw.hook_url, "http://127.0.0.1:18789/hooks/agent");
+        assert_eq!(c.openclaw.agent_id, "");
         assert_eq!(c.openclaw.telegram_to, "");
         assert_eq!(c.openclaw.hook_model, "");
         assert_eq!(c.openclaw.hook_thinking, "low");
@@ -1293,6 +1296,7 @@ mod tests {
             "http://127.0.0.1:18789/hooks/agent"
         );
         assert_eq!(loaded.openclaw.hook_thinking, "low");
+        assert_eq!(loaded.openclaw.agent_id, "");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -96,7 +96,14 @@ OpenClaw's `/hooks/agent` does not post text to Telegram; it runs an isolated mo
 turn whose prompt is the `message` (D11). `report` therefore sends an instruction:
 "Chuyển nguyên văn cho người dùng, không diễn giải lại, không dịch, không thêm lời:"
 followed by the tagged line, with `thinking` set from `[openclaw] hook_thinking`
-(default `low`) and `model` from `[openclaw] hook_model` when set. The relay still
+(default `low`) and `model` from `[openclaw] hook_model` when set. When
+`[openclaw] agent_id` is set, the body also carries `agentId`, so the turn runs as that
+OpenClaw agent, such as a dedicated `wd` bot, instead of the gateway's default agent;
+empty, the default, sends no `agentId`. Two OpenClaw facts hold the target in place, both seen live on 2026-10-17: the
+gateway builds the hook's known-agent set at start, so a newly added agent gets the
+default agent's turn until the gateway restarts (`kill -USR1 <openclaw-gateway pid>`
+restarts it in-process), and with `telegram_to` empty the target agent delivers to its
+own last chat, so its bot must have had one direct message from the user first. The relay still
 passes through a model, so the Telegram text can drift from the report text. That is
 the accepted limit; the live proof checks it by quoting one against the other.
 
@@ -169,7 +176,10 @@ Installs aicoworker's side, in this order:
 1. Writes `<data dir>/hook.token` (32 random bytes, hex, owner-only) when absent; an
    existing token is never overwritten.
 2. Writes the `waggledance-orchestrator` skill into
-   `<[openclaw] home>/workspace-main/skills/`, moving any unversioned copy to
+   the workspace of `[openclaw] agent_id`: its `agents.list[].workspace` in
+   `openclaw.json` (relative paths under the OpenClaw home), else
+   `<[openclaw] home>/workspace-<agent_id>/skills/`, and `workspace-main` when
+   `agent_id` is empty. It moves any unversioned copy to
    `<data dir>/backups/` first.
 3. Refreshes `~/.agents/skills/waggledance-supervisor/` from
    `docs/waggledance-supervisor-skill-template.md` the same way.
