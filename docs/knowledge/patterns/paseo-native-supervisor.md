@@ -14,7 +14,7 @@ bee:
 
 # A task handed in from outside Paseo goes to the supervisor, which runs the project's leader as its own subagent
 
-Locked by paseo-native-supervisor D1–D13
+Locked by paseo-native-supervisor D1/D2/D3/D4/D5/D6/D7/D8/D9/D10/D11/D12/D13
 (`docs/history/paseo-native-supervisor/CONTEXT.md`). D8 freezes the daemon path in
 [A request for a project reaches its one Paseo leader](paseo-leader-dispatch.md): it
 keeps working for its callers and gains nothing from this feature.

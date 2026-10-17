@@ -88,16 +88,16 @@ Exact JSON shape inside `leaders`; where the hook token file lives under `~/.wag
 
 ## Outstanding Questions
 
-### Deferred To Planning
+### Resolved In Planning
 
-- [ ] How the supervisor keeps the task-to-leader-to-caller mapping across its own turns — its own context, `update_agent` labels, or a small file under `~/.waggledance/`; answered by checking what survives a Paseo restart.
-- [ ] Whether `paseo ls -g --json` exposes labels in 0.11.2 so `leaders` and `supervisor ensure` can filter by them; answered by capturing a fixture.
-- [ ] How the supervisor waits between leader turns: rely on `notifyOnFinish` alone, or add a `create_heartbeat` as a safety net; answered by one live probe of a long leader turn.
+- [x] How the supervisor keeps the task-to-leader-to-caller mapping across its own turns — an append-only `ledger.md` in its cwd, a hint re-derived from the map every turn (D13).
+- [x] Whether `paseo ls -g --json` exposes labels in 0.11.2 — it does not; it filters by `--label` but prints none, so `leaders` maps by cwd and `ensure` queries by label (plan claims 1 and 2).
+- [x] How the supervisor waits between leader turns — `notifyOnFinish` plus one 30-minute heartbeat (D13).
 
-## Deferred Ideas
+## Out Of Scope
 
-- Several leaders per project when a task is marked independent — backlog; one leader per project holds (D3) until worktree and bee-state collisions are understood.
-- Letting Paseo-internal callers (the Waggle Dance plugin request box) route through the supervisor instead of the frozen daemon path.
+- Several leaders per project when a task is marked independent — a proposed PBI exists; one leader per project holds (D3).
+- Paseo-internal callers (the Waggle Dance plugin request box) keep the frozen daemon path (D8).
 
 ## Handoff Note
 
