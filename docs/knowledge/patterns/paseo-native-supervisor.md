@@ -196,7 +196,7 @@ the supervisor never reuses or archives, and one the supervisor opened
 (`via: supervisor`). `leaders` lists both. The daemon's `resolve_leader` filters on the
 role and project labels only, so it takes the first unarchived leader of either kind
 and may deliver into the supervisor's. Routing the request box through the supervisor
-is deferred.
+waits on trigger `the-waggle-dance-paseo-plugin-s-request-b__469884e6`.
 
 ## Pointers
 
