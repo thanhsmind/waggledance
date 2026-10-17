@@ -227,10 +227,18 @@ registers every Paseo workspace as a project on its own. Once a project opts in,
 `waggledance_dispatch` with `leader: true` queues the task; the running daemon
 (`waggledance serve`) delivers it when that leader is idle, or starts one, and tells the
 caller when the leader's turn ends. Pass a `request_id` so a retry never sends twice.
-The waggledance agent in Paseo, the request box in the Waggle Dance Paseo plugin, and any
-external agent running `waggledance mcp` all use this path. The detection order, the
-workspace rules, and the run statuses are in
+The request box in the Waggle Dance Paseo plugin uses this path; it is frozen and gains
+no new behaviour. The detection order, the workspace rules, and the run statuses are in
 [A request for a project reaches its one Paseo leader](docs/knowledge/patterns/paseo-leader-dispatch.md).
+
+An agent outside Paseo, such as aicoworker on OpenClaw, hands its task to the
+waggledance supervisor instead: one long-lived Paseo agent that opens each project's
+leader as its own subagent, hears from Paseo when the leader finishes or asks, and
+reports to Telegram through the OpenClaw hook. `waggledance supervisor ensure` finds or
+starts it, `waggledance setup openclaw` installs aicoworker's side, and
+`waggledance_ask_state` lists each project's `leaders`. The hops, message shapes and
+limits are in
+[A task handed in from outside Paseo goes to the supervisor](docs/knowledge/patterns/paseo-native-supervisor.md).
 
 ### Per-project settings: .waggledance.toml
 
