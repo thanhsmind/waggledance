@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub enum Target {
     Pi,
     Paseo,
+    #[value(name = "openclaw")]
+    OpenClaw,
 }
 
 const PASEO_ID: &str = "waggledance";
@@ -80,6 +82,24 @@ const PASEO_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+const OPENCLAW_FILES: &[(&str, &str)] = &[
+    (
+        "SKILL.md",
+        include_str!("../../../integrations/openclaw/waggledance-orchestrator/SKILL.md"),
+    ),
+    (
+        "bin/wd-bridge.py",
+        include_str!("../../../integrations/openclaw/waggledance-orchestrator/bin/wd-bridge.py"),
+    ),
+];
+
+const SUPERVISOR_SKILL_FILES: &[(&str, &str)] = &[(
+    "SKILL.md",
+    include_str!("../../../docs/waggledance-supervisor-skill-template.md"),
+)];
+
+const HOOK_SESSION_KEY: &str = "hook:waggledance";
+
 type Files = BTreeMap<String, String>;
 type Runner<'a> = &'a mut dyn FnMut(&[&str]) -> Result<String>;
 
@@ -106,6 +126,14 @@ fn pi_files(exe: &Path) -> Files {
 
 fn paseo_files(exe: &Path) -> Files {
     files(PASEO_FILES, "server/installed.ts", exe)
+}
+
+fn openclaw_files() -> Files {
+    files(OPENCLAW_FILES, "", Path::new(""))
+}
+
+fn supervisor_skill_files() -> Files {
+    files(SUPERVISOR_SKILL_FILES, "", Path::new(""))
 }
 
 fn read_tree(dir: &Path, base: &Path, out: &mut Files) -> std::io::Result<()> {
@@ -170,6 +198,226 @@ fn remove_tree(dst: &Path) -> Result<bool> {
     refuse_foreign(dst)?;
     std::fs::remove_dir_all(dst).with_context(|| format!("removing {}", dst.display()))?;
     Ok(true)
+}
+
+struct OpenClawPaths {
+    data: PathBuf,
+    home: PathBuf,
+    agent_skills: PathBuf,
+}
+
+impl OpenClawPaths {
+    fn skill(&self) -> PathBuf {
+        self.home
+            .join("workspace-main")
+            .join("skills")
+            .join("waggledance-orchestrator")
+    }
+
+    fn supervisor_skill(&self) -> PathBuf {
+        self.agent_skills.join("waggledance-supervisor")
+    }
+
+    fn backups(&self) -> PathBuf {
+        self.data.join("backups")
+    }
+
+    fn json(&self) -> PathBuf {
+        self.home.join("openclaw.json")
+    }
+}
+
+fn expand_home(raw: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    match raw.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if raw == "~" => home,
+        None => PathBuf::from(raw),
+    }
+}
+
+fn backup_name(name: &str, now: u64) -> String {
+    format!("{name}.bak-{now}")
+}
+
+fn newest_backup(dir: &Path, name: &str) -> Option<PathBuf> {
+    let prefix = format!("{name}.bak-");
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let secs: u64 = file.strip_prefix(&prefix)?.parse().ok()?;
+            Some((secs, e.path()))
+        })
+        .max_by_key(|(secs, _)| *secs)
+        .map(|(_, path)| path)
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn set_aside_foreign(dst: &Path, backups: &Path, now: u64) -> Result<Option<PathBuf>> {
+    if !dst.exists() || dst.join("VERSION").is_file() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(backups).with_context(|| format!("creating {}", backups.display()))?;
+    let to = backups.join(backup_name(&file_name(dst), now));
+    std::fs::rename(dst, &to)
+        .with_context(|| format!("moving {} to {}", dst.display(), to.display()))?;
+    Ok(Some(to))
+}
+
+fn install_skill(dst: &Path, want: &Files, backups: &Path, now: u64) -> Result<Vec<String>> {
+    let mut done = Vec::new();
+    if let Some(to) = set_aside_foreign(dst, backups, now)? {
+        done.push(format!(
+            "moved the existing {} to {}",
+            dst.display(),
+            to.display()
+        ));
+    }
+    if write_tree(dst, want)? {
+        done.push(format!("wrote {}", dst.display()));
+    }
+    Ok(done)
+}
+
+fn remove_skill(dst: &Path, backups: &Path) -> Result<Vec<String>> {
+    let mut done = Vec::new();
+    if remove_tree(dst)? {
+        done.push(format!("removed {}", dst.display()));
+    }
+    if let Some(from) = newest_backup(backups, &file_name(dst)) {
+        std::fs::rename(&from, dst)
+            .with_context(|| format!("restoring {} from {}", dst.display(), from.display()))?;
+        done.push(format!(
+            "restored {} from {}",
+            dst.display(),
+            from.display()
+        ));
+    }
+    Ok(done)
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("marking {} executable", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn edit_openclaw_json(path: &Path, token: &str, now: u64) -> Result<Option<PathBuf>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("`hooks` in {} is not an object", path.display()))?;
+    let want = [
+        ("enabled", serde_json::json!(true)),
+        ("token", serde_json::json!(token)),
+        ("defaultSessionKey", serde_json::json!(HOOK_SESSION_KEY)),
+        ("allowRequestSessionKey", serde_json::json!(false)),
+    ];
+    if want.iter().all(|(k, v)| hooks.get(*k) == Some(v)) {
+        return Ok(None);
+    }
+    for (k, v) in want {
+        hooks.insert(k.into(), v);
+    }
+    let bak = path.with_file_name(backup_name(&file_name(path), now));
+    waggledance_core::config::write_owner_only(&bak, text.as_bytes())
+        .with_context(|| format!("backing up {} to {}", path.display(), bak.display()))?;
+    let mut out = serde_json::to_string_pretty(&doc)?;
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(bak))
+}
+
+fn openclaw_install(p: &OpenClawPaths, now: u64) -> Result<Vec<String>> {
+    let mut done = Vec::new();
+    let token_path = waggledance_core::config::hook_token_path(&p.data);
+    if waggledance_core::config::ensure_hook_token(&p.data)
+        .with_context(|| format!("writing {}", token_path.display()))?
+    {
+        done.push(format!("wrote {}", token_path.display()));
+    }
+    let token = waggledance_core::config::read_hook_token(&p.data)
+        .ok_or_else(|| anyhow::anyhow!("{} is empty; delete it and rerun", token_path.display()))?;
+    let skill = p.skill();
+    let wrote = install_skill(&skill, &openclaw_files(), &p.backups(), now)?;
+    if !wrote.is_empty() {
+        make_executable(&skill.join("bin").join("wd-bridge.py"))?;
+    }
+    done.extend(wrote);
+    done.extend(install_skill(
+        &p.supervisor_skill(),
+        &supervisor_skill_files(),
+        &p.backups(),
+        now,
+    )?);
+    if let Some(bak) = edit_openclaw_json(&p.json(), &token, now)? {
+        done.push(format!(
+            "enabled hooks in {} (backup {})",
+            p.json().display(),
+            bak.display()
+        ));
+    }
+    Ok(done)
+}
+
+fn openclaw_remove(p: &OpenClawPaths) -> Result<Vec<String>> {
+    refuse_foreign(&p.skill())?;
+    refuse_foreign(&p.supervisor_skill())?;
+    let mut done = remove_skill(&p.skill(), &p.backups())?;
+    done.extend(remove_skill(&p.supervisor_skill(), &p.backups())?);
+    let json = p.json();
+    if let Some(bak) = newest_backup(&p.home, &file_name(&json)) {
+        std::fs::rename(&bak, &json)
+            .with_context(|| format!("restoring {} from {}", json.display(), bak.display()))?;
+        done.push(format!(
+            "restored {} from {}",
+            json.display(),
+            bak.display()
+        ));
+    }
+    let token = waggledance_core::config::hook_token_path(&p.data);
+    if token.exists() {
+        std::fs::remove_file(&token).with_context(|| format!("removing {}", token.display()))?;
+        done.push(format!("removed {}", token.display()));
+    }
+    Ok(done)
+}
+
+fn openclaw_notes(hook_url: &str, token: &Path) -> Vec<String> {
+    let curl = format!(
+        "curl -s -o /dev/null -w '%{{http_code}}' -X POST {hook_url} -H 'Content-Type: application/json'"
+    );
+    vec![
+        format!("check the hook refuses a call without the token (expect 401): {curl} -d '{{\"message\":\"x\"}}'"),
+        format!(
+            "check the hook reaches Telegram with the token (expect 200): {curl} -H \"Authorization: Bearer $(cat {})\" -d '{{\"message\":\"Chuyển nguyên văn cho người dùng: [waggledance] hook online\",\"deliver\":true,\"channel\":\"telegram\"}}'",
+            token.display()
+        ),
+        "the OpenClaw gateway may need a restart to pick up `hooks`; setup never restarts it, restart it yourself".into(),
+    ]
 }
 
 fn pi_agent_dir() -> PathBuf {
@@ -376,6 +624,30 @@ pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
             };
             (dst, done)
         }
+        Target::OpenClaw => {
+            let config = waggledance_core::Config::load();
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            let paths = OpenClawPaths {
+                data: waggledance_core::config::resolve_data_dir(None),
+                home: expand_home(&config.openclaw.home),
+                agent_skills: home.join(".agents").join("skills"),
+            };
+            let done = if remove {
+                openclaw_remove(&paths)?
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default();
+                let done = openclaw_install(&paths, now)?;
+                notes.extend(openclaw_notes(
+                    &config.openclaw.hook_url,
+                    &waggledance_core::config::hook_token_path(&paths.data),
+                ));
+                done
+            };
+            (paths.skill(), done)
+        }
     };
     if !remove {
         warnings.extend(dev_build_warning(&exe));
@@ -383,6 +655,7 @@ pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
     let name = match target {
         Target::Pi => "pi",
         Target::Paseo => "paseo",
+        Target::OpenClaw => "openclaw",
     };
     if json {
         println!(
@@ -492,6 +765,7 @@ mod tests {
                     && !p.ends_with(".test.ts")
                     && p != "package-lock.json"
                     && !p.starts_with('.')
+                    && !p.contains("__pycache__/")
             })
             .collect()
     }
@@ -504,6 +778,188 @@ mod tests {
         let paseo: BTreeSet<String> = names(PASEO_FILES);
         assert_eq!(pi, shipped(&root.join("pi")));
         assert_eq!(paseo, shipped(&root.join("paseo")));
+        let openclaw: BTreeSet<String> = names(OPENCLAW_FILES);
+        assert_eq!(
+            openclaw,
+            shipped(&root.join("openclaw").join("waggledance-orchestrator"))
+        );
+    }
+
+    #[test]
+    fn embedded_openclaw_files_equal_the_repo_files() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let skill = repo.join("integrations/openclaw/waggledance-orchestrator");
+        for (name, body) in OPENCLAW_FILES {
+            assert_eq!(
+                std::fs::read_to_string(skill.join(name)).unwrap(),
+                *body,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.join("docs/waggledance-supervisor-skill-template.md"))
+                .unwrap(),
+            SUPERVISOR_SKILL_FILES[0].1
+        );
+    }
+
+    const OPENCLAW_JSON: &str = r#"{
+  "meta": {
+    "lastTouchedVersion": "2026.3.13"
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "session-memory": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "botToken": "keep-me"
+    }
+  },
+  "zUnknown": [1, 2]
+}
+"#;
+
+    fn openclaw_paths(root: &Path) -> OpenClawPaths {
+        let p = OpenClawPaths {
+            data: root.join("data"),
+            home: root.join("openclaw"),
+            agent_skills: root.join("agents").join("skills"),
+        };
+        std::fs::create_dir_all(&p.home).unwrap();
+        std::fs::write(p.json(), OPENCLAW_JSON).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn openclaw_json_edit_keeps_every_other_key_and_backs_up_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = openclaw_paths(tmp.path());
+        let bak = edit_openclaw_json(&p.json(), "tok", 100).unwrap().unwrap();
+        assert_eq!(bak, p.home.join("openclaw.json.bak-100"));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), OPENCLAW_JSON);
+        #[cfg(unix)]
+        assert_eq!(mode(&bak), 0o600);
+        let text = std::fs::read_to_string(p.json()).unwrap();
+        assert!(text.ends_with("}\n"));
+        assert!(text.contains("\n  \"meta\": {\n    \"lastTouchedVersion\""));
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let before: serde_json::Value = serde_json::from_str(OPENCLAW_JSON).unwrap();
+        assert_eq!(doc["hooks"]["internal"], before["hooks"]["internal"]);
+        assert_eq!(doc["channels"], before["channels"]);
+        assert_eq!(doc["meta"], before["meta"]);
+        assert_eq!(doc["zUnknown"], before["zUnknown"]);
+        assert_eq!(doc["hooks"]["enabled"], true);
+        assert_eq!(doc["hooks"]["token"], "tok");
+        assert_eq!(doc["hooks"]["defaultSessionKey"], "hook:waggledance");
+        assert_eq!(doc["hooks"]["allowRequestSessionKey"], false);
+        let keys: Vec<&String> = doc.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["meta", "hooks", "channels", "zUnknown"]);
+        assert!(edit_openclaw_json(&p.json(), "tok", 200).unwrap().is_none());
+        assert!(!p.home.join("openclaw.json.bak-200").exists());
+        assert_eq!(std::fs::read_to_string(p.json()).unwrap(), text);
+    }
+
+    #[test]
+    fn hook_token_is_owner_only_and_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let path = waggledance_core::config::hook_token_path(&data);
+        assert!(waggledance_core::config::ensure_hook_token(&data).unwrap());
+        let token = waggledance_core::config::read_hook_token(&data).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+        assert!(!waggledance_core::config::ensure_hook_token(&data).unwrap());
+        assert_eq!(
+            waggledance_core::config::read_hook_token(&data).unwrap(),
+            token
+        );
+        std::fs::write(&path, "mine\n").unwrap();
+        assert!(!waggledance_core::config::ensure_hook_token(&data).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn openclaw_install_then_remove_round_trips_the_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = openclaw_paths(tmp.path());
+        std::fs::create_dir_all(p.skill().join("bin")).unwrap();
+        std::fs::write(p.skill().join("SKILL.md"), "old skill").unwrap();
+        std::fs::create_dir_all(p.supervisor_skill()).unwrap();
+        std::fs::write(p.supervisor_skill().join("SKILL.md"), "old supervisor").unwrap();
+
+        let done = openclaw_install(&p, 100).unwrap();
+        assert!(done[0].contains("hook.token"), "{done:?}");
+        let token = waggledance_core::config::read_hook_token(&p.data).unwrap();
+        assert!(is_current(&p.skill(), &openclaw_files()));
+        assert!(is_current(&p.supervisor_skill(), &supervisor_skill_files()));
+        #[cfg(unix)]
+        assert_eq!(mode(&p.skill().join("bin/wd-bridge.py")), 0o755);
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(p.json()).unwrap()).unwrap();
+        assert_eq!(doc["hooks"]["token"], token.as_str());
+        assert!(p
+            .backups()
+            .join("waggledance-orchestrator.bak-100")
+            .is_dir());
+        assert!(p.backups().join("waggledance-supervisor.bak-100").is_dir());
+        assert!(openclaw_install(&p, 200).unwrap().is_empty());
+
+        openclaw_remove(&p).unwrap();
+        assert_eq!(std::fs::read_to_string(p.json()).unwrap(), OPENCLAW_JSON);
+        assert!(!waggledance_core::config::hook_token_path(&p.data).exists());
+        assert_eq!(
+            std::fs::read_to_string(p.skill().join("SKILL.md")).unwrap(),
+            "old skill"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.supervisor_skill().join("SKILL.md")).unwrap(),
+            "old supervisor"
+        );
+        assert!(!p.home.join("openclaw.json.bak-100").exists());
+    }
+
+    #[test]
+    fn openclaw_remove_leaves_a_foreign_skill_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = openclaw_paths(tmp.path());
+        std::fs::create_dir_all(p.skill()).unwrap();
+        std::fs::write(p.skill().join("SKILL.md"), "mine").unwrap();
+        assert!(openclaw_remove(&p).is_err());
+        assert_eq!(
+            std::fs::read_to_string(p.skill().join("SKILL.md")).unwrap(),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn openclaw_notes_carry_both_curl_checks_and_the_restart() {
+        let notes = openclaw_notes(
+            "http://127.0.0.1:18789/hooks/agent",
+            Path::new("/d/hook.token"),
+        );
+        assert!(notes[0].contains("expect 401"));
+        assert!(notes[0].contains(
+            "curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18789/hooks/agent -H 'Content-Type: application/json' -d '{\"message\":\"x\"}'"
+        ));
+        assert!(notes[1].contains("expect 200"));
+        assert!(notes[1].contains("-H \"Authorization: Bearer $(cat /d/hook.token)\""));
+        assert!(notes[1].contains(r#""deliver":true,"channel":"telegram""#));
+        assert!(notes[2].contains("restart"));
     }
 
     fn install_calls(ls: &str, pre_write: bool) -> Vec<String> {

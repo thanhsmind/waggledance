@@ -83,7 +83,7 @@ pub enum Command {
     },
     /// Run the MCP server over stdio (used by Claude Code).
     Mcp,
-    /// Install (or --remove) the pi extension or the Paseo plugin.
+    /// Install (or --remove) the pi extension, the Paseo plugin, or the OpenClaw bridge.
     Setup {
         #[arg(value_enum)]
         target: crate::setup::Target,
@@ -92,6 +92,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Find or start the supervisor agent, or report to its webhook.
+    Supervisor {
+        #[command(subcommand)]
+        action: SupervisorAction,
+    },
     /// Edit configuration.
     Config {
         #[command(subcommand)]
@@ -99,6 +104,28 @@ pub enum Command {
     },
     /// Print the version (same value as `--version`).
     Version,
+}
+
+#[derive(Subcommand)]
+pub enum SupervisorAction {
+    /// Find the supervisor agent by label, or start it when absent.
+    Ensure {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Post one report to the OpenClaw hook.
+    Report {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        corr: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -141,6 +168,7 @@ pub fn run(cli: Cli) -> Result<()> {
             remove,
             json,
         } => crate::setup::run(target, remove, json),
+        Command::Supervisor { action } => crate::seat::run(action),
         Command::Config { action } => match action {
             ConfigAction::Edit => cmd_config_edit(),
         },

@@ -154,30 +154,24 @@ either — ask the human which mode, rather than guessing.
 
 ## Leader mode — when the target project runs in Paseo
 
-When the target project's lead lives in Paseo, dispatch with `{project, task, leader: true}` instead of
-`{project, task, preset}`. Everything else in both procedures holds unchanged: the mode
-gate, the correlation id, the provenance line as line 1, the spec body, and the
-file-and-stop or execute-to-completion contract.
+A project whose lead lives in Paseo is reached through the waggledance supervisor, the
+one Paseo agent labelled `waggledance.role=supervisor`. It opens or reuses the
+project's leader, watches it, and reports back on Telegram. Hand the task to it:
 
-- Always pass `request_id` equal to the correlation id. A re-send after a timeout then
-  returns the original run with `duplicate: true` and sends nothing again.
-- waggledance finds the project's one long-lived leader by its labels, or starts one in
-  a Paseo workspace at the project root that waggledance picks itself. Never name a
-  workspace, an agent id, a provider, or a working directory — waggledance and the
-  project's `.waggledance.toml` own them.
-- The leader takes the task as a new message. That is reuse by design, not a competing
-  run, so step 2's live-lead check does not apply. A busy leader is not refused: the
-  run starts `queued` and the waggledance daemon delivers it, in order, once the leader
-  is idle. `queued` is normal, not a failure.
-- A warning "paused — waggledance daemon not running" means the request is stored but
-  nothing delivers it. Tell the human to start `waggledance serve`; do not re-dispatch.
-- Track the run with `waggledance_await` and `waggledance_runs` exactly as above, or
-  wait for the leader notice instead of looping on `waggledance_await`: when the run
-  ends or blocks, waggledance sends this seat a `[waggledance]` message naming the run.
-  `queued` comes with its age. `done` means the leader's turn that carried this task
-  ended; its reply is the delta. `blocked` means the leader waits on a permission in
-  Paseo — the human answers it there. `lost` means the turn's end was not seen; its text
-  says why, and the leader may still be finishing.
+- From aicoworker, run its `waggledance-orchestrator` skill's `handoff --task "<task>"`.
+  Keep the `corr` it prints; `reply`, `redo` and `accept` carry it.
+- From anywhere else, run `waggledance supervisor ensure --json` for the supervisor's
+  `agent_id` (it starts one when none is listed), then
+  `paseo send <agent_id> --no-wait` with the message `[handoff <corr>] <task>`.
+
+The mode gate, the provenance line as line 1, the spec body, and the file-and-stop or
+execute-to-completion contract hold unchanged inside the task text. Never name a
+workspace, an agent id, a provider, or a working directory for the leader; the
+supervisor and the project's `.waggledance.toml` own them.
+
+`waggledance_dispatch` with `leader: true` is the daemon's door. It is frozen and kept
+for the Waggle Dance plugin's request box; do not use it as the first choice. Its
+queue, statuses, and notices are in `docs/knowledge/patterns/paseo-leader-dispatch.md`.
 
 ## Refusals
 

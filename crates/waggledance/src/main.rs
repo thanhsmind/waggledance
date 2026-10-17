@@ -20,6 +20,7 @@ mod orchestrate;
 mod paseo;
 mod reaper;
 mod runtime;
+mod seat;
 mod server;
 mod setup;
 mod slash;

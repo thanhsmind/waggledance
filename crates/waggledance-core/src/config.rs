@@ -17,6 +17,8 @@ pub struct Config {
     pub search: SearchConfig,
     pub terminal: TerminalConfig,
     pub paseo: PaseoConfig,
+    pub supervisor: SupervisorConfig,
+    pub openclaw: OpenClawConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +52,48 @@ impl Default for PaseoConfig {
 pub struct PaseoLeader {
     pub project: String,
     pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SupervisorConfig {
+    pub provider: String,
+    pub mode: String,
+    pub thinking: String,
+    pub title: String,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            provider: "claude/claude-haiku-5-5".into(),
+            mode: "bypassPermissions".into(),
+            thinking: String::new(),
+            title: "waggledance supervisor".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OpenClawConfig {
+    pub home: String,
+    pub hook_url: String,
+    pub telegram_to: String,
+    pub hook_model: String,
+    pub hook_thinking: String,
+}
+
+impl Default for OpenClawConfig {
+    fn default() -> Self {
+        Self {
+            home: "~/aicoworker/openclaw".into(),
+            hook_url: "http://127.0.0.1:18789/hooks/agent".into(),
+            telegram_to: String::new(),
+            hook_model: String::new(),
+            hook_thinking: "low".into(),
+        }
+    }
 }
 
 impl PaseoConfig {
@@ -451,6 +495,33 @@ pub fn notify_store_path_override(override_dir: Option<&Path>) -> PathBuf {
 /// (now-unused) `terminal.token` — saving one never disturbs the other.
 const NOTIFY_CREDENTIAL_FILE_NAME: &str = "telegram.token";
 
+const HOOK_CREDENTIAL_FILE_NAME: &str = "hook.token";
+
+pub fn hook_token_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(HOOK_CREDENTIAL_FILE_NAME)
+}
+
+pub fn read_hook_token(data_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(hook_token_path(data_dir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn ensure_hook_token(data_dir: &Path) -> Result<bool> {
+    let path = hook_token_path(data_dir);
+    if path.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(data_dir)?;
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    write_owner_only(&path, format!("{token}\n").as_bytes())?;
+    Ok(true)
+}
+
 /// `<data_dir>/telegram.token`, or `override_dir/telegram.token` when given
 /// — mirrors `config_path_override` so a route-level test never touches the
 /// real `~/.waggledance`.
@@ -516,7 +587,7 @@ fn random_temp_suffix() -> String {
 }
 
 #[cfg(unix)]
-fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -529,7 +600,7 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 #[cfg(not(unix))]
-fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -1064,9 +1135,14 @@ mod tests {
             !config_text.contains(secret),
             "config.toml must never carry the Telegram credential: {config_text}"
         );
+        let lower = config_text.to_lowercase();
         assert!(
-            !config_text.to_lowercase().contains("telegram"),
-            "config.toml must carry no telegram-shaped field at all: {config_text}"
+            !lower.contains("token") && !lower.contains("credential"),
+            "config.toml must carry no credential-shaped field at all: {config_text}"
+        );
+        assert!(
+            !config_text.contains(&cred_path.display().to_string()),
+            "config.toml must never name the credential file: {config_text}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1184,6 +1260,82 @@ mod tests {
             None,
             "a failed save must never leave a partial credential readable"
         );
+    }
+
+    #[test]
+    fn supervisor_and_openclaw_defaults_are_the_shipped_values() {
+        let c = Config::default();
+        assert_eq!(c.supervisor.provider, "claude/claude-haiku-5-5");
+        assert_eq!(c.supervisor.mode, "bypassPermissions");
+        assert_eq!(c.supervisor.thinking, "");
+        assert_eq!(c.supervisor.title, "waggledance supervisor");
+        assert_eq!(c.openclaw.home, "~/aicoworker/openclaw");
+        assert_eq!(c.openclaw.hook_url, "http://127.0.0.1:18789/hooks/agent");
+        assert_eq!(c.openclaw.telegram_to, "");
+        assert_eq!(c.openclaw.hook_model, "");
+        assert_eq!(c.openclaw.hook_thinking, "low");
+    }
+
+    #[test]
+    fn supervisor_and_openclaw_should_read_as_the_defaults_from_a_file_without_the_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "waggledance-cfg-seat-defaults-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[server]\nport = 7711\n").unwrap();
+        let loaded = Config::load_from(&p);
+        assert_eq!(loaded.supervisor.provider, "claude/claude-haiku-5-5");
+        assert_eq!(loaded.supervisor.mode, "bypassPermissions");
+        assert_eq!(
+            loaded.openclaw.hook_url,
+            "http://127.0.0.1:18789/hooks/agent"
+        );
+        assert_eq!(loaded.openclaw.hook_thinking, "low");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_token_path_is_beside_the_config() {
+        let dir = Path::new("/tmp/wd-data");
+        assert_eq!(hook_token_path(dir), dir.join("hook.token"));
+    }
+
+    #[test]
+    fn read_hook_token_is_none_when_absent_empty_or_blank() {
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-cfg-hooktok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_hook_token(&dir), None);
+
+        std::fs::write(hook_token_path(&dir), "").unwrap();
+        assert_eq!(read_hook_token(&dir), None);
+
+        std::fs::write(hook_token_path(&dir), "   \n\t ").unwrap();
+        assert_eq!(read_hook_token(&dir), None);
+
+        std::fs::write(hook_token_path(&dir), "  abc123  \n").unwrap();
+        assert_eq!(read_hook_token(&dir).as_deref(), Some("abc123"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_token_never_becomes_a_config_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "waggledance-cfg-hooktok-leak-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = "hook-bearer-secret-abc123";
+        std::fs::write(hook_token_path(&dir), secret).unwrap();
+        let path = config_path_override(Some(&dir));
+        Config::default().save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(secret), "{text}");
+        assert!(!text.to_lowercase().contains("token"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Defect (4): originally added because the identical mechanism next

@@ -100,6 +100,16 @@ herdr.
 
 ## Dispatch
 
+### Frozen
+
+Per paseo-native-supervisor D8, the queue, the per-project lock, turn-end detection and
+caller notices below stay as documented and receive no new behaviour. They keep
+serving the Paseo plugin's request box and existing MCP callers. An agent outside
+Paseo hands its task to the supervisor instead; see
+[A task handed in from outside Paseo goes to the supervisor](paseo-native-supervisor.md).
+Both paths share the role and project labels, so a project reached through both at
+once may hold a daemon leader and a supervisor leader; that page names the limit.
+
 A caller sends `{project, task, leader: true, request_id}` to `waggledance_dispatch`.
 Exactly one of `preset`, `pane_id`, and `leader: true` is accepted. The task text is
 sent unchanged. `request_id` is optional; pass one on every call.
@@ -315,15 +325,15 @@ the leader wrote. waggledance never interrupts a turn itself (D5).
 
 ## Sources
 
-Three sources reach the same door, and each one names the project itself:
+Each source names the project itself:
 
-- **The waggledance agent in Paseo.** The `waggledance-supervisor` skill dispatches with
-  `leader: true` and its correlation id as `request_id` in its leader mode.
 - **The Waggle Dance Paseo plugin.** The request box in the workspace panel spawns
   `waggledance mcp` over stdio and calls `waggledance_dispatch` with the panel's project,
   the typed task, `leader: true`, and one `request_id` per draft.
-- **External MCP agents.** openclaw, hermes, aicoworker, and any other MCP client that
-  runs `waggledance mcp` call the same tool with the same arguments.
+- **External MCP agents.** Any MCP client that runs `waggledance mcp` can still call the
+  same tool with the same arguments. An agent outside Paseo, such as aicoworker, hands
+  its task to the supervisor instead; see
+  [A task handed in from outside Paseo goes to the supervisor](paseo-native-supervisor.md).
 
 ## Pointers
 
@@ -353,6 +363,7 @@ Three sources reach the same door, and each one names the project itself:
   client is tested against, with a README per file.
 - `integrations/paseo/server/dispatch.ts` and `integrations/paseo/client/composer.tsx` —
   the plugin's request box.
-- `docs/waggledance-supervisor-skill-template.md` — the supervisor skill's leader mode.
+- `docs/waggledance-supervisor-skill-template.md` — the supervisor skill's leader mode,
+  which names this door as frozen and points to the supervisor.
 - `docs/knowledge/patterns/existence-is-not-evidence.md` — why every Paseo behaviour the
   client relies on has a capture.
