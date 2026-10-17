@@ -204,12 +204,12 @@ struct OpenClawPaths {
     data: PathBuf,
     home: PathBuf,
     agent_skills: PathBuf,
+    workspace: PathBuf,
 }
 
 impl OpenClawPaths {
     fn skill(&self) -> PathBuf {
-        self.home
-            .join("workspace-main")
+        self.workspace
             .join("skills")
             .join("waggledance-orchestrator")
     }
@@ -229,10 +229,46 @@ impl OpenClawPaths {
 
 fn expand_home(raw: &str) -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    expand_from(&home, raw)
+}
+
+fn expand_from(home: &Path, raw: &str) -> PathBuf {
     match raw.strip_prefix("~/") {
         Some(rest) => home.join(rest),
-        None if raw == "~" => home,
+        None if raw == "~" => home.to_path_buf(),
         None => PathBuf::from(raw),
+    }
+}
+
+fn workspace_from(home: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        home.join(path)
+    }
+}
+
+fn agent_workspace(home: &Path, agent_id: &str) -> PathBuf {
+    if agent_id.is_empty() {
+        return home.join("workspace-main");
+    }
+    let listed = std::fs::read_to_string(home.join("openclaw.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|doc| {
+            doc.get("agents")?
+                .get("list")?
+                .as_array()?
+                .iter()
+                .find(|entry| entry.get("id").and_then(|id| id.as_str()) == Some(agent_id))
+                .cloned()
+        })
+        .and_then(|entry| entry.get("workspace")?.as_str().map(str::to_string))
+        .filter(|raw| !raw.is_empty());
+    match listed {
+        Some(raw) => workspace_from(home, &raw),
+        None => home.join(format!("workspace-{agent_id}")),
     }
 }
 
@@ -627,9 +663,11 @@ pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
         Target::OpenClaw => {
             let config = waggledance_core::Config::load();
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            let openclaw_home = expand_home(&config.openclaw.home);
             let paths = OpenClawPaths {
+                workspace: agent_workspace(&openclaw_home, &config.openclaw.agent_id),
                 data: waggledance_core::config::resolve_data_dir(None),
-                home: expand_home(&config.openclaw.home),
+                home: openclaw_home,
                 agent_skills: home.join(".agents").join("skills"),
             };
             let done = if remove {
@@ -803,6 +841,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn openclaw_workspace_follows_the_configured_agent_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("openclaw");
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(agent_workspace(&home, ""), home.join("workspace-main"));
+        assert_eq!(agent_workspace(&home, "wd"), home.join("workspace-wd"));
+        std::fs::write(
+            home.join("openclaw.json"),
+            r#"{"agents":{"list":[{"id":"main","workspace":"/srv/main"},{"id":"wd","workspace":"boxes/wd"},{"id":"bare"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(agent_workspace(&home, "wd"), home.join("boxes/wd"));
+        assert_eq!(agent_workspace(&home, "main"), PathBuf::from("/srv/main"));
+        assert_eq!(agent_workspace(&home, "bare"), home.join("workspace-bare"));
+        assert_eq!(
+            agent_workspace(&home, "missing"),
+            home.join("workspace-missing")
+        );
+    }
+
+    #[test]
+    fn openclaw_install_writes_the_skill_under_the_resolved_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("openclaw");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("openclaw.json"),
+            r#"{"agents":{"list":[{"id":"wd","workspace":"agent-wd"}]}}"#,
+        )
+        .unwrap();
+        let p = OpenClawPaths {
+            data: tmp.path().join("data"),
+            agent_skills: tmp.path().join("agents").join("skills"),
+            workspace: agent_workspace(&home, "wd"),
+            home,
+        };
+        assert_eq!(
+            p.skill(),
+            p.workspace.join("skills/waggledance-orchestrator")
+        );
+        assert_eq!(p.workspace, tmp.path().join("openclaw/agent-wd"));
+        openclaw_install(&p, 100).unwrap();
+        assert!(is_current(&p.skill(), &openclaw_files()));
+    }
+
     const OPENCLAW_JSON: &str = r#"{
   "meta": {
     "lastTouchedVersion": "2026.3.13"
@@ -831,6 +915,7 @@ mod tests {
             data: root.join("data"),
             home: root.join("openclaw"),
             agent_skills: root.join("agents").join("skills"),
+            workspace: root.join("openclaw").join("workspace-main"),
         };
         std::fs::create_dir_all(&p.home).unwrap();
         std::fs::write(p.json(), OPENCLAW_JSON).unwrap();

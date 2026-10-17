@@ -222,6 +222,9 @@ pub fn hook_body(
         "wakeMode": "now",
     });
     let object = body.as_object_mut().expect("object literal");
+    if !cfg.agent_id.is_empty() {
+        object.insert("agentId".into(), serde_json::json!(cfg.agent_id));
+    }
     if !cfg.telegram_to.is_empty() {
         object.insert("to".into(), serde_json::json!(cfg.telegram_to));
     }
@@ -477,6 +480,7 @@ mod tests {
         assert_eq!(body["thinking"], "low");
         assert!(body.get("to").is_none());
         assert!(body.get("model").is_none());
+        assert!(body.get("agentId").is_none());
     }
 
     #[test]
@@ -506,12 +510,14 @@ mod tests {
     #[test]
     fn hook_body_adds_to_and_model_only_when_configured() {
         let cfg = OpenClawConfig {
+            agent_id: "wd".into(),
             telegram_to: "12345".into(),
             hook_model: "gemini-flash".into(),
             hook_thinking: "minimal".into(),
             ..OpenClawConfig::default()
         };
         let body = hook_body(&cfg, "progress", "p", "t-1", "x").unwrap();
+        assert_eq!(body["agentId"], "wd");
         assert_eq!(body["to"], "12345");
         assert_eq!(body["model"], "gemini-flash");
         assert_eq!(body["thinking"], "minimal");
