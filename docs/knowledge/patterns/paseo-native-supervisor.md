@@ -84,12 +84,20 @@ A turn end is not a task end. Every prompt the supervisor sends a leader carries
 mail rule: end each turn with `[mail waggledance#<corr> <kind>]`, where `<kind>` is
 `result`, `question`, `blocked` or `working`. `working` means the leader stopped while
 its own advisors, subagents or builds still run. The supervisor reports nothing for a
-`working` turn, sends the leader nothing, and waits for the next turn end; a reply
-with no mail line that says something still runs reads as `working`. A leader whose
-last mail is `working` is not free, and the heartbeat reports it as `progress` once
-that has lasted over an hour. This is piggery's split between `reply` and `settled`,
-carried on Paseo's own finish notification (decision `9d5fbab7`, after `t-334d78`
-reported a leader as done while its plan check and baseline build still ran).
+`working` turn and waits for the next turn end; a reply with no mail line that says
+something still runs reads as `working`. A leader whose last mail is `working` is not
+free. This is piggery's split between `reply` and `settled`, carried on Paseo's own
+finish notification (decision `8558b2b0`, after `t-334d78` reported a leader as done
+while its plan check and baseline build still ran).
+
+A `working` mail opens a follow-up that the supervisor owns until the leader sends
+`result`, `question` or `blocked` (decision `c6881832`). The finish notification only
+arrives when the leader's own next turn ends, and nothing guarantees that wake: in
+`t-bd665a` the leader stopped on "Tôi chờ worker" with a Monitor armed on a child
+worker. So on each beat the heartbeat nudges once a leader that is idle, whose last
+mail was `working`, and that has had no turn end for 15 minutes. If the leader is
+still silent on the next beat, the heartbeat reports `progress` to the user once,
+quoting the leader's last reply.
 
 An advisor is a short-lived subagent with no `workspaceId`, labelled
 `waggledance.role=advisor`, opened when a leader asks a question and archived once it
@@ -98,8 +106,8 @@ otherwise the supervisor reports `question` to the user (D4).
 
 The supervisor keeps `ledger.md` in its working directory, append-only. The ledger is
 a hint; `ask_state.leaders` and `paseo ls` are the truth, re-read at every turn start.
-A Paseo heartbeat every 30 minutes reports `progress` for any leader running longer
-than an hour and retries any report the hook refused (D13).
+A Paseo heartbeat every 10 minutes follows `working` tasks, reports `progress` for any
+leader running longer than an hour, and retries any report the hook refused (D13).
 
 ## The hook is a model turn
 

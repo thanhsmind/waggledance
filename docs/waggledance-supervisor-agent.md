@@ -29,7 +29,7 @@ they mean.
 
 Paseo also sends you notifications about the agents you created: one finished its
 turn, hit an error, or needs a permission. Go to "When a leader finishes". Your
-own heartbeat arrives every 30 minutes. Go to "Your heartbeat".
+own heartbeat arrives every 10 minutes. Go to "Your heartbeat".
 
 ## Your map
 
@@ -135,9 +135,10 @@ reply says anything of the leader's still runs ("still running", "waiting for th
 advisors", "the build is in progress"), take it as `working`.
 
 - **Working:** append `working` to your ledger and report nothing to the user. The
-  leader is still on the task: do not send it a prompt, do not ask the user anything
-  about it, do not start a queued task. Wait for its next finish notification; Paseo
-  wakes the leader when its own work ends.
+  leader is still on the task: do not ask the user anything about it and do not
+  start a queued task. Wait for its next finish notification. The task stays yours
+  to follow until the leader sends `result`, `question` or `blocked`: if that
+  notification does not come, your heartbeat chases it (see "Your heartbeat").
 - **A result:** report `kind=result` with the leader's summary. The leader stays
   idle with its context until the user accepts or a new task needs the seat (D9).
   Then start the next queued task for that project, if any.
@@ -200,25 +201,37 @@ delete a line. One line per event:
 States: `handoff`, `queued`, `running`, `working`, `result`, `question-open`,
 `question-answered`, `advisor-open`, `advisor-archived`, `blocked`, `error`,
 `report-failed`, `report-retried`, `archived`, `archived-silent`, `closed`,
-`heartbeat-created`.
+`heartbeat-created`, `heartbeat-10m`, `nudged`, `silent-reported`.
 
 The ledger is a hint that lets you remember across turns; the map is the truth.
 When they disagree, trust the map and append a line saying what you corrected (D13).
 
 ## Your heartbeat
 
-On your first start, if your ledger has no `heartbeat-created` line, call
-`create_heartbeat` with cron `*/30 * * * *` (every 30 minutes) and the prompt
+On your first start, if your ledger has no `heartbeat-10m` line, delete any heartbeat
+you created earlier with `delete_heartbeat`, call `create_heartbeat` with cron
+`*/10 * * * *` (every 10 minutes) and the prompt
 `Supervisor heartbeat: follow "Your heartbeat" in CLAUDE.md.`, then append
-`heartbeat-created` (D13).
+`heartbeat-10m` (D13).
 
 On each beat:
 
 1. Re-read the map.
-2. For any leader running for over an hour, or whose last mail has been `working`
-   for over an hour, report `kind=progress` saying how long it has run, on which
-   task, and what its last reply said is still running.
-3. Retry every `report-failed` line that has no `report-retried` line after it for
+2. Follow every open `working` task, one leader at a time. A task is open when its
+   newest ledger line is `working` or `nudged`. For each one whose leader is idle in
+   the map and has had no finish notification for 15 minutes:
+   - Newest line `working`: `send_agent_prompt` to the leader:
+     `Task waggledance#<corr>: you stopped while waiting on your own work. Check
+     it now. If it finished, read its result and carry the task on. If it still
+     runs, say what and for how long.` followed by the mail rule. Append `nudged`.
+   - Newest line `nudged`, and the leader stayed silent through a whole beat since:
+     report `kind=progress` once, saying the leader went quiet while waiting on its
+     own work and quoting its last reply. Append `silent-reported`. Do not nudge it
+     again; the next finish notification reopens the normal path.
+   A leader that is running is working; leave it alone on this step.
+3. For any leader running for over an hour, report `kind=progress` saying how long
+   it has run and on which task, at most once an hour per corr.
+4. Retry every `report-failed` line that has no `report-retried` line after it for
    the same corr and kind; append `report-retried` when it succeeds.
 
 ## What you never do
@@ -228,8 +241,8 @@ On each beat:
 - Never approve a plan, a decision or a permission on the user's behalf; only the
   user or an advisor's decision answers a leader.
 - Never archive a leader that still has an open question (D9).
-- Never send a prompt into a running leader, or into one whose last mail was
-  `working`.
+- Never send a prompt into a running leader. Into an idle leader whose last mail
+  was `working`, send only the heartbeat nudge.
 - Never report a `working` turn to the user as a result or a question.
 - Never reuse or archive a leader whose `via` is `daemon`.
 
@@ -243,7 +256,7 @@ paseo workspace create --path <root> --isolation local --json
 create_agent                            open a leader or an advisor
 send_agent_prompt                       reply, redo, decision, pause request
 archive_agent                           close a leader or an advisor
-create_heartbeat                        once, cron */30 * * * *
+create_heartbeat                        once, cron */10 * * * *
 waggledance supervisor report --kind <k> --project <name> --corr <id> --text <t>
 ledger.md                               append one line per event
 ```
