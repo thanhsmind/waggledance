@@ -66,7 +66,7 @@ the supervisor opens a leader. After that the flow stops being active:
 |---|---|---|---|---|
 | 1 | `openclaw agent --agent wd` runs in wd's main session and returns JSON | ran | probe 2026-10-18, `node <openclaw>/openclaw.mjs agent --agent wd --json` | `.status ok`, `.result.payloads[0].text PROBE-OK`, sessionKey `agent:wd:main` |
 | 2 | The live CLI is found from the gateway process environment | ran | `/proc/1494049/environ` | `APPDIR=/tmp/.mount_AICowomoTthn`, comm `openclaw-gateway` |
-| 3 | `/hooks/agent` always runs an isolated fresh turn | guessed | OpenClaw source outside this repo, reported by the gather worker | "`gateway/server/hooks.ts:60` hardcodes `sessionTarget: \"isolated\"`" |
+| 3 | `/hooks/agent` always runs an isolated turn | ran | `rg -n -i isolated <openclaw>/docs/automation/webhook.md` | `94:- Runs an **isolated** agent turn (own session key)` |
 | 4 | The report builds the hook body here | read | `crates/waggledance/src/seat.rs:205` | `pub fn hook_body(` |
 | 5 | The supervisor default provider is Haiku | read | `crates/waggledance-core/src/config.rs:69` | `provider: "claude/claude-haiku-5-5".into(),` |
 | 6 | The supervisor skipped the advisor on t-39cfa3 | read | `~/.waggledance/supervisor/ledger.md` | `t-39cfa3 … question-open` with no `advisor-open` line |
