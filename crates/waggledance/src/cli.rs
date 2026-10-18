@@ -92,7 +92,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Find or start the supervisor agent, or report to its webhook.
+    /// Find or start the supervisor agent, or hand a report to the OpenClaw agent.
     Supervisor {
         #[command(subcommand)]
         action: SupervisorAction,
@@ -113,7 +113,7 @@ pub enum SupervisorAction {
         #[arg(long)]
         json: bool,
     },
-    /// Post one report to the OpenClaw hook.
+    /// Hand one report to the OpenClaw agent's main session through the OpenClaw CLI.
     Report {
         #[arg(long)]
         kind: String,
