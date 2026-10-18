@@ -80,6 +80,17 @@ archives outright only when the leader does not answer within its wait. A leader
 archived only after the user's acceptance is relayed as `[accept <corr>]`; a finished
 but unaccepted leader stays idle with its context (D9).
 
+A turn end is not a task end. Every prompt the supervisor sends a leader carries the
+mail rule: end each turn with `[mail waggledance#<corr> <kind>]`, where `<kind>` is
+`result`, `question`, `blocked` or `working`. `working` means the leader stopped while
+its own advisors, subagents or builds still run. The supervisor reports nothing for a
+`working` turn, sends the leader nothing, and waits for the next turn end; a reply
+with no mail line that says something still runs reads as `working`. A leader whose
+last mail is `working` is not free, and the heartbeat reports it as `progress` once
+that has lasted over an hour. This is piggery's split between `reply` and `settled`,
+carried on Paseo's own finish notification (decision `9d5fbab7`, after `t-334d78`
+reported a leader as done while its plan check and baseline build still ran).
+
 An advisor is a short-lived subagent with no `workspaceId`, labelled
 `waggledance.role=advisor`, opened when a leader asks a question and archived once it
 answers. When it can decide, the supervisor forwards the decision to the leader;

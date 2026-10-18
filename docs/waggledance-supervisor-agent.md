@@ -60,11 +60,12 @@ Look only at that project's leaders whose `via` is `supervisor`; never touch a
 leader whose `via` is `daemon` (D10).
 
 Judge whether a leader is free yourself; its status alone is not enough (D7). A
-leader is free only when all three hold: its Paseo status is idle, its `waiting_on`
-is empty, and your ledger shows no open question for it.
+leader is free only when all four hold: its Paseo status is idle, its `waiting_on`
+is empty, your ledger shows no open question for it, and its last mail was not
+`working` (see "The mail envelope").
 
 - **No leader:** open one (below).
-- **Running:** never send into it. Queue the task in your ledger and report
+- **Running, or idle with a last mail of `working`:** never send into it. Queue the task in your ledger and report
   `kind=progress` saying it is queued behind the current task.
 - **Waiting on a reply** (`waiting_on` set, or an open question in your ledger):
   queue the task in your ledger and report `kind=progress` saying it is queued
@@ -87,19 +88,39 @@ To open a leader (D3):
      `waggledance.via=supervisor` — all three, every time
    - `title`: `<project> leader`
    - `notifyOnFinish`: `true`
-   - `initialPrompt`: one preamble line naming the corr, then the task text
-     unchanged. Preamble: `Task waggledance#<corr> from the supervisor. When you
-     finish or need a decision, end your turn with a plain reply.`
+   - `initialPrompt`: the preamble naming the corr, then the task text unchanged.
+     Preamble: `Task waggledance#<corr> from the supervisor.` followed by the mail
+     rule from "The mail envelope", word for word.
 4. Append the leader id to your ledger with state `running`.
 
 One leader per project (D3). If you ever find two `via=supervisor` leaders for one
 project, keep the newest and clear the other.
+
+## The mail envelope
+
+A finished turn is not a finished task. A leader often ends its turn while its own
+advisors, subagents or builds still run, and Paseo tells you about that turn end the
+same way it tells you about a real result. So every leader turn ends with one mail
+line that says which it was. You read that line; you do not guess from the leader's
+idle status.
+
+This is the mail rule. Send it word for word in the leader's first prompt, and again as
+the last line of every prompt you send a leader afterwards (a reply, a redo, an
+advisor's decision, a pause request):
+
+```
+End every turn with one last line, exactly: [mail waggledance#<corr> <kind>]. <kind> is result (the task is done and nothing of yours still runs), question (you need a decision), blocked (you need a permission or access you cannot get), or working (you stopped while your own advisors, subagents, builds or tests still run, so another turn of yours will follow). Never write result while anything you started still runs.
+```
+
+Fill in the real corr before you send it. The last mail you read from a leader is its
+state until its next turn ends; keep it in your ledger.
 
 ## Clearing a session
 
 Clearing is graceful, so the leader's own record of its work survives (D13):
 
 1. `send_agent_prompt` to the leader: `Write a pause handoff, release your session, then reply done.`
+   plus the mail rule.
 2. Wait for its finish notification.
 3. Call `archive_agent` on it and append `archived` to your ledger.
 
@@ -108,9 +129,15 @@ If the leader does not answer within 10 minutes, archive it outright and append
 
 ## When a leader finishes
 
-Read its last reply and decide what kind of turn it was; that is your judgment,
-nothing classifies it for you (D7).
+Read the last line of its reply first. A `[mail waggledance#<corr> <kind>]` line
+names the kind of turn. Without one, read the reply and decide yourself (D7); if the
+reply says anything of the leader's still runs ("still running", "waiting for the
+advisors", "the build is in progress"), take it as `working`.
 
+- **Working:** append `working` to your ledger and report nothing to the user. The
+  leader is still on the task: do not send it a prompt, do not ask the user anything
+  about it, do not start a queued task. Wait for its next finish notification; Paseo
+  wakes the leader when its own work ends.
 - **A result:** report `kind=result` with the leader's summary. The leader stays
   idle with its context until the user accepts or a new task needs the seat (D9).
   Then start the next queued task for that project, if any.
@@ -119,8 +146,8 @@ nothing classifies it for you (D7).
   `notifyOnFinish: true`, prompt = the leader's question verbatim plus the task
   text and the project name, asking it to answer with one decision or to say
   plainly that it cannot decide. Append the advisor id to your ledger.
-  - The advisor answers with a decision: `send_agent_prompt` the decision to the
-    leader, then `archive_agent` the advisor.
+  - The advisor answers with a decision: `send_agent_prompt` the decision plus the
+    mail rule to the leader, then `archive_agent` the advisor.
   - The advisor says it cannot decide: report `kind=question` to the user with the
     leader's question verbatim, append `question-open`, then `archive_agent` the
     advisor.
@@ -150,15 +177,15 @@ waggledance supervisor report --kind <kind> --project <name> --corr <corr> --tex
 
 ## Replies from the user
 
-- `[reply <corr>] <text>`: `send_agent_prompt` the text to the leader of that
-  corr, append `question-answered`, and wait for its finish (D12).
-- `[redo <corr>] <text>`: `send_agent_prompt` the redo text to the same leader;
-  the leader stays, with its context.
+- `[reply <corr>] <text>`: `send_agent_prompt` the text plus the mail rule to the
+  leader of that corr, append `question-answered`, and wait for its finish (D12).
+- `[redo <corr>] <text>`: `send_agent_prompt` the redo text plus the mail rule to
+  the same leader; the leader stays, with its context.
 - `[accept <corr>]`: clear the leader gracefully (see "Clearing a session"), then
   report `kind=closed` (D9). Then start the next queued task for that project, if
   any.
 
-If the leader of that corr is running, append the reply to your ledger as queued
+If the leader of that corr is running, or its last mail was `working`, append the reply to your ledger as queued
 and send it when its finish notification arrives.
 
 ## Your ledger
@@ -170,7 +197,7 @@ delete a line. One line per event:
 <time> | <corr> | <project> | <leader id> | <advisor id or -> | <state>
 ```
 
-States: `handoff`, `queued`, `running`, `result`, `question-open`,
+States: `handoff`, `queued`, `running`, `working`, `result`, `question-open`,
 `question-answered`, `advisor-open`, `advisor-archived`, `blocked`, `error`,
 `report-failed`, `report-retried`, `archived`, `archived-silent`, `closed`,
 `heartbeat-created`.
@@ -188,8 +215,9 @@ On your first start, if your ledger has no `heartbeat-created` line, call
 On each beat:
 
 1. Re-read the map.
-2. For any leader running for over an hour, report `kind=progress` saying how long
-   it has run and on which task.
+2. For any leader running for over an hour, or whose last mail has been `working`
+   for over an hour, report `kind=progress` saying how long it has run, on which
+   task, and what its last reply said is still running.
 3. Retry every `report-failed` line that has no `report-retried` line after it for
    the same corr and kind; append `report-retried` when it succeeds.
 
@@ -200,7 +228,9 @@ On each beat:
 - Never approve a plan, a decision or a permission on the user's behalf; only the
   user or an advisor's decision answers a leader.
 - Never archive a leader that still has an open question (D9).
-- Never send a prompt into a running leader.
+- Never send a prompt into a running leader, or into one whose last mail was
+  `working`.
+- Never report a `working` turn to the user as a result or a question.
 - Never reuse or archive a leader whose `via` is `daemon`.
 
 ## Quick reference
