@@ -2,15 +2,15 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use waggledance_core::config::{read_hook_token, OpenClawConfig, SupervisorConfig};
+use waggledance_core::config::{OpenClawConfig, SupervisorConfig};
 use waggledance_core::Config;
 
 use crate::paseo::{command, detect_binary, parse_document, parse_listed, paseo_unavailable};
 
 const SUPERVISOR_LABEL: &str = "waggledance.role=supervisor";
 const PASEO_TIMEOUT: Duration = Duration::from_secs(15);
-const HOOK_TIMEOUT: Duration = Duration::from_secs(15);
-const BODY_HEAD: usize = 300;
+const REPORT_TIMEOUT: Duration = Duration::from_secs(900);
+const GATEWAY_COMM: &str = "openclaw-gateway";
 
 pub const DOC: &str = include_str!("../../../docs/waggledance-supervisor-agent.md");
 
@@ -187,104 +187,181 @@ fn kind_label(kind: &str) -> Result<&'static str> {
         "error" => "lỗi",
         "closed" => "đã đóng",
         "progress" => "tiến độ",
+        "board" => "bảng việc",
         other => bail!(
-            "unknown kind `{other}`: use result, question, blocked, error, closed or progress"
+            "unknown kind `{other}`: use result, question, blocked, error, closed, progress or board"
         ),
     })
 }
 
-fn hook_token_or_refuse(dir: &Path) -> Result<String> {
-    read_hook_token(dir).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no hook token at {} — run `waggledance setup openclaw` to write it",
-            waggledance_core::config::hook_token_path(dir).display()
-        )
-    })
-}
-
-pub fn hook_body(
-    cfg: &OpenClawConfig,
-    kind: &str,
-    project: &str,
-    corr: &str,
-    text: &str,
-) -> Result<serde_json::Value> {
+pub fn framed_message(kind: &str, project: &str, corr: &str, text: &str) -> Result<String> {
     let label = kind_label(kind)?;
-    let message = format!(
-        "Chuyển nguyên văn cho người dùng, không diễn giải lại, không dịch, không thêm lời: \
-         [waggledance#{corr}] {project} — {label}: {text}"
-    );
-    let mut body = serde_json::json!({
-        "message": message,
-        "name": "waggledance",
-        "deliver": true,
-        "channel": "telegram",
-        "wakeMode": "now",
-    });
-    let object = body.as_object_mut().expect("object literal");
-    if !cfg.agent_id.is_empty() {
-        object.insert("agentId".into(), serde_json::json!(cfg.agent_id));
-    }
-    if !cfg.telegram_to.is_empty() {
-        object.insert("to".into(), serde_json::json!(cfg.telegram_to));
-    }
-    if !cfg.hook_model.is_empty() {
-        object.insert("model".into(), serde_json::json!(cfg.hook_model));
-    }
-    object.insert("thinking".into(), serde_json::json!(cfg.hook_thinking));
-    Ok(body)
+    Ok(format!(
+        "Đối chiếu báo cáo này với đúng task bạn đã giao cho waggledance, rồi viết tin nhắn \
+         người dùng sẽ đọc trên Telegram, bằng tiếng Việt: nêu việc đã xong và việc còn lại, \
+         chép nguyên văn con số, đường dẫn và lời của leader; nếu báo cáo cần người dùng quyết \
+         định thì hỏi thẳng người dùng: [waggledance#{corr}] {project} — {label}: {text}"
+    ))
 }
 
-fn head(text: &str) -> String {
-    text.chars().take(BODY_HEAD).collect()
+fn is_gateway_comm(comm: &str) -> bool {
+    comm.len() >= GATEWAY_COMM.len() - 1 && GATEWAY_COMM.starts_with(comm)
 }
 
-async fn post(url: &str, token: &str, body: &serde_json::Value) -> Result<u16> {
-    let client = reqwest::Client::builder().timeout(HOOK_TIMEOUT).build()?;
-    let resp = client
-        .post(url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .body(serde_json::to_string(body)?)
-        .send()
-        .await;
-    match resp {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                Ok(status.as_u16())
-            } else {
-                let text = resp.text().await.unwrap_or_default();
-                bail!("hook at {url} returned {status}: {}", head(text.trim()))
-            }
+fn gateway_appdir(proc_root: &Path) -> Option<String> {
+    for entry in std::fs::read_dir(proc_root).ok()?.flatten() {
+        let pid_dir = entry.path();
+        let comm = match std::fs::read_to_string(pid_dir.join("comm")) {
+            Ok(comm) => comm,
+            Err(_) => continue,
+        };
+        if !is_gateway_comm(comm.trim()) {
+            continue;
         }
-        Err(e) => bail!("hook at {url} could not be reached: {e}"),
+        let environ = match std::fs::read(pid_dir.join("environ")) {
+            Ok(environ) => environ,
+            Err(_) => continue,
+        };
+        let found = environ
+            .split(|b| *b == 0)
+            .filter_map(|kv| std::str::from_utf8(kv).ok())
+            .find_map(|kv| kv.strip_prefix("APPDIR="))
+            .filter(|dir| !dir.is_empty());
+        if let Some(dir) = found {
+            return Some(dir.to_string());
+        }
     }
+    None
+}
+
+pub fn openclaw_cli(cfg: &OpenClawConfig, proc_root: &Path) -> Result<Vec<String>> {
+    if !cfg.cli.trim().is_empty() {
+        let words: Vec<String> = cfg.cli.split_whitespace().map(str::to_string).collect();
+        if !words.is_empty() {
+            return Ok(words);
+        }
+    }
+    match gateway_appdir(proc_root) {
+        Some(appdir) => Ok(vec![
+            "node".into(),
+            format!("{appdir}/resources/openclaw/openclaw.mjs"),
+        ]),
+        None => bail!(
+            "no OpenClaw CLI: no running `{GATEWAY_COMM}` process names an APPDIR under {}, and \
+             `[openclaw] cli` in config is empty — start the gateway, or set `cli` to the full \
+             openclaw command",
+            proc_root.display()
+        ),
+    }
+}
+
+pub fn report_argv(cli: &[String], cfg: &OpenClawConfig, message: &str) -> Result<Vec<String>> {
+    if cfg.agent_id.trim().is_empty() {
+        bail!(
+            "no `[openclaw] agent_id` in config — name the OpenClaw agent whose main session \
+             receives supervisor reports"
+        );
+    }
+    let mut argv = cli.to_vec();
+    for arg in [
+        "agent",
+        "--agent",
+        cfg.agent_id.as_str(),
+        "--message",
+        message,
+        "--deliver",
+        "--channel",
+        "telegram",
+        "--json",
+    ] {
+        argv.push(arg.to_string());
+    }
+    if !cfg.telegram_to.trim().is_empty() {
+        argv.push("--reply-to".into());
+        argv.push(cfg.telegram_to.clone());
+    }
+    Ok(argv)
+}
+
+fn cli_run(rt: &tokio::runtime::Runtime, argv: &[String]) -> Result<String> {
+    let shown = argv.join(" ");
+    let program = argv[0].clone();
+    let args: Vec<String> = argv[1..].to_vec();
+    let (run_program, run_args, run_shown) = (program, args, shown.clone());
+    let waited: Result<std::process::Output> = rt.block_on(async move {
+        let child = tokio::process::Command::new(&run_program)
+            .args(&run_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("running `{run_shown}`: {e}"))?;
+        match tokio::time::timeout(REPORT_TIMEOUT, child.wait_with_output()).await {
+            Ok(out) => Ok(out?),
+            Err(_) => bail!(
+                "`{run_shown}` timed out after {}s",
+                REPORT_TIMEOUT.as_secs()
+            ),
+        }
+    });
+    let output = waited?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        bail!(
+            "`{shown}` failed ({}): {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+            stdout.trim()
+        );
+    }
+    Ok(stdout)
+}
+
+pub fn cli_status(stdout: &str, shown: &str) -> Result<String> {
+    let doc: serde_json::Value = parse_document(stdout)
+        .map_err(|e| anyhow::anyhow!("`{shown}` printed no JSON document ({e})"))?;
+    let status = doc
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if status != "ok" {
+        let shown_status = if status.is_empty() { "<none>" } else { &status };
+        bail!(
+            "`{shown}` reported status {shown_status}: {}",
+            stdout.trim()
+        );
+    }
+    Ok(status)
 }
 
 fn report(
     config: &Config,
-    dir: &Path,
+    proc_root: &Path,
     kind: &str,
     project: &str,
     corr: &str,
     text: &str,
-) -> Result<u16> {
-    let token = hook_token_or_refuse(dir)?;
-    let body = hook_body(&config.openclaw, kind, project, corr, text)?;
-    let url = config.openclaw.hook_url.clone();
+) -> Result<String> {
+    let message = framed_message(kind, project, corr, text)?;
+    let cli = openclaw_cli(&config.openclaw, proc_root)?;
+    let argv = report_argv(&cli, &config.openclaw, &message)?;
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(post(&url, &token, &body))
+    let stdout = cli_run(&rt, &argv)?;
+    cli_status(&stdout, &argv.join(" "))
 }
 
 fn report_cmd(kind: &str, project: &str, corr: &str, text: &str, json: bool) -> Result<()> {
     let config = Config::load();
-    let dir = waggledance_core::config::resolve_data_dir(None);
-    let status = report(&config, &dir, kind, project, corr, text)?;
+    let status = report(&config, Path::new("/proc"), kind, project, corr, text)?;
     if json {
-        println!("{}", serde_json::json!({ "status": status, "sent": true }));
+        println!(
+            "{}",
+            serde_json::json!({ "status": status, "sent": true, "via": "openclaw-cli" })
+        );
     } else {
-        println!("report sent ({kind}) for {corr}/{project}");
+        println!("report sent ({kind}) for {corr}/{project} through the OpenClaw CLI");
     }
     Ok(())
 }
@@ -391,7 +468,7 @@ mod tests {
                 "--cwd",
                 &dir.to_string_lossy(),
                 "--provider",
-                "claude/claude-haiku-5-5",
+                "claude/claude-sonnet-5-5",
                 "--mode",
                 "bypassPermissions",
                 "--title",
@@ -463,29 +540,49 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn hook_body_carries_the_verbatim_instruction_the_tag_and_the_label() {
-        let cfg = OpenClawConfig::default();
-        let body = hook_body(&cfg, "result", "waggledance", "t-abc123", "xong rồi").unwrap();
-        let message = body["message"].as_str().unwrap();
-        assert_eq!(
-            message,
-            "Chuyển nguyên văn cho người dùng, không diễn giải lại, không dịch, không thêm lời: \
-             [waggledance#t-abc123] waggledance — kết quả: xong rồi"
-        );
-        assert_eq!(body["name"], "waggledance");
-        assert_eq!(body["deliver"], true);
-        assert_eq!(body["channel"], "telegram");
-        assert_eq!(body["wakeMode"], "now");
-        assert_eq!(body["thinking"], "low");
-        assert!(body.get("to").is_none());
-        assert!(body.get("model").is_none());
-        assert!(body.get("agentId").is_none());
+    fn fake_proc_root(label: &str, gateway: Option<(&str, Option<&str>)>) -> PathBuf {
+        let root = scratch(label);
+        match gateway {
+            Some((comm, appdir)) => {
+                let pid = root.join("4242");
+                std::fs::create_dir_all(&pid).unwrap();
+                std::fs::write(pid.join("comm"), format!("{comm}\n")).unwrap();
+                let mut environ: Vec<u8> = Vec::new();
+                for kv in ["HOME=/home/u", "PATH=/usr/bin"] {
+                    environ.extend_from_slice(kv.as_bytes());
+                    environ.push(0);
+                }
+                if let Some(dir) = appdir {
+                    environ.extend_from_slice(format!("APPDIR={dir}").as_bytes());
+                    environ.push(0);
+                }
+                std::fs::write(pid.join("environ"), environ).unwrap();
+            }
+            None => {
+                let pid = root.join("9");
+                std::fs::create_dir_all(&pid).unwrap();
+                std::fs::write(pid.join("comm"), "node\n").unwrap();
+                std::fs::write(pid.join("environ"), b"HOME=/home/u\0").unwrap();
+            }
+        }
+        root
     }
 
     #[test]
-    fn hook_body_maps_every_kind_and_refuses_an_unknown_one() {
-        let cfg = OpenClawConfig::default();
+    fn the_framed_message_carries_the_tag_the_label_and_the_instruction() {
+        let message = framed_message("result", "waggledance", "t-abc123", "xong rồi").unwrap();
+        assert!(
+            message.contains("[waggledance#t-abc123] waggledance — kết quả: xong rồi"),
+            "{message}"
+        );
+        assert!(message.contains("Telegram"), "{message}");
+        assert!(message.contains("tiếng Việt"), "{message}");
+        assert!(message.contains("nguyên văn"), "{message}");
+        assert!(message.contains("hỏi thẳng người dùng"), "{message}");
+    }
+
+    #[test]
+    fn the_framed_message_maps_every_kind_and_refuses_an_unknown_one() {
         for (kind, label) in [
             ("result", "kết quả"),
             ("question", "câu hỏi"),
@@ -493,34 +590,129 @@ mod tests {
             ("error", "lỗi"),
             ("closed", "đã đóng"),
             ("progress", "tiến độ"),
+            ("board", "bảng việc"),
         ] {
-            let body = hook_body(&cfg, kind, "p", "t-1", "x").unwrap();
-            let message = body["message"].as_str().unwrap();
+            let message = framed_message(kind, "p", "t-1", "x").unwrap();
             assert!(
                 message.contains(&format!("— {label}: x")),
                 "{kind}: {message}"
             );
         }
-        let err = hook_body(&cfg, "nonsense", "p", "t-1", "x")
+        let err = framed_message("nonsense", "p", "t-1", "x")
             .unwrap_err()
             .to_string();
         assert!(err.contains("nonsense"), "{err}");
     }
 
     #[test]
-    fn hook_body_adds_to_and_model_only_when_configured() {
-        let cfg = OpenClawConfig {
+    fn the_report_argv_names_the_agent_the_delivery_and_the_json_and_never_local() {
+        let cli = vec!["node".to_string(), "/mnt/openclaw.mjs".to_string()];
+        let with_to = OpenClawConfig {
             agent_id: "wd".into(),
             telegram_to: "12345".into(),
-            hook_model: "gemini-flash".into(),
-            hook_thinking: "minimal".into(),
             ..OpenClawConfig::default()
         };
-        let body = hook_body(&cfg, "progress", "p", "t-1", "x").unwrap();
-        assert_eq!(body["agentId"], "wd");
-        assert_eq!(body["to"], "12345");
-        assert_eq!(body["model"], "gemini-flash");
-        assert_eq!(body["thinking"], "minimal");
+        let argv = report_argv(&cli, &with_to, "msg").unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "node",
+                "/mnt/openclaw.mjs",
+                "agent",
+                "--agent",
+                "wd",
+                "--message",
+                "msg",
+                "--deliver",
+                "--channel",
+                "telegram",
+                "--json",
+                "--reply-to",
+                "12345",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+        assert!(!argv.iter().any(|a| a == "--local"), "{argv:?}");
+
+        let bare = OpenClawConfig {
+            agent_id: "wd".into(),
+            ..OpenClawConfig::default()
+        };
+        let argv = report_argv(&cli, &bare, "msg").unwrap();
+        assert!(!argv.iter().any(|a| a == "--reply-to"), "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--local"), "{argv:?}");
+    }
+
+    #[test]
+    fn a_report_without_an_agent_id_names_the_missing_config_key() {
+        let err = report_argv(&["node".to_string()], &OpenClawConfig::default(), "m")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent_id"), "{err}");
+    }
+
+    #[test]
+    fn a_kernel_truncated_comm_still_names_the_gateway() {
+        let root = fake_proc_root("gw-trunc", Some(("openclaw-gatewa", Some("/tmp/.mount_Y"))));
+        assert_eq!(
+            openclaw_cli(&OpenClawConfig::default(), &root).unwrap()[1],
+            "/tmp/.mount_Y/resources/openclaw/openclaw.mjs"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_comm_that_only_prefixes_the_gateway_name_is_not_the_gateway() {
+        let root = fake_proc_root("gw-prefix", Some(("openclaw", Some("/tmp/.mount_Z"))));
+        assert!(openclaw_cli(&OpenClawConfig::default(), &root).is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_cli_is_discovered_from_a_gateway_process_and_its_appdir() {
+        let root = fake_proc_root("gw", Some(("openclaw-gateway", Some("/tmp/.mount_X"))));
+        let cli = openclaw_cli(&OpenClawConfig::default(), &root).unwrap();
+        assert_eq!(
+            cli,
+            vec![
+                "node".to_string(),
+                "/tmp/.mount_X/resources/openclaw/openclaw.mjs".to_string()
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_config_cli_overrides_the_gateway_discovery() {
+        let root = fake_proc_root(
+            "gw-override",
+            Some(("openclaw-gateway", Some("/tmp/.mount_X"))),
+        );
+        let cfg = OpenClawConfig {
+            cli: "bun /opt/openclaw/cli.mjs --flag".into(),
+            ..OpenClawConfig::default()
+        };
+        assert_eq!(
+            openclaw_cli(&cfg, &root).unwrap(),
+            vec!["bun", "/opt/openclaw/cli.mjs", "--flag"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn with_no_gateway_and_no_override_the_refusal_names_both() {
+        let root = fake_proc_root("gw-none", None);
+        let err = openclaw_cli(&OpenClawConfig::default(), &root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("openclaw-gateway"), "{err}");
+        assert!(err.contains("[openclaw] cli"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -539,76 +731,36 @@ mod tests {
         assert!(err.contains("boom"), "{err}");
     }
 
-    #[test]
-    fn report_refuses_without_a_token_file_before_any_request() {
-        let dir = scratch("notoken");
-        assert_eq!(read_hook_token(&dir), None);
-        let err = hook_token_or_refuse(&dir).unwrap_err().to_string();
-        assert!(err.contains("setup openclaw"), "{err}");
-        assert!(err.contains("hook.token"), "{err}");
+    fn cli_script(label: &str, body: &str) -> PathBuf {
+        let dir = scratch(label);
+        let path = dir.join("fake-openclaw.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
 
+    fn config_over(script: &Path) -> Config {
         let mut config = Config::default();
+        config.openclaw.cli = script.to_string_lossy().into_owned();
+        config.openclaw.agent_id = "wd".into();
         config.openclaw.hook_url = "http://127.0.0.1:1/hooks/agent".into();
-        let err = report(&config, &dir, "result", "p", "t-1", "x")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("setup openclaw"), "{err}");
-        assert!(!err.contains("127.0.0.1:1"), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
+        config
     }
 
     #[test]
-    fn report_posts_the_body_with_the_bearer_header_and_reports_the_status() {
-        use axum::routing::post;
-        use axum::{extract::State, Json};
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct Seen {
-            auth: Option<String>,
-            body: serde_json::Value,
-        }
-
-        let seen: Arc<Mutex<Option<Seen>>> = Arc::new(Mutex::new(None));
-        let handler = move |State(seen): State<Arc<Mutex<Option<Seen>>>>,
-                            headers: axum::http::HeaderMap,
-                            Json(body): Json<serde_json::Value>| async move {
-            *seen.lock().unwrap() = Some(Seen {
-                auth: headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string),
-                body,
-            });
-            axum::http::StatusCode::OK
-        };
-        let app = axum::Router::new()
-            .route("/hooks/agent", post(handler))
-            .with_state(seen.clone());
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let server_seen = seen.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                tx.send(listener.local_addr().unwrap()).unwrap();
-                let _ = axum::serve(listener, app).await;
-            });
-            drop(server_seen);
-        });
-        let addr = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-
-        let dir = scratch("report-ok");
-        std::fs::write(waggledance_core::config::hook_token_path(&dir), "tok-9\n").unwrap();
-        let mut config = Config::default();
-        config.openclaw.hook_url = format!("http://{addr}/hooks/agent");
-
+    fn a_report_runs_the_cli_in_the_wd_session_and_never_posts_to_the_hook() {
+        let dir = scratch("report-argv");
+        let argv_file = dir.join("argv.txt");
+        let script = cli_script(
+            "report-argv-script",
+            &format!(
+                "printf '%s\\n' \"$@\" > {}\necho '{{\"status\":\"ok\",\"result\":{{\"payloads\":[]}}}}'",
+                argv_file.display()
+            ),
+        );
         let status = report(
-            &config,
+            &config_over(&script),
             &dir,
             "question",
             "waggledance",
@@ -616,14 +768,84 @@ mod tests {
             "màu gì?",
         )
         .unwrap();
-        assert_eq!(status, 200);
+        assert_eq!(status, "ok");
 
-        let seen = seen.lock().unwrap().clone().unwrap();
-        assert_eq!(seen.auth.as_deref(), Some("Bearer tok-9"));
-        assert_eq!(seen.body["deliver"], true);
-        assert_eq!(seen.body["channel"], "telegram");
-        assert!(seen.body["message"].as_str().unwrap().contains("câu hỏi"));
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            argv,
+            vec![
+                "agent",
+                "--agent",
+                "wd",
+                "--message",
+                &framed_message("question", "waggledance", "t-abc123", "màu gì?").unwrap(),
+                "--deliver",
+                "--channel",
+                "telegram",
+                "--json",
+            ]
+        );
+        assert!(!argv.contains(&"--local"));
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(script.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_report_adds_reply_to_only_when_a_telegram_target_is_set() {
+        let dir = scratch("report-reply-to");
+        let argv_file = dir.join("argv.txt");
+        let script = cli_script(
+            "report-reply-to-script",
+            &format!(
+                "printf '%s\\n' \"$@\" > {}\necho '{{\"status\":\"ok\"}}'",
+                argv_file.display()
+            ),
+        );
+        let mut config = config_over(&script);
+        config.openclaw.telegram_to = "777".into();
+        report(&config, &dir, "board", "waggledance", "t-1", "x").unwrap();
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        let at = argv.iter().position(|a| *a == "--reply-to").unwrap();
+        assert_eq!(argv[at + 1], "777");
+        assert!(argv[0..at].contains(&"--json"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(script.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_report_exits_non_zero_when_the_cli_does() {
+        let dir = scratch("report-cli-red");
+        let script = cli_script("report-cli-red-script", "echo 'no gateway' >&2\nexit 3");
+        let err = report(&config_over(&script), &dir, "result", "p", "t-1", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no gateway"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(script.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_report_exits_non_zero_when_the_cli_status_is_not_ok() {
+        let dir = scratch("report-status-red");
+        let script = cli_script("report-status-red-script", "echo '{\"status\":\"error\"}'");
+        let err = report(&config_over(&script), &dir, "result", "p", "t-1", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("status error"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(script.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_report_refuses_before_running_anything_when_no_gateway_and_no_override_exist() {
+        let root = fake_proc_root("report-no-gateway", None);
+        let err = report(&Config::default(), &root, "result", "p", "t-1", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("openclaw-gateway"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

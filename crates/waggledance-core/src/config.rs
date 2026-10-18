@@ -66,7 +66,7 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            provider: "claude/claude-haiku-5-5".into(),
+            provider: "claude/claude-sonnet-5-5".into(),
             mode: "bypassPermissions".into(),
             thinking: String::new(),
             title: "waggledance supervisor".into(),
@@ -79,6 +79,7 @@ impl Default for SupervisorConfig {
 pub struct OpenClawConfig {
     pub home: String,
     pub hook_url: String,
+    pub cli: String,
     pub agent_id: String,
     pub telegram_to: String,
     pub hook_model: String,
@@ -90,6 +91,7 @@ impl Default for OpenClawConfig {
         Self {
             home: "~/aicoworker/openclaw".into(),
             hook_url: "http://127.0.0.1:18789/hooks/agent".into(),
+            cli: String::new(),
             agent_id: String::new(),
             telegram_to: String::new(),
             hook_model: String::new(),
@@ -1267,12 +1269,13 @@ mod tests {
     #[test]
     fn supervisor_and_openclaw_defaults_are_the_shipped_values() {
         let c = Config::default();
-        assert_eq!(c.supervisor.provider, "claude/claude-haiku-5-5");
+        assert_eq!(c.supervisor.provider, "claude/claude-sonnet-5-5");
         assert_eq!(c.supervisor.mode, "bypassPermissions");
         assert_eq!(c.supervisor.thinking, "");
         assert_eq!(c.supervisor.title, "waggledance supervisor");
         assert_eq!(c.openclaw.home, "~/aicoworker/openclaw");
         assert_eq!(c.openclaw.hook_url, "http://127.0.0.1:18789/hooks/agent");
+        assert_eq!(c.openclaw.cli, "");
         assert_eq!(c.openclaw.agent_id, "");
         assert_eq!(c.openclaw.telegram_to, "");
         assert_eq!(c.openclaw.hook_model, "");
@@ -1289,12 +1292,13 @@ mod tests {
         let p = dir.join("config.toml");
         std::fs::write(&p, "[server]\nport = 7711\n").unwrap();
         let loaded = Config::load_from(&p);
-        assert_eq!(loaded.supervisor.provider, "claude/claude-haiku-5-5");
+        assert_eq!(loaded.supervisor.provider, "claude/claude-sonnet-5-5");
         assert_eq!(loaded.supervisor.mode, "bypassPermissions");
         assert_eq!(
             loaded.openclaw.hook_url,
             "http://127.0.0.1:18789/hooks/agent"
         );
+        assert_eq!(loaded.openclaw.cli, "");
         assert_eq!(loaded.openclaw.hook_thinking, "low");
         assert_eq!(loaded.openclaw.agent_id, "");
         std::fs::remove_dir_all(&dir).ok();
