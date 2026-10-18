@@ -1,13 +1,13 @@
 ---
 type: bee.pattern
 title: "A task handed in from outside Paseo goes to the supervisor, which runs the project's leader as its own subagent"
-description: "Practice: an agent outside Paseo, such as aicoworker on OpenClaw, hands a task to the one waggledance supervisor with paseo send; the supervisor opens or reuses the project's leader as a Paseo subagent, hears its turn ends from Paseo itself, routes its questions to an advisor or the user, and reports to Telegram with waggledance supervisor report through the OpenClaw hook. The daemon's leader queue is frozen beside it."
-timestamp: 2026-10-17
+description: "Practice: an agent outside Paseo, such as aicoworker on OpenClaw, hands a task to the one waggledance supervisor with paseo send; the supervisor opens or reuses the project's leader as a Paseo subagent, hears its turn ends from Paseo itself, routes every question to an advisor before the user, and reports with waggledance supervisor report into wd's main OpenClaw session, where wd writes the Telegram message. A heartbeat reconciles its ledger and sends wd a board of open tasks. The daemon's leader queue is frozen beside it."
+timestamp: 2026-10-18
 bee:
   id: paseo-native-supervisor
   lifecycle: active
   areas: [orchestration]
-  sources: [docs/history/paseo-native-supervisor/CONTEXT.md, docs/history/paseo-native-supervisor/plan.md]
+  sources: [docs/history/paseo-native-supervisor/CONTEXT.md, docs/history/paseo-native-supervisor/plan.md, docs/history/supervisor-active-loop/plan.md]
   polarity: practice
   signature: a task handed in from outside Paseo
 ---
@@ -18,6 +18,9 @@ Locked by paseo-native-supervisor D1/D2/D3/D4/D5/D6/D7/D8/D9/D10/D11/D12/D13
 (`docs/history/paseo-native-supervisor/CONTEXT.md`). D8 freezes the daemon path in
 [A request for a project reaches its one Paseo leader](paseo-leader-dispatch.md): it
 keeps working for its callers and gains nothing from this feature.
+supervisor-active-loop (`docs/history/supervisor-active-loop/plan.md`, decisions
+`15cc4a55`, `c505ac8d`, `83d65d2e`, `4d03d229`, `221af324`) moves the outbound hop
+into wd's session and adds the done report, advisor-first and the board.
 
 Inside Paseo, agents talk through Paseo's own tools: `create_agent`,
 `send_agent_prompt` with `notifyOnFinish`, `archive_agent`, and labels. waggledance is
@@ -31,13 +34,15 @@ supervisor's call; waggledance exposes the raw fields and decides nothing (D7).
 |-----|-----------|------------|
 | In | aicoworker → supervisor | `wd-bridge.py handoff`: `waggledance supervisor ensure --json`, then `paseo send <supervisor id> --no-wait --prompt-file <tmp> --json` (D5) |
 | Inside | supervisor ↔ leaders and advisors | Paseo subagents the supervisor creates with MCP `create_agent`; Paseo tells the parent when a child's turn ends, errors, or asks for a permission (D3, D4) |
-| Out | supervisor → user | `waggledance supervisor report`, which posts to OpenClaw's `POST /hooks/agent` with `deliver: true`, `channel: telegram` (D6) |
+| Out | supervisor → wd → user | `waggledance supervisor report`, which runs `openclaw agent --agent <agent_id> --message <framed report> --deliver --channel telegram --json`: a turn in `agent:<agent_id>:main`, whose reply goes to Telegram (decision `15cc4a55`) |
 
-The supervisor is one long-lived Paseo agent for every project, on Claude Haiku,
+The supervisor is one long-lived Paseo agent for every project, on Claude Sonnet
+(decision `4d03d229`),
 labelled `waggledance.role=supervisor` (D2). Its working directory is
 `<data dir>/supervisor/`. Its standing instructions are the `CLAUDE.md` there, written
 from `docs/waggledance-supervisor-agent.md`. aicoworker is not a Paseo agent, so Paseo
-notifications cannot reach it; that is why the outbound hop goes through the hook.
+notifications cannot reach it; that is why the outbound hop goes through the OpenClaw
+CLI.
 
 ## Message shapes
 
@@ -51,10 +56,12 @@ aicoworker sends the supervisor exactly four shapes (D12):
 | `accept` | `[accept <corr>]` |
 
 The supervisor reports with `--kind` one of `result`, `question`, `blocked`, `error`,
-`closed`, `progress`. Each report reaches Telegram tagged
+`closed`, `progress`, `board`. Each report reaches wd tagged
 `[waggledance#<corr>] <project> — <kind label>: <text>`, the kind label in Vietnamese
-(kết quả, câu hỏi, đang chờ quyền, lỗi, đã đóng, tiến độ). A bare "ok" from the user
-means `accept` of the newest open item; the OpenClaw skill tells aicoworker so.
+(kết quả, câu hỏi, đang chờ quyền, lỗi, đã đóng, tiến độ, bảng việc). wd checks it
+against the task it handed off and writes the user one Vietnamese message that keeps
+the tag; it never answers a leader's question for the user. A bare "ok" from the user
+means `accept` of the newest open item; the OpenClaw skill tells wd so.
 
 ## Leaders and advisors
 
@@ -96,35 +103,43 @@ arrives when the leader's own next turn ends, and nothing guarantees that wake: 
 `t-bd665a` the leader stopped on "Tôi chờ worker" with a Monitor armed on a child
 worker. So on each beat the heartbeat nudges once a leader that is idle, whose last
 mail was `working`, and that has had no turn end for 15 minutes. If the leader is
-still silent on the next beat, the heartbeat reports `progress` to the user once,
-quoting the leader's last reply.
+still silent on the next beat, the heartbeat reports `progress` once, quoting the
+leader's last reply.
+
+A `result` mail carries a done report above its mail line: what was done, the proof
+(command and outcome), what is left, and where it lives. A result missing any part goes
+back to the leader and is not reported (decision `c505ac8d`).
 
 An advisor is a short-lived subagent with no `workspaceId`, labelled
-`waggledance.role=advisor`, opened when a leader asks a question and archived once it
-answers. When it can decide, the supervisor forwards the decision to the leader;
-otherwise the supervisor reports `question` to the user (D4).
+`waggledance.role=advisor`, opened for every question, a leader's or the supervisor's
+own, and archived once it answers. When it can decide, the supervisor carries out the
+decision; otherwise the supervisor appends `advisor-undecided` and only then reports
+`question` (D4, decision `83d65d2e`, after `t-39cfa3` put a question to the user with
+no advisor step).
 
 The supervisor keeps `ledger.md` in its working directory, append-only. The ledger is
 a hint; `ask_state.leaders` and `paseo ls` are the truth, re-read at every turn start.
-A Paseo heartbeat every 10 minutes follows `working` tasks, reports `progress` for any
-leader running longer than an hour, and retries any report the hook refused (D13).
+A Paseo heartbeat every 10 minutes reconciles the ledger with the map, follows
+`working` tasks, reports `progress` for any leader running longer than an hour, and
+retries any report that failed (D13). A task is open from `handoff` until `closed` or
+`stale-closed`; a task whose leader is closed, archived or gone from the map gets
+`stale-closed` (after `t-bd665a` stayed on the list once its leader closed). The beat
+sends `board` when any task changed state since the last `board-sent`, and every 2
+hours while any task is open: every open task with project, step, waiting on whom and
+since when, questions waiting on the user included (decision `221af324`).
 
-## The hook is a model turn
+## The report is a turn in wd's session
 
-OpenClaw's `/hooks/agent` does not post text to Telegram; it runs an isolated model
-turn whose prompt is the `message` (D11). `report` therefore sends an instruction:
-"Chuyển nguyên văn cho người dùng, không diễn giải lại, không dịch, không thêm lời:"
-followed by the tagged line, with `thinking` set from `[openclaw] hook_thinking`
-(default `low`) and `model` from `[openclaw] hook_model` when set. When
-`[openclaw] agent_id` is set, the body also carries `agentId`, so the turn runs as that
-OpenClaw agent, such as a dedicated `wd` bot, instead of the gateway's default agent;
-empty, the default, sends no `agentId`. Two OpenClaw facts hold the target in place, both seen live on 2026-10-17: the
-gateway builds the hook's known-agent set at start, so a newly added agent gets the
-default agent's turn until the gateway restarts (`kill -USR1 <openclaw-gateway pid>`
-restarts it in-process), and with `telegram_to` empty the target agent delivers to its
-own last chat, so its bot must have had one direct message from the user first. The relay still
-passes through a model, so the Telegram text can drift from the report text. That is
-the accepted limit; the live proof checks it by quoting one against the other.
+OpenClaw's `/hooks/agent` runs an isolated turn with its own session key, so wd never
+saw what the supervisor said about the task wd handed off. `report` runs the live
+OpenClaw CLI instead, in wd's main session, and the framed message asks wd to check the
+report against that task and write the user's message in Vietnamese, quoting numbers,
+paths and the leader's words verbatim. The CLI is found from the running
+`openclaw-gateway` process: its `APPDIR` environment names the AppImage mount, and the
+CLI is `<APPDIR>/resources/openclaw/openclaw.mjs`, run by `node`; `[openclaw] cli`
+overrides that. With no gateway running, `report` fails and the supervisor's ledger
+retry covers it; it never runs the agent locally. The message still passes through
+wd's model, so the Telegram text is wd's wording, not the report's.
 
 ## The `leaders` field
 
@@ -171,22 +186,22 @@ from the embedded instructions. It refuses when Paseo is unavailable.
 
 `instructions_stale` is true when a running supervisor was found and `CLAUDE.md` had to
 be rewritten: that agent read the old copy. `[supervisor]` defaults: provider
-`claude/claude-haiku-5-5`, mode `bypassPermissions`, no thinking, title
+`claude/claude-sonnet-5-5`, mode `bypassPermissions`, no thinking, title
 `waggledance supervisor`. `ensure` takes no lock; two racing callers on a missing
 supervisor can start two, and the next `ensure` returns the first listed.
 
 ### waggledance supervisor report
 
-`report --kind <kind> --project <name> --corr <corr> --text <text> [--json]` reads the
-bearer token from `<data dir>/hook.token` and posts the D11 body to
-`[openclaw] hook_url` (default `http://127.0.0.1:18789/hooks/agent`) with a 15-second
-timeout. A 2xx prints `{status, sent: true}`. A missing token file refuses before any
-request and names `waggledance setup openclaw`; any other status exits non-zero with
-the status and the first 300 characters of the body; a connection error exits non-zero
-naming the URL. An unknown kind is refused.
+`report --kind <kind> --project <name> --corr <corr> --text <text> [--json]` runs
+`<cli> agent --agent <[openclaw] agent_id> --message <framed report> --deliver
+--channel telegram --json`, adding `--reply-to <[openclaw] telegram_to>` when set, and
+never `--local`. It exits non-zero when no gateway runs and no `[openclaw] cli` is set,
+when the CLI exits non-zero, or when its JSON status is not ok. An unknown kind is
+refused. The heartbeat's board goes as `--kind board --project all --corr board`.
 
-The token is written owner-only, like `telegram.token`, and is never a `Config` field
-(D13). The supervisor never reads it; `report` does.
+`hook.token` and the hook config fields stay, written by `setup openclaw`, until
+nothing reads them; `report` no longer does. The token is owner-only and never a
+`Config` field (D13).
 
 ### waggledance setup openclaw
 
@@ -230,7 +245,7 @@ waits on trigger `the-waggle-dance-paseo-plugin-s-request-b__469884e6`.
 ## Pointers
 
 - `crates/waggledance/src/seat.rs` — `supervisor ensure` and `report`: `ensure_over`,
-  `write_doc`, `hook_body`, `kind_label`, `post`.
+  `write_doc`, `kind_label`, and the OpenClaw CLI discovery and argv.
 - `crates/waggledance/src/setup.rs` — `Target::OpenClaw`: `openclaw_install`,
   `openclaw_remove`, `edit_openclaw_json`, `openclaw_notes`, the embedded skill files.
 - `crates/waggledance/src/mcp.rs` — `read_leaders`, `LeadersRead`, `attach_leaders`,
@@ -240,7 +255,8 @@ waits on trigger `the-waggle-dance-paseo-plugin-s-request-b__469884e6`.
 - `crates/waggledance-core/src/config.rs` — `SupervisorConfig`, `OpenClawConfig`,
   `hook_token_path`, `read_hook_token`, `ensure_hook_token`.
 - `integrations/openclaw/` — the `waggledance-orchestrator` skill: `SKILL.md` and
-  `bin/wd-bridge.py` with `handoff`, `reply`, `redo`, `accept`.
+  `bin/wd-bridge.py` with `handoff`, `reply`, `redo`, `accept`, and how wd reads a
+  report and a board.
 - `docs/waggledance-supervisor-agent.md` — the supervisor's standing instructions.
 - `crates/waggledance/testdata/fixtures/paseo-0.11.2/ls-label-leader.out` and
   `npm-run-detached.out` — the captured `ls --label` and `run -d --json` answers.

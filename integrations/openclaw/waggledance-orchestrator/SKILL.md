@@ -84,7 +84,7 @@ wd-bridge.py open docs/decisions/0012-model-tiers-config.md --project-root /home
 
 ### 8. `handoff` — give a task to the waggledance supervisor
 
-This is the default way to get work done in a project. The supervisor (one Paseo agent for every project) picks the project, opens or reuses its leader, and reports back on Telegram.
+This is the default way to get work done in a project. The supervisor (one Paseo agent for every project) picks the project, opens or reuses its leader, and reports back into this session.
 ```bash
 wd-bridge.py handoff --task "Thêm nút xuất CSV cho trang báo cáo"
 wd-bridge.py handoff --task-file /tmp/spec.md
@@ -112,7 +112,14 @@ What this skill sends to the supervisor, exactly:
 | `redo` | `[redo <corr>] <text>` |
 | `accept` | `[accept <corr>]` |
 
-What comes back: the supervisor posts to this gateway's hook and the line reaches the user on Telegram as `[waggledance#<corr>] <project> — <kind>: <text>`, where the kind is a result (kết quả), a question (câu hỏi), waiting on a permission (đang chờ quyền), an error (lỗi), closed (đã đóng) or progress (tiến độ). Forward it to the user verbatim; never rephrase or translate it.
+What comes back: the supervisor's report arrives in this session as a turn, tagged `[waggledance#<corr>] <project> — <kind>: <text>`, where the kind is a result (kết quả), a question (câu hỏi), waiting on a permission (đang chờ quyền), an error (lỗi), closed (đã đóng), progress (tiến độ) or the task board (bảng việc). Your reply to that turn goes to the user on Telegram.
+
+### Handling a report or a board
+
+1. Check the report against the task you handed off under that `corr`: does it answer what the user asked? Say plainly when it does not, or when a result has no proof or leaves work undone.
+2. Write the user one clear message in Vietnamese. Start it with the tag `[waggledance#<corr>] <project> — <kind>` unchanged. Quote numbers, paths, commands and the leader's words verbatim.
+3. A question: put it to the user plainly, verbatim, and wait for their answer. Never answer a leader's question on the user's behalf, and never pick an option for them; relay their answer with `reply`.
+4. A board (`bảng việc`): list each open task with its project, step, who it waits on and since when. Put the questions waiting on the user first, each with how long it has waited.
 
 ### Reading the user's answer
 
