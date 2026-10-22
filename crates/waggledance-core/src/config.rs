@@ -84,6 +84,7 @@ pub struct OpenClawConfig {
     pub telegram_to: String,
     pub hook_model: String,
     pub hook_thinking: String,
+    pub heartbeat_secs: u64,
 }
 
 impl Default for OpenClawConfig {
@@ -96,6 +97,7 @@ impl Default for OpenClawConfig {
             telegram_to: String::new(),
             hook_model: String::new(),
             hook_thinking: "low".into(),
+            heartbeat_secs: 600,
         }
     }
 }
@@ -1280,6 +1282,7 @@ mod tests {
         assert_eq!(c.openclaw.telegram_to, "");
         assert_eq!(c.openclaw.hook_model, "");
         assert_eq!(c.openclaw.hook_thinking, "low");
+        assert_eq!(c.openclaw.heartbeat_secs, 600);
     }
 
     #[test]
@@ -1301,6 +1304,7 @@ mod tests {
         assert_eq!(loaded.openclaw.cli, "");
         assert_eq!(loaded.openclaw.hook_thinking, "low");
         assert_eq!(loaded.openclaw.agent_id, "");
+        assert_eq!(loaded.openclaw.heartbeat_secs, 600);
         std::fs::remove_dir_all(&dir).ok();
     }
 

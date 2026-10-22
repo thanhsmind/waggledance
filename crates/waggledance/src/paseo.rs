@@ -72,6 +72,16 @@ pub struct PendingPermission {
     pub tool: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Permit {
+    pub id: String,
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    pub name: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEnd {
     Completed,
@@ -140,6 +150,7 @@ pub trait Paseo: Send + Sync {
     async fn logs_since(&self, id: &str, since: &str) -> Result<String>;
     async fn archive(&self, id: &str) -> Result<()>;
     async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()>;
+    async fn permits(&self) -> Result<Vec<Permit>>;
 }
 
 pub fn delivery_heartbeat_path(data_dir: &Path) -> PathBuf {
@@ -897,6 +908,13 @@ impl Paseo for PaseoCli {
         .await
         .map(|_| ())
     }
+
+    async fn permits(&self) -> Result<Vec<Permit>> {
+        let (binary, out) = self
+            .exec(&["permit".into(), "ls".into(), "--json".into()], TIMEOUT)
+            .await?;
+        parse_document(&out).map_err(|e| unparsable(&binary, "permit", e))
+    }
 }
 
 struct PromptFile(PathBuf);
@@ -1119,6 +1137,7 @@ pub mod fake {
         LogsSince(String, String),
         Archive(String),
         Permit(String, String, bool),
+        Permits,
     }
 
     #[derive(Default)]
@@ -1132,6 +1151,7 @@ pub mod fake {
         pub store: Vec<StoredWorkspace>,
         pub logs: HashMap<String, String>,
         pub turn_ends: VecDeque<TurnEnd>,
+        pub permits: Vec<Permit>,
         pub calls: Vec<Call>,
     }
 
@@ -1331,6 +1351,11 @@ pub mod fake {
         async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()> {
             self.record(Call::Permit(id.to_string(), req_id.to_string(), allow));
             Ok(())
+        }
+
+        async fn permits(&self) -> Result<Vec<Permit>> {
+            self.record(Call::Permits);
+            Ok(self.state.lock().unwrap().permits.clone())
         }
     }
 }
@@ -2475,6 +2500,26 @@ mod tests {
                 "permit allow lead-1 req-7 --json",
                 "permit deny lead-1 req-8 --json",
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permits_reads_the_permit_ls_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(
+            &dir.path().join("paseo"),
+            r#"printf '[{"id":"req-1","agentId":"lead-1","name":"Bash","description":"ls -la","provider":"claude"}]'"#,
+        );
+        let cli = PaseoCli::with_binary(&lossy(&bin));
+        assert_eq!(
+            cli.permits().await.unwrap(),
+            vec![Permit {
+                id: "req-1".into(),
+                agent_id: "lead-1".into(),
+                name: "Bash".into(),
+                description: "ls -la".into(),
+            }]
         );
     }
 }

@@ -39,13 +39,23 @@ pub fn kind_label(kind: &str) -> Result<&'static str> {
     })
 }
 
+const REPORT_INSTRUCTION: &str = "Đối chiếu báo cáo này với đúng task bạn đã giao cho \
+     waggledance, rồi viết tin nhắn người dùng sẽ đọc trên Telegram, bằng tiếng Việt: nêu việc \
+     đã xong và việc còn lại, chép nguyên văn con số, đường dẫn và lời của leader; nếu báo cáo \
+     cần người dùng quyết định thì hỏi thẳng người dùng";
+const BOARD_INSTRUCTION: &str = "Đây là danh sách các task đang mở mà bạn đã giao cho \
+     waggledance, không phải báo cáo về một task: viết cho người dùng trên Telegram, bằng tiếng \
+     Việt, mỗi task một dòng, chép nguyên văn mã task, tên dự án và trạng thái leader";
+
 fn frame(tag: &str, kind: &str, project: &str, text: &str) -> Result<String> {
     let label = kind_label(kind)?;
+    let instruction = if kind == "board" {
+        BOARD_INSTRUCTION
+    } else {
+        REPORT_INSTRUCTION
+    };
     Ok(format!(
-        "Đối chiếu báo cáo này với đúng task bạn đã giao cho waggledance, rồi viết tin nhắn \
-         người dùng sẽ đọc trên Telegram, bằng tiếng Việt: nêu việc đã xong và việc còn lại, \
-         chép nguyên văn con số, đường dẫn và lời của leader; nếu báo cáo cần người dùng quyết \
-         định thì hỏi thẳng người dùng: [waggledance#{tag}] {project} — {label}: {text}"
+        "{instruction}: [waggledance#{tag}] {project} — {label}: {text}"
     ))
 }
 
@@ -303,6 +313,9 @@ fn prune(engine: &Engine, now: OffsetDateTime) {
     if let Err(e) = engine.prune_inbox(&cutoff) {
         tracing::warn!("wake could not prune the wd inbox: {e}");
     }
+    if let Err(e) = engine.prune_tasks(&cutoff) {
+        tracing::warn!("wake could not prune closed wd tasks: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +537,49 @@ mod tests {
             "{framed}"
         );
         assert!(framed.starts_with("Đối chiếu báo cáo này"), "{framed}");
+    }
+
+    #[tokio::test]
+    async fn the_board_frame_wakes_wd_with_its_own_instruction() {
+        let engine = engine_with("wd");
+        let seq = engine
+            .insert_inbox_message(
+                RECIPIENT,
+                "board",
+                "all",
+                "board",
+                "c-1 waggledance idle",
+                NOW,
+            )
+            .unwrap();
+        let (wake, calls) = scripted(engine.clone(), vec![Ok(OK.into())]);
+        assert_eq!(wake.tick().await, Outcome::Acked);
+        let calls = calls.lock().unwrap();
+        let framed = message_of(&calls[0]);
+        assert!(
+            framed.ends_with(&format!(
+                "[waggledance#board #{seq}] all — bảng việc: c-1 waggledance idle"
+            )),
+            "{framed}"
+        );
+        assert!(!framed.starts_with("Đối chiếu báo cáo này"), "{framed}");
+        assert!(framed.contains("task đang mở"), "{framed}");
+    }
+
+    #[test]
+    fn wake_prune_also_drops_closed_tasks_older_than_thirty_days() {
+        let engine = engine_with("wd");
+        engine
+            .insert_task("c-old", "proj-1", "2026-08-01T00:00:00Z")
+            .unwrap();
+        engine.close_task("c-old", "2026-09-01T00:00:00Z").unwrap();
+        engine
+            .insert_task("c-open", "proj-1", "2026-08-01T00:00:00Z")
+            .unwrap();
+        let now = OffsetDateTime::parse(NOW, &Rfc3339).unwrap();
+        prune(&engine, now);
+        assert!(engine.get_task("c-old").unwrap().is_none());
+        assert!(engine.get_task("c-open").unwrap().is_some());
     }
 
     #[test]

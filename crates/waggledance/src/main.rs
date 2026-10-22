@@ -13,6 +13,7 @@ mod delivery;
 mod discovery;
 mod doctor;
 mod guide;
+mod heartbeat;
 mod herdr;
 mod mail;
 mod mcp;
@@ -102,6 +103,7 @@ pub struct TerminalBackground {
     notify_store: delivery::NotifySlot,
     delivery: Mutex<Option<JoinHandle<()>>>,
     wake: Mutex<Option<JoinHandle<()>>>,
+    heartbeat: Mutex<Option<JoinHandle<()>>>,
     /// The most recently stopped task's handle, kept only until the next
     /// switch-on has waited for it to finish.
     supervisor_stopping: Mutex<Option<JoinHandle<()>>>,
@@ -243,6 +245,11 @@ impl TerminalBackground {
                 .filter(|e| paseo::paseo_available(&e.config.paseo)),
         );
         self.reconcile_wake(engine.clone().filter(|e| wake::enabled(e)));
+        self.reconcile_heartbeat(
+            engine
+                .clone()
+                .filter(|e| wake::enabled(e) && paseo::paseo_available(&e.config.paseo)),
+        );
         self.reconcile_notify(cfg.notify_enabled, herdr, notify_store, telegram, engine);
     }
 
@@ -289,6 +296,28 @@ impl TerminalBackground {
     #[cfg(test)]
     fn wake_running(&self) -> bool {
         self.wake.lock().unwrap().is_some()
+    }
+
+    fn reconcile_heartbeat(&self, engine: Option<Arc<waggledance_core::Engine>>) {
+        let mut slot = self.heartbeat.lock().unwrap();
+        match (engine, slot.take()) {
+            (Some(_), Some(running)) => *slot = Some(running),
+            (Some(engine), None) => {
+                let task = heartbeat::Heartbeat::new(
+                    Arc::new(paseo::PaseoCli::new(&engine.config.paseo)),
+                    engine,
+                    waggledance_core::config::resolve_data_dir(None),
+                );
+                *slot = Some(tokio::spawn(task.run()));
+            }
+            (None, Some(running)) => running.abort(),
+            (None, None) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn heartbeat_running(&self) -> bool {
+        self.heartbeat.lock().unwrap().is_some()
     }
 
     fn reconcile_reaper(
@@ -1178,6 +1207,10 @@ mod terminal_background_tests {
         );
         assert!(bg.wake_running(), "an agent_id starts the wake");
         assert!(!bg.delivery_running(), "the wake does not need paseo");
+        assert!(
+            !bg.heartbeat_running(),
+            "the heartbeat drives paseo, so it waits for it"
+        );
 
         bg.reconcile(
             &TerminalConfig::default(),
@@ -1187,6 +1220,40 @@ mod terminal_background_tests {
             Some(engine()),
         );
         assert!(!bg.wake_running(), "no agent_id stops the wake");
+    }
+
+    #[tokio::test]
+    async fn an_agent_id_with_paseo_starts_the_heartbeat_and_its_absence_stops_it() {
+        let bg = TerminalBackground::new();
+        let fake = Arc::new(FakeHerdr::new());
+        let mut config = waggledance_core::Config::default();
+        config.paseo.enabled = Some(true);
+        config.openclaw.agent_id = "wd".into();
+        let wd_engine = Arc::new(waggledance_core::Engine::new(
+            waggledance_core::SqliteStore::open_in_memory().unwrap(),
+            config,
+        ));
+
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake.clone(),
+            store(),
+            None,
+            Some(wd_engine),
+        );
+        assert!(
+            bg.heartbeat_running(),
+            "agent_id and paseo start the heartbeat"
+        );
+
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake,
+            store(),
+            None,
+            Some(engine()),
+        );
+        assert!(!bg.heartbeat_running(), "no agent_id stops the heartbeat");
     }
 
     /// The reaper's own teeth: `reaper_ticks` counts completed sweeps, so a

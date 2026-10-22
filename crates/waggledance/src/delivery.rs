@@ -359,7 +359,6 @@ impl Delivery {
     async fn blocked_then_done(&self, name: &str, run: &Run, agent: &str, deadline: Instant) {
         loop {
             self.end(name, run, "blocked", None, Some(agent));
-            self.mail_permissions(name, run, agent).await;
             loop {
                 if Instant::now() >= deadline {
                     return self.lose(name, run, Some(agent), "permission still pending");
@@ -385,34 +384,6 @@ impl Delivery {
                 Err(e) => return self.lose(name, run, Some(agent), &e.to_string()),
             }
         }
-    }
-
-    async fn mail_permissions(&self, name: &str, run: &Run, agent: &str) {
-        let Some(to) = self.mailbox(run) else {
-            return;
-        };
-        let permissions = match self.paseo.inspect(agent).await {
-            Ok(s) => s.permissions,
-            Err(e) => {
-                tracing::warn!("delivery could not inspect leader {agent}: {e}");
-                Vec::new()
-            }
-        };
-        let list = permissions
-            .iter()
-            .map(|p| format!("{} ({})", p.id, p.tool))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let body = format!(
-            "{name} leader {agent} is waiting for a permission on run {}: {list}",
-            run.id
-        );
-        self.mail(run, &to, "permission", &body);
-    }
-
-    fn mailbox(&self, run: &Run) -> Option<String> {
-        let caller = self.engine.run_caller(&run.id).ok().flatten()?;
-        caller.strip_prefix("openclaw:").map(str::to_string)
     }
 
     fn mail(&self, run: &Run, to: &str, kind: &str, body: &str) {
@@ -1193,7 +1164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_blocked_wd_run_mails_one_permission_and_sends_no_notice() {
+    async fn a_blocked_wd_run_mails_no_permission_and_sends_no_notice() {
         let r = rig();
         r.fake.add_wd_leader("proj-1", "lead", "idle");
         r.fake.set_permissions("lead", &["Write"]);
@@ -1205,9 +1176,7 @@ mod tests {
         let mut set = JoinSet::new();
         r.delivery.tick(&mut set).await;
         for _ in 0..200 {
-            if r.status("run-1") == "blocked"
-                && r.engine.next_inbox_message("wd").unwrap().is_some()
-            {
+            if r.status("run-1") == "blocked" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1218,16 +1187,9 @@ mod tests {
         }
         assert_eq!(r.status("run-1"), "done");
         let mail = inbox(&r.engine);
-        assert_eq!(mail.len(), 1, "{mail:?}");
-        assert_eq!(
-            (mail[0].kind.as_str(), mail[0].corr.as_str()),
-            ("permission", "corr-2")
-        );
-        assert!(mail[0].body.contains("lead"), "{}", mail[0].body);
         assert!(
-            mail[0].body.contains("permission-0 (Write)"),
-            "{}",
-            mail[0].body
+            mail.is_empty(),
+            "the permission watcher is the one writer: {mail:?}"
         );
         r.tick().await;
         assert!(r.notices().is_empty());
