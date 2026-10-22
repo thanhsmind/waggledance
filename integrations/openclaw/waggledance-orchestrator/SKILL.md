@@ -111,14 +111,27 @@ Hand-off does not wait for the work: the daemon queues the task for that project
 and delivers it when the leader is idle, so a `queued` run id is a sent task, not a
 finished one. Say what you handed off and to which project; do not report the work done.
 
-### 9. `reply`, `redo`, `accept` — relay the user's answer
+### 9. `reply`, `redo`, `accept`, `permit` — relay the user's answer
 ```bash
 wd-bridge.py reply --corr t-1a2b3c --text "Dùng định dạng ngày dd/mm/yyyy"
 wd-bridge.py redo --corr t-1a2b3c --text "Nút phải nằm bên phải"
 wd-bridge.py accept --corr t-1a2b3c
+wd-bridge.py permit allow t-1a2b3c
+wd-bridge.py permit deny t-1a2b3c perm-42
 ```
-Each still runs `waggledance supervisor ensure --json` and sends one message the way
-`handoff` used to, and accepts `--dry-run` too. They move to the daemon in slice 2.
+Each runs `waggledance mcp` with `WAGGLEDANCE_CALLER=wd` and calls `waggledance_task` with
+`{corr, action, text?, req_id?}`, and accepts `--dry-run` too.
+
+- `reply` and `redo` queue the user's words for the task's leader; the leader gets them
+  under the same `waggledance#<corr>` tag.
+- `accept` closes the task and archives its leader when no other task or queued run still
+  uses it; it prints `"archived": false` and why otherwise.
+- `permit allow|deny <corr> [req_id]` answers the leader's permission request; without a
+  `req_id` it answers the newest unanswered request of that task.
+
+A command that fails exits non-zero with one line naming the cause, such as an unknown or
+closed corr, or a task whose leader has not received it yet. Tell the user it did not go
+through.
 
 ### Message shapes
 
@@ -143,11 +156,12 @@ write the user a second time for it.
 2. Write the user one clear message in Vietnamese. Start it with the tag `[waggledance#<corr>] <project> — <kind>` unchanged. Quote numbers, paths, commands and the leader's words verbatim.
 3. A question: put it to the user plainly, verbatim, and wait for their answer. Never answer a leader's question on the user's behalf, and never pick an option for them; relay their answer with `reply`.
 4. A board (`bảng việc`): list each open task with its project, step, who it waits on and since when. Put the questions waiting on the user first, each with how long it has waited.
-5. A permission request (`xin quyền`): name the project, the tool or command, and its `req_id`, and ask the user to allow or deny it. Never decide one yourself.
+5. A permission request (`xin quyền`): name the project, the tool or command, and its `req_id`, and ask the user to allow or deny it. Never decide one yourself: run `permit` only with the answer the user gave.
 
 ### Reading the user's answer
 
 - A bare `ok` or `được` from the user means `accept` of the newest open `corr` — the newest `[waggledance#<corr>]` result not yet accepted.
+- The user's allow or deny of a permission request (`cho phép`, `từ chối`) means `permit allow` or `permit deny` with that request's `corr` and `req_id`. Never choose allow or deny for the user, and never read a bare `ok` as an allow.
 - A sentence that answers a question means `reply` with that question's `corr` and the user's words as `--text`.
 - A request to change or do again what was delivered means `redo` with its `corr`.
 - When a sentence could answer either of two open questions, ask the user which one, naming both tags.

@@ -138,6 +138,8 @@ pub trait Paseo: Send + Sync {
     async fn send(&self, id: &str, text: &str) -> Result<()>;
     async fn wait(&self, id: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn logs_since(&self, id: &str, since: &str) -> Result<String>;
+    async fn archive(&self, id: &str) -> Result<()>;
+    async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()>;
 }
 
 pub fn delivery_heartbeat_path(data_dir: &Path) -> PathBuf {
@@ -873,6 +875,28 @@ impl Paseo for PaseoCli {
         .await
         .map(|(_, out)| strip_noise(&out))
     }
+
+    async fn archive(&self, id: &str) -> Result<()> {
+        self.exec(&["archive".into(), id.into(), "--json".into()], TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()> {
+        let verb = if allow { "allow" } else { "deny" };
+        self.exec(
+            &[
+                "permit".into(),
+                verb.into(),
+                id.into(),
+                req_id.into(),
+                "--json".into(),
+            ],
+            TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
 }
 
 struct PromptFile(PathBuf);
@@ -1093,6 +1117,8 @@ pub mod fake {
         Send(String, String),
         Wait(String),
         LogsSince(String, String),
+        Archive(String),
+        Permit(String, String, bool),
     }
 
     #[derive(Default)]
@@ -1292,6 +1318,19 @@ pub mod fake {
                 .get(id)
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        async fn archive(&self, id: &str) -> Result<()> {
+            self.record(Call::Archive(id.to_string()));
+            if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
+                a.archived = true;
+            }
+            Ok(())
+        }
+
+        async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()> {
+            self.record(Call::Permit(id.to_string(), req_id.to_string(), allow));
+            Ok(())
         }
     }
 }
@@ -2408,5 +2447,34 @@ mod tests {
         println!("workspaces: {workspaces:?}");
         println!("leaders: {leaders:?}");
         assert!(leaders.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_and_permit_run_their_cli_verbs_on_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = dir.path().join("argv");
+        let bin = script(
+            &dir.path().join("paseo"),
+            &format!("echo \"$*\" >> '{}'\nprintf '{{}}'", argv.display()),
+        );
+        let cli = PaseoCli::with_binary(&lossy(&bin));
+        cli.archive("lead-1").await.unwrap();
+        cli.permit("lead-1", "req-7", true).await.unwrap();
+        cli.permit("lead-1", "req-8", false).await.unwrap();
+        let lines: Vec<String> = std::fs::read_to_string(&argv)
+            .unwrap()
+            .lines()
+            .filter(|l| *l != "settle")
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "archive lead-1 --json",
+                "permit allow lead-1 req-7 --json",
+                "permit deny lead-1 req-8 --json",
+            ]
+        );
     }
 }

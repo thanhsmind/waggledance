@@ -141,7 +141,8 @@ pub fn run() -> Result<()> {
                         ask_state_schema(),
                         dispatch_schema(),
                         await_schema(),
-                        runs_schema()
+                        runs_schema(),
+                        task_schema()
                     ]
                 }),
             )),
@@ -301,6 +302,27 @@ fn runs_schema() -> Value {
     })
 }
 
+fn task_schema() -> Value {
+    json!({
+        "name": "waggledance_task",
+        "description": "Follow up on a task wd handed to a project's Paseo leader, by its corr. \
+    `reply` and `redo` queue the user's words for that leader; `accept` closes the task and \
+    archives its leader when nothing else uses it; `allow` and `deny` answer the leader's \
+    permission request `req_id` (the newest unanswered one when absent). Only ever pass the \
+    user's own allow or deny.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "corr": { "type": "string", "description": "The task's correlation id" },
+                "action": { "type": "string", "enum": ["reply", "redo", "accept", "allow", "deny"] },
+                "text": { "type": "string", "description": "The user's words — required for reply and redo" },
+                "req_id": { "type": "string", "description": "The permission request to answer — allow and deny only" }
+            },
+            "required": ["corr", "action"]
+        }
+    })
+}
+
 fn handle_tool_call(
     id: Option<Value>,
     engine: &Engine,
@@ -327,6 +349,7 @@ fn handle_tool_call(
             handle_await(id, engine, orchestration, &args, &resolve_data_dir(None))
         }
         "waggledance_runs" => handle_runs(id, engine, &args),
+        "waggledance_task" => handle_task(id, engine, orchestration, &args),
         _ => err(id, -32602, "unknown tool"),
     }
 }
@@ -1293,7 +1316,10 @@ fn dispatch_to_leader(
     let now = now_rfc3339();
     let run_id = format!("run-{:016x}", rand::random::<u64>());
     let task = match caller == Some(paseo::WD_CALLER) {
-        true => paseo::wd_task(request_id.unwrap_or(&run_id), task),
+        true => {
+            let corr = request_id.unwrap_or(&run_id);
+            paseo::wd_task(corr.split_once(':').map_or(corr, |(c, _)| c), task)
+        }
         false => task.to_string(),
     };
     let run = Run {
@@ -1348,6 +1374,221 @@ fn dispatch_to_leader(
                 "duplicate": false,
                 "warnings": warnings
             }
+        }),
+    )
+}
+
+fn handle_task(
+    id: Option<Value>,
+    engine: &Engine,
+    orchestration: &mut Option<Orchestration>,
+    args: &Value,
+) -> Value {
+    let orch = match orchestration_handle(orchestration, &engine.config.terminal) {
+        Ok(o) => o,
+        Err(e) => return tool_error(id, &e),
+    };
+    let cli = paseo::PaseoCli::new(&engine.config.paseo);
+    orch.runtime
+        .block_on(task_action(id, engine, &cli, args, &resolve_data_dir(None)))
+}
+
+async fn task_action(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    args: &Value,
+    data_dir: &Path,
+) -> Value {
+    let arg = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let Some(corr) = arg("corr") else {
+        return tool_error(id, "\"corr\" is required");
+    };
+    let action = arg("action").unwrap_or_default();
+    let prefix = match action {
+        "reply" => "Reply from the user:",
+        "redo" => "Redo requested:",
+        "accept" | "allow" | "deny" => "",
+        _ => {
+            return tool_error(
+                id,
+                &format!("unknown action {action}: use reply, redo, accept, allow or deny"),
+            )
+        }
+    };
+    let text = arg("text");
+    if !prefix.is_empty() && text.is_none() {
+        return tool_error(id, &format!("\"text\" is required for {action}"));
+    }
+    let task = match engine.get_task(corr) {
+        Ok(Some(task)) => task,
+        Ok(None) => return tool_error(id, &format!("unknown task {corr}")),
+        Err(e) => return tool_error(id, &format!("task lookup failed: {e}")),
+    };
+    if task.state == "closed" {
+        return match action {
+            "accept" => ok(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": format!("task {corr} was already closed") }],
+                    "structuredContent": { "corr": corr, "closed": true, "archived": false }
+                }),
+            ),
+            _ => tool_error(id, &format!("task {corr} is closed")),
+        };
+    }
+    let Some(leader) = task.leader_id.as_deref() else {
+        return tool_error(
+            id,
+            &format!("task {corr} has no leader yet — it is still queued for delivery"),
+        );
+    };
+    let project = match engine.get_project(&task.project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return tool_error(id, &format!("project not found: {}", task.project_id)),
+        Err(e) => return tool_error(id, &format!("project lookup failed: {e}")),
+    };
+    if !prefix.is_empty() {
+        let body = format!("{prefix}\n{}", text.unwrap_or_default());
+        for n in 1.. {
+            let resp = dispatch_to_leader(
+                id.clone(),
+                engine,
+                &project,
+                &body,
+                Some(&format!("{corr}:{n}")),
+                Some(paseo::WD_CALLER),
+                data_dir,
+            );
+            if resp["result"]["structuredContent"]["duplicate"] != true {
+                return resp;
+            }
+        }
+    }
+    if let Some(why) = paseo::paseo_unavailable(&engine.config.paseo) {
+        return tool_error(id, &why);
+    }
+    match action {
+        "accept" => accept_task(id, engine, paseo, corr, leader, &project.id).await,
+        _ => {
+            permit_task(
+                id,
+                engine,
+                paseo,
+                corr,
+                leader,
+                action == "allow",
+                arg("req_id"),
+            )
+            .await
+        }
+    }
+}
+
+async fn accept_task(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    corr: &str,
+    leader: &str,
+    project_id: &str,
+) -> Value {
+    if let Err(e) = engine.close_task(corr, &now_rfc3339()) {
+        return tool_error(id, &format!("task {corr} was not closed: {e}"));
+    }
+    let pane = format!("{}{leader}", orchestrate::PASEO_PANE_PREFIX);
+    let pending = format!("{}pending", orchestrate::PASEO_PANE_PREFIX);
+    let queued = engine
+        .list_queued_paseo_runs(project_id)
+        .unwrap_or_default();
+    let inflight = engine.list_inflight_paseo_runs().unwrap_or_default();
+    let live = queued
+        .iter()
+        .filter(|r| {
+            r.pane_id == pane || (r.pane_id == pending && paseo::wd_corr(&r.task).is_some())
+        })
+        .chain(inflight.iter().filter(|r| r.pane_id == pane))
+        .next();
+    let sharing = engine
+        .list_open_tasks()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|t| t.leader_id.as_deref() == Some(leader));
+    let kept = match (live, sharing) {
+        (Some(run), _) => Some(format!("run {} is still queued or working on it", run.id)),
+        (None, Some(other)) => Some(format!("open task {} shares it", other.corr)),
+        (None, None) => None,
+    };
+    let text = match &kept {
+        Some(why) => format!("task {corr} closed; leader {leader} left running: {why}"),
+        None => match paseo.archive(leader).await {
+            Ok(()) => format!("task {corr} closed; leader {leader} archived"),
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("task {corr} closed, but archiving leader {leader} failed: {e}"),
+                )
+            }
+        },
+    };
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "corr": corr, "closed": true, "archived": kept.is_none() }
+        }),
+    )
+}
+
+async fn permit_task(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    corr: &str,
+    leader: &str,
+    allow: bool,
+    req_id: Option<&str>,
+) -> Value {
+    let req_id = match req_id {
+        Some(r) => r.to_string(),
+        None => match engine.unanswered_permission_requests(corr) {
+            Ok(requests) => match requests.into_iter().next() {
+                Some(r) => r.req_id,
+                None => {
+                    return tool_error(
+                        id,
+                        &format!("task {corr} has no unanswered permission request"),
+                    )
+                }
+            },
+            Err(e) => return tool_error(id, &format!("permission lookup failed: {e}")),
+        },
+    };
+    let verb = if allow { "allow" } else { "deny" };
+    if let Err(e) = paseo.permit(leader, &req_id, allow).await {
+        return tool_error(
+            id,
+            &format!("paseo permit {verb} {leader} {req_id} failed: {e}"),
+        );
+    }
+    let mut warnings = Vec::new();
+    if let Err(e) = engine.answer_permission_request(&req_id, &now_rfc3339()) {
+        warnings.push(format!("request {req_id} not marked answered: {e}"));
+    }
+    let mut text = format!("{verb} sent for request {req_id} of leader {leader} (task {corr})");
+    for warning in &warnings {
+        text.push_str("; ");
+        text.push_str(warning);
+    }
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "corr": corr, "req_id": req_id, "answer": verb, "warnings": warnings }
         }),
     )
 }
@@ -1704,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_seven_schemas() {
+    fn tools_list_has_eight_schemas() {
         let tools = [
             view_file_schema(),
             search_schema(),
@@ -1713,6 +1954,7 @@ mod tests {
             dispatch_schema(),
             await_schema(),
             runs_schema(),
+            task_schema(),
         ];
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
@@ -1724,7 +1966,8 @@ mod tests {
                 "waggledance_ask_state",
                 "waggledance_dispatch",
                 "waggledance_await",
-                "waggledance_runs"
+                "waggledance_runs",
+                "waggledance_task"
             ]
         );
     }
@@ -3481,6 +3724,279 @@ mod tests {
         assert_eq!(sc["status"], "working");
         assert_eq!(sc["duplicate"], true);
         assert!(orchestration.is_none());
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    fn task_rig(tag: &str) -> (Engine, Project, std::path::PathBuf, paseo::fake::FakePaseo) {
+        let (engine, project, data_dir) = leader_engine(tag, true, true, true);
+        beat(&data_dir, 0);
+        engine
+            .insert_task("t-1", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-1", "lead-1", "2026-10-22T10:01:00Z")
+            .unwrap();
+        (engine, project, data_dir, paseo::fake::FakePaseo::default())
+    }
+
+    async fn task_call(
+        engine: &Engine,
+        fake: &paseo::fake::FakePaseo,
+        data_dir: &Path,
+        args: Value,
+    ) -> Value {
+        task_action(Some(json!(1)), engine, fake, &args, data_dir).await
+    }
+
+    fn permission(req_id: &str, seen_at: &str) -> waggledance_core::domain::PermissionRequest {
+        waggledance_core::domain::PermissionRequest {
+            req_id: req_id.into(),
+            corr: "t-1".into(),
+            leader_id: "lead-1".into(),
+            tool: "Bash".into(),
+            description: "rm -rf build".into(),
+            seen_at: seen_at.into(),
+            answered_at: None,
+            closed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_and_redo_queue_numbered_wd_runs_that_resolve_to_the_corr() {
+        let (engine, project, data_dir, fake) = task_rig("task-reply");
+        let reply = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "reply", "text": "use dd/mm" }),
+        )
+        .await;
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+        let first = engine
+            .run_by_request(&project.id, "t-1:1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["result"]["structuredContent"]["run_id"], first.id);
+        assert_eq!(
+            first.task,
+            paseo::wd_task("t-1", "Reply from the user:\nuse dd/mm")
+        );
+        assert_eq!(paseo::wd_corr(&first.task), Some("t-1"));
+        assert_eq!(first.status, "queued");
+        assert_eq!(
+            engine.run_caller(&first.id).unwrap().as_deref(),
+            Some(paseo::WD_CALLER)
+        );
+
+        let redo = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "redo", "text": "button on the right" }),
+        )
+        .await;
+        assert_eq!(
+            redo["result"]["structuredContent"]["duplicate"], false,
+            "{redo}"
+        );
+        let second = engine
+            .run_by_request(&project.id, "t-1:2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.task,
+            paseo::wd_task("t-1", "Redo requested:\nbutton on the right")
+        );
+        assert!(fake.calls().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn accept_closes_the_task_archives_an_unused_leader_and_repeats_quietly() {
+        let (engine, project, data_dir, fake) = task_rig("task-accept");
+        let args = json!({ "corr": "t-1", "action": "accept" });
+        let resp = task_call(&engine, &fake, &data_dir, args.clone()).await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], true,
+            "{resp}"
+        );
+        assert_eq!(engine.get_task("t-1").unwrap().unwrap().state, "closed");
+        assert_eq!(
+            fake.calls(),
+            vec![paseo::fake::Call::Archive("lead-1".into())]
+        );
+
+        let again = task_call(&engine, &fake, &data_dir, args).await;
+        assert_ne!(again["result"]["isError"], true, "{again}");
+        assert_eq!(again["result"]["structuredContent"]["archived"], false);
+        assert_eq!(fake.calls().len(), 1);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn accept_leaves_a_leader_another_task_or_a_live_run_still_uses() {
+        let (engine, project, data_dir, fake) = task_rig("task-accept-shared");
+        engine
+            .insert_task("t-2", &project.id, "2026-10-22T10:02:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-2", "lead-1", "2026-10-22T10:03:00Z")
+            .unwrap();
+        let resp = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "accept" }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], false,
+            "{resp}"
+        );
+        assert!(text_of(&resp).contains("t-2"), "{resp}");
+        assert_eq!(engine.get_task("t-1").unwrap().unwrap().state, "closed");
+
+        task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-2", "action": "reply", "text": "one more" }),
+        )
+        .await;
+        let resp = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-2", "action": "accept" }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], false,
+            "{resp}"
+        );
+        assert!(text_of(&resp).contains("queued or working"), "{resp}");
+        assert!(fake.calls().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn allow_and_deny_permit_the_leader_and_mark_the_request_answered() {
+        let (engine, project, data_dir, fake) = task_rig("task-permit");
+        engine
+            .insert_permission_request(&permission("req-old", "2026-10-22T10:05:00Z"))
+            .unwrap();
+        engine
+            .insert_permission_request(&permission("req-new", "2026-10-22T10:06:00Z"))
+            .unwrap();
+        let allow = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "allow" }),
+        )
+        .await;
+        assert_ne!(allow["result"]["isError"], true, "{allow}");
+        let deny = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "deny", "req_id": "req-old" }),
+        )
+        .await;
+        assert_ne!(deny["result"]["isError"], true, "{deny}");
+        assert_eq!(
+            fake.calls(),
+            vec![
+                paseo::fake::Call::Permit("lead-1".into(), "req-new".into(), true),
+                paseo::fake::Call::Permit("lead-1".into(), "req-old".into(), false),
+            ]
+        );
+        assert!(engine
+            .unanswered_permission_requests("t-1")
+            .unwrap()
+            .is_empty());
+
+        let none_left = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "allow" }),
+        )
+        .await;
+        assert_eq!(none_left["result"]["isError"], true);
+        assert!(text_of(&none_left).contains("no unanswered permission request"));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn task_refusals_name_their_cause_and_touch_nothing() {
+        let (engine, project, data_dir, fake) = task_rig("task-refuse");
+        engine
+            .insert_task("t-new", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .insert_task("t-done", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-done", "lead-9", "2026-10-22T10:01:00Z")
+            .unwrap();
+        engine.close_task("t-done", "2026-10-22T10:02:00Z").unwrap();
+        let cases = [
+            (
+                json!({ "action": "reply", "text": "x" }),
+                "\"corr\" is required",
+            ),
+            (
+                json!({ "corr": "t-1", "action": "merge" }),
+                "unknown action merge",
+            ),
+            (
+                json!({ "corr": "t-1", "action": "reply" }),
+                "\"text\" is required",
+            ),
+            (
+                json!({ "corr": "t-zz", "action": "reply", "text": "x" }),
+                "unknown task t-zz",
+            ),
+            (
+                json!({ "corr": "t-done", "action": "reply", "text": "x" }),
+                "task t-done is closed",
+            ),
+            (
+                json!({ "corr": "t-done", "action": "allow" }),
+                "task t-done is closed",
+            ),
+            (
+                json!({ "corr": "t-new", "action": "redo", "text": "x" }),
+                "task t-new has no leader yet",
+            ),
+            (
+                json!({ "corr": "t-new", "action": "deny" }),
+                "task t-new has no leader yet",
+            ),
+        ];
+        for (args, cause) in cases {
+            let resp = task_call(&engine, &fake, &data_dir, args.clone()).await;
+            assert_eq!(resp["result"]["isError"], true, "{args} {resp}");
+            assert!(text_of(&resp).contains(cause), "{args} {resp}");
+        }
+        assert!(fake.calls().is_empty());
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn the_task_tool_is_listed_and_routed() {
+        let schema = task_schema();
+        assert_eq!(schema["name"], "waggledance_task");
+        assert_eq!(schema["inputSchema"]["required"], json!(["corr", "action"]));
+        let (engine, pa) = dispatch_engine("task-routed");
+        let resp = call_tool(
+            &engine,
+            "waggledance_task",
+            json!({ "corr": "t-x", "action": "reply", "text": "x" }),
+        );
+        assert!(text_of(&resp).contains("unknown task t-x"), "{resp}");
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
 }
