@@ -109,6 +109,33 @@ pub struct InboxMessage {
     pub dead_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WdTask {
+    pub corr: String,
+    pub project_id: String,
+    pub leader_id: Option<String>,
+    pub state: String,
+    pub created_at: String,
+    pub last_delivered_at: Option<String>,
+    pub last_mail_at: Option<String>,
+    pub nudged_at: Option<String>,
+    pub progress_sent_at: Option<String>,
+    pub changed_at: String,
+    pub board_sent_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    pub req_id: String,
+    pub corr: String,
+    pub leader_id: String,
+    pub tool: String,
+    pub description: String,
+    pub seen_at: String,
+    pub answered_at: Option<String>,
+    pub closed_at: Option<String>,
+}
+
 /// Rendered markdown page plus metadata for the viewer.
 #[derive(Debug, Clone)]
 pub struct RenderedPage {

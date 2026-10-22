@@ -86,9 +86,11 @@ fn send(
         }
     }
     match project {
-        Some(project) if problems.is_empty() => Ok(Ok(
-            engine.insert_inbox_message(RECIPIENT, corr, &project, kind, body, now)?
-        )),
+        Some(project) if problems.is_empty() => {
+            let seq = engine.insert_inbox_message(RECIPIENT, corr, &project, kind, body, now)?;
+            engine.mark_task_mail(corr, now)?;
+            Ok(Ok(seq))
+        }
         _ => Ok(Err(problems)),
     }
 }
@@ -195,6 +197,28 @@ mod tests {
         assert_eq!(msg.kind, "result");
         assert_eq!(msg.corr, "c-7");
         assert_eq!(msg.body, FULL);
+    }
+
+    #[test]
+    fn every_accepted_mail_stamps_the_tasks_last_mail_and_a_refused_one_does_not() {
+        let e = engine();
+        run_at(&e, "r1", "proj-1", "c-7", NOW);
+        e.insert_task("c-7", "proj-1", "2026-10-22T09:00:00Z")
+            .unwrap();
+        refused(send(&e, "wd", "c-7", "result", "Done: x\n", NOW));
+        assert_eq!(e.get_task("c-7").unwrap().unwrap().last_mail_at, None);
+
+        for (kind, at) in [
+            ("question", "2026-10-22T10:01:00Z"),
+            ("progress", "2026-10-22T10:02:00Z"),
+            ("error", "2026-10-22T10:03:00Z"),
+            ("result", "2026-10-22T10:04:00Z"),
+        ] {
+            send(&e, "wd", "c-7", kind, FULL, at).unwrap().unwrap();
+            let t = e.get_task("c-7").unwrap().unwrap();
+            assert_eq!(t.last_mail_at.as_deref(), Some(at), "{kind}");
+            assert_eq!(t.changed_at, at, "{kind}");
+        }
     }
 
     #[test]

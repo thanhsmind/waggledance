@@ -1319,11 +1319,17 @@ fn dispatch_to_leader(
             Err(e) => tool_error(id, &format!("run lookup failed: {e}")),
         };
     }
-    let warnings: Vec<String> = if delivery_paused(data_dir) {
+    let mut warnings: Vec<String> = if delivery_paused(data_dir) {
         vec![DELIVERY_PAUSED.to_string()]
     } else {
         Vec::new()
     };
+    let hand_off = request_id.filter(|r| caller == Some(paseo::WD_CALLER) && !r.contains(':'));
+    if let Some(corr) = hand_off {
+        if let Err(e) = engine.insert_task(corr, &project.id, &run.created_at) {
+            warnings.push(format!("task {corr} was not recorded: {e}"));
+        }
+    }
     let mut text = format!(
         "queued run {} for project {}'s Paseo leader",
         run.id, project.id
@@ -3292,6 +3298,45 @@ mod tests {
             engine.run_caller(run_id).unwrap().as_deref(),
             Some("openclaw:wd")
         );
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_wd_hand_off_opens_one_task_and_follow_ups_and_other_callers_open_none() {
+        let (engine, project, data_dir) = leader_engine("wd-task", true, true, true);
+        beat(&data_dir, 0);
+        let send = |task: &str, request_id: &str, caller: Option<&str>| {
+            dispatch_to_leader(
+                Some(json!(1)),
+                &engine,
+                &project,
+                task,
+                Some(request_id),
+                caller,
+                &data_dir,
+            )
+        };
+        send("ship it", "t-abc123", Some(paseo::WD_CALLER));
+        let task = engine.get_task("t-abc123").unwrap().unwrap();
+        assert_eq!(
+            (task.project_id.as_str(), task.state.as_str()),
+            (project.id.as_str(), "open")
+        );
+        assert_eq!(task.changed_at, task.created_at);
+        assert_eq!(task.leader_id, None);
+
+        let dup = send("ship it", "t-abc123", Some(paseo::WD_CALLER));
+        assert_eq!(dup["result"]["structuredContent"]["duplicate"], true);
+        send("more", "t-abc123:1", Some(paseo::WD_CALLER));
+        send("plain", "t-def456", Some("agent-caller"));
+        send("plain", "t-fed654", None);
+        let open: Vec<String> = engine
+            .list_open_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.corr)
+            .collect();
+        assert_eq!(open, vec!["t-abc123"]);
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 

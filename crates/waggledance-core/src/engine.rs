@@ -4,7 +4,9 @@
 
 use crate::code_source::{self, DirListing, SourceContent};
 use crate::config::Config;
-use crate::domain::{InboxMessage, IndexedFile, Project, RenderedPage, Run, SearchResult};
+use crate::domain::{
+    InboxMessage, IndexedFile, PermissionRequest, Project, RenderedPage, Run, SearchResult, WdTask,
+};
 use crate::error::{Error, Result};
 use crate::fuzzy::{self, FuzzyHit};
 use crate::git_diff::{self, ActiveBase, CommitEntry, DiffBase, GitDiffError, WorkingTreeDiff};
@@ -507,6 +509,66 @@ impl Engine {
 
     pub fn prune_inbox(&self, acked_before: &str) -> Result<usize> {
         self.store.prune_inbox(acked_before)
+    }
+
+    pub fn insert_task(&self, corr: &str, project_id: &str, at: &str) -> Result<bool> {
+        self.store.insert_task(corr, project_id, at)
+    }
+
+    pub fn get_task(&self, corr: &str) -> Result<Option<WdTask>> {
+        self.store.get_task(corr)
+    }
+
+    pub fn list_open_tasks(&self) -> Result<Vec<WdTask>> {
+        self.store.list_open_tasks()
+    }
+
+    pub fn mark_task_delivered(&self, corr: &str, leader_id: &str, at: &str) -> Result<()> {
+        self.store.mark_task_delivered(corr, leader_id, at)
+    }
+
+    pub fn mark_task_mail(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.mark_task_mail(corr, at)
+    }
+
+    pub fn close_task(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.close_task(corr, at)
+    }
+
+    pub fn set_task_nudged(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.set_task_nudged(corr, at)
+    }
+
+    pub fn set_task_progress_sent(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.set_task_progress_sent(corr, at)
+    }
+
+    pub fn stamp_board_sent(&self, at: &str) -> Result<()> {
+        self.store.stamp_board_sent(at)
+    }
+
+    pub fn insert_permission_request(&self, request: &PermissionRequest) -> Result<bool> {
+        self.store.insert_permission_request(request)
+    }
+
+    pub fn unanswered_permission_requests(&self, corr: &str) -> Result<Vec<PermissionRequest>> {
+        self.store.unanswered_permission_requests(corr)
+    }
+
+    pub fn answer_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        self.store.answer_permission_request(req_id, at)
+    }
+
+    pub fn close_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        self.store.close_permission_request(req_id, at)
+    }
+
+    pub fn permission_request_ids(&self, corr: &str) -> Result<Vec<String>> {
+        self.store.permission_request_ids(corr)
+    }
+
+    pub fn prune_tasks(&self, before: &str) -> Result<usize> {
+        self.store.prune_tasks(before)
     }
 
     /// The transcript a finished run ended with — `None` while it is still

@@ -293,6 +293,7 @@ impl Delivery {
             Ok(leader) => leader,
             Err(e) => return self.presend_failed(&name, run, &e.to_string()),
         };
+        let sent_at = now_rfc3339();
         let (agent, outcome) = match leader {
             Leader::Existing { busy: true, .. } => {
                 self.set_status(&run.id, "queued");
@@ -300,7 +301,7 @@ impl Delivery {
                 return;
             }
             Leader::Existing { id, .. } => {
-                self.set_pane(&run.id, Some(&id));
+                self.sent(run, &id, wd, &sent_at);
                 let outcome = self.paseo.send_and_wait(&id, &run.task, timeout).await;
                 (Some(id), outcome)
             }
@@ -324,7 +325,7 @@ impl Delivery {
                     .await
                 {
                     Ok((id, end)) => {
-                        self.set_pane(&run.id, Some(&id));
+                        self.sent(run, &id, wd, &sent_at);
                         (Some(id), Ok(end))
                     }
                     Err(e) => (None, Err(e)),
@@ -592,6 +593,16 @@ impl Delivery {
             .update_run_status(run_id, status, &now_rfc3339(), None, None)
         {
             tracing::warn!("delivery could not mark run {run_id} {status}: {e}");
+        }
+    }
+
+    fn sent(&self, run: &Run, agent: &str, wd: bool, at: &str) {
+        self.set_pane(&run.id, Some(agent));
+        let Some(corr) = wd.then(|| paseo::wd_corr(&run.task)).flatten() else {
+            return;
+        };
+        if let Err(e) = self.engine.mark_task_delivered(corr, agent, at) {
+            tracing::warn!("delivery could not record task {corr}'s leader: {e}");
         }
     }
 
@@ -1138,6 +1149,47 @@ mod tests {
         assert!(inbox(&r.engine).is_empty());
         r.tick().await;
         assert!(r.notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivering_a_wd_run_records_its_leader_and_clears_the_nudge_marks() {
+        let r = rig();
+        r.fake.add_wd_leader("proj-1", "lead", "idle");
+        r.engine
+            .insert_task("corr-4", "proj-1", "2026-10-14T13:00:00Z")
+            .unwrap();
+        r.engine
+            .set_task_nudged("corr-4", "2026-10-14T13:10:00Z")
+            .unwrap();
+        r.engine
+            .set_task_progress_sent("corr-4", "2026-10-14T13:20:00Z")
+            .unwrap();
+        let before = now_rfc3339();
+        let task = paseo::wd_task("corr-4", "one");
+        r.queue("proj-1", "run-1", &task, Some(paseo::WD_CALLER));
+        r.tick().await;
+        assert_eq!(r.sends_to("lead"), vec![task]);
+        let t = r.engine.get_task("corr-4").unwrap().unwrap();
+        assert_eq!(t.leader_id.as_deref(), Some("lead"));
+        let delivered = t.last_delivered_at.unwrap();
+        assert!(delivered >= before, "{delivered} < {before}");
+        assert_eq!(t.changed_at, delivered);
+        assert_eq!((t.nudged_at, t.progress_sent_at), (None, None));
+    }
+
+    #[tokio::test]
+    async fn delivering_a_non_wd_run_touches_no_task() {
+        let r = rig();
+        r.fake.add_leader("proj-1", "lead", "idle", false);
+        r.engine
+            .insert_task("corr-5", "proj-1", "2026-10-14T13:00:00Z")
+            .unwrap();
+        r.queue("proj-1", "run-1", &paseo::wd_task("corr-5", "one"), None);
+        r.tick().await;
+        assert_eq!(r.status("run-1"), "done");
+        let t = r.engine.get_task("corr-5").unwrap().unwrap();
+        assert_eq!((t.leader_id, t.last_delivered_at), (None, None));
+        assert_eq!(t.changed_at, "2026-10-14T13:00:00Z");
     }
 
     #[tokio::test]
