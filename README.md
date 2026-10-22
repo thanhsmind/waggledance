@@ -227,18 +227,18 @@ registers every Paseo workspace as a project on its own. Once a project opts in,
 `waggledance_dispatch` with `leader: true` queues the task; the running daemon
 (`waggledance serve`) delivers it when that leader is idle, or starts one, and tells the
 caller when the leader's turn ends. Pass a `request_id` so a retry never sends twice.
-The request box in the Waggle Dance Paseo plugin uses this path; it is frozen and gains
-no new behaviour. The detection order, the workspace rules, and the run statuses are in
+The request box in the Waggle Dance Paseo plugin uses this path. The detection order,
+the workspace rules, and the run statuses are in
 [A request for a project reaches its one Paseo leader](docs/knowledge/patterns/paseo-leader-dispatch.md).
 
-An agent outside Paseo, such as aicoworker on OpenClaw, hands its task to the
-waggledance supervisor instead: one long-lived Paseo agent that opens each project's
-leader as its own subagent, hears from Paseo when the leader finishes or asks, and
-reports to Telegram through the OpenClaw hook. `waggledance supervisor ensure` finds or
-starts it, `waggledance setup openclaw` installs aicoworker's side, and
-`waggledance_ask_state` lists each project's `leaders`. The hops, message shapes and
-limits are in
-[A task handed in from outside Paseo goes to the supervisor](docs/knowledge/patterns/paseo-native-supervisor.md).
+wd, the aicoworker agent on OpenClaw, uses the same door: `wd-bridge.py handoff` sends
+the task to the project's leader, and the leader answers with `waggledance mail send`.
+The daemon keeps those answers in an inbox and wakes wd's main session once per message.
+It also nudges a silent leader, sends wd a board of open tasks, and relays each
+permission request for wd to allow or deny. `waggledance setup openclaw` installs wd's
+side, and `waggledance_ask_state` lists each project's `leaders`. The inbox, the wake,
+the follow-up commands and the known gaps are in
+[wd hands a task straight to a project's leader](docs/knowledge/patterns/wd-direct-leader.md).
 
 ### Per-project settings: .waggledance.toml
 

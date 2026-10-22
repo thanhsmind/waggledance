@@ -1,11 +1,11 @@
 ---
 type: bee.pattern
 title: "A task handed in from outside Paseo goes to the supervisor, which runs the project's leader as its own subagent"
-description: "Practice: an agent outside Paseo, such as aicoworker on OpenClaw, hands a task to the one waggledance supervisor with paseo send; the supervisor opens or reuses the project's leader as a Paseo subagent, hears its turn ends from Paseo itself, routes every question to an advisor before the user, and reports with waggledance supervisor report into wd's main OpenClaw session, where wd writes the Telegram message. A heartbeat reconciles its ledger and sends wd a board of open tasks. The daemon's leader queue is frozen beside it."
+description: "Retired, superseded by wd-direct-leader. Practice: an agent outside Paseo, such as aicoworker on OpenClaw, hands a task to the one waggledance supervisor with paseo send; the supervisor opens or reuses the project's leader as a Paseo subagent, hears its turn ends from Paseo itself, routes every question to an advisor before the user, and reports with waggledance supervisor report into wd's main OpenClaw session, where wd writes the Telegram message. A heartbeat reconciles its ledger and sends wd a board of open tasks. The daemon's leader queue is frozen beside it."
 timestamp: 2026-10-18
 bee:
   id: paseo-native-supervisor
-  lifecycle: active
+  lifecycle: retired
   areas: [orchestration]
   sources: [docs/history/paseo-native-supervisor/CONTEXT.md, docs/history/paseo-native-supervisor/plan.md, docs/history/supervisor-active-loop/plan.md]
   polarity: practice
@@ -13,6 +13,8 @@ bee:
 ---
 
 # A task handed in from outside Paseo goes to the supervisor, which runs the project's leader as its own subagent
+
+Retired by wd-direct-leader D11: the supervisor and its commands are gone, and wd now hands tasks straight to a project's leader; see [wd hands a task straight to a project's leader](wd-direct-leader.md). The rest of this page records the retired path.
 
 Locked by paseo-native-supervisor D1/D2/D3/D4/D5/D6/D7/D8/D9/D10/D11/D12/D13
 (`docs/history/paseo-native-supervisor/CONTEXT.md`). D8 freezes the daemon path in

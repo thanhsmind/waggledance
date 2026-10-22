@@ -100,15 +100,14 @@ herdr.
 
 ## Dispatch
 
-### Frozen
+### wd is a caller
 
-Per paseo-native-supervisor D8, the queue, the per-project lock, turn-end detection and
-caller notices below stay as documented and receive no new behaviour. They keep
-serving the Paseo plugin's request box and existing MCP callers. An agent outside
-Paseo hands its task to the supervisor instead; see
-[A task handed in from outside Paseo goes to the supervisor](paseo-native-supervisor.md).
-Both paths share the role and project labels, so a project reached through both at
-once may hold a daemon leader and a supervisor leader; that page names the limit.
+wd-direct-leader D1 lifts the freeze paseo-native-supervisor D8 put on this path. wd,
+the aicoworker agent on OpenClaw, hands its tasks through this door with caller
+`openclaw:wd`. Its runs go only to leaders labelled `waggledance.via=wd`, and every other
+caller's runs skip those leaders. A wd run sends no caller notice: its outcome reaches
+wd through the waggledance inbox. See
+[wd hands a task straight to a project's leader](wd-direct-leader.md).
 
 A caller sends `{project, task, leader: true, request_id}` to `waggledance_dispatch`.
 Exactly one of `preset`, `pane_id`, and `leader: true` is accepted. The task text is
@@ -225,8 +224,8 @@ When a run becomes `done`, `lost`, or `blocked`, waggledance tells the caller wi
 being asked (D4):
 
 - through the existing notify path, and
-- when the run has a caller that is not the leader itself, with one `paseo send
-  --no-wait` to that agent. The notice goes out only while the caller is idle (D5),
+- when the run has a caller that is not the leader itself and not an `openclaw:`
+  caller, with one `paseo send --no-wait` to that agent. The notice goes out only while the caller is idle (D5),
   and is retried for up to an hour. Notices for one caller are combined into a single
   message per tick, followed by 30 seconds of quiet, because Paseo still reports a
   just-messaged agent as idle for a few seconds.
@@ -331,9 +330,10 @@ Each source names the project itself:
   `waggledance mcp` over stdio and calls `waggledance_dispatch` with the panel's project,
   the typed task, `leader: true`, and one `request_id` per draft.
 - **External MCP agents.** Any MCP client that runs `waggledance mcp` can still call the
-  same tool with the same arguments. An agent outside Paseo, such as aicoworker, hands
-  its task to the supervisor instead; see
-  [A task handed in from outside Paseo goes to the supervisor](paseo-native-supervisor.md).
+  same tool with the same arguments.
+- **wd.** `wd-bridge.py handoff` runs `waggledance mcp` with `WAGGLEDANCE_CALLER=wd` and
+  passes the task's corr as `request_id`; see
+  [wd hands a task straight to a project's leader](wd-direct-leader.md).
 
 ## Pointers
 
@@ -364,6 +364,6 @@ Each source names the project itself:
 - `integrations/paseo/server/dispatch.ts` and `integrations/paseo/client/composer.tsx` —
   the plugin's request box.
 - `docs/waggledance-supervisor-skill-template.md` — the supervisor skill's leader mode,
-  which names this door as frozen and points to the supervisor.
+  which hands a task through this door.
 - `docs/knowledge/patterns/existence-is-not-evidence.md` — why every Paseo behaviour the
   client relies on has a capture.
