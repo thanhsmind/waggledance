@@ -95,6 +95,20 @@ pub struct Run {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxMessage {
+    pub seq: i64,
+    pub recipient: String,
+    pub corr: String,
+    pub project_id: String,
+    pub kind: String,
+    pub body: String,
+    pub created_at: String,
+    pub acked_at: Option<String>,
+    pub attempts: i64,
+    pub dead_at: Option<String>,
+}
+
 /// Rendered markdown page plus metadata for the viewer.
 #[derive(Debug, Clone)]
 pub struct RenderedPage {

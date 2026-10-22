@@ -4,7 +4,7 @@
 
 use crate::code_source::{self, DirListing, SourceContent};
 use crate::config::Config;
-use crate::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
+use crate::domain::{InboxMessage, IndexedFile, Project, RenderedPage, Run, SearchResult};
 use crate::error::{Error, Result};
 use crate::fuzzy::{self, FuzzyHit};
 use crate::git_diff::{self, ActiveBase, CommitEntry, DiffBase, GitDiffError, WorkingTreeDiff};
@@ -478,6 +478,35 @@ impl Engine {
 
     pub fn run_notice_state(&self, id: &str) -> Result<Option<String>> {
         self.store.run_notice_state(id)
+    }
+
+    pub fn insert_inbox_message(
+        &self,
+        recipient: &str,
+        corr: &str,
+        project_id: &str,
+        kind: &str,
+        body: &str,
+        created_at: &str,
+    ) -> Result<i64> {
+        self.store
+            .insert_inbox_message(recipient, corr, project_id, kind, body, created_at)
+    }
+
+    pub fn next_inbox_message(&self, recipient: &str) -> Result<Option<InboxMessage>> {
+        self.store.next_inbox_message(recipient)
+    }
+
+    pub fn ack_inbox_message(&self, seq: i64, acked_at: &str) -> Result<()> {
+        self.store.ack_inbox_message(seq, acked_at)
+    }
+
+    pub fn fail_inbox_message(&self, seq: i64, dead_at_attempts: i64, now: &str) -> Result<bool> {
+        self.store.fail_inbox_message(seq, dead_at_attempts, now)
+    }
+
+    pub fn prune_inbox(&self, acked_before: &str) -> Result<usize> {
+        self.store.prune_inbox(acked_before)
     }
 
     /// The transcript a finished run ended with — `None` while it is still

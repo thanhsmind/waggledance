@@ -1,7 +1,7 @@
 //! SQLite adapter: project registry + file index + FTS5 search.
 //! Behind a `Mutex<Connection>` so it is Send+Sync for the async daemon.
 
-use crate::domain::{IndexedFile, Project, Run, SearchResult};
+use crate::domain::{InboxMessage, IndexedFile, Project, Run, SearchResult};
 use crate::error::Result;
 use crate::short_link;
 use rusqlite::{params, Connection};
@@ -93,6 +93,7 @@ impl SqliteStore {
         c.execute("DELETE FROM files_fts WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM links WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM runs WHERE project_id=?1", params![id])?;
+        c.execute("DELETE FROM inbox WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM projects WHERE id=?1", params![id])?;
         Ok(())
     }
@@ -487,6 +488,80 @@ impl SqliteStore {
             .flatten())
     }
 
+    pub fn insert_inbox_message(
+        &self,
+        recipient: &str,
+        corr: &str,
+        project_id: &str,
+        kind: &str,
+        body: &str,
+        created_at: &str,
+    ) -> Result<i64> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO inbox(recipient, corr, project_id, kind, body, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![recipient, corr, project_id, kind, body, created_at],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn next_inbox_message(&self, recipient: &str) -> Result<Option<InboxMessage>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT seq, recipient, corr, project_id, kind, body, created_at, acked_at,
+                    attempts, dead_at
+             FROM inbox
+             WHERE recipient=?1 AND acked_at IS NULL AND dead_at IS NULL
+             ORDER BY seq ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![recipient])?;
+        Ok(rows.next()?.map(|r| InboxMessage {
+            seq: r.get_unwrap(0),
+            recipient: r.get_unwrap(1),
+            corr: r.get_unwrap(2),
+            project_id: r.get_unwrap(3),
+            kind: r.get_unwrap(4),
+            body: r.get_unwrap(5),
+            created_at: r.get_unwrap(6),
+            acked_at: r.get_unwrap(7),
+            attempts: r.get_unwrap(8),
+            dead_at: r.get_unwrap(9),
+        }))
+    }
+
+    pub fn ack_inbox_message(&self, seq: i64, acked_at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE inbox SET acked_at=?2 WHERE seq=?1",
+            params![seq, acked_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_inbox_message(&self, seq: i64, dead_at_attempts: i64, now: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE inbox SET attempts=attempts+1,
+                    dead_at=CASE WHEN attempts+1 >= ?2 THEN ?3 ELSE dead_at END
+             WHERE seq=?1",
+            params![seq, dead_at_attempts, now],
+        )?;
+        Ok(c.query_row(
+            "SELECT dead_at IS NOT NULL FROM inbox WHERE seq=?1",
+            params![seq],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn prune_inbox(&self, acked_before: &str) -> Result<usize> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "DELETE FROM inbox WHERE acked_at IS NOT NULL AND acked_at < ?1",
+            params![acked_before],
+        )?)
+    }
+
     // ---- files ----
 
     pub fn upsert_file(&self, f: &IndexedFile, content: &str) -> Result<()> {
@@ -750,10 +825,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (4, migration_4_runs_final_transcript),
     (5, migration_5_runs_request),
     (6, migration_6_runs_notice),
+    (7, migration_7_inbox),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -865,6 +941,25 @@ fn migration_6_runs_notice(conn: &Connection) -> Result<()> {
     if !has_column(conn, "runs", "notice_until")? {
         conn.execute("ALTER TABLE runs ADD COLUMN notice_until TEXT", [])?;
     }
+    Ok(())
+}
+
+fn migration_7_inbox(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS inbox (
+             seq INTEGER PRIMARY KEY,
+             recipient TEXT NOT NULL,
+             corr TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             body TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             acked_at TEXT,
+             attempts INTEGER NOT NULL DEFAULT 0,
+             dead_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(recipient, acked_at, dead_at, seq);",
+    )?;
     Ok(())
 }
 
@@ -2074,5 +2169,149 @@ mod tests {
             )
             .unwrap();
         assert!(!flag, "existing rows must default the new column to off");
+    }
+
+    fn mail(s: &SqliteStore, project_id: &str, body: &str) -> i64 {
+        s.insert_inbox_message(
+            "wd",
+            "corr-1",
+            project_id,
+            "result",
+            body,
+            "2026-10-22T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migrate_adds_the_inbox_table_to_a_v6_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 feature TEXT,
+                 final_transcript TEXT,
+                 request_id TEXT,
+                 caller TEXT,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 notice TEXT,
+                 notice_state TEXT,
+                 notice_until TEXT
+             );
+             INSERT INTO runs VALUES('r-a','p1','paseo:a1',NULL,'t','','m','done','t','t',NULL,'fin','req-1','caller',0,NULL,NULL,NULL);
+             INSERT INTO runs VALUES('r-b','p1','paseo:a2',NULL,'t','','m','working','t','t',NULL,NULL,'req-2',NULL,1,NULL,NULL,NULL);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                7
+            );
+            assert_eq!(
+                c.query_row::<i64, _, _>("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+                    .unwrap(),
+                2
+            );
+            super::migrate(&c).unwrap();
+            super::migration_7_inbox(&c).unwrap();
+        }
+        assert_eq!(s.get_run("r-b").unwrap().unwrap().status, "working");
+        let seq = mail(&s, "p1", "hello");
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, seq);
+    }
+
+    #[test]
+    fn next_pending_inbox_message_is_the_lowest_seq_and_ack_hides_it() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
+        let first = mail(&s, "p1", "one");
+        let second = mail(&s, "p1", "two");
+        s.insert_inbox_message("other", "c", "p1", "result", "x", "t")
+            .unwrap();
+        assert!(second > first);
+
+        let next = s.next_inbox_message("wd").unwrap().unwrap();
+        assert_eq!(next.seq, first);
+        assert_eq!(next.recipient, "wd");
+        assert_eq!(next.corr, "corr-1");
+        assert_eq!(next.project_id, "p1");
+        assert_eq!(next.kind, "result");
+        assert_eq!(next.body, "one");
+        assert_eq!(next.created_at, "2026-10-22T00:00:00Z");
+        assert_eq!(next.acked_at, None);
+        assert_eq!(next.attempts, 0);
+        assert_eq!(next.dead_at, None);
+
+        s.ack_inbox_message(first, "2026-10-22T00:01:00Z").unwrap();
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, second);
+        s.ack_inbox_message(second, "2026-10-22T00:02:00Z").unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
+    }
+
+    #[test]
+    fn five_failed_attempts_mark_an_inbox_message_dead_and_next_pending_skips_it() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let poison = mail(&s, "p1", "poison");
+        let after = mail(&s, "p1", "after");
+        for attempt in 1..5 {
+            assert!(!s
+                .fail_inbox_message(poison, 5, "2026-10-22T00:05:00Z")
+                .unwrap());
+            let next = s.next_inbox_message("wd").unwrap().unwrap();
+            assert_eq!((next.seq, next.attempts), (poison, attempt));
+        }
+        assert!(s
+            .fail_inbox_message(poison, 5, "2026-10-22T00:05:00Z")
+            .unwrap());
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, after);
+    }
+
+    #[test]
+    fn prune_deletes_only_acked_inbox_rows_older_than_the_cutoff() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let old_acked = mail(&s, "p1", "old");
+        let new_acked = mail(&s, "p1", "new");
+        let pending = mail(&s, "p1", "pending");
+        s.ack_inbox_message(old_acked, "2026-09-01T00:00:00Z")
+            .unwrap();
+        s.ack_inbox_message(new_acked, "2026-10-21T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(s.prune_inbox("2026-09-22T00:00:00Z").unwrap(), 1);
+        let c = s.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT seq FROM inbox ORDER BY seq").unwrap();
+        let left: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec![new_acked, pending]);
+    }
+
+    #[test]
+    fn delete_project_removes_only_that_projects_inbox_rows() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        mail(&s, "p1", "gone");
+        let kept = mail(&s, "p2", "kept");
+        s.delete_project("p1").unwrap();
+        let next = s.next_inbox_message("wd").unwrap().unwrap();
+        assert_eq!((next.seq, next.project_id.as_str()), (kept, "p2"));
+        s.ack_inbox_message(kept, "t").unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
     }
 }
