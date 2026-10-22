@@ -197,123 +197,46 @@ Three slices; only slice 1 has cells.
 | wdl-4 | Wake wd's main session once per unacked inbox message | crates/waggledance/src/wake.rs (new), crates/waggledance/src/seat.rs, crates/waggledance/src/main.rs | wdl-1, wdl-3 | the daemon runs one `openclaw agent` turn per message and marks it read only when the turn returns ok | `cargo test --profile fast -p waggledance wake` green |
 | wdl-5 | Route wd-bridge hand-off through the daemon and walk it live | integrations/openclaw/waggledance-orchestrator/bin/wd-bridge.py, integrations/openclaw/waggledance-orchestrator/SKILL.md, docs/history/wd-direct-leader/reports/slice-1-live.md (new) | wdl-2, wdl-3, wdl-4 | `wd-bridge.py handoff --project <p> --task ...` returns a corr and run id; the leader's done mail reaches wd's main session | `green:live` — the walk's commands and outputs in `docs/history/wd-direct-leader/reports/slice-1-live.md` |
 
+Slice 1 (wdl-1..wdl-5) is capped; its preview rows above stay as the record. Plan rev 1 carries slice 2: contract in `docs/history/wd-direct-leader/slice-2.md`, risks consult folded in from the hat-risks seat (2026-10-22). Current slice cells:
+
 ```json
 [
-  {
-    "id": "wdl-1",
-    "feature": "wd-direct-leader",
-    "title": "Store wd inbox messages in the registry database",
-    "lane": "high-risk",
-    "role": "test",
-    "status": "open",
-    "deps": [],
-    "decisions": ["D3", "D6", "50943778-7dd4-4505-b797-aed7f88a0015", "288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
-    "files": ["crates/waggledance-core/src/repository.rs", "crates/waggledance-core/src/engine.rs", "crates/waggledance-core/src/domain.rs"],
-    "read_first": ["docs/history/wd-direct-leader/plan.md", "crates/waggledance-core/src/repository.rs", "crates/waggledance-core/src/engine.rs"],
-    "affects_skills": [],
-    "affects_specs": [],
-    "action": "Follow the 'Slice-1 contract' section of docs/history/wd-direct-leader/plan.md exactly; it is the one home for names, kinds, grammar and frame. Add migration 7 (bump SCHEMA_VERSION from 6 to 7, append migration_7_inbox to the migration list beside migration_6_runs_notice) creating the inbox table with the columns the contract names (per D3), indexed on (recipient, acked_at, dead_at, seq). Add an InboxMessage domain struct and SqliteStore plus Engine pass-through methods: insert a message, next pending message for a recipient (lowest seq, acked_at and dead_at null), ack by seq, record a failed attempt (increments attempts, sets dead_at at a given limit), prune acked rows older than a cutoff, and delete a project's rows inside delete_project next to the existing DELETE FROM runs line. Red-first tests in the repository test module: a v6 database with runs migrates to 7 with the run count unchanged; insert then next pending returns the lowest seq; ack hides it; five failed attempts set dead_at and next pending skips it; prune deletes only old acked rows; delete_project removes that project's rows only.",
-    "must_haves": {
-      "truths": ["A v6 registry.db opens at user_version 7 with every run row intact", "next pending never returns an acked or dead row"],
-      "artifacts": [{"path": "crates/waggledance-core/src/repository.rs", "substantive": "migration_7_inbox and inbox store methods with tests"}],
-      "key_links": ["Engine exposes the inbox methods used by wdl-2, wdl-3 and wdl-4"],
-      "prohibitions": ["No change to the runs table or to migrations 1-6"]
-    },
-    "verify": "cargo test --profile fast -p waggledance-core",
-    "trace": {"worker": null, "outcome": null, "files_changed": [], "deviations": [], "friction": null, "capped_at": null, "behavior_change": true}
-  },
-  {
-    "id": "wdl-2",
-    "feature": "wd-direct-leader",
-    "title": "Hand wd tasks to via=wd leaders and mail wd when a wd run blocks or is lost",
-    "lane": "high-risk",
-    "role": "test",
-    "status": "open",
-    "deps": ["wdl-1"],
-    "decisions": ["D1", "D2", "D7", "D12", "50943778-7dd4-4505-b797-aed7f88a0015", "288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
-    "files": ["crates/waggledance/src/mcp.rs", "crates/waggledance/src/paseo.rs", "crates/waggledance/src/delivery.rs"],
-    "read_first": ["docs/history/wd-direct-leader/plan.md", "crates/waggledance/src/mcp.rs", "crates/waggledance/src/paseo.rs", "crates/waggledance/src/delivery.rs"],
-    "affects_skills": [],
-    "affects_specs": [],
-    "action": "Follow the 'Slice-1 contract' section of docs/history/wd-direct-leader/plan.md exactly. In mcp.rs handle_dispatch, where the caller is read from PASEO_AGENT_ID, fall back to env WAGGLEDANCE_CALLER=wd and store caller openclaw:wd (per D1; the tool input schema stays unchanged); for an openclaw:wd leader run, store the task with the leader prompt prefix the contract gives (mail rule and advisor rule, per D7). In paseo.rs add a waggledance.via=wd label constant beside VIA_LABEL; resolve_leader and the leader lookup built by leaders_args take whether the run is a wd run: a wd run lists only via=wd leaders and creates leaders with the three labels (per D2); any other run skips leaders labelled waggledance.via=wd (per D12). The ask_state leaders via field gains the value wd where mcp.rs emits via. In delivery.rs end(), for a run whose caller starts with openclaw:, write a permission inbox message on blocked (leader id, each pending permission id and tool from inspect) and an error message on lost, and never attempt a Paseo caller notice for it; flush_notices skips openclaw: callers. Red-first tests with FakePaseo and the existing rig: a wd run creates a via=wd leader when only a non-wd leader exists; a non-wd run skips a via=wd leader; the stored task carries the prefix; a wd run ending on Permission leaves one permission message; existing delivery and mcp leader tests pass unmodified.",
-    "must_haves": {
-      "truths": ["A wd dispatch never reaches a leader without waggledance.via=wd", "A non-wd dispatch never reaches a via=wd leader", "A blocked wd run leaves one permission inbox message"],
-      "artifacts": [{"path": "crates/waggledance/src/paseo.rs", "substantive": "via=wd label and the lookup filtered both ways"}],
-      "key_links": ["the run caller openclaw:wd reaches resolve_leader through delivery"],
-      "prohibitions": ["Existing tests in delivery.rs and mcp.rs pass without edits", "No new field in the waggledance_dispatch input schema"]
-    },
-    "verify": "cargo test --profile fast -p waggledance",
-    "trace": {"worker": null, "outcome": null, "files_changed": [], "deviations": [], "friction": null, "capped_at": null, "behavior_change": true}
-  },
-  {
-    "id": "wdl-3",
-    "feature": "wd-direct-leader",
-    "title": "Let a leader mail wd with waggledance mail send",
-    "lane": "high-risk",
-    "role": "test",
-    "status": "open",
-    "deps": ["wdl-1"],
-    "decisions": ["D4", "50943778-7dd4-4505-b797-aed7f88a0015", "288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
-    "files": ["crates/waggledance/src/cli.rs", "crates/waggledance/src/mail.rs", "crates/waggledance/src/main.rs"],
-    "read_first": ["docs/history/wd-direct-leader/plan.md", "crates/waggledance/src/cli.rs", "crates/waggledance/src/seat.rs"],
-    "affects_skills": [],
-    "affects_specs": [],
-    "action": "Follow the 'Slice-1 contract' section of docs/history/wd-direct-leader/plan.md exactly. Add a Mail command with a Send action to cli.rs (flags --to, --corr, --kind, --body-file; body read from stdin otherwise) dispatched to a new mail.rs, the way Command::Supervisor dispatches to seat::run. mail.rs checks that the recipient is wd, the kind is one a leader may send, the corr resolves to a project through the newest run whose request_id equals it or starts with it plus a colon, and for result the done-report grammar (per D4); any failure exits 2 naming every problem and writes nothing. On success it inserts one inbox message through the Engine and prints its seq as JSON. Register the module in main.rs. Red-first tests in mail.rs for each validation row of the test matrix and the happy path over an in-memory store.",
-    "must_haves": {
-      "truths": ["A result missing parts exits 2 naming each missing part and writes no row", "A valid mail prints its seq"],
-      "artifacts": [{"path": "crates/waggledance/src/mail.rs", "substantive": "validation, corr lookup, insert, tests"}],
-      "key_links": ["cli.rs Mail Send reaches mail.rs"],
-      "prohibitions": ["No change to existing CLI commands"]
-    },
-    "verify": "cargo test --profile fast -p waggledance mail",
-    "trace": {"worker": null, "outcome": null, "files_changed": [], "deviations": [], "friction": null, "capped_at": null, "behavior_change": true}
-  },
-  {
-    "id": "wdl-4",
-    "feature": "wd-direct-leader",
-    "title": "Wake wd's main session once per unacked inbox message",
-    "lane": "high-risk",
-    "role": "test",
-    "status": "open",
-    "deps": ["wdl-1", "wdl-3"],
-    "decisions": ["D5", "D6", "50943778-7dd4-4505-b797-aed7f88a0015", "288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
-    "files": ["crates/waggledance/src/wake.rs", "crates/waggledance/src/seat.rs", "crates/waggledance/src/main.rs"],
-    "read_first": ["docs/history/wd-direct-leader/plan.md", "crates/waggledance/src/seat.rs", "crates/waggledance/src/main.rs"],
-    "affects_skills": [],
-    "affects_specs": [],
-    "action": "Follow the 'Slice-1 contract' section of docs/history/wd-direct-leader/plan.md exactly. Create wake.rs: one serial tokio loop that the TerminalBackground reconciler in main.rs starts when openclaw.agent_id is set and stops otherwise, beside the delivery slot. Move kind_label (add permission = xin quyền, keep the seven existing labels), the framing, openclaw_cli and report_argv from seat.rs into wake.rs and make seat.rs call them, so supervisor report keeps working until slice 3. Rewrite cli_run as an async function with no runtime of its own; seat.rs keeps a thin blocking wrapper for its own CLI path. Each tick takes the next pending wd message, frames it with corr and seq per the contract, runs the argv with the 900 s timeout, acks on status ok (per D6), otherwise records a failed attempt with dead at 5 and backs off 30 s; once an hour it prunes acked rows older than 30 days. Inject the command runner so tests can fake the CLI. Red-first tests under tokio::test: ok acks; non-zero exit and status not ok leave it unacked with attempts 1; the fifth failure sets dead and the next message is woken; three messages wake in seq order; the frame carries the seq; an empty agent_id runs nothing; existing seat.rs tests still pass.",
-    "must_haves": {
-      "truths": ["A message is acked only after an ok turn", "A message failing five times stops blocking later ones"],
-      "artifacts": [{"path": "crates/waggledance/src/wake.rs", "substantive": "async wake loop, frame, tests"}],
-      "key_links": ["main.rs reconciler starts and stops the wake slot"],
-      "prohibitions": ["supervisor report behaviour unchanged in slice 1", "No runtime created inside a daemon task"]
-    },
-    "verify": "cargo test --profile fast -p waggledance wake",
-    "trace": {"worker": null, "outcome": null, "files_changed": [], "deviations": [], "friction": null, "capped_at": null, "behavior_change": true}
-  },
-  {
-    "id": "wdl-5",
-    "feature": "wd-direct-leader",
-    "title": "Route wd-bridge hand-off through the daemon and walk it live",
-    "lane": "high-risk",
-    "role": "code",
-    "status": "open",
-    "deps": ["wdl-2", "wdl-3", "wdl-4"],
-    "decisions": ["D1", "D5", "D11", "50943778-7dd4-4505-b797-aed7f88a0015", "288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
-    "files": ["integrations/openclaw/waggledance-orchestrator/bin/wd-bridge.py", "integrations/openclaw/waggledance-orchestrator/SKILL.md", "docs/history/wd-direct-leader/reports/slice-1-live.md"],
-    "read_first": ["docs/history/wd-direct-leader/plan.md", "integrations/openclaw/waggledance-orchestrator/bin/wd-bridge.py", "integrations/openclaw/waggledance-orchestrator/SKILL.md"],
-    "affects_skills": [],
-    "affects_specs": [],
-    "action": "Follow the 'Slice-1 contract' section of docs/history/wd-direct-leader/plan.md exactly. In wd-bridge.py, make handoff take --project and call waggledance_dispatch with project, task, leader true and request_id corr through the existing mcp helper, spawning waggledance mcp with env WAGGLEDANCE_CALLER=wd (per D1); print corr and run_id. Leave reply, redo and accept as they are until slice 2. In SKILL.md update the handoff section: wd picks the project, asks the user when unsure, and names the chosen project; describe the inbox frame with #seq and that a seq already answered is a redelivery to skip; keep the Vietnamese kind labels and add xin quyền. Then walk it live: build with cargo build --profile fast -p waggledance --message-format=json, confirm the executable by content with strings and a literal only this change contains, restart the daemon on it, hand a tiny task to a scratch project through wd-bridge handoff, let the leader mail its result, and record each command and its output in docs/history/wd-direct-leader/reports/slice-1-live.md, including the inbox row's acked_at.",
-    "must_haves": {
-      "truths": ["wd-bridge handoff returns a corr and run id", "The leader's result reaches wd's main session and its row is acked"],
-      "artifacts": [{"path": "integrations/openclaw/waggledance-orchestrator/bin/wd-bridge.py", "substantive": "handoff through waggledance_dispatch"}],
-      "key_links": ["wd-bridge spawns waggledance mcp with WAGGLEDANCE_CALLER=wd"],
-      "prohibitions": ["reply, redo and accept unchanged in slice 1", "setup.rs parity test still passes"]
-    },
-    "verify": "green:live recorded in docs/history/wd-direct-leader/reports/slice-1-live.md",
-    "trace": {"worker": null, "outcome": null, "files_changed": [], "deviations": [], "friction": null, "capped_at": null, "behavior_change": true}
-  }
+ {"id":"wdl-6","feature":"wd-direct-leader","title":"Track wd tasks and permission requests in the registry database","lane":"high-risk","role":"test","status":"open","deps":["wdl-5"],
+  "decisions":["D8","D9","D10","50943778-7dd4-4505-b797-aed7f88a0015","288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
+  "files":["crates/waggledance-core/src/repository.rs","crates/waggledance-core/src/engine.rs","crates/waggledance-core/src/domain.rs","crates/waggledance/src/mcp.rs","crates/waggledance/src/delivery.rs","crates/waggledance/src/mail.rs"],
+  "read_first":["docs/history/wd-direct-leader/slice-2.md","docs/history/wd-direct-leader/plan.md","crates/waggledance-core/src/repository.rs"],
+  "affects_skills":[],"affects_specs":[],
+  "action":"Follow docs/history/wd-direct-leader/slice-2.md (sections 'Tasks table' and 'Permission relay' for the table) and the slice-1 contract in plan.md. Add migration 8 (SCHEMA_VERSION 7 to 8, after migration_7_inbox) creating tasks and permission_requests with the listed columns; delete_project deletes both tables' rows for the project. Add store and Engine methods: insert task, get task by corr, list open tasks, mark delivered (leader_id, last_delivered_at, clear nudged_at and progress_sent_at), mark mail (last_mail_at), close, set nudged, set progress sent, stamp board sent, plus permission request insert, list unanswered by corr, mark answered, mark closed, known ids for a corr, and prune of closed tasks and closed or answered requests older than a cutoff. Wire the writers the contract names: mcp.rs dispatch_to_leader inserts the open task for an openclaw:wd hand-off whose request_id has no colon; delivery.rs marks delivered when it sends a wd run to its leader; mail.rs marks mail on every successful mail send. Every writer sets changed_at. Red-first tests for the migration from v7, each store method, and each writer.",
+  "must_haves":{"truths":["A wd hand-off creates one open task row","Delivering a wd run records its leader and clears the nudge marks","Any mail stamps last_mail_at"],"artifacts":[{"path":"crates/waggledance-core/src/repository.rs","substantive":"migration 8 with tasks and permission_requests and their methods"}],"key_links":["mcp, delivery and mail write the task row"],"prohibitions":["No change to migrations 1-7","Non-wd runs write no task rows"]},
+  "verify":"cargo test --profile fast -p waggledance-core && cargo test --profile fast -p waggledance",
+  "trace":{"worker":null,"outcome":null,"files_changed":[],"deviations":[],"friction":null,"capped_at":null,"behavior_change":true}},
+ {"id":"wdl-7","feature":"wd-direct-leader","title":"Let wd reply, redo, accept and answer permissions through waggledance_task","lane":"high-risk","role":"test","status":"open","deps":["wdl-6"],
+  "decisions":["D9","D10","50943778-7dd4-4505-b797-aed7f88a0015","288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
+  "files":["crates/waggledance/src/mcp.rs","crates/waggledance/src/paseo.rs","integrations/openclaw/waggledance-orchestrator/bin/wd-bridge.py","integrations/openclaw/waggledance-orchestrator/SKILL.md"],
+  "read_first":["docs/history/wd-direct-leader/slice-2.md","crates/waggledance/src/mcp.rs","crates/waggledance/src/paseo.rs","integrations/openclaw/waggledance-orchestrator/bin/wd-bridge.py"],
+  "affects_skills":[],"affects_specs":[],
+  "action":"Follow docs/history/wd-direct-leader/slice-2.md section 'Follow-up commands'. Add the waggledance_task MCP tool in mcp.rs beside waggledance_dispatch with the input and the four action rows of the table, refusing with a tool error that names the cause. Add archive(id) and permit(id, req_id, allow) to the Paseo trait in paseo.rs with the CLI implementation (paseo archive <id> --json, paseo permit allow|deny <agent> <req_id> --json) and FakePaseo calls. accept archives only when no queued or working run belongs to the leader and no other open task shares it. reply and redo queue a leader run through the existing dispatch path with request_id corr:n (a duplicate return retries with n + 1) and the wd_task prefix, so wd_corr keeps resolving the corr. In wd-bridge.py replace send_to_supervisor for reply, redo and accept with waggledance_task calls under WAGGLEDANCE_CALLER=wd and add permit allow|deny <corr> [req_id]; update SKILL.md: ok means accept of the newest open corr, the user's allow or deny maps to permit, never decide a permission for the user. Red-first tests over FakePaseo for each action and each refusal.",
+  "must_haves":{"truths":["reply queues a run whose request_id is corr:n for the same leader path","accept closes the task and archives its leader","allow and deny run paseo permit for the task's leader"],"artifacts":[{"path":"crates/waggledance/src/mcp.rs","substantive":"waggledance_task tool with tests"}],"key_links":["wd-bridge reply, redo, accept and permit call waggledance_task"],"prohibitions":["waggledance_dispatch input schema unchanged","wd-bridge never chooses allow or deny on its own"]},
+  "verify":"cargo test --profile fast -p waggledance",
+  "trace":{"worker":null,"outcome":null,"files_changed":[],"deviations":[],"friction":null,"capped_at":null,"behavior_change":true}},
+ {"id":"wdl-8","feature":"wd-direct-leader","title":"Run the heartbeat and the permission watcher in the daemon","lane":"high-risk","role":"test","status":"open","deps":["wdl-7"],
+  "decisions":["D8","D9","50943778-7dd4-4505-b797-aed7f88a0015","288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
+  "files":["crates/waggledance/src/heartbeat.rs","crates/waggledance/src/main.rs","crates/waggledance/src/delivery.rs","crates/waggledance/src/paseo.rs","crates/waggledance/src/wake.rs","crates/waggledance-core/src/config.rs"],
+  "read_first":["docs/history/wd-direct-leader/slice-2.md","crates/waggledance/src/wake.rs","crates/waggledance/src/delivery.rs","crates/waggledance/src/main.rs"],
+  "affects_skills":[],"affects_specs":[],
+  "action":"Follow docs/history/wd-direct-leader/slice-2.md sections 'Permission relay' and 'Heartbeat'. Create heartbeat.rs with two loops the main.rs reconciler starts beside the wake slot when openclaw.agent_id is set: the permission watcher every 30 s and the heartbeat every [openclaw] heartbeat_secs (new config field, default 600). Add permits() to the Paseo trait (paseo permit ls --json rows id, agentId, name, description) with FakePaseo support. The watcher inserts new requests and one permission message each, and marks vanished unanswered requests closed with one closed message. Remove the permission message write from delivery.rs blocked_then_done (mail_permissions) so the watcher is the one writer. The heartbeat applies the three rules in order. wake.rs frames a board message with its own instruction line and its hourly prune also prunes closed tasks and closed or answered permission requests older than 30 days. The nudge runs under the project LeaderLock with idle re-checked inside it. Red-first tests: one watcher pass with a new request writes one message and a second pass writes none; a vanished request writes one closed message; nudge once then progress once; board only when something changed; the board frame wakes.",
+  "must_haves":{"truths":["Each permission request reaches wd exactly once","A silent idle leader is nudged once, then wd hears progress once","A board goes out only when a task changed"],"artifacts":[{"path":"crates/waggledance/src/heartbeat.rs","substantive":"watcher and heartbeat loops with tests"}],"key_links":["main.rs reconciler starts and stops both loops"],"prohibitions":["The daemon never answers a permission","No model turn in the heartbeat"]},
+  "verify":"cargo test --profile fast -p waggledance",
+  "trace":{"worker":null,"outcome":null,"files_changed":[],"deviations":[],"friction":null,"capped_at":null,"behavior_change":true}},
+ {"id":"wdl-9","feature":"wd-direct-leader","title":"Walk wd's follow-up, permission relay and heartbeat live","lane":"high-risk","role":"code","status":"open","deps":["wdl-8"],
+  "decisions":["D8","D9","D10","50943778-7dd4-4505-b797-aed7f88a0015","288802b5-6ac2-4e6e-a5b9-3ec25f7e985e"],
+  "files":["docs/history/wd-direct-leader/reports/slice-2-live.md"],
+  "read_first":["docs/history/wd-direct-leader/slice-2.md","docs/history/wd-direct-leader/reports/slice-1-live.md","docs/knowledge/patterns/the-binary-you-ran-is-not-the-one-you-built.md"],
+  "affects_skills":[],"affects_specs":[],
+  "action":"Build with cargo build --profile fast -p waggledance --message-format=json into its own CARGO_TARGET_DIR, prove the artifact by content (a literal only slice 2 contains, scored 0 on the old binary), install it the way slice-1-live.md did and restart the daemon. Using the scratch project /tmp/wdl5-scratch (no bypassPermissions), hand off a task through wd-bridge handoff that needs a permission; show the permission message reached wd once; answer it with wd-bridge permit allow <corr>; show the leader continues and its result reaches wd. Then wd-bridge reply on the same corr and show a corr:1 run; then wd-bridge accept and show the task closed and the leader archived. For the heartbeat set [openclaw] heartbeat_secs to 60 temporarily, show one nudge then one progress message for a leader left idle without a result, then restore 600. Record every command and output in docs/history/wd-direct-leader/reports/slice-2-live.md. Unregister /tmp/wdl5-live and /tmp/wdl5-scratch at the end.",
+  "must_haves":{"truths":["A permission answered through wd unblocks the leader","accept archives the leader","The heartbeat nudges then reports progress"],"artifacts":[{"path":"docs/history/wd-direct-leader/reports/slice-2-live.md","substantive":"every command and output of the walk"}],"key_links":["wd-bridge permit reaches paseo permit through waggledance_task"],"prohibitions":["heartbeat_secs restored to 600","no permission answered without a recorded wd-bridge permit command"]},
+  "verify":"green:live recorded in docs/history/wd-direct-leader/reports/slice-2-live.md",
+  "trace":{"worker":null,"outcome":null,"files_changed":[],"deviations":[],"friction":null,"capped_at":null,"behavior_change":true}}
 ]
 ```
 
