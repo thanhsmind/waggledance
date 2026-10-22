@@ -9,13 +9,17 @@ import secrets
 import shlex
 import tempfile
 
-def call_mcp(tool_name, arguments):
+def call_mcp(tool_name, arguments, extra_env=None):
+    env = child_env()
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.Popen(
         ["waggledance", "mcp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True,
+        env=env
     )
     req = {
         "jsonrpc": "2.0",
@@ -70,6 +74,46 @@ def run_or_fail(cmd, who):
     return out.stdout
 
 ENSURE = ["waggledance", "supervisor", "ensure", "--json"]
+
+WD_ENV = {"WAGGLEDANCE_CALLER": "wd"}
+
+
+def hand_off(project, task, corr, dry_run):
+    if dry_run:
+        print(shlex.join(["WAGGLEDANCE_CALLER=wd", "waggledance", "mcp"]))
+        print(json.dumps({
+            "tool": "waggledance_dispatch",
+            "arguments": {"project": project, "task": task, "leader": True, "request_id": corr},
+        }, ensure_ascii=False))
+        return
+    res = call_mcp(
+        "waggledance_dispatch",
+        {"project": project, "task": task, "leader": True, "request_id": corr},
+        WD_ENV,
+    )
+    if "error" in res:
+        fail(f"waggledance dispatch failed: {json.dumps(res['error'], ensure_ascii=False)[:300]}")
+    if res.get("isError"):
+        fail(f"waggledance dispatch failed: {res_text(res)}")
+    structured = res.get("structuredContent") or {}
+    run_id = structured.get("run_id")
+    if not run_id:
+        fail(f"waggledance dispatch printed no run_id: {res_text(res)[:300]}")
+    print(json.dumps({
+        "corr": corr,
+        "run_id": run_id,
+        "project": project,
+        "status": structured.get("status"),
+        "duplicate": structured.get("duplicate"),
+        "warnings": structured.get("warnings", []),
+    }, ensure_ascii=False))
+
+
+def res_text(res):
+    return " ".join(
+        part.get("text", "") for part in res.get("content", []) if isinstance(part, dict)
+    )
+
 
 def send_to_supervisor(message, corr, dry_run):
     paseo = paseo_binary()
@@ -131,7 +175,8 @@ def main():
     open_parser.add_argument("path", help="Relative or absolute path to markdown file")
     open_parser.add_argument("--project-root", help="Project root path")
 
-    handoff_parser = subparsers.add_parser("handoff", help="Hand a task to the supervisor")
+    handoff_parser = subparsers.add_parser("handoff", help="Hand a task to a project's leader")
+    handoff_parser.add_argument("--project", "-p", required=True, help="Target project ID")
     source = handoff_parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--task", help="Task text")
     source.add_argument("--task-file", help="File holding the task text")
@@ -192,7 +237,7 @@ def main():
         print(json.dumps(res, indent=2, ensure_ascii=False))
     elif args.command == "handoff":
         corr = args.corr or f"t-{secrets.token_hex(3)}"
-        send_to_supervisor(f"[handoff {corr}] {task_text(args)}", corr, args.dry_run)
+        hand_off(args.project, task_text(args), corr, args.dry_run)
     elif args.command in ("reply", "redo"):
         send_to_supervisor(f"[{args.command} {args.corr}] {args.text}", args.corr, args.dry_run)
     elif args.command == "accept":

@@ -82,16 +82,34 @@ Preview markdown file in browser via Waggledance:
 wd-bridge.py open docs/decisions/0012-model-tiers-config.md --project-root /home/thanhsmind/Projects/goglbe/beehive
 ```
 
-### 8. `handoff` — give a task to the waggledance supervisor
+### 8. `handoff` — give a task to a project's leader
 
-This is the default way to get work done in a project. The supervisor (one Paseo agent for every project) picks the project, opens or reuses its leader, and reports back into this session.
+This is the default way to get work done in a project. You pick the project, the daemon
+opens or reuses that project's own leader, and the leader's reports come back into this
+session through waggledance's inbox.
+
+Pick the project before you hand off: read the user's words and the project list
+(`wd-bridge.py projects`), and name the project you chose when you tell the user what you
+are doing. When the words could mean more than one project, ask the user which one and
+wait — never guess a project silently.
+
 ```bash
-wd-bridge.py handoff --task "Thêm nút xuất CSV cho trang báo cáo"
-wd-bridge.py handoff --task-file /tmp/spec.md
-wd-bridge.py handoff --task "..." --corr t-1a2b3c
-wd-bridge.py handoff --task probe --dry-run
+wd-bridge.py handoff --project beehive --task "Thêm nút xuất CSV cho trang báo cáo"
+wd-bridge.py handoff --project beehive --task-file /tmp/spec.md
+wd-bridge.py handoff --project beehive --task "..." --corr t-1a2b3c
+wd-bridge.py handoff --project beehive --task probe --dry-run
 ```
-It runs `waggledance supervisor ensure --json` (finds the supervisor, or starts it), mints a correlation id `t-<6 hex>` when `--corr` is absent, and sends `[handoff <corr>] <task>` with `paseo send <supervisor_id> --no-wait`. It prints `{"supervisor_id": ..., "corr": ..., "sent": true}`. Keep the `corr`: every later message about this task carries it. `--dry-run` prints the two commands and runs nothing.
+
+It mints a correlation id `t-<6 hex>` when `--corr` is absent, runs `waggledance mcp`
+with `WAGGLEDANCE_CALLER=wd`, and calls `waggledance_dispatch` with
+`{project, task, leader: true, request_id: <corr>}`. It prints
+`{"corr": ..., "run_id": ..., "project": ..., "status": "queued", ...}`. Keep the
+`corr`: every later message about this task carries it. `--dry-run` prints the command and
+the MCP request and runs nothing.
+
+Hand-off does not wait for the work: the daemon queues the task for that project's leader
+and delivers it when the leader is idle, so a `queued` run id is a sent task, not a
+finished one. Say what you handed off and to which project; do not report the work done.
 
 ### 9. `reply`, `redo`, `accept` — relay the user's answer
 ```bash
@@ -99,20 +117,25 @@ wd-bridge.py reply --corr t-1a2b3c --text "Dùng định dạng ngày dd/mm/yyyy
 wd-bridge.py redo --corr t-1a2b3c --text "Nút phải nằm bên phải"
 wd-bridge.py accept --corr t-1a2b3c
 ```
-Each sends one message to the supervisor the same way `handoff` does, and accepts `--dry-run` too.
+Each still runs `waggledance supervisor ensure --json` and sends one message the way
+`handoff` used to, and accepts `--dry-run` too. They move to the daemon in slice 2.
 
 ### Message shapes
 
-What this skill sends to the supervisor, exactly:
+What `handoff` sends: the dispatch request `{project, task, leader: true, request_id:
+<corr>}` — the leader receives `Task waggledance#<corr> from wd.` followed by the mail rule,
+the advisor rule, and the task text unchanged.
 
-| Command | Message |
-|---|---|
-| `handoff` | `[handoff <corr>] <task>` |
-| `reply` | `[reply <corr>] <text>` |
-| `redo` | `[redo <corr>] <text>` |
-| `accept` | `[accept <corr>]` |
+What comes back: a turn in this session per message, tagged
+`[waggledance#<corr> #<seq>] <project> — <kind label>: <text>`. `<seq>` is the inbox row's
+number and the kinds are a result (kết quả), a question (câu hỏi), progress (tiến độ), an
+error (lỗi), a permission request (xin quyền), closed (đã đóng) or the task board (bảng
+việc). Your reply to that turn goes to the user on Telegram.
 
-What comes back: the supervisor's report arrives in this session as a turn, tagged `[waggledance#<corr>] <project> — <kind>: <text>`, where the kind is a result (kết quả), a question (câu hỏi), waiting on a permission (đang chờ quyền), an error (lỗi), closed (đã đóng), progress (tiến độ) or the task board (bảng việc). Your reply to that turn goes to the user on Telegram.
+A `#<seq>` you have already answered can arrive again: waggledance marks a message read
+only after your turn ends, so a turn that failed redelivers the same row with the same
+`#<seq>`. Treat a repeated `#<seq>` for the same corr as a redelivery — skip it, and do not
+write the user a second time for it.
 
 ### Handling a report or a board
 
@@ -120,6 +143,7 @@ What comes back: the supervisor's report arrives in this session as a turn, tagg
 2. Write the user one clear message in Vietnamese. Start it with the tag `[waggledance#<corr>] <project> — <kind>` unchanged. Quote numbers, paths, commands and the leader's words verbatim.
 3. A question: put it to the user plainly, verbatim, and wait for their answer. Never answer a leader's question on the user's behalf, and never pick an option for them; relay their answer with `reply`.
 4. A board (`bảng việc`): list each open task with its project, step, who it waits on and since when. Put the questions waiting on the user first, each with how long it has waited.
+5. A permission request (`xin quyền`): name the project, the tool or command, and its `req_id`, and ask the user to allow or deny it. Never decide one yourself.
 
 ### Reading the user's answer
 
@@ -130,18 +154,21 @@ What comes back: the supervisor's report arrives in this session as a turn, tagg
 
 ### When `handoff` fails
 
-`handoff`, `reply`, `redo` and `accept` exit non-zero with one line naming Paseo or waggledance. Then tell the user that Paseo or waggledance is down and the task did not go through. Never say the task was handed off unless the command printed `"sent": true`.
+`handoff` exits non-zero with one line naming waggledance. Then tell the user that
+waggledance is down and the task did not go through. Never say the task was handed off
+unless the command printed a `run_id`.
 
 ### Known limit
 
-Two `handoff` calls racing while no supervisor exists may start two supervisors: `ensure` takes no lock. After the race the next `ensure` returns the supervisor `paseo ls` lists first, which is the newest, so later messages all reach one consistent supervisor.
+A project whose leader is busy with another caller's task parks the wd task on the same
+project until that leader is idle. Hand-off still returns at once with `queued`.
 
 ---
 
 ## Orchestrator Rules & Safety
 
 1. **Prefer `handoff` for new work**:
-   Hand tasks to the supervisor with `handoff`; it checks live leaders itself. Use `dispatch` only when the user asks for a specific preset or pane.
+   Hand tasks to a project's leader with `handoff`; the daemon checks live leaders itself. Use `dispatch` only when the user asks for a specific preset or pane.
 2. **Check Live Leads Before Dispatch**:
    Always run `wd-bridge.py state --project <target>` before spawning. If a lead agent is already actively working or swarming, reuse or inform the user rather than spawning a competing run.
 3. **Provenance Tracking**:
