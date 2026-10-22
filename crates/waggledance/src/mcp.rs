@@ -229,7 +229,8 @@ fn ask_state_schema() -> Value {
     waggledance.role=leader whose cwd sits in the project's root or one of its worktrees, \
     oldest first: {agent_id, status, cwd, created, via, labels, waiting_on, \
     last_daemon_run}, where `via` is `supervisor` for a leader carrying \
-    waggledance.via=supervisor and `daemon` otherwise. `leaders` is ABSENT when \
+    waggledance.via=supervisor, `wd` for one carrying waggledance.via=wd, and `daemon` \
+    otherwise. `leaders` is ABSENT when \
     `[paseo] enabled = false`, `null` beside a `leaders_error` reason when Paseo cannot \
     be read, and an array (possibly empty) beside `leaders_skipped`, the count of \
     leaders under no registered project, otherwise.",
@@ -836,6 +837,7 @@ enum LeadersRead {
     Listed {
         all: Vec<paseo::ListedAgent>,
         via: std::collections::HashSet<String>,
+        wd: std::collections::HashSet<String>,
     },
 }
 
@@ -862,9 +864,12 @@ fn read_leaders(config: &waggledance_core::config::PaseoConfig) -> LeadersRead {
         .block_on(async {
             let all = cli.list_labelled(&paseo::role_leaders_args()).await?;
             let via = cli.list_labelled(&paseo::via_leaders_args()).await?;
+            let wd = paseo::labelled(paseo::role_leaders_args(), paseo::WD_LABEL);
+            let wd = cli.list_labelled(&wd).await?;
             Ok::<_, paseo::PaseoError>(LeadersRead::Listed {
                 all,
                 via: via.into_iter().map(|a| a.id).collect(),
+                wd: wd.into_iter().map(|a| a.id).collect(),
             })
         })
         .unwrap_or_else(|e| LeadersRead::Unreachable(e.to_string()))
@@ -916,14 +921,14 @@ fn attach_leaders(
     let Some(object) = digest.as_object_mut() else {
         return;
     };
-    let (all, via) = match leaders {
+    let (all, via, wd) = match leaders {
         LeadersRead::Off => return,
         LeadersRead::Unreachable(reason) => {
             object.insert("leaders".to_string(), Value::Null);
             object.insert("leaders_error".to_string(), json!(reason));
             return;
         }
-        LeadersRead::Listed { all, via } => (all, via),
+        LeadersRead::Listed { all, via, wd } => (all, via, wd),
     };
     let mut skipped = 0usize;
     let mut mine: Vec<(&paseo::ListedAgent, std::path::PathBuf)> = Vec::new();
@@ -963,17 +968,21 @@ fn attach_leaders(
     let entries: Vec<Value> = mine
         .into_iter()
         .map(|(agent, cwd)| {
-            let supervised = via.contains(&agent.id);
+            let via = match (via.contains(&agent.id), wd.contains(&agent.id)) {
+                (true, _) => Some("supervisor"),
+                (_, true) => Some("wd"),
+                _ => None,
+            };
             json!({
                 "agent_id": agent.id,
                 "status": agent.status,
                 "cwd": cwd.display().to_string(),
                 "created": agent.created,
-                "via": if supervised { "supervisor" } else { "daemon" },
+                "via": via.unwrap_or("daemon"),
                 "labels": {
                     "waggledance.role": "leader",
                     "waggledance.project": project.id,
-                    "waggledance.via": supervised.then_some("supervisor")
+                    "waggledance.via": via
                 },
                 "waiting_on": waiting_on,
                 "last_daemon_run": last_daemon_run
@@ -1145,9 +1154,10 @@ fn handle_dispatch(
         }
     }
     if leader {
-        let caller = std::env::var("PASEO_AGENT_ID")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let caller = dispatch_caller(
+            std::env::var("PASEO_AGENT_ID").ok(),
+            std::env::var("WAGGLEDANCE_CALLER").ok(),
+        );
         return dispatch_to_leader(
             id,
             engine,
@@ -1259,6 +1269,12 @@ fn duplicate(id: Option<Value>, run: &Run) -> Value {
     )
 }
 
+fn dispatch_caller(paseo_agent: Option<String>, waggledance: Option<String>) -> Option<String> {
+    paseo_agent
+        .filter(|s| !s.is_empty())
+        .or_else(|| (waggledance.as_deref() == Some("wd")).then(|| paseo::WD_CALLER.to_string()))
+}
+
 fn dispatch_to_leader(
     id: Option<Value>,
     engine: &Engine,
@@ -1275,12 +1291,17 @@ fn dispatch_to_leader(
         return tool_error(id, &why);
     }
     let now = now_rfc3339();
+    let run_id = format!("run-{:016x}", rand::random::<u64>());
+    let task = match caller == Some(paseo::WD_CALLER) {
+        true => paseo::wd_task(request_id.unwrap_or(&run_id), task),
+        false => task.to_string(),
+    };
     let run = Run {
-        id: format!("run-{:016x}", rand::random::<u64>()),
+        id: run_id,
         project_id: project.id.clone(),
         pane_id: format!("{}pending", orchestrate::PASEO_PANE_PREFIX),
         preset_label: None,
-        task: task.to_string(),
+        task,
         baseline: now.clone(),
         marker: String::new(),
         status: "queued".to_string(),
@@ -2238,6 +2259,7 @@ mod tests {
                 ),
             ],
             via: ["young".to_string()].into_iter().collect(),
+            wd: Default::default(),
         };
         let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
         attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
@@ -2317,6 +2339,7 @@ mod tests {
         let read = LeadersRead::Listed {
             all: vec![listed("theirs", "/srv/elsewhere", "1 hours ago")],
             via: Default::default(),
+            wd: Default::default(),
         };
         let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
         attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
@@ -3222,6 +3245,74 @@ mod tests {
             run.id
         );
         std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_wd_caller_comes_from_waggledance_caller_only_without_a_paseo_agent() {
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(
+            dispatch_caller(None, some("wd")).as_deref(),
+            Some("openclaw:wd")
+        );
+        assert_eq!(
+            dispatch_caller(some(""), some("wd")).as_deref(),
+            Some("openclaw:wd")
+        );
+        assert_eq!(
+            dispatch_caller(some("agent"), some("wd")).as_deref(),
+            Some("agent")
+        );
+        assert_eq!(dispatch_caller(None, some("other")), None);
+        assert_eq!(dispatch_caller(None, None), None);
+        let schema = dispatch_schema();
+        assert!(schema["inputSchema"]["properties"].get("caller").is_none());
+        assert!(schema["inputSchema"]["properties"].get("via").is_none());
+    }
+
+    #[test]
+    fn a_wd_leader_dispatch_stores_the_task_behind_the_wd_prefix() {
+        let (engine, project, data_dir) = leader_engine("wd-prefix", true, true, true);
+        beat(&data_dir, 0);
+        let resp = dispatch_to_leader(
+            Some(json!(1)),
+            &engine,
+            &project,
+            "ship it",
+            Some("corr-9"),
+            Some(paseo::WD_CALLER),
+            &data_dir,
+        );
+        let run_id = resp["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap();
+        let run = engine.get_run(run_id).unwrap().unwrap();
+        assert_eq!(run.task, paseo::wd_task("corr-9", "ship it"));
+        assert_eq!(paseo::wd_corr(&run.task), Some("corr-9"));
+        assert_eq!(
+            engine.run_caller(run_id).unwrap().as_deref(),
+            Some("openclaw:wd")
+        );
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_via_wd_leader_shows_via_wd_in_ask_state() {
+        let (engine, project, base) = leaders_project("wd-via");
+        let rollup = bee::read_rollup(std::slice::from_ref(&project.root_path))
+            .pop()
+            .unwrap();
+        let claims = vec![(canonical(&project.root_path), project.id.clone())];
+        let root = project.root_path.display().to_string();
+        let read = LeadersRead::Listed {
+            all: vec![listed("wd-lead", &root, "2 hours ago")],
+            via: Default::default(),
+            wd: ["wd-lead".to_string()].into_iter().collect(),
+        };
+        let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
+        attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
+        assert_eq!(digest["leaders"][0]["via"], "wd", "{digest}");
+        assert_eq!(digest["leaders"][0]["labels"]["waggledance.via"], "wd");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

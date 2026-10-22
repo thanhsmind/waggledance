@@ -286,13 +286,13 @@ impl Delivery {
         for warning in warnings {
             tracing::warn!("delivery for {name}: {warning}");
         }
-        let leader =
-            match paseo::resolve_leader(self.paseo.as_ref(), config, &settings.paseo, &project)
-                .await
-            {
-                Ok(leader) => leader,
-                Err(e) => return self.presend_failed(&name, run, &e.to_string()),
-            };
+        let wd = matches!(self.engine.run_caller(&run.id), Ok(Some(c)) if c == paseo::WD_CALLER);
+        let paseo = self.paseo.as_ref();
+        let leader = match paseo::resolve_leader(paseo, config, &settings.paseo, &project, wd).await
+        {
+            Ok(leader) => leader,
+            Err(e) => return self.presend_failed(&name, run, &e.to_string()),
+        };
         let (agent, outcome) = match leader {
             Leader::Existing { busy: true, .. } => {
                 self.set_status(&run.id, "queued");
@@ -358,6 +358,7 @@ impl Delivery {
     async fn blocked_then_done(&self, name: &str, run: &Run, agent: &str, deadline: Instant) {
         loop {
             self.end(name, run, "blocked", None, Some(agent));
+            self.mail_permissions(name, run, agent).await;
             loop {
                 if Instant::now() >= deadline {
                     return self.lose(name, run, Some(agent), "permission still pending");
@@ -382,6 +383,45 @@ impl Delivery {
                 }
                 Err(e) => return self.lose(name, run, Some(agent), &e.to_string()),
             }
+        }
+    }
+
+    async fn mail_permissions(&self, name: &str, run: &Run, agent: &str) {
+        let Some(to) = self.mailbox(run) else {
+            return;
+        };
+        let permissions = match self.paseo.inspect(agent).await {
+            Ok(s) => s.permissions,
+            Err(e) => {
+                tracing::warn!("delivery could not inspect leader {agent}: {e}");
+                Vec::new()
+            }
+        };
+        let list = permissions
+            .iter()
+            .map(|p| format!("{} ({})", p.id, p.tool))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "{name} leader {agent} is waiting for a permission on run {}: {list}",
+            run.id
+        );
+        self.mail(run, &to, "permission", &body);
+    }
+
+    fn mailbox(&self, run: &Run) -> Option<String> {
+        let caller = self.engine.run_caller(&run.id).ok().flatten()?;
+        caller.strip_prefix("openclaw:").map(str::to_string)
+    }
+
+    fn mail(&self, run: &Run, to: &str, kind: &str, body: &str) {
+        let corr = paseo::wd_corr(&run.task).unwrap_or(&run.id);
+        let now = now_rfc3339();
+        if let Err(e) =
+            self.engine
+                .insert_inbox_message(to, corr, &run.project_id, kind, body, &now)
+        {
+            tracing::warn!("delivery could not mail {to} about run {}: {e}", run.id);
         }
     }
 
@@ -447,6 +487,9 @@ impl Delivery {
         transcript: Option<&str>,
         leader: Option<&str>,
     ) {
+        let first = transcript
+            .and_then(|t| t.lines().next())
+            .unwrap_or_default();
         let transcript = transcript.map(|text| {
             let header = self.state.lock().unwrap().headers.remove(&run.id);
             header.map_or_else(|| text.to_string(), |h| format!("{h}\n\n{text}"))
@@ -459,6 +502,13 @@ impl Delivery {
             Ok(Some(caller)) if Some(caller.as_str()) != leader => Some(caller),
             _ => None,
         };
+        let mailbox = caller.as_deref().and_then(|c| c.strip_prefix("openclaw:"));
+        if let (Some(to), "lost") = (mailbox, status) {
+            let leader = leader.unwrap_or("(not started)");
+            let body = format!("{name} leader {leader} lost run {}: {first}", run.id);
+            self.mail(run, to, "error", &body);
+        }
+        let caller = caller.filter(|c| !c.starts_with("openclaw:"));
         let until = notice_until();
         let notice = caller.map(|_| (notice_text(name, &run.id, status), until));
         let notice = notice
@@ -487,6 +537,9 @@ impl Delivery {
                 if let Err(e) = self.engine.set_notice_state(&run_id, "dropped") {
                     tracing::warn!("delivery could not mark run {run_id}'s notice dropped: {e}");
                 }
+                continue;
+            }
+            if caller.starts_with("openclaw:") {
                 continue;
             }
             match batches.iter_mut().find(|(c, _)| *c == caller) {
@@ -1046,6 +1099,109 @@ mod tests {
             "an expired notice is never delivered"
         );
         assert_eq!(r.notice_state("run-1").as_deref(), Some("dropped"));
+    }
+
+    fn inbox(engine: &Engine) -> Vec<waggledance_core::domain::InboxMessage> {
+        let mut got = Vec::new();
+        while let Some(m) = engine.next_inbox_message("wd").unwrap() {
+            engine.ack_inbox_message(m.seq, &now_rfc3339()).unwrap();
+            got.push(m);
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn a_wd_run_starts_a_via_wd_leader_and_never_uses_a_plain_one() {
+        let r = rig();
+        r.fake.add_leader("proj-1", "plain", "idle", false);
+        r.fake.add_workspace(
+            "wks",
+            "local",
+            &r.engine.get_project("proj-1").unwrap().unwrap().root_path,
+        );
+        let task = paseo::wd_task("corr-1", "build it");
+        r.queue("proj-1", "run-1", &task, Some(paseo::WD_CALLER));
+        r.tick().await;
+        let labels: Vec<Vec<String>> = r
+            .fake
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Run(spec) => Some(spec.labels),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert!(labels[0].iter().any(|l| l == paseo::WD_LABEL));
+        assert!(r.sends_to("plain").is_empty());
+        assert_eq!(r.status("run-1"), "done");
+        assert!(inbox(&r.engine).is_empty());
+        r.tick().await;
+        assert!(r.notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_blocked_wd_run_mails_one_permission_and_sends_no_notice() {
+        let r = rig();
+        r.fake.add_wd_leader("proj-1", "lead", "idle");
+        r.fake.set_permissions("lead", &["Write"]);
+        r.fake.push_turn_end(TurnEnd::Permission);
+        r.fake.push_turn_end(TurnEnd::Completed);
+        let task = paseo::wd_task("corr-2", "one");
+        r.queue("proj-1", "run-1", &task, Some(paseo::WD_CALLER));
+
+        let mut set = JoinSet::new();
+        r.delivery.tick(&mut set).await;
+        for _ in 0..200 {
+            if r.status("run-1") == "blocked"
+                && r.engine.next_inbox_message("wd").unwrap().is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        r.fake.set_permissions("lead", &[]);
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
+        assert_eq!(r.status("run-1"), "done");
+        let mail = inbox(&r.engine);
+        assert_eq!(mail.len(), 1, "{mail:?}");
+        assert_eq!(
+            (mail[0].kind.as_str(), mail[0].corr.as_str()),
+            ("permission", "corr-2")
+        );
+        assert!(mail[0].body.contains("lead"), "{}", mail[0].body);
+        assert!(
+            mail[0].body.contains("permission-0 (Write)"),
+            "{}",
+            mail[0].body
+        );
+        r.tick().await;
+        assert!(r.notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lost_wd_run_mails_one_error_and_sends_no_notice() {
+        let r = rig();
+        r.fake.add_wd_leader("proj-1", "lead", "idle");
+        r.fake.push_turn_end(TurnEnd::Other {
+            status: "timeout".into(),
+            message: "still running".into(),
+        });
+        let task = paseo::wd_task("corr-3", "one");
+        r.queue("proj-1", "run-1", &task, Some(paseo::WD_CALLER));
+        r.tick().await;
+        assert_eq!(r.status("run-1"), "lost");
+        let mail = inbox(&r.engine);
+        assert_eq!(mail.len(), 1, "{mail:?}");
+        assert_eq!(
+            (mail[0].kind.as_str(), mail[0].corr.as_str()),
+            ("error", "corr-3")
+        );
+        assert!(mail[0].body.contains(MAY_STILL_FINISH), "{}", mail[0].body);
+        r.tick().await;
+        assert!(r.notices().is_empty());
     }
 
     #[test]
