@@ -2,15 +2,14 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use waggledance_core::config::{OpenClawConfig, SupervisorConfig};
+use waggledance_core::config::SupervisorConfig;
 use waggledance_core::Config;
 
 use crate::paseo::{command, detect_binary, parse_document, parse_listed, paseo_unavailable};
+use crate::wake::{cli_status, framed_message, openclaw_cli, report_argv};
 
 const SUPERVISOR_LABEL: &str = "waggledance.role=supervisor";
 const PASEO_TIMEOUT: Duration = Duration::from_secs(15);
-const REPORT_TIMEOUT: Duration = Duration::from_secs(900);
-const GATEWAY_COMM: &str = "openclaw-gateway";
 
 pub const DOC: &str = include_str!("../../../docs/waggledance-supervisor-agent.md");
 
@@ -179,161 +178,8 @@ fn ensure(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn kind_label(kind: &str) -> Result<&'static str> {
-    Ok(match kind {
-        "result" => "kết quả",
-        "question" => "câu hỏi",
-        "blocked" => "đang chờ quyền",
-        "error" => "lỗi",
-        "closed" => "đã đóng",
-        "progress" => "tiến độ",
-        "board" => "bảng việc",
-        other => bail!(
-            "unknown kind `{other}`: use result, question, blocked, error, closed, progress or board"
-        ),
-    })
-}
-
-pub fn framed_message(kind: &str, project: &str, corr: &str, text: &str) -> Result<String> {
-    let label = kind_label(kind)?;
-    Ok(format!(
-        "Đối chiếu báo cáo này với đúng task bạn đã giao cho waggledance, rồi viết tin nhắn \
-         người dùng sẽ đọc trên Telegram, bằng tiếng Việt: nêu việc đã xong và việc còn lại, \
-         chép nguyên văn con số, đường dẫn và lời của leader; nếu báo cáo cần người dùng quyết \
-         định thì hỏi thẳng người dùng: [waggledance#{corr}] {project} — {label}: {text}"
-    ))
-}
-
-fn is_gateway_comm(comm: &str) -> bool {
-    comm.len() >= GATEWAY_COMM.len() - 1 && GATEWAY_COMM.starts_with(comm)
-}
-
-fn gateway_appdir(proc_root: &Path) -> Option<String> {
-    for entry in std::fs::read_dir(proc_root).ok()?.flatten() {
-        let pid_dir = entry.path();
-        let comm = match std::fs::read_to_string(pid_dir.join("comm")) {
-            Ok(comm) => comm,
-            Err(_) => continue,
-        };
-        if !is_gateway_comm(comm.trim()) {
-            continue;
-        }
-        let environ = match std::fs::read(pid_dir.join("environ")) {
-            Ok(environ) => environ,
-            Err(_) => continue,
-        };
-        let found = environ
-            .split(|b| *b == 0)
-            .filter_map(|kv| std::str::from_utf8(kv).ok())
-            .find_map(|kv| kv.strip_prefix("APPDIR="))
-            .filter(|dir| !dir.is_empty());
-        if let Some(dir) = found {
-            return Some(dir.to_string());
-        }
-    }
-    None
-}
-
-pub fn openclaw_cli(cfg: &OpenClawConfig, proc_root: &Path) -> Result<Vec<String>> {
-    if !cfg.cli.trim().is_empty() {
-        let words: Vec<String> = cfg.cli.split_whitespace().map(str::to_string).collect();
-        if !words.is_empty() {
-            return Ok(words);
-        }
-    }
-    match gateway_appdir(proc_root) {
-        Some(appdir) => Ok(vec![
-            "node".into(),
-            format!("{appdir}/resources/openclaw/openclaw.mjs"),
-        ]),
-        None => bail!(
-            "no OpenClaw CLI: no running `{GATEWAY_COMM}` process names an APPDIR under {}, and \
-             `[openclaw] cli` in config is empty — start the gateway, or set `cli` to the full \
-             openclaw command",
-            proc_root.display()
-        ),
-    }
-}
-
-pub fn report_argv(cli: &[String], cfg: &OpenClawConfig, message: &str) -> Result<Vec<String>> {
-    if cfg.agent_id.trim().is_empty() {
-        bail!(
-            "no `[openclaw] agent_id` in config — name the OpenClaw agent whose main session \
-             receives supervisor reports"
-        );
-    }
-    let mut argv = cli.to_vec();
-    for arg in [
-        "agent",
-        "--agent",
-        cfg.agent_id.as_str(),
-        "--message",
-        message,
-        "--deliver",
-        "--channel",
-        "telegram",
-        "--json",
-    ] {
-        argv.push(arg.to_string());
-    }
-    if !cfg.telegram_to.trim().is_empty() {
-        argv.push("--reply-to".into());
-        argv.push(cfg.telegram_to.clone());
-    }
-    Ok(argv)
-}
-
-fn cli_run(rt: &tokio::runtime::Runtime, argv: &[String]) -> Result<String> {
-    let shown = argv.join(" ");
-    let program = argv[0].clone();
-    let args: Vec<String> = argv[1..].to_vec();
-    let (run_program, run_args, run_shown) = (program, args, shown.clone());
-    let waited: Result<std::process::Output> = rt.block_on(async move {
-        let child = tokio::process::Command::new(&run_program)
-            .args(&run_args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("running `{run_shown}`: {e}"))?;
-        match tokio::time::timeout(REPORT_TIMEOUT, child.wait_with_output()).await {
-            Ok(out) => Ok(out?),
-            Err(_) => bail!(
-                "`{run_shown}` timed out after {}s",
-                REPORT_TIMEOUT.as_secs()
-            ),
-        }
-    });
-    let output = waited?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.status.success() {
-        bail!(
-            "`{shown}` failed ({}): {}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim(),
-            stdout.trim()
-        );
-    }
-    Ok(stdout)
-}
-
-pub fn cli_status(stdout: &str, shown: &str) -> Result<String> {
-    let doc: serde_json::Value = parse_document(stdout)
-        .map_err(|e| anyhow::anyhow!("`{shown}` printed no JSON document ({e})"))?;
-    let status = doc
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if status != "ok" {
-        let shown_status = if status.is_empty() { "<none>" } else { &status };
-        bail!(
-            "`{shown}` reported status {shown_status}: {}",
-            stdout.trim()
-        );
-    }
-    Ok(status)
+fn cli_run(argv: &[String]) -> Result<String> {
+    tokio::runtime::Runtime::new()?.block_on(crate::wake::cli_run(argv))
 }
 
 fn report(
@@ -347,8 +193,7 @@ fn report(
     let message = framed_message(kind, project, corr, text)?;
     let cli = openclaw_cli(&config.openclaw, proc_root)?;
     let argv = report_argv(&cli, &config.openclaw, &message)?;
-    let rt = tokio::runtime::Runtime::new()?;
-    let stdout = cli_run(&rt, &argv)?;
+    let stdout = cli_run(&argv)?;
     cli_status(&stdout, &argv.join(" "))
 }
 
@@ -382,6 +227,7 @@ pub fn run(action: crate::cli::SupervisorAction) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use waggledance_core::config::OpenClawConfig;
 
     fn cfg() -> SupervisorConfig {
         SupervisorConfig::default()

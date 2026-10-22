@@ -29,6 +29,7 @@ mod slash_builtins;
 mod supervisor;
 mod trigger;
 mod views;
+mod wake;
 mod watch;
 mod watcher;
 
@@ -100,6 +101,7 @@ pub struct TerminalBackground {
     /// are disabled.
     notify_store: delivery::NotifySlot,
     delivery: Mutex<Option<JoinHandle<()>>>,
+    wake: Mutex<Option<JoinHandle<()>>>,
     /// The most recently stopped task's handle, kept only until the next
     /// switch-on has waited for it to finish.
     supervisor_stopping: Mutex<Option<JoinHandle<()>>>,
@@ -240,6 +242,7 @@ impl TerminalBackground {
                 .clone()
                 .filter(|e| paseo::paseo_available(&e.config.paseo)),
         );
+        self.reconcile_wake(engine.clone().filter(|e| wake::enabled(e)));
         self.reconcile_notify(cfg.notify_enabled, herdr, notify_store, telegram, engine);
     }
 
@@ -264,6 +267,28 @@ impl TerminalBackground {
     #[cfg(test)]
     fn delivery_running(&self) -> bool {
         self.delivery.lock().unwrap().is_some()
+    }
+
+    fn reconcile_wake(&self, engine: Option<Arc<waggledance_core::Engine>>) {
+        let mut slot = self.wake.lock().unwrap();
+        match (engine, slot.take()) {
+            (Some(_), Some(running)) => *slot = Some(running),
+            (Some(engine), None) => {
+                let task = wake::Wake::new(
+                    engine,
+                    std::path::PathBuf::from("/proc"),
+                    |argv: Vec<String>| async move { wake::cli_run(&argv).await },
+                );
+                *slot = Some(tokio::spawn(task.run()));
+            }
+            (None, Some(running)) => running.abort(),
+            (None, None) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn wake_running(&self) -> bool {
+        self.wake.lock().unwrap().is_some()
     }
 
     fn reconcile_reaper(
@@ -1130,6 +1155,38 @@ mod terminal_background_tests {
             Some(engine()),
         );
         assert!(!bg.delivery_running(), "paseo off stops delivery");
+    }
+
+    #[tokio::test]
+    async fn an_openclaw_agent_id_starts_the_wake_and_its_absence_stops_it() {
+        let bg = TerminalBackground::new();
+        let fake = Arc::new(FakeHerdr::new());
+        let mut config = waggledance_core::Config::default();
+        config.paseo.enabled = Some(false);
+        config.openclaw.agent_id = "wd".into();
+        let wd_engine = Arc::new(waggledance_core::Engine::new(
+            waggledance_core::SqliteStore::open_in_memory().unwrap(),
+            config,
+        ));
+
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake.clone(),
+            store(),
+            None,
+            Some(wd_engine),
+        );
+        assert!(bg.wake_running(), "an agent_id starts the wake");
+        assert!(!bg.delivery_running(), "the wake does not need paseo");
+
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake,
+            store(),
+            None,
+            Some(engine()),
+        );
+        assert!(!bg.wake_running(), "no agent_id stops the wake");
     }
 
     /// The reaper's own teeth: `reaper_ticks` counts completed sweeps, so a
