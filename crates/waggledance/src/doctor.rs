@@ -1007,6 +1007,17 @@ mod agent_instruction_tests {
     }
 
     #[test]
+    fn supervisor_skill_description_routes_leader_requests() {
+        let description = SUPERVISOR_SKILL_TEMPLATE
+            .lines()
+            .find(|line| line.starts_with("description:"))
+            .expect("description line");
+        assert!(description.contains("gửi qua leader của project X"));
+        assert!(description.contains("send it to X's leader"));
+        assert!(SUPERVISOR_SKILL_TEMPLATE.contains("never search for the leader yourself"));
+    }
+
+    #[test]
     fn supervisor_skill_installs_then_reports_in_sync_idempotently() {
         let base = tmp_path("supervisor-skill");
         let path = base.join("skills/waggledance-supervisor/SKILL.md");
