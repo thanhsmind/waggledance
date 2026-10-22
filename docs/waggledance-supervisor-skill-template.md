@@ -1,6 +1,6 @@
 ---
 name: waggledance-supervisor
-description: Hand a spec into a target project's own team via a lead agent opened through waggledance's dispatch door — relay mode files it as a proposed PBI and stops; execute mode has the lead run its own full chain to a finished result. Use whenever a request routes work into another repo, whether to file it (hand off, drop, route) or to get it fully built/done there (làm hoàn chỉnh, do it completely, build it, finish it) — the skill states which mode first, always. Never drives that repo's work directly from this session in either mode.
+description: Hand a spec into a target project's own team via a lead agent opened through waggledance's dispatch door — relay mode files it as a proposed PBI and stops; execute mode has the lead run its own full chain to a finished result. Use whenever a request routes work into another repo, whether to file it (hand off, drop, route) or to get it fully built/done there (làm hoàn chỉnh, do it completely, build it, finish it) — the skill states which mode first, always. Never drives that repo's work directly from this session in either mode. Also use whenever the human asks to send or hand a task to a project's leader ("gửi qua leader của project X", "gửi cho leader X", "send it to X's leader", "tell the X leader") — that goes to the waggledance supervisor in leader mode, which finds and drives the leader.
 ---
 
 # waggledance-supervisor
@@ -153,6 +153,12 @@ either — ask the human which mode, rather than guessing.
    it does not answer that repo's gate questions.
 
 ## Leader mode — when the target project runs in Paseo
+
+A request that names a project's leader ("gửi qua leader của project X", "send it to
+X's leader") is leader mode at once: hand it to the waggledance supervisor as described
+below, and never search for the leader yourself — do not list Paseo agents, panes or
+workspaces to find it. The mode gate still decides scope: a routing phrase with no
+completion verb is relay mode.
 
 A project whose lead lives in Paseo is reached through the waggledance supervisor, the
 one Paseo agent labelled `waggledance.role=supervisor`. It opens or reuses the
