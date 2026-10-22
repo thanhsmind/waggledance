@@ -3,19 +3,21 @@ import sys
 import json
 import subprocess
 import argparse
-import glob
 import os
 import secrets
 import shlex
-import tempfile
 
-def call_mcp(tool_name, arguments):
+def call_mcp(tool_name, arguments, extra_env=None):
+    env = child_env()
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.Popen(
         ["waggledance", "mcp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True,
+        env=env
     )
     req = {
         "jsonrpc": "2.0",
@@ -38,17 +40,6 @@ def call_mcp(tool_name, arguments):
             continue
     return {"error": f"Failed to get valid json-rpc response. Stderr: {stderr}"}
 
-def paseo_binary():
-    explicit = os.environ.get("PASEO_CLI")
-    if explicit:
-        return explicit
-    home = os.path.expanduser("~")
-    npm = sorted(glob.glob(os.path.join(home, ".local/share/mise/installs/node/*/bin/paseo")), reverse=True)
-    for candidate in npm:
-        if os.access(candidate, os.X_OK):
-            return candidate
-    return "paseo"
-
 def child_env():
     env = dict(os.environ)
     env.pop("PASEO_AGENT_ID", None)
@@ -59,37 +50,65 @@ def fail(message):
     print(f"error: {message}", file=sys.stderr)
     sys.exit(1)
 
-def run_or_fail(cmd, who):
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=child_env())
-    except (OSError, subprocess.TimeoutExpired) as e:
-        fail(f"{who} is down or missing: `{shlex.join(cmd)}` could not run ({e})")
-    if out.returncode != 0:
-        detail = " ".join((out.stderr.strip() or out.stdout.strip()).split())[:300]
-        fail(f"{who} failed: `{shlex.join(cmd)}` exited {out.returncode}: {detail}")
-    return out.stdout
+WD_ENV = {"WAGGLEDANCE_CALLER": "wd"}
 
-ENSURE = ["waggledance", "supervisor", "ensure", "--json"]
 
-def send_to_supervisor(message, corr, dry_run):
-    paseo = paseo_binary()
+def wd_call(tool, arguments, dry_run):
     if dry_run:
-        print(shlex.join(ENSURE))
-        print(shlex.join([paseo, "send", "<supervisor_id>", "--no-wait", "--prompt-file", "<prompt-file>", "--json"]))
+        print(shlex.join(["WAGGLEDANCE_CALLER=wd", "waggledance", "mcp"]))
+        print(json.dumps({"tool": tool, "arguments": arguments}, ensure_ascii=False))
+        return None
+    res = call_mcp(tool, arguments, WD_ENV)
+    if "error" in res:
+        fail(f"{tool} failed: {json.dumps(res['error'], ensure_ascii=False)[:300]}")
+    if res.get("isError"):
+        fail(f"{tool} failed: {res_text(res)}")
+    return res
+
+
+def hand_off(project, task, corr, dry_run):
+    res = wd_call(
+        "waggledance_dispatch",
+        {"project": project, "task": task, "leader": True, "request_id": corr},
+        dry_run,
+    )
+    if res is None:
         return
-    out = run_or_fail(ENSURE, "waggledance")
-    try:
-        supervisor_id = json.loads(out.strip().splitlines()[-1])["agent_id"]
-    except (ValueError, KeyError, IndexError):
-        fail(f"waggledance supervisor ensure printed no agent_id: {' '.join(out.split())[:300]}")
-    with tempfile.NamedTemporaryFile("w", prefix="wd-handoff-", suffix=".txt", delete=False, encoding="utf-8") as f:
-        f.write(message)
-        prompt_file = f.name
-    try:
-        run_or_fail([paseo, "send", supervisor_id, "--no-wait", "--prompt-file", prompt_file, "--json"], "Paseo")
-    finally:
-        os.unlink(prompt_file)
-    print(json.dumps({"supervisor_id": supervisor_id, "corr": corr, "sent": True}, ensure_ascii=False))
+    structured = res.get("structuredContent") or {}
+    run_id = structured.get("run_id")
+    if not run_id:
+        fail(f"waggledance dispatch printed no run_id: {res_text(res)[:300]}")
+    print(json.dumps({
+        "corr": corr,
+        "run_id": run_id,
+        "project": project,
+        "status": structured.get("status"),
+        "duplicate": structured.get("duplicate"),
+        "warnings": structured.get("warnings", []),
+    }, ensure_ascii=False))
+
+
+def res_text(res):
+    return " ".join(
+        part.get("text", "") for part in res.get("content", []) if isinstance(part, dict)
+    )
+
+
+def follow_up(corr, action, dry_run, text=None, req_id=None):
+    arguments = {"corr": corr, "action": action}
+    if text is not None:
+        arguments["text"] = text
+    if req_id:
+        arguments["req_id"] = req_id
+    res = wd_call("waggledance_task", arguments, dry_run)
+    if res is None:
+        return
+    print(json.dumps({
+        "corr": corr,
+        "action": action,
+        "text": res_text(res),
+        **(res.get("structuredContent") or {}),
+    }, ensure_ascii=False))
 
 def task_text(args):
     if args.task_file:
@@ -131,7 +150,8 @@ def main():
     open_parser.add_argument("path", help="Relative or absolute path to markdown file")
     open_parser.add_argument("--project-root", help="Project root path")
 
-    handoff_parser = subparsers.add_parser("handoff", help="Hand a task to the supervisor")
+    handoff_parser = subparsers.add_parser("handoff", help="Hand a task to a project's leader")
+    handoff_parser.add_argument("--project", "-p", required=True, help="Target project ID")
     source = handoff_parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--task", help="Task text")
     source.add_argument("--task-file", help="File holding the task text")
@@ -147,6 +167,12 @@ def main():
     accept_parser = subparsers.add_parser("accept", help="Relay the user's acceptance")
     accept_parser.add_argument("--corr", required=True, help="Correlation id")
     accept_parser.add_argument("--dry-run", action="store_true", help="Print the commands without running them")
+
+    permit_parser = subparsers.add_parser("permit", help="Relay the user's allow or deny of a permission request")
+    permit_parser.add_argument("answer", choices=["allow", "deny"], help="The user's answer")
+    permit_parser.add_argument("corr", help="Correlation id")
+    permit_parser.add_argument("req_id", nargs="?", help="Request id (the newest unanswered one when absent)")
+    permit_parser.add_argument("--dry-run", action="store_true", help="Print the commands without running them")
 
     args = parser.parse_args()
 
@@ -192,11 +218,13 @@ def main():
         print(json.dumps(res, indent=2, ensure_ascii=False))
     elif args.command == "handoff":
         corr = args.corr or f"t-{secrets.token_hex(3)}"
-        send_to_supervisor(f"[handoff {corr}] {task_text(args)}", corr, args.dry_run)
+        hand_off(args.project, task_text(args), corr, args.dry_run)
     elif args.command in ("reply", "redo"):
-        send_to_supervisor(f"[{args.command} {args.corr}] {args.text}", args.corr, args.dry_run)
+        follow_up(args.corr, args.command, args.dry_run, text=args.text)
     elif args.command == "accept":
-        send_to_supervisor(f"[accept {args.corr}]", args.corr, args.dry_run)
+        follow_up(args.corr, "accept", args.dry_run)
+    elif args.command == "permit":
+        follow_up(args.corr, args.answer, args.dry_run, req_id=args.req_id)
     else:
         parser.print_help()
 

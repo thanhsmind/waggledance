@@ -4,7 +4,9 @@
 
 use crate::code_source::{self, DirListing, SourceContent};
 use crate::config::Config;
-use crate::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
+use crate::domain::{
+    InboxMessage, IndexedFile, PermissionRequest, Project, RenderedPage, Run, SearchResult, WdTask,
+};
 use crate::error::{Error, Result};
 use crate::fuzzy::{self, FuzzyHit};
 use crate::git_diff::{self, ActiveBase, CommitEntry, DiffBase, GitDiffError, WorkingTreeDiff};
@@ -480,6 +482,95 @@ impl Engine {
         self.store.run_notice_state(id)
     }
 
+    pub fn insert_inbox_message(
+        &self,
+        recipient: &str,
+        corr: &str,
+        project_id: &str,
+        kind: &str,
+        body: &str,
+        created_at: &str,
+    ) -> Result<i64> {
+        self.store
+            .insert_inbox_message(recipient, corr, project_id, kind, body, created_at)
+    }
+
+    pub fn next_inbox_message(&self, recipient: &str) -> Result<Option<InboxMessage>> {
+        self.store.next_inbox_message(recipient)
+    }
+
+    pub fn ack_inbox_message(&self, seq: i64, acked_at: &str) -> Result<()> {
+        self.store.ack_inbox_message(seq, acked_at)
+    }
+
+    pub fn fail_inbox_message(&self, seq: i64, dead_at_attempts: i64, now: &str) -> Result<bool> {
+        self.store.fail_inbox_message(seq, dead_at_attempts, now)
+    }
+
+    pub fn prune_inbox(&self, acked_before: &str) -> Result<usize> {
+        self.store.prune_inbox(acked_before)
+    }
+
+    pub fn insert_task(&self, corr: &str, project_id: &str, at: &str) -> Result<bool> {
+        self.store.insert_task(corr, project_id, at)
+    }
+
+    pub fn get_task(&self, corr: &str) -> Result<Option<WdTask>> {
+        self.store.get_task(corr)
+    }
+
+    pub fn list_open_tasks(&self) -> Result<Vec<WdTask>> {
+        self.store.list_open_tasks()
+    }
+
+    pub fn mark_task_delivered(&self, corr: &str, leader_id: &str, at: &str) -> Result<()> {
+        self.store.mark_task_delivered(corr, leader_id, at)
+    }
+
+    pub fn mark_task_mail(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.mark_task_mail(corr, at)
+    }
+
+    pub fn close_task(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.close_task(corr, at)
+    }
+
+    pub fn set_task_nudged(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.set_task_nudged(corr, at)
+    }
+
+    pub fn set_task_progress_sent(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.set_task_progress_sent(corr, at)
+    }
+
+    pub fn stamp_board_sent(&self, at: &str) -> Result<()> {
+        self.store.stamp_board_sent(at)
+    }
+
+    pub fn insert_permission_request(&self, request: &PermissionRequest) -> Result<bool> {
+        self.store.insert_permission_request(request)
+    }
+
+    pub fn unanswered_permission_requests(&self, corr: &str) -> Result<Vec<PermissionRequest>> {
+        self.store.unanswered_permission_requests(corr)
+    }
+
+    pub fn answer_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        self.store.answer_permission_request(req_id, at)
+    }
+
+    pub fn close_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        self.store.close_permission_request(req_id, at)
+    }
+
+    pub fn permission_request_ids(&self, corr: &str) -> Result<Vec<String>> {
+        self.store.permission_request_ids(corr)
+    }
+
+    pub fn prune_tasks(&self, before: &str) -> Result<usize> {
+        self.store.prune_tasks(before)
+    }
+
     /// The transcript a finished run ended with — `None` while it is still
     /// working, and for rows written before the column existed.
     pub fn run_final_transcript(&self, id: &str) -> Result<Option<String>> {
@@ -499,6 +590,10 @@ impl Engine {
 
     pub fn run_by_request(&self, project_id: &str, request_id: &str) -> Result<Option<Run>> {
         self.store.run_by_request(project_id, request_id)
+    }
+
+    pub fn project_for_corr(&self, corr: &str) -> Result<Option<String>> {
+        self.store.project_for_corr(corr)
     }
 
     pub fn run_caller(&self, id: &str) -> Result<Option<String>> {

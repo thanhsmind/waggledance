@@ -10,7 +10,8 @@ use waggledance_core::domain::Project;
 use waggledance_core::project_settings::ProjectPaseo;
 
 pub const ROLE_LABEL: &str = "waggledance.role=leader";
-pub const VIA_LABEL: &str = "waggledance.via=supervisor";
+pub const WD_LABEL: &str = "waggledance.via=wd";
+pub const WD_CALLER: &str = "openclaw:wd";
 pub const PROJECT_LABEL_KEY: &str = "waggledance.project";
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -70,6 +71,16 @@ pub struct PendingPermission {
     pub tool: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Permit {
+    pub id: String,
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    pub name: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEnd {
     Completed,
@@ -125,6 +136,7 @@ pub struct RunSpec {
 #[async_trait]
 pub trait Paseo: Send + Sync {
     async fn leaders(&self, project_id: &str) -> Result<Vec<String>>;
+    async fn wd_leaders(&self, project_id: &str) -> Result<Vec<String>>;
     async fn inspect(&self, id: &str) -> Result<AgentState>;
     async fn workspaces(&self) -> Result<Vec<Workspace>>;
     async fn providers(&self) -> Result<Vec<String>>;
@@ -135,6 +147,9 @@ pub trait Paseo: Send + Sync {
     async fn send(&self, id: &str, text: &str) -> Result<()>;
     async fn wait(&self, id: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn logs_since(&self, id: &str, since: &str) -> Result<String>;
+    async fn archive(&self, id: &str) -> Result<()>;
+    async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()>;
+    async fn permits(&self) -> Result<Vec<Permit>>;
 }
 
 pub fn delivery_heartbeat_path(data_dir: &Path) -> PathBuf {
@@ -167,10 +182,28 @@ pub fn role_leaders_args() -> Vec<String> {
     ]
 }
 
-pub fn via_leaders_args() -> Vec<String> {
-    let mut args = role_leaders_args();
-    args.splice(4..4, ["--label".to_string(), VIA_LABEL.to_string()]);
+pub fn labelled(mut args: Vec<String>, label: &str) -> Vec<String> {
+    let at = args.len() - 1;
+    args.splice(at..at, ["--label".to_string(), label.to_string()]);
     args
+}
+
+pub fn wd_task(corr: &str, task: &str) -> String {
+    format!(
+        "Task waggledance#{corr} from wd.\n\n\
+         When done, run `waggledance mail send --to wd --corr {corr} --kind result` with the \
+         body on stdin, carrying four parts: `Done:`, `Proof:`, `Left:`, `Where:`.\n\
+         Before mailing `--kind question`, ask this project's bee advisor \
+         (`bee dispatch prepare --kind advisor`); mail only what it cannot decide, quoting its \
+         answer.\n\n{task}"
+    )
+}
+
+pub fn wd_corr(task: &str) -> Option<&str> {
+    task.lines()
+        .next()?
+        .strip_prefix("Task waggledance#")?
+        .strip_suffix(" from wd.")
 }
 
 pub fn created_age_secs(created: &str) -> Option<u64> {
@@ -739,6 +772,12 @@ impl Paseo for PaseoCli {
         parse_leaders(&out).map_err(|e| unparsable(&binary, "ls", e))
     }
 
+    async fn wd_leaders(&self, project_id: &str) -> Result<Vec<String>> {
+        let args = labelled(leaders_args(project_id), WD_LABEL);
+        let (binary, out) = self.exec(&args, TIMEOUT).await?;
+        parse_leaders(&out).map_err(|e| unparsable(&binary, "ls", e))
+    }
+
     async fn inspect(&self, id: &str) -> Result<AgentState> {
         let (binary, out) = self
             .exec(&["inspect".into(), id.into(), "--json".into()], TIMEOUT)
@@ -841,6 +880,35 @@ impl Paseo for PaseoCli {
         )
         .await
         .map(|(_, out)| strip_noise(&out))
+    }
+
+    async fn archive(&self, id: &str) -> Result<()> {
+        self.exec(&["archive".into(), id.into(), "--json".into()], TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()> {
+        let verb = if allow { "allow" } else { "deny" };
+        self.exec(
+            &[
+                "permit".into(),
+                verb.into(),
+                id.into(),
+                req_id.into(),
+                "--json".into(),
+            ],
+            TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn permits(&self) -> Result<Vec<Permit>> {
+        let (binary, out) = self
+            .exec(&["permit".into(), "ls".into(), "--json".into()], TIMEOUT)
+            .await?;
+        parse_document(&out).map_err(|e| unparsable(&binary, "permit", e))
     }
 }
 
@@ -955,8 +1023,19 @@ pub async fn resolve_leader(
     config: &PaseoConfig,
     settings: &ProjectPaseo,
     project: &Project,
+    wd: bool,
 ) -> Result<Leader> {
-    for id in paseo.leaders(&project.id).await? {
+    let wd_ids = paseo.wd_leaders(&project.id).await?;
+    let ids = match wd {
+        true => wd_ids,
+        false => paseo
+            .leaders(&project.id)
+            .await?
+            .into_iter()
+            .filter(|id| !wd_ids.contains(id))
+            .collect(),
+    };
+    for id in ids {
         let state = paseo.inspect(&id).await?;
         if !state.archived {
             let busy = matches!(state.status.as_str(), "running" | "initializing");
@@ -995,7 +1074,10 @@ pub async fn resolve_leader(
         workspace,
         cwd: project.root_path.clone(),
         title: format!("{} leader", project.name),
-        labels: vec![ROLE_LABEL.to_string(), project_label(&project.id)],
+        labels: [ROLE_LABEL.to_string(), project_label(&project.id)]
+            .into_iter()
+            .chain(wd.then(|| WD_LABEL.to_string()))
+            .collect(),
         reason,
         provider,
         mode: either(&settings.mode, &config.mode),
@@ -1038,6 +1120,7 @@ pub mod fake {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
         Leaders(String),
+        WdLeaders(String),
         Inspect(String),
         Workspaces,
         Providers,
@@ -1047,11 +1130,15 @@ pub mod fake {
         Send(String, String),
         Wait(String),
         LogsSince(String, String),
+        Archive(String),
+        Permit(String, String, bool),
+        Permits,
     }
 
     #[derive(Default)]
     pub struct FakeState {
         pub leaders: HashMap<String, Vec<String>>,
+        pub wd: std::collections::HashSet<String>,
         pub agents: HashMap<String, AgentState>,
         pub workspaces: Vec<Workspace>,
         pub workspaces_fail: bool,
@@ -1059,6 +1146,7 @@ pub mod fake {
         pub store: Vec<StoredWorkspace>,
         pub logs: HashMap<String, String>,
         pub turn_ends: VecDeque<TurnEnd>,
+        pub permits: Vec<Permit>,
         pub calls: Vec<Call>,
     }
 
@@ -1088,6 +1176,11 @@ pub mod fake {
                     updated_at: None,
                 },
             );
+        }
+
+        pub fn add_wd_leader(&self, project_id: &str, id: &str, status: &str) {
+            self.add_leader(project_id, id, status, false);
+            self.state.lock().unwrap().wd.insert(id.to_string());
         }
 
         pub fn push_turn_end(&self, end: TurnEnd) {
@@ -1143,6 +1236,13 @@ pub mod fake {
             tokio::task::yield_now().await;
             let s = self.state.lock().unwrap();
             Ok(s.leaders.get(project_id).cloned().unwrap_or_default())
+        }
+
+        async fn wd_leaders(&self, project_id: &str) -> Result<Vec<String>> {
+            self.record(Call::WdLeaders(project_id.to_string()));
+            let s = self.state.lock().unwrap();
+            let all = s.leaders.get(project_id).cloned().unwrap_or_default();
+            Ok(all.into_iter().filter(|id| s.wd.contains(id)).collect())
         }
 
         async fn inspect(&self, id: &str) -> Result<AgentState> {
@@ -1202,6 +1302,9 @@ pub mod fake {
             {
                 self.add_leader(project, &id, "idle", false);
             }
+            if spec.labels.iter().any(|l| l == WD_LABEL) {
+                self.state.lock().unwrap().wd.insert(id.clone());
+            }
             Ok((id, self.next_turn_end()))
         }
 
@@ -1230,6 +1333,24 @@ pub mod fake {
                 .get(id)
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        async fn archive(&self, id: &str) -> Result<()> {
+            self.record(Call::Archive(id.to_string()));
+            if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
+                a.archived = true;
+            }
+            Ok(())
+        }
+
+        async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()> {
+            self.record(Call::Permit(id.to_string(), req_id.to_string(), allow));
+            Ok(())
+        }
+
+        async fn permits(&self) -> Result<Vec<Permit>> {
+            self.record(Call::Permits);
+            Ok(self.state.lock().unwrap().permits.clone())
         }
     }
 }
@@ -1269,6 +1390,7 @@ mod tests {
             &PaseoConfig::default(),
             &ProjectPaseo::default(),
             &project(dir.path()),
+            false,
         )
         .await
         .unwrap();
@@ -1281,6 +1403,7 @@ mod tests {
             &PaseoConfig::default(),
             &ProjectPaseo::default(),
             &project(dir.path()),
+            false,
         )
         .await
         .unwrap();
@@ -1299,6 +1422,7 @@ mod tests {
                 &PaseoConfig::default(),
                 &ProjectPaseo::default(),
                 &project(dir.path()),
+                false,
             )
             .await
             .unwrap(),
@@ -1333,6 +1457,7 @@ mod tests {
                 &config,
                 &ProjectPaseo::default(),
                 &project(dir.path()),
+                false,
             )
             .await
             .unwrap(),
@@ -1359,6 +1484,7 @@ mod tests {
                 &PaseoConfig::default(),
                 &ProjectPaseo::default(),
                 &project(dir.path()),
+                false,
             )
             .await
             .unwrap(),
@@ -1381,6 +1507,7 @@ mod tests {
                 &PaseoConfig::default(),
                 &ProjectPaseo::default(),
                 &project(dir.path()),
+                false,
             )
             .await
             .unwrap(),
@@ -1409,7 +1536,7 @@ mod tests {
             ..ProjectPaseo::default()
         };
         let s = start(
-            resolve_leader(&fake, &config, &settings, &project(dir.path()))
+            resolve_leader(&fake, &config, &settings, &project(dir.path()), false)
                 .await
                 .unwrap(),
         );
@@ -1434,6 +1561,7 @@ mod tests {
                 &PaseoConfig::default(),
                 &ProjectPaseo::default(),
                 &project(dir.path()),
+                false,
             )
             .await
             .unwrap(),
@@ -1445,6 +1573,7 @@ mod tests {
             &PaseoConfig::default(),
             &ProjectPaseo::default(),
             &project(dir.path()),
+            false,
         )
         .await
         .unwrap_err();
@@ -1495,6 +1624,7 @@ mod tests {
                 &PaseoConfig::default(),
                 &ProjectPaseo::default(),
                 &project(dir.path()),
+                false,
             )
             .await
             .unwrap(),
@@ -1538,6 +1668,7 @@ mod tests {
                     &PaseoConfig::default(),
                     &ProjectPaseo::default(),
                     &project(&root),
+                    false,
                 )
                 .await
                 .unwrap();
@@ -1598,6 +1729,104 @@ mod tests {
         assert!(pair("--mode", "plan"));
         assert!(pair("--thinking", "high"));
         assert_eq!(&args[args.len() - 2..], &["--", "t"]);
+    }
+
+    #[tokio::test]
+    async fn a_wd_run_starts_a_via_wd_leader_beside_a_non_wd_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakePaseo::default();
+        fake.add_leader("proj-1", "plain", "idle", false);
+        fake.add_workspace("wks_root", "local", dir.path());
+        let s = start(
+            resolve_leader(
+                &fake,
+                &PaseoConfig::default(),
+                &ProjectPaseo::default(),
+                &project(dir.path()),
+                true,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            s.labels,
+            vec![
+                "waggledance.role=leader".to_string(),
+                "waggledance.project=proj-1".to_string(),
+                "waggledance.via=wd".to_string()
+            ]
+        );
+        assert!(!fake.calls().contains(&Call::Inspect("plain".into())));
+
+        let (id, _) = fake
+            .run_and_wait(&s.spec("t"), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let again = resolve_leader(
+            &fake,
+            &PaseoConfig::default(),
+            &ProjectPaseo::default(),
+            &project(dir.path()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(again, Leader::Existing { id: ref got, .. } if *got == id));
+    }
+
+    #[tokio::test]
+    async fn a_non_wd_run_skips_a_via_wd_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakePaseo::default();
+        fake.add_wd_leader("proj-1", "wd-lead", "idle");
+        fake.add_workspace("wks_root", "local", dir.path());
+        let s = start(
+            resolve_leader(
+                &fake,
+                &PaseoConfig::default(),
+                &ProjectPaseo::default(),
+                &project(dir.path()),
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!s.labels.iter().any(|l| l == WD_LABEL), "{:?}", s.labels);
+        fake.add_leader("proj-1", "plain", "idle", false);
+        let got = resolve_leader(
+            &fake,
+            &PaseoConfig::default(),
+            &ProjectPaseo::default(),
+            &project(dir.path()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(got, Leader::Existing { ref id, .. } if id == "plain"));
+    }
+
+    #[test]
+    fn a_wd_task_carries_its_corr_and_the_mail_and_advisor_rules() {
+        let task = wd_task("c-7", "fix the build\nsecond line");
+        assert!(
+            task.starts_with("Task waggledance#c-7 from wd.\n\n"),
+            "{task}"
+        );
+        assert!(
+            task.contains("waggledance mail send --to wd --corr c-7 --kind result"),
+            "{task}"
+        );
+        assert!(
+            task.contains("bee dispatch prepare --kind advisor"),
+            "{task}"
+        );
+        assert!(task.ends_with("\n\nfix the build\nsecond line"), "{task}");
+        assert_eq!(wd_corr(&task), Some("c-7"));
+        assert_eq!(wd_corr("fix the build"), None);
+        assert_eq!(
+            labelled(leaders_args("proj-1"), WD_LABEL)[6..],
+            ["--label", "waggledance.via=wd", "--json"]
+        );
     }
 
     #[test]
@@ -2124,22 +2353,10 @@ mod tests {
     }
 
     #[test]
-    fn leaders_lists_filter_by_role_then_by_role_and_via() {
+    fn leaders_lists_filter_by_role() {
         assert_eq!(
             role_leaders_args(),
             ["ls", "-g", "--label", "waggledance.role=leader", "--json"]
-        );
-        assert_eq!(
-            via_leaders_args(),
-            [
-                "ls",
-                "-g",
-                "--label",
-                "waggledance.role=leader",
-                "--label",
-                "waggledance.via=supervisor",
-                "--json"
-            ]
         );
     }
 
@@ -2238,5 +2455,54 @@ mod tests {
         println!("workspaces: {workspaces:?}");
         println!("leaders: {leaders:?}");
         assert!(leaders.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_and_permit_run_their_cli_verbs_on_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = dir.path().join("argv");
+        let bin = script(
+            &dir.path().join("paseo"),
+            &format!("echo \"$*\" >> '{}'\nprintf '{{}}'", argv.display()),
+        );
+        let cli = PaseoCli::with_binary(&lossy(&bin));
+        cli.archive("lead-1").await.unwrap();
+        cli.permit("lead-1", "req-7", true).await.unwrap();
+        cli.permit("lead-1", "req-8", false).await.unwrap();
+        let lines: Vec<String> = std::fs::read_to_string(&argv)
+            .unwrap()
+            .lines()
+            .filter(|l| *l != "settle")
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "archive lead-1 --json",
+                "permit allow lead-1 req-7 --json",
+                "permit deny lead-1 req-8 --json",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permits_reads_the_permit_ls_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(
+            &dir.path().join("paseo"),
+            r#"printf '[{"id":"req-1","agentId":"lead-1","name":"Bash","description":"ls -la","provider":"claude"}]'"#,
+        );
+        let cli = PaseoCli::with_binary(&lossy(&bin));
+        assert_eq!(
+            cli.permits().await.unwrap(),
+            vec![Permit {
+                id: "req-1".into(),
+                agent_id: "lead-1".into(),
+                name: "Bash".into(),
+                description: "ls -la".into(),
+            }]
+        );
     }
 }

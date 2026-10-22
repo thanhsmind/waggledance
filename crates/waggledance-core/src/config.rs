@@ -17,7 +17,6 @@ pub struct Config {
     pub search: SearchConfig,
     pub terminal: TerminalConfig,
     pub paseo: PaseoConfig,
-    pub supervisor: SupervisorConfig,
     pub openclaw: OpenClawConfig,
 }
 
@@ -56,26 +55,6 @@ pub struct PaseoLeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
-pub struct SupervisorConfig {
-    pub provider: String,
-    pub mode: String,
-    pub thinking: String,
-    pub title: String,
-}
-
-impl Default for SupervisorConfig {
-    fn default() -> Self {
-        Self {
-            provider: "claude/claude-sonnet-5-5".into(),
-            mode: "bypassPermissions".into(),
-            thinking: String::new(),
-            title: "waggledance supervisor".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
 pub struct OpenClawConfig {
     pub home: String,
     pub hook_url: String,
@@ -84,6 +63,7 @@ pub struct OpenClawConfig {
     pub telegram_to: String,
     pub hook_model: String,
     pub hook_thinking: String,
+    pub heartbeat_secs: u64,
 }
 
 impl Default for OpenClawConfig {
@@ -96,6 +76,7 @@ impl Default for OpenClawConfig {
             telegram_to: String::new(),
             hook_model: String::new(),
             hook_thinking: "low".into(),
+            heartbeat_secs: 600,
         }
     }
 }
@@ -1267,12 +1248,8 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_and_openclaw_defaults_are_the_shipped_values() {
+    fn openclaw_defaults_are_the_shipped_values() {
         let c = Config::default();
-        assert_eq!(c.supervisor.provider, "claude/claude-sonnet-5-5");
-        assert_eq!(c.supervisor.mode, "bypassPermissions");
-        assert_eq!(c.supervisor.thinking, "");
-        assert_eq!(c.supervisor.title, "waggledance supervisor");
         assert_eq!(c.openclaw.home, "~/aicoworker/openclaw");
         assert_eq!(c.openclaw.hook_url, "http://127.0.0.1:18789/hooks/agent");
         assert_eq!(c.openclaw.cli, "");
@@ -1280,10 +1257,28 @@ mod tests {
         assert_eq!(c.openclaw.telegram_to, "");
         assert_eq!(c.openclaw.hook_model, "");
         assert_eq!(c.openclaw.hook_thinking, "low");
+        assert_eq!(c.openclaw.heartbeat_secs, 600);
     }
 
     #[test]
-    fn supervisor_and_openclaw_should_read_as_the_defaults_from_a_file_without_the_keys() {
+    fn a_retired_supervisor_table_should_still_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "waggledance-cfg-retired-supervisor-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(
+            &p,
+            "[server]\nport = 7711\n\n[supervisor]\nprovider = \"claude/x\"\ntitle = \"old\"\n",
+        )
+        .unwrap();
+        assert_eq!(Config::load_from(&p).server.port, 7711);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn openclaw_should_read_as_the_defaults_from_a_file_without_the_keys() {
         let dir = std::env::temp_dir().join(format!(
             "waggledance-cfg-seat-defaults-{}",
             std::process::id()
@@ -1292,8 +1287,6 @@ mod tests {
         let p = dir.join("config.toml");
         std::fs::write(&p, "[server]\nport = 7711\n").unwrap();
         let loaded = Config::load_from(&p);
-        assert_eq!(loaded.supervisor.provider, "claude/claude-sonnet-5-5");
-        assert_eq!(loaded.supervisor.mode, "bypassPermissions");
         assert_eq!(
             loaded.openclaw.hook_url,
             "http://127.0.0.1:18789/hooks/agent"
@@ -1301,6 +1294,7 @@ mod tests {
         assert_eq!(loaded.openclaw.cli, "");
         assert_eq!(loaded.openclaw.hook_thinking, "low");
         assert_eq!(loaded.openclaw.agent_id, "");
+        assert_eq!(loaded.openclaw.heartbeat_secs, 600);
         std::fs::remove_dir_all(&dir).ok();
     }
 

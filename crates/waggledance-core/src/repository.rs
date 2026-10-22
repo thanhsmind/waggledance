@@ -1,7 +1,9 @@
 //! SQLite adapter: project registry + file index + FTS5 search.
 //! Behind a `Mutex<Connection>` so it is Send+Sync for the async daemon.
 
-use crate::domain::{IndexedFile, Project, Run, SearchResult};
+use crate::domain::{
+    InboxMessage, IndexedFile, PermissionRequest, Project, Run, SearchResult, WdTask,
+};
 use crate::error::Result;
 use crate::short_link;
 use rusqlite::{params, Connection};
@@ -93,6 +95,13 @@ impl SqliteStore {
         c.execute("DELETE FROM files_fts WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM links WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM runs WHERE project_id=?1", params![id])?;
+        c.execute("DELETE FROM inbox WHERE project_id=?1", params![id])?;
+        c.execute(
+            "DELETE FROM permission_requests
+             WHERE corr IN (SELECT corr FROM tasks WHERE project_id=?1)",
+            params![id],
+        )?;
+        c.execute("DELETE FROM tasks WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM projects WHERE id=?1", params![id])?;
         Ok(())
     }
@@ -171,6 +180,17 @@ impl SqliteStore {
         )?;
         let mut rows = stmt.query(params![project_id, request_id])?;
         Ok(rows.next()?.map(row_to_run))
+    }
+
+    pub fn project_for_corr(&self, corr: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT project_id FROM runs
+             WHERE request_id=?1 OR substr(request_id,1,length(?1)+1)=?1||':'
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![corr])?;
+        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
     }
 
     pub fn run_caller(&self, id: &str) -> Result<Option<String>> {
@@ -487,6 +507,247 @@ impl SqliteStore {
             .flatten())
     }
 
+    pub fn insert_inbox_message(
+        &self,
+        recipient: &str,
+        corr: &str,
+        project_id: &str,
+        kind: &str,
+        body: &str,
+        created_at: &str,
+    ) -> Result<i64> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO inbox(recipient, corr, project_id, kind, body, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![recipient, corr, project_id, kind, body, created_at],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn next_inbox_message(&self, recipient: &str) -> Result<Option<InboxMessage>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT seq, recipient, corr, project_id, kind, body, created_at, acked_at,
+                    attempts, dead_at
+             FROM inbox
+             WHERE recipient=?1 AND acked_at IS NULL AND dead_at IS NULL
+             ORDER BY seq ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![recipient])?;
+        Ok(rows.next()?.map(|r| InboxMessage {
+            seq: r.get_unwrap(0),
+            recipient: r.get_unwrap(1),
+            corr: r.get_unwrap(2),
+            project_id: r.get_unwrap(3),
+            kind: r.get_unwrap(4),
+            body: r.get_unwrap(5),
+            created_at: r.get_unwrap(6),
+            acked_at: r.get_unwrap(7),
+            attempts: r.get_unwrap(8),
+            dead_at: r.get_unwrap(9),
+        }))
+    }
+
+    pub fn ack_inbox_message(&self, seq: i64, acked_at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE inbox SET acked_at=?2 WHERE seq=?1",
+            params![seq, acked_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_inbox_message(&self, seq: i64, dead_at_attempts: i64, now: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE inbox SET attempts=attempts+1,
+                    dead_at=CASE WHEN attempts+1 >= ?2 THEN ?3 ELSE dead_at END
+             WHERE seq=?1",
+            params![seq, dead_at_attempts, now],
+        )?;
+        Ok(c.query_row(
+            "SELECT dead_at IS NOT NULL FROM inbox WHERE seq=?1",
+            params![seq],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn prune_inbox(&self, acked_before: &str) -> Result<usize> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "DELETE FROM inbox WHERE acked_at IS NOT NULL AND acked_at < ?1",
+            params![acked_before],
+        )?)
+    }
+
+    pub fn insert_task(&self, corr: &str, project_id: &str, at: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "INSERT OR IGNORE INTO tasks(corr, project_id, state, created_at, changed_at)
+             VALUES(?1, ?2, 'open', ?3, ?3)",
+            params![corr, project_id, at],
+        )? == 1)
+    }
+
+    pub fn get_task(&self, corr: &str) -> Result<Option<WdTask>> {
+        Ok(self.select_tasks("WHERE corr=?1", params![corr])?.pop())
+    }
+
+    pub fn list_open_tasks(&self) -> Result<Vec<WdTask>> {
+        self.select_tasks(
+            "WHERE state='open' ORDER BY created_at ASC, corr ASC",
+            params![],
+        )
+    }
+
+    fn select_tasks(&self, filter: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<WdTask>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(&format!(
+            "SELECT corr, project_id, leader_id, state, created_at, last_delivered_at,
+                    last_mail_at, nudged_at, progress_sent_at, changed_at, board_sent_at
+             FROM tasks {filter}"
+        ))?;
+        let rows = stmt.query_map(args, |r| {
+            Ok(WdTask {
+                corr: r.get(0)?,
+                project_id: r.get(1)?,
+                leader_id: r.get(2)?,
+                state: r.get(3)?,
+                created_at: r.get(4)?,
+                last_delivered_at: r.get(5)?,
+                last_mail_at: r.get(6)?,
+                nudged_at: r.get(7)?,
+                progress_sent_at: r.get(8)?,
+                changed_at: r.get(9)?,
+                board_sent_at: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn update_task(&self, set: &str, corr: &str, args: &[&str]) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&corr];
+        values.extend(args.iter().map(|a| a as &dyn rusqlite::ToSql));
+        c.execute(
+            &format!("UPDATE tasks SET {set} WHERE corr=?1"),
+            values.as_slice(),
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_task_delivered(&self, corr: &str, leader_id: &str, at: &str) -> Result<()> {
+        self.update_task(
+            "leader_id=?2, last_delivered_at=?3, nudged_at=NULL, progress_sent_at=NULL,
+             changed_at=?3",
+            corr,
+            &[leader_id, at],
+        )
+    }
+
+    pub fn mark_task_mail(&self, corr: &str, at: &str) -> Result<()> {
+        self.update_task("last_mail_at=?2, changed_at=?2", corr, &[at])
+    }
+
+    pub fn close_task(&self, corr: &str, at: &str) -> Result<()> {
+        self.update_task("state='closed', changed_at=?2", corr, &[at])
+    }
+
+    pub fn set_task_nudged(&self, corr: &str, at: &str) -> Result<()> {
+        self.update_task("nudged_at=?2", corr, &[at])
+    }
+
+    pub fn set_task_progress_sent(&self, corr: &str, at: &str) -> Result<()> {
+        self.update_task("progress_sent_at=?2", corr, &[at])
+    }
+
+    pub fn stamp_board_sent(&self, at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("UPDATE tasks SET board_sent_at=?1", params![at])?;
+        Ok(())
+    }
+
+    pub fn insert_permission_request(&self, r: &PermissionRequest) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "INSERT OR IGNORE INTO permission_requests
+                 (req_id, corr, leader_id, tool, description, seen_at, answered_at, closed_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                r.req_id,
+                r.corr,
+                r.leader_id,
+                r.tool,
+                r.description,
+                r.seen_at,
+                r.answered_at,
+                r.closed_at
+            ],
+        )? == 1)
+    }
+
+    pub fn unanswered_permission_requests(&self, corr: &str) -> Result<Vec<PermissionRequest>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT req_id, corr, leader_id, tool, description, seen_at, answered_at, closed_at
+             FROM permission_requests
+             WHERE corr=?1 AND answered_at IS NULL AND closed_at IS NULL
+             ORDER BY seen_at DESC, rowid DESC",
+        )?;
+        let rows = stmt.query_map(params![corr], |r| {
+            Ok(PermissionRequest {
+                req_id: r.get(0)?,
+                corr: r.get(1)?,
+                leader_id: r.get(2)?,
+                tool: r.get(3)?,
+                description: r.get(4)?,
+                seen_at: r.get(5)?,
+                answered_at: r.get(6)?,
+                closed_at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn answer_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE permission_requests SET answered_at=?2 WHERE req_id=?1",
+            params![req_id, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn close_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE permission_requests SET closed_at=?2 WHERE req_id=?1",
+            params![req_id, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn permission_request_ids(&self, corr: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT req_id FROM permission_requests WHERE corr=?1")?;
+        let rows = stmt.query_map(params![corr], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn prune_tasks(&self, before: &str) -> Result<usize> {
+        let c = self.conn.lock().unwrap();
+        let tasks = c.execute(
+            "DELETE FROM tasks WHERE state='closed' AND changed_at < ?1",
+            params![before],
+        )?;
+        let requests = c.execute(
+            "DELETE FROM permission_requests WHERE closed_at < ?1 OR answered_at < ?1",
+            params![before],
+        )?;
+        Ok(tasks + requests)
+    }
+
     // ---- files ----
 
     pub fn upsert_file(&self, f: &IndexedFile, content: &str) -> Result<()> {
@@ -750,10 +1011,12 @@ const MIGRATIONS: &[MigrationStep] = &[
     (4, migration_4_runs_final_transcript),
     (5, migration_5_runs_request),
     (6, migration_6_runs_notice),
+    (7, migration_7_inbox),
+    (8, migration_8_tasks),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -865,6 +1128,55 @@ fn migration_6_runs_notice(conn: &Connection) -> Result<()> {
     if !has_column(conn, "runs", "notice_until")? {
         conn.execute("ALTER TABLE runs ADD COLUMN notice_until TEXT", [])?;
     }
+    Ok(())
+}
+
+fn migration_7_inbox(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS inbox (
+             seq INTEGER PRIMARY KEY,
+             recipient TEXT NOT NULL,
+             corr TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             body TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             acked_at TEXT,
+             attempts INTEGER NOT NULL DEFAULT 0,
+             dead_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(recipient, acked_at, dead_at, seq);",
+    )?;
+    Ok(())
+}
+
+fn migration_8_tasks(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tasks (
+             corr TEXT PRIMARY KEY,
+             project_id TEXT NOT NULL,
+             leader_id TEXT,
+             state TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             last_delivered_at TEXT,
+             last_mail_at TEXT,
+             nudged_at TEXT,
+             progress_sent_at TEXT,
+             changed_at TEXT NOT NULL,
+             board_sent_at TEXT
+         );
+         CREATE TABLE IF NOT EXISTS permission_requests (
+             req_id TEXT PRIMARY KEY,
+             corr TEXT NOT NULL,
+             leader_id TEXT NOT NULL,
+             tool TEXT NOT NULL,
+             description TEXT NOT NULL,
+             seen_at TEXT NOT NULL,
+             answered_at TEXT,
+             closed_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_permission_requests_corr ON permission_requests(corr);",
+    )?;
     Ok(())
 }
 
@@ -2074,5 +2386,361 @@ mod tests {
             )
             .unwrap();
         assert!(!flag, "existing rows must default the new column to off");
+    }
+
+    fn mail(s: &SqliteStore, project_id: &str, body: &str) -> i64 {
+        s.insert_inbox_message(
+            "wd",
+            "corr-1",
+            project_id,
+            "result",
+            body,
+            "2026-10-22T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migrate_adds_the_inbox_table_to_a_v6_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 feature TEXT,
+                 final_transcript TEXT,
+                 request_id TEXT,
+                 caller TEXT,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 notice TEXT,
+                 notice_state TEXT,
+                 notice_until TEXT
+             );
+             INSERT INTO runs VALUES('r-a','p1','paseo:a1',NULL,'t','','m','done','t','t',NULL,'fin','req-1','caller',0,NULL,NULL,NULL);
+             INSERT INTO runs VALUES('r-b','p1','paseo:a2',NULL,'t','','m','working','t','t',NULL,NULL,'req-2',NULL,1,NULL,NULL,NULL);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            assert_eq!(
+                c.query_row::<i64, _, _>("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+                    .unwrap(),
+                2
+            );
+            super::migrate(&c).unwrap();
+            super::migration_7_inbox(&c).unwrap();
+        }
+        assert_eq!(s.get_run("r-b").unwrap().unwrap().status, "working");
+        let seq = mail(&s, "p1", "hello");
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, seq);
+    }
+
+    #[test]
+    fn next_pending_inbox_message_is_the_lowest_seq_and_ack_hides_it() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
+        let first = mail(&s, "p1", "one");
+        let second = mail(&s, "p1", "two");
+        s.insert_inbox_message("other", "c", "p1", "result", "x", "t")
+            .unwrap();
+        assert!(second > first);
+
+        let next = s.next_inbox_message("wd").unwrap().unwrap();
+        assert_eq!(next.seq, first);
+        assert_eq!(next.recipient, "wd");
+        assert_eq!(next.corr, "corr-1");
+        assert_eq!(next.project_id, "p1");
+        assert_eq!(next.kind, "result");
+        assert_eq!(next.body, "one");
+        assert_eq!(next.created_at, "2026-10-22T00:00:00Z");
+        assert_eq!(next.acked_at, None);
+        assert_eq!(next.attempts, 0);
+        assert_eq!(next.dead_at, None);
+
+        s.ack_inbox_message(first, "2026-10-22T00:01:00Z").unwrap();
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, second);
+        s.ack_inbox_message(second, "2026-10-22T00:02:00Z").unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
+    }
+
+    #[test]
+    fn five_failed_attempts_mark_an_inbox_message_dead_and_next_pending_skips_it() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let poison = mail(&s, "p1", "poison");
+        let after = mail(&s, "p1", "after");
+        for attempt in 1..5 {
+            assert!(!s
+                .fail_inbox_message(poison, 5, "2026-10-22T00:05:00Z")
+                .unwrap());
+            let next = s.next_inbox_message("wd").unwrap().unwrap();
+            assert_eq!((next.seq, next.attempts), (poison, attempt));
+        }
+        assert!(s
+            .fail_inbox_message(poison, 5, "2026-10-22T00:05:00Z")
+            .unwrap());
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, after);
+    }
+
+    #[test]
+    fn prune_deletes_only_acked_inbox_rows_older_than_the_cutoff() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let old_acked = mail(&s, "p1", "old");
+        let new_acked = mail(&s, "p1", "new");
+        let pending = mail(&s, "p1", "pending");
+        s.ack_inbox_message(old_acked, "2026-09-01T00:00:00Z")
+            .unwrap();
+        s.ack_inbox_message(new_acked, "2026-10-21T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(s.prune_inbox("2026-09-22T00:00:00Z").unwrap(), 1);
+        let c = s.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT seq FROM inbox ORDER BY seq").unwrap();
+        let left: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec![new_acked, pending]);
+    }
+
+    #[test]
+    fn delete_project_removes_only_that_projects_inbox_rows() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        mail(&s, "p1", "gone");
+        let kept = mail(&s, "p2", "kept");
+        s.delete_project("p1").unwrap();
+        let next = s.next_inbox_message("wd").unwrap().unwrap();
+        assert_eq!((next.seq, next.project_id.as_str()), (kept, "p2"));
+        s.ack_inbox_message(kept, "t").unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_adds_the_tasks_and_permission_tables_to_a_v7_database_keeping_its_inbox() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::migration_7_inbox(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO inbox(recipient, corr, project_id, kind, body, created_at)
+             VALUES('wd','c-1','p1','result','kept','t');
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                8
+            );
+            super::migrate(&c).unwrap();
+            super::migration_8_tasks(&c).unwrap();
+        }
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().body, "kept");
+        assert!(s.insert_task("c-1", "p1", "t0").unwrap());
+        assert!(s
+            .insert_permission_request(&request("q-1", "c-1", "t0"))
+            .unwrap());
+    }
+
+    fn request(req_id: &str, corr: &str, seen_at: &str) -> PermissionRequest {
+        PermissionRequest {
+            req_id: req_id.into(),
+            corr: corr.into(),
+            leader_id: "lead".into(),
+            tool: "Bash".into(),
+            description: "rm -rf target".into(),
+            seen_at: seen_at.into(),
+            answered_at: None,
+            closed_at: None,
+        }
+    }
+
+    #[test]
+    fn an_inserted_task_is_open_with_only_its_creation_stamps_and_inserts_once() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.get_task("c-1").unwrap().is_none());
+        assert!(s.insert_task("c-1", "p1", "t1").unwrap());
+        assert!(!s.insert_task("c-1", "p2", "t2").unwrap());
+        assert_eq!(
+            s.get_task("c-1").unwrap().unwrap(),
+            WdTask {
+                corr: "c-1".into(),
+                project_id: "p1".into(),
+                leader_id: None,
+                state: "open".into(),
+                created_at: "t1".into(),
+                last_delivered_at: None,
+                last_mail_at: None,
+                nudged_at: None,
+                progress_sent_at: None,
+                changed_at: "t1".into(),
+                board_sent_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn delivery_records_the_leader_and_clears_the_nudge_marks() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_task("c-1", "p1", "t1").unwrap();
+        s.set_task_nudged("c-1", "t2").unwrap();
+        s.set_task_progress_sent("c-1", "t3").unwrap();
+        let t = s.get_task("c-1").unwrap().unwrap();
+        assert_eq!(
+            (t.nudged_at.as_deref(), t.progress_sent_at.as_deref()),
+            (Some("t2"), Some("t3"))
+        );
+        assert_eq!(t.changed_at, "t1");
+
+        s.mark_task_delivered("c-1", "lead", "t4").unwrap();
+        let t = s.get_task("c-1").unwrap().unwrap();
+        assert_eq!(t.leader_id.as_deref(), Some("lead"));
+        assert_eq!(t.last_delivered_at.as_deref(), Some("t4"));
+        assert_eq!((t.nudged_at, t.progress_sent_at), (None, None));
+        assert_eq!(t.changed_at, "t4");
+    }
+
+    #[test]
+    fn mail_and_close_stamp_changed_at_and_close_drops_the_task_from_the_open_list() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_task("c-1", "p1", "t1").unwrap();
+        s.insert_task("c-2", "p2", "t2").unwrap();
+        s.mark_task_mail("c-1", "t3").unwrap();
+        let t = s.get_task("c-1").unwrap().unwrap();
+        assert_eq!(
+            (t.last_mail_at.as_deref(), t.changed_at.as_str()),
+            (Some("t3"), "t3")
+        );
+        let open: Vec<String> = s
+            .list_open_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.corr)
+            .collect();
+        assert_eq!(open, vec!["c-1", "c-2"]);
+
+        s.close_task("c-1", "t4").unwrap();
+        let t = s.get_task("c-1").unwrap().unwrap();
+        assert_eq!((t.state.as_str(), t.changed_at.as_str()), ("closed", "t4"));
+        let open: Vec<String> = s
+            .list_open_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.corr)
+            .collect();
+        assert_eq!(open, vec!["c-2"]);
+    }
+
+    #[test]
+    fn stamping_the_board_marks_every_task() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_task("c-1", "p1", "t1").unwrap();
+        s.insert_task("c-2", "p2", "t2").unwrap();
+        s.close_task("c-2", "t3").unwrap();
+        s.stamp_board_sent("t5").unwrap();
+        for corr in ["c-1", "c-2"] {
+            let t = s.get_task(corr).unwrap().unwrap();
+            assert_eq!(t.board_sent_at.as_deref(), Some("t5"), "{corr}");
+        }
+        assert_eq!(s.get_task("c-1").unwrap().unwrap().changed_at, "t1");
+    }
+
+    #[test]
+    fn permission_requests_insert_once_and_answer_or_close_hides_them() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s
+            .insert_permission_request(&request("q-1", "c-1", "t1"))
+            .unwrap());
+        assert!(!s
+            .insert_permission_request(&request("q-1", "c-1", "t9"))
+            .unwrap());
+        s.insert_permission_request(&request("q-2", "c-1", "t2"))
+            .unwrap();
+        s.insert_permission_request(&request("q-3", "c-1", "t3"))
+            .unwrap();
+        s.insert_permission_request(&request("q-4", "c-2", "t4"))
+            .unwrap();
+
+        let open = s.unanswered_permission_requests("c-1").unwrap();
+        assert_eq!(open[0], request("q-3", "c-1", "t3"));
+        let ids: Vec<&str> = open.iter().map(|r| r.req_id.as_str()).collect();
+        assert_eq!(ids, vec!["q-3", "q-2", "q-1"]);
+
+        s.answer_permission_request("q-3", "t5").unwrap();
+        s.close_permission_request("q-1", "t6").unwrap();
+        let ids: Vec<String> = s
+            .unanswered_permission_requests("c-1")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.req_id)
+            .collect();
+        assert_eq!(ids, vec!["q-2"]);
+        let mut known = s.permission_request_ids("c-1").unwrap();
+        known.sort();
+        assert_eq!(known, vec!["q-1", "q-2", "q-3"]);
+    }
+
+    #[test]
+    fn prune_drops_old_closed_tasks_and_old_answered_or_closed_requests_only() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_task("old-closed", "p1", "2026-08-01").unwrap();
+        s.close_task("old-closed", "2026-08-02").unwrap();
+        s.insert_task("new-closed", "p1", "2026-08-01").unwrap();
+        s.close_task("new-closed", "2026-10-20").unwrap();
+        s.insert_task("old-open", "p1", "2026-08-01").unwrap();
+        for id in ["old-answered", "old-closed", "new-answered", "old-pending"] {
+            s.insert_permission_request(&request(id, "c-1", "2026-08-01"))
+                .unwrap();
+        }
+        s.answer_permission_request("old-answered", "2026-08-02")
+            .unwrap();
+        s.close_permission_request("old-closed", "2026-08-02")
+            .unwrap();
+        s.answer_permission_request("new-answered", "2026-10-20")
+            .unwrap();
+
+        assert_eq!(s.prune_tasks("2026-09-22").unwrap(), 3);
+        assert!(s.get_task("old-closed").unwrap().is_none());
+        assert!(s.get_task("new-closed").unwrap().is_some());
+        assert!(s.get_task("old-open").unwrap().is_some());
+        let mut known = s.permission_request_ids("c-1").unwrap();
+        known.sort();
+        assert_eq!(known, vec!["new-answered", "old-pending"]);
+    }
+
+    #[test]
+    fn delete_project_removes_only_that_projects_tasks_and_their_requests() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        s.insert_task("c-1", "p1", "t1").unwrap();
+        s.insert_task("c-2", "p2", "t1").unwrap();
+        s.insert_permission_request(&request("q-1", "c-1", "t1"))
+            .unwrap();
+        s.insert_permission_request(&request("q-2", "c-2", "t1"))
+            .unwrap();
+        s.delete_project("p1").unwrap();
+        assert!(s.get_task("c-1").unwrap().is_none());
+        assert!(s.get_task("c-2").unwrap().is_some());
+        assert!(s.permission_request_ids("c-1").unwrap().is_empty());
+        assert_eq!(s.permission_request_ids("c-2").unwrap(), vec!["q-2"]);
     }
 }

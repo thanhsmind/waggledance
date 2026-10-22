@@ -141,7 +141,8 @@ pub fn run() -> Result<()> {
                         ask_state_schema(),
                         dispatch_schema(),
                         await_schema(),
-                        runs_schema()
+                        runs_schema(),
+                        task_schema()
                     ]
                 }),
             )),
@@ -228,8 +229,8 @@ fn ask_state_schema() -> Value {
     project's own orchestration opt-in. `leaders` lists the Paseo agents labelled \
     waggledance.role=leader whose cwd sits in the project's root or one of its worktrees, \
     oldest first: {agent_id, status, cwd, created, via, labels, waiting_on, \
-    last_daemon_run}, where `via` is `supervisor` for a leader carrying \
-    waggledance.via=supervisor and `daemon` otherwise. `leaders` is ABSENT when \
+    last_daemon_run}, where `via` is `wd` for a leader carrying \
+    waggledance.via=wd and `daemon` otherwise. `leaders` is ABSENT when \
     `[paseo] enabled = false`, `null` beside a `leaders_error` reason when Paseo cannot \
     be read, and an array (possibly empty) beside `leaders_skipped`, the count of \
     leaders under no registered project, otherwise.",
@@ -300,6 +301,27 @@ fn runs_schema() -> Value {
     })
 }
 
+fn task_schema() -> Value {
+    json!({
+        "name": "waggledance_task",
+        "description": "Follow up on a task wd handed to a project's Paseo leader, by its corr. \
+    `reply` and `redo` queue the user's words for that leader; `accept` closes the task and \
+    archives its leader when nothing else uses it; `allow` and `deny` answer the leader's \
+    permission request `req_id` (the newest unanswered one when absent). Only ever pass the \
+    user's own allow or deny.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "corr": { "type": "string", "description": "The task's correlation id" },
+                "action": { "type": "string", "enum": ["reply", "redo", "accept", "allow", "deny"] },
+                "text": { "type": "string", "description": "The user's words — required for reply and redo" },
+                "req_id": { "type": "string", "description": "The permission request to answer — allow and deny only" }
+            },
+            "required": ["corr", "action"]
+        }
+    })
+}
+
 fn handle_tool_call(
     id: Option<Value>,
     engine: &Engine,
@@ -326,6 +348,7 @@ fn handle_tool_call(
             handle_await(id, engine, orchestration, &args, &resolve_data_dir(None))
         }
         "waggledance_runs" => handle_runs(id, engine, &args),
+        "waggledance_task" => handle_task(id, engine, orchestration, &args),
         _ => err(id, -32602, "unknown tool"),
     }
 }
@@ -835,7 +858,7 @@ enum LeadersRead {
     Unreachable(String),
     Listed {
         all: Vec<paseo::ListedAgent>,
-        via: std::collections::HashSet<String>,
+        wd: std::collections::HashSet<String>,
     },
 }
 
@@ -861,10 +884,11 @@ fn read_leaders(config: &waggledance_core::config::PaseoConfig) -> LeadersRead {
     runtime
         .block_on(async {
             let all = cli.list_labelled(&paseo::role_leaders_args()).await?;
-            let via = cli.list_labelled(&paseo::via_leaders_args()).await?;
+            let wd = paseo::labelled(paseo::role_leaders_args(), paseo::WD_LABEL);
+            let wd = cli.list_labelled(&wd).await?;
             Ok::<_, paseo::PaseoError>(LeadersRead::Listed {
                 all,
-                via: via.into_iter().map(|a| a.id).collect(),
+                wd: wd.into_iter().map(|a| a.id).collect(),
             })
         })
         .unwrap_or_else(|e| LeadersRead::Unreachable(e.to_string()))
@@ -916,14 +940,14 @@ fn attach_leaders(
     let Some(object) = digest.as_object_mut() else {
         return;
     };
-    let (all, via) = match leaders {
+    let (all, wd) = match leaders {
         LeadersRead::Off => return,
         LeadersRead::Unreachable(reason) => {
             object.insert("leaders".to_string(), Value::Null);
             object.insert("leaders_error".to_string(), json!(reason));
             return;
         }
-        LeadersRead::Listed { all, via } => (all, via),
+        LeadersRead::Listed { all, wd } => (all, wd),
     };
     let mut skipped = 0usize;
     let mut mine: Vec<(&paseo::ListedAgent, std::path::PathBuf)> = Vec::new();
@@ -963,17 +987,17 @@ fn attach_leaders(
     let entries: Vec<Value> = mine
         .into_iter()
         .map(|(agent, cwd)| {
-            let supervised = via.contains(&agent.id);
+            let via = wd.contains(&agent.id).then_some("wd");
             json!({
                 "agent_id": agent.id,
                 "status": agent.status,
                 "cwd": cwd.display().to_string(),
                 "created": agent.created,
-                "via": if supervised { "supervisor" } else { "daemon" },
+                "via": via.unwrap_or("daemon"),
                 "labels": {
                     "waggledance.role": "leader",
                     "waggledance.project": project.id,
-                    "waggledance.via": supervised.then_some("supervisor")
+                    "waggledance.via": via
                 },
                 "waiting_on": waiting_on,
                 "last_daemon_run": last_daemon_run
@@ -1145,9 +1169,10 @@ fn handle_dispatch(
         }
     }
     if leader {
-        let caller = std::env::var("PASEO_AGENT_ID")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let caller = dispatch_caller(
+            std::env::var("PASEO_AGENT_ID").ok(),
+            std::env::var("WAGGLEDANCE_CALLER").ok(),
+        );
         return dispatch_to_leader(
             id,
             engine,
@@ -1259,6 +1284,12 @@ fn duplicate(id: Option<Value>, run: &Run) -> Value {
     )
 }
 
+fn dispatch_caller(paseo_agent: Option<String>, waggledance: Option<String>) -> Option<String> {
+    paseo_agent
+        .filter(|s| !s.is_empty())
+        .or_else(|| (waggledance.as_deref() == Some("wd")).then(|| paseo::WD_CALLER.to_string()))
+}
+
 fn dispatch_to_leader(
     id: Option<Value>,
     engine: &Engine,
@@ -1275,12 +1306,20 @@ fn dispatch_to_leader(
         return tool_error(id, &why);
     }
     let now = now_rfc3339();
+    let run_id = format!("run-{:016x}", rand::random::<u64>());
+    let task = match caller == Some(paseo::WD_CALLER) {
+        true => {
+            let corr = request_id.unwrap_or(&run_id);
+            paseo::wd_task(corr.split_once(':').map_or(corr, |(c, _)| c), task)
+        }
+        false => task.to_string(),
+    };
     let run = Run {
-        id: format!("run-{:016x}", rand::random::<u64>()),
+        id: run_id,
         project_id: project.id.clone(),
         pane_id: format!("{}pending", orchestrate::PASEO_PANE_PREFIX),
         preset_label: None,
-        task: task.to_string(),
+        task,
         baseline: now.clone(),
         marker: String::new(),
         status: "queued".to_string(),
@@ -1298,11 +1337,17 @@ fn dispatch_to_leader(
             Err(e) => tool_error(id, &format!("run lookup failed: {e}")),
         };
     }
-    let warnings: Vec<String> = if delivery_paused(data_dir) {
+    let mut warnings: Vec<String> = if delivery_paused(data_dir) {
         vec![DELIVERY_PAUSED.to_string()]
     } else {
         Vec::new()
     };
+    let hand_off = request_id.filter(|r| caller == Some(paseo::WD_CALLER) && !r.contains(':'));
+    if let Some(corr) = hand_off {
+        if let Err(e) = engine.insert_task(corr, &project.id, &run.created_at) {
+            warnings.push(format!("task {corr} was not recorded: {e}"));
+        }
+    }
     let mut text = format!(
         "queued run {} for project {}'s Paseo leader",
         run.id, project.id
@@ -1321,6 +1366,221 @@ fn dispatch_to_leader(
                 "duplicate": false,
                 "warnings": warnings
             }
+        }),
+    )
+}
+
+fn handle_task(
+    id: Option<Value>,
+    engine: &Engine,
+    orchestration: &mut Option<Orchestration>,
+    args: &Value,
+) -> Value {
+    let orch = match orchestration_handle(orchestration, &engine.config.terminal) {
+        Ok(o) => o,
+        Err(e) => return tool_error(id, &e),
+    };
+    let cli = paseo::PaseoCli::new(&engine.config.paseo);
+    orch.runtime
+        .block_on(task_action(id, engine, &cli, args, &resolve_data_dir(None)))
+}
+
+async fn task_action(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    args: &Value,
+    data_dir: &Path,
+) -> Value {
+    let arg = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let Some(corr) = arg("corr") else {
+        return tool_error(id, "\"corr\" is required");
+    };
+    let action = arg("action").unwrap_or_default();
+    let prefix = match action {
+        "reply" => "Reply from the user:",
+        "redo" => "Redo requested:",
+        "accept" | "allow" | "deny" => "",
+        _ => {
+            return tool_error(
+                id,
+                &format!("unknown action {action}: use reply, redo, accept, allow or deny"),
+            )
+        }
+    };
+    let text = arg("text");
+    if !prefix.is_empty() && text.is_none() {
+        return tool_error(id, &format!("\"text\" is required for {action}"));
+    }
+    let task = match engine.get_task(corr) {
+        Ok(Some(task)) => task,
+        Ok(None) => return tool_error(id, &format!("unknown task {corr}")),
+        Err(e) => return tool_error(id, &format!("task lookup failed: {e}")),
+    };
+    if task.state == "closed" {
+        return match action {
+            "accept" => ok(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": format!("task {corr} was already closed") }],
+                    "structuredContent": { "corr": corr, "closed": true, "archived": false }
+                }),
+            ),
+            _ => tool_error(id, &format!("task {corr} is closed")),
+        };
+    }
+    let Some(leader) = task.leader_id.as_deref() else {
+        return tool_error(
+            id,
+            &format!("task {corr} has no leader yet — it is still queued for delivery"),
+        );
+    };
+    let project = match engine.get_project(&task.project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return tool_error(id, &format!("project not found: {}", task.project_id)),
+        Err(e) => return tool_error(id, &format!("project lookup failed: {e}")),
+    };
+    if !prefix.is_empty() {
+        let body = format!("{prefix}\n{}", text.unwrap_or_default());
+        for n in 1.. {
+            let resp = dispatch_to_leader(
+                id.clone(),
+                engine,
+                &project,
+                &body,
+                Some(&format!("{corr}:{n}")),
+                Some(paseo::WD_CALLER),
+                data_dir,
+            );
+            if resp["result"]["structuredContent"]["duplicate"] != true {
+                return resp;
+            }
+        }
+    }
+    if let Some(why) = paseo::paseo_unavailable(&engine.config.paseo) {
+        return tool_error(id, &why);
+    }
+    match action {
+        "accept" => accept_task(id, engine, paseo, corr, leader, &project.id).await,
+        _ => {
+            permit_task(
+                id,
+                engine,
+                paseo,
+                corr,
+                leader,
+                action == "allow",
+                arg("req_id"),
+            )
+            .await
+        }
+    }
+}
+
+async fn accept_task(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    corr: &str,
+    leader: &str,
+    project_id: &str,
+) -> Value {
+    if let Err(e) = engine.close_task(corr, &now_rfc3339()) {
+        return tool_error(id, &format!("task {corr} was not closed: {e}"));
+    }
+    let pane = format!("{}{leader}", orchestrate::PASEO_PANE_PREFIX);
+    let pending = format!("{}pending", orchestrate::PASEO_PANE_PREFIX);
+    let queued = engine
+        .list_queued_paseo_runs(project_id)
+        .unwrap_or_default();
+    let inflight = engine.list_inflight_paseo_runs().unwrap_or_default();
+    let live = queued
+        .iter()
+        .filter(|r| {
+            r.pane_id == pane || (r.pane_id == pending && paseo::wd_corr(&r.task).is_some())
+        })
+        .chain(inflight.iter().filter(|r| r.pane_id == pane))
+        .next();
+    let sharing = engine
+        .list_open_tasks()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|t| t.leader_id.as_deref() == Some(leader));
+    let kept = match (live, sharing) {
+        (Some(run), _) => Some(format!("run {} is still queued or working on it", run.id)),
+        (None, Some(other)) => Some(format!("open task {} shares it", other.corr)),
+        (None, None) => None,
+    };
+    let text = match &kept {
+        Some(why) => format!("task {corr} closed; leader {leader} left running: {why}"),
+        None => match paseo.archive(leader).await {
+            Ok(()) => format!("task {corr} closed; leader {leader} archived"),
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("task {corr} closed, but archiving leader {leader} failed: {e}"),
+                )
+            }
+        },
+    };
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "corr": corr, "closed": true, "archived": kept.is_none() }
+        }),
+    )
+}
+
+async fn permit_task(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    corr: &str,
+    leader: &str,
+    allow: bool,
+    req_id: Option<&str>,
+) -> Value {
+    let req_id = match req_id {
+        Some(r) => r.to_string(),
+        None => match engine.unanswered_permission_requests(corr) {
+            Ok(requests) => match requests.into_iter().next() {
+                Some(r) => r.req_id,
+                None => {
+                    return tool_error(
+                        id,
+                        &format!("task {corr} has no unanswered permission request"),
+                    )
+                }
+            },
+            Err(e) => return tool_error(id, &format!("permission lookup failed: {e}")),
+        },
+    };
+    let verb = if allow { "allow" } else { "deny" };
+    if let Err(e) = paseo.permit(leader, &req_id, allow).await {
+        return tool_error(
+            id,
+            &format!("paseo permit {verb} {leader} {req_id} failed: {e}"),
+        );
+    }
+    let mut warnings = Vec::new();
+    if let Err(e) = engine.answer_permission_request(&req_id, &now_rfc3339()) {
+        warnings.push(format!("request {req_id} not marked answered: {e}"));
+    }
+    let mut text = format!("{verb} sent for request {req_id} of leader {leader} (task {corr})");
+    for warning in &warnings {
+        text.push_str("; ");
+        text.push_str(warning);
+    }
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "corr": corr, "req_id": req_id, "answer": verb, "warnings": warnings }
         }),
     )
 }
@@ -1677,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_seven_schemas() {
+    fn tools_list_has_eight_schemas() {
         let tools = [
             view_file_schema(),
             search_schema(),
@@ -1686,6 +1946,7 @@ mod tests {
             dispatch_schema(),
             await_schema(),
             runs_schema(),
+            task_schema(),
         ];
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
@@ -1697,7 +1958,8 @@ mod tests {
                 "waggledance_ask_state",
                 "waggledance_dispatch",
                 "waggledance_await",
-                "waggledance_runs"
+                "waggledance_runs",
+                "waggledance_task"
             ]
         );
     }
@@ -2237,7 +2499,7 @@ mod tests {
                     "1 days ago",
                 ),
             ],
-            via: ["young".to_string()].into_iter().collect(),
+            wd: Default::default(),
         };
         let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
         attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
@@ -2253,8 +2515,8 @@ mod tests {
         assert_eq!(digest["leaders_skipped"], 1, "{digest}");
         assert_eq!(leaders[0]["via"], "daemon");
         assert!(leaders[0]["labels"]["waggledance.via"].is_null());
-        assert_eq!(leaders[1]["via"], "supervisor");
-        assert_eq!(leaders[1]["labels"]["waggledance.via"], "supervisor");
+        assert_eq!(leaders[1]["via"], "daemon");
+        assert!(leaders[1]["labels"]["waggledance.via"].is_null());
         assert_eq!(leaders[1]["labels"]["waggledance.role"], "leader");
         assert_eq!(
             leaders[1]["labels"]["waggledance.project"],
@@ -2316,7 +2578,7 @@ mod tests {
         ];
         let read = LeadersRead::Listed {
             all: vec![listed("theirs", "/srv/elsewhere", "1 hours ago")],
-            via: Default::default(),
+            wd: Default::default(),
         };
         let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
         attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
@@ -3225,6 +3487,112 @@ mod tests {
     }
 
     #[test]
+    fn a_wd_caller_comes_from_waggledance_caller_only_without_a_paseo_agent() {
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(
+            dispatch_caller(None, some("wd")).as_deref(),
+            Some("openclaw:wd")
+        );
+        assert_eq!(
+            dispatch_caller(some(""), some("wd")).as_deref(),
+            Some("openclaw:wd")
+        );
+        assert_eq!(
+            dispatch_caller(some("agent"), some("wd")).as_deref(),
+            Some("agent")
+        );
+        assert_eq!(dispatch_caller(None, some("other")), None);
+        assert_eq!(dispatch_caller(None, None), None);
+        let schema = dispatch_schema();
+        assert!(schema["inputSchema"]["properties"].get("caller").is_none());
+        assert!(schema["inputSchema"]["properties"].get("via").is_none());
+    }
+
+    #[test]
+    fn a_wd_leader_dispatch_stores_the_task_behind_the_wd_prefix() {
+        let (engine, project, data_dir) = leader_engine("wd-prefix", true, true, true);
+        beat(&data_dir, 0);
+        let resp = dispatch_to_leader(
+            Some(json!(1)),
+            &engine,
+            &project,
+            "ship it",
+            Some("corr-9"),
+            Some(paseo::WD_CALLER),
+            &data_dir,
+        );
+        let run_id = resp["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap();
+        let run = engine.get_run(run_id).unwrap().unwrap();
+        assert_eq!(run.task, paseo::wd_task("corr-9", "ship it"));
+        assert_eq!(paseo::wd_corr(&run.task), Some("corr-9"));
+        assert_eq!(
+            engine.run_caller(run_id).unwrap().as_deref(),
+            Some("openclaw:wd")
+        );
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_wd_hand_off_opens_one_task_and_follow_ups_and_other_callers_open_none() {
+        let (engine, project, data_dir) = leader_engine("wd-task", true, true, true);
+        beat(&data_dir, 0);
+        let send = |task: &str, request_id: &str, caller: Option<&str>| {
+            dispatch_to_leader(
+                Some(json!(1)),
+                &engine,
+                &project,
+                task,
+                Some(request_id),
+                caller,
+                &data_dir,
+            )
+        };
+        send("ship it", "t-abc123", Some(paseo::WD_CALLER));
+        let task = engine.get_task("t-abc123").unwrap().unwrap();
+        assert_eq!(
+            (task.project_id.as_str(), task.state.as_str()),
+            (project.id.as_str(), "open")
+        );
+        assert_eq!(task.changed_at, task.created_at);
+        assert_eq!(task.leader_id, None);
+
+        let dup = send("ship it", "t-abc123", Some(paseo::WD_CALLER));
+        assert_eq!(dup["result"]["structuredContent"]["duplicate"], true);
+        send("more", "t-abc123:1", Some(paseo::WD_CALLER));
+        send("plain", "t-def456", Some("agent-caller"));
+        send("plain", "t-fed654", None);
+        let open: Vec<String> = engine
+            .list_open_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.corr)
+            .collect();
+        assert_eq!(open, vec!["t-abc123"]);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_via_wd_leader_shows_via_wd_in_ask_state() {
+        let (engine, project, base) = leaders_project("wd-via");
+        let rollup = bee::read_rollup(std::slice::from_ref(&project.root_path))
+            .pop()
+            .unwrap();
+        let claims = vec![(canonical(&project.root_path), project.id.clone())];
+        let root = project.root_path.display().to_string();
+        let read = LeadersRead::Listed {
+            all: vec![listed("wd-lead", &root, "2 hours ago")],
+            wd: ["wd-lead".to_string()].into_iter().collect(),
+        };
+        let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
+        attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
+        assert_eq!(digest["leaders"][0]["via"], "wd", "{digest}");
+        assert_eq!(digest["leaders"][0]["labels"]["waggledance.via"], "wd");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn a_leader_dispatch_is_accepted_while_an_earlier_one_is_still_held() {
         let (engine, project, data_dir) = leader_engine("busy", true, true, true);
         beat(&data_dir, 0);
@@ -3345,6 +3713,279 @@ mod tests {
         assert_eq!(sc["status"], "working");
         assert_eq!(sc["duplicate"], true);
         assert!(orchestration.is_none());
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    fn task_rig(tag: &str) -> (Engine, Project, std::path::PathBuf, paseo::fake::FakePaseo) {
+        let (engine, project, data_dir) = leader_engine(tag, true, true, true);
+        beat(&data_dir, 0);
+        engine
+            .insert_task("t-1", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-1", "lead-1", "2026-10-22T10:01:00Z")
+            .unwrap();
+        (engine, project, data_dir, paseo::fake::FakePaseo::default())
+    }
+
+    async fn task_call(
+        engine: &Engine,
+        fake: &paseo::fake::FakePaseo,
+        data_dir: &Path,
+        args: Value,
+    ) -> Value {
+        task_action(Some(json!(1)), engine, fake, &args, data_dir).await
+    }
+
+    fn permission(req_id: &str, seen_at: &str) -> waggledance_core::domain::PermissionRequest {
+        waggledance_core::domain::PermissionRequest {
+            req_id: req_id.into(),
+            corr: "t-1".into(),
+            leader_id: "lead-1".into(),
+            tool: "Bash".into(),
+            description: "rm -rf build".into(),
+            seen_at: seen_at.into(),
+            answered_at: None,
+            closed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_and_redo_queue_numbered_wd_runs_that_resolve_to_the_corr() {
+        let (engine, project, data_dir, fake) = task_rig("task-reply");
+        let reply = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "reply", "text": "use dd/mm" }),
+        )
+        .await;
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+        let first = engine
+            .run_by_request(&project.id, "t-1:1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["result"]["structuredContent"]["run_id"], first.id);
+        assert_eq!(
+            first.task,
+            paseo::wd_task("t-1", "Reply from the user:\nuse dd/mm")
+        );
+        assert_eq!(paseo::wd_corr(&first.task), Some("t-1"));
+        assert_eq!(first.status, "queued");
+        assert_eq!(
+            engine.run_caller(&first.id).unwrap().as_deref(),
+            Some(paseo::WD_CALLER)
+        );
+
+        let redo = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "redo", "text": "button on the right" }),
+        )
+        .await;
+        assert_eq!(
+            redo["result"]["structuredContent"]["duplicate"], false,
+            "{redo}"
+        );
+        let second = engine
+            .run_by_request(&project.id, "t-1:2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.task,
+            paseo::wd_task("t-1", "Redo requested:\nbutton on the right")
+        );
+        assert!(fake.calls().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn accept_closes_the_task_archives_an_unused_leader_and_repeats_quietly() {
+        let (engine, project, data_dir, fake) = task_rig("task-accept");
+        let args = json!({ "corr": "t-1", "action": "accept" });
+        let resp = task_call(&engine, &fake, &data_dir, args.clone()).await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], true,
+            "{resp}"
+        );
+        assert_eq!(engine.get_task("t-1").unwrap().unwrap().state, "closed");
+        assert_eq!(
+            fake.calls(),
+            vec![paseo::fake::Call::Archive("lead-1".into())]
+        );
+
+        let again = task_call(&engine, &fake, &data_dir, args).await;
+        assert_ne!(again["result"]["isError"], true, "{again}");
+        assert_eq!(again["result"]["structuredContent"]["archived"], false);
+        assert_eq!(fake.calls().len(), 1);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn accept_leaves_a_leader_another_task_or_a_live_run_still_uses() {
+        let (engine, project, data_dir, fake) = task_rig("task-accept-shared");
+        engine
+            .insert_task("t-2", &project.id, "2026-10-22T10:02:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-2", "lead-1", "2026-10-22T10:03:00Z")
+            .unwrap();
+        let resp = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "accept" }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], false,
+            "{resp}"
+        );
+        assert!(text_of(&resp).contains("t-2"), "{resp}");
+        assert_eq!(engine.get_task("t-1").unwrap().unwrap().state, "closed");
+
+        task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-2", "action": "reply", "text": "one more" }),
+        )
+        .await;
+        let resp = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-2", "action": "accept" }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], false,
+            "{resp}"
+        );
+        assert!(text_of(&resp).contains("queued or working"), "{resp}");
+        assert!(fake.calls().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn allow_and_deny_permit_the_leader_and_mark_the_request_answered() {
+        let (engine, project, data_dir, fake) = task_rig("task-permit");
+        engine
+            .insert_permission_request(&permission("req-old", "2026-10-22T10:05:00Z"))
+            .unwrap();
+        engine
+            .insert_permission_request(&permission("req-new", "2026-10-22T10:06:00Z"))
+            .unwrap();
+        let allow = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "allow" }),
+        )
+        .await;
+        assert_ne!(allow["result"]["isError"], true, "{allow}");
+        let deny = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "deny", "req_id": "req-old" }),
+        )
+        .await;
+        assert_ne!(deny["result"]["isError"], true, "{deny}");
+        assert_eq!(
+            fake.calls(),
+            vec![
+                paseo::fake::Call::Permit("lead-1".into(), "req-new".into(), true),
+                paseo::fake::Call::Permit("lead-1".into(), "req-old".into(), false),
+            ]
+        );
+        assert!(engine
+            .unanswered_permission_requests("t-1")
+            .unwrap()
+            .is_empty());
+
+        let none_left = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "allow" }),
+        )
+        .await;
+        assert_eq!(none_left["result"]["isError"], true);
+        assert!(text_of(&none_left).contains("no unanswered permission request"));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn task_refusals_name_their_cause_and_touch_nothing() {
+        let (engine, project, data_dir, fake) = task_rig("task-refuse");
+        engine
+            .insert_task("t-new", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .insert_task("t-done", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-done", "lead-9", "2026-10-22T10:01:00Z")
+            .unwrap();
+        engine.close_task("t-done", "2026-10-22T10:02:00Z").unwrap();
+        let cases = [
+            (
+                json!({ "action": "reply", "text": "x" }),
+                "\"corr\" is required",
+            ),
+            (
+                json!({ "corr": "t-1", "action": "merge" }),
+                "unknown action merge",
+            ),
+            (
+                json!({ "corr": "t-1", "action": "reply" }),
+                "\"text\" is required",
+            ),
+            (
+                json!({ "corr": "t-zz", "action": "reply", "text": "x" }),
+                "unknown task t-zz",
+            ),
+            (
+                json!({ "corr": "t-done", "action": "reply", "text": "x" }),
+                "task t-done is closed",
+            ),
+            (
+                json!({ "corr": "t-done", "action": "allow" }),
+                "task t-done is closed",
+            ),
+            (
+                json!({ "corr": "t-new", "action": "redo", "text": "x" }),
+                "task t-new has no leader yet",
+            ),
+            (
+                json!({ "corr": "t-new", "action": "deny" }),
+                "task t-new has no leader yet",
+            ),
+        ];
+        for (args, cause) in cases {
+            let resp = task_call(&engine, &fake, &data_dir, args.clone()).await;
+            assert_eq!(resp["result"]["isError"], true, "{args} {resp}");
+            assert!(text_of(&resp).contains(cause), "{args} {resp}");
+        }
+        assert!(fake.calls().is_empty());
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn the_task_tool_is_listed_and_routed() {
+        let schema = task_schema();
+        assert_eq!(schema["name"], "waggledance_task");
+        assert_eq!(schema["inputSchema"]["required"], json!(["corr", "action"]));
+        let (engine, pa) = dispatch_engine("task-routed");
+        let resp = call_tool(
+            &engine,
+            "waggledance_task",
+            json!({ "corr": "t-x", "action": "reply", "text": "x" }),
+        );
+        assert!(text_of(&resp).contains("unknown task t-x"), "{resp}");
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: waggledance-supervisor
-description: Hand a spec into a target project's own team via a lead agent opened through waggledance's dispatch door — relay mode files it as a proposed PBI and stops; execute mode has the lead run its own full chain to a finished result. Use whenever a request routes work into another repo, whether to file it (hand off, drop, route) or to get it fully built/done there (làm hoàn chỉnh, do it completely, build it, finish it) — the skill states which mode first, always. Never drives that repo's work directly from this session in either mode. Also use whenever the human asks to send or hand a task to a project's leader ("gửi qua leader của project X", "gửi cho leader X", "send it to X's leader", "tell the X leader") — that goes to the waggledance supervisor in leader mode, which finds and drives the leader.
+description: Hand a spec into a target project's own team via a lead agent opened through waggledance's dispatch door — relay mode files it as a proposed PBI and stops; execute mode has the lead run its own full chain to a finished result. Use whenever a request routes work into another repo, whether to file it (hand off, drop, route) or to get it fully built/done there (làm hoàn chỉnh, do it completely, build it, finish it) — the skill states which mode first, always. Never drives that repo's work directly from this session in either mode. Also use whenever the human asks to send or hand a task to a project's leader ("gửi qua leader của project X", "gửi cho leader X", "send it to X's leader", "tell the X leader") — that is leader mode, which hands it to the project's leader through waggledance.
 ---
 
 # waggledance-supervisor
@@ -155,29 +155,25 @@ either — ask the human which mode, rather than guessing.
 ## Leader mode — when the target project runs in Paseo
 
 A request that names a project's leader ("gửi qua leader của project X", "send it to
-X's leader") is leader mode at once: hand it to the waggledance supervisor as described
+X's leader") is leader mode at once: hand it to waggledance through one of the two doors
 below, and never search for the leader yourself — do not list Paseo agents, panes or
 workspaces to find it. The mode gate still decides scope: a routing phrase with no
 completion verb is relay mode.
 
-A project whose lead lives in Paseo is reached through the waggledance supervisor, the
-one Paseo agent labelled `waggledance.role=supervisor`. It opens or reuses the
-project's leader, watches it, and reports back on Telegram. Hand the task to it:
+The daemon finds the project's Paseo leader or creates it, queues per project, and
+delivers while the leader is idle. Hand the task to it:
 
-- From aicoworker, run its `waggledance-orchestrator` skill's `handoff --task "<task>"`.
+- From aicoworker, run `wd-bridge.py handoff --project <project> --task "<task>"`.
   Keep the `corr` it prints; `reply`, `redo` and `accept` carry it.
-- From anywhere else, run `waggledance supervisor ensure --json` for the supervisor's
-  `agent_id` (it starts one when none is listed), then
-  `paseo send <agent_id> --no-wait` with the message `[handoff <corr>] <task>`.
+- From any other session, call `waggledance_dispatch` with `{project, task, leader:
+  true, request_id}`, where `request_id` is the correlation id minted for this hand-off,
+  so a retry never sends twice.
 
 The mode gate, the provenance line as line 1, the spec body, and the file-and-stop or
 execute-to-completion contract hold unchanged inside the task text. Never name a
-workspace, an agent id, a provider, or a working directory for the leader; the
-supervisor and the project's `.waggledance.toml` own them.
-
-`waggledance_dispatch` with `leader: true` is the daemon's door. It is frozen and kept
-for the Waggle Dance plugin's request box; do not use it as the first choice. Its
-queue, statuses, and notices are in `docs/knowledge/patterns/paseo-leader-dispatch.md`.
+workspace, an agent id, a provider, or a working directory for the leader; the daemon
+and the project's `.waggledance.toml` own them. The queue, statuses, and notices are in
+`docs/knowledge/patterns/paseo-leader-dispatch.md`.
 
 ## Refusals
 
