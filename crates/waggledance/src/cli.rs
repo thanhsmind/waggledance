@@ -97,6 +97,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SupervisorAction,
     },
+    #[command(about = "Send one message to wd's inbox (leaders use this to report back).")]
+    Mail {
+        #[command(subcommand)]
+        action: MailAction,
+    },
     /// Edit configuration.
     Config {
         #[command(subcommand)]
@@ -125,6 +130,21 @@ pub enum SupervisorAction {
         text: String,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MailAction {
+    #[command(about = "Queue one message for wd; the body is read from --body-file or stdin.")]
+    Send {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        corr: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        body_file: Option<PathBuf>,
     },
 }
 
@@ -169,6 +189,7 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
         } => crate::setup::run(target, remove, json),
         Command::Supervisor { action } => crate::seat::run(action),
+        Command::Mail { action } => crate::mail::run(action),
         Command::Config { action } => match action {
             ConfigAction::Edit => cmd_config_edit(),
         },

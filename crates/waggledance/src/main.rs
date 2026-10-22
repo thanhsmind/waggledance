@@ -14,6 +14,7 @@ mod discovery;
 mod doctor;
 mod guide;
 mod herdr;
+mod mail;
 mod mcp;
 mod notify;
 mod orchestrate;

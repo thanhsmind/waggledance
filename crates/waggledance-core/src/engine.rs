@@ -530,6 +530,10 @@ impl Engine {
         self.store.run_by_request(project_id, request_id)
     }
 
+    pub fn project_for_corr(&self, corr: &str) -> Result<Option<String>> {
+        self.store.project_for_corr(corr)
+    }
+
     pub fn run_caller(&self, id: &str) -> Result<Option<String>> {
         self.store.run_caller(id)
     }

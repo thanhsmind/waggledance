@@ -174,6 +174,17 @@ impl SqliteStore {
         Ok(rows.next()?.map(row_to_run))
     }
 
+    pub fn project_for_corr(&self, corr: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT project_id FROM runs
+             WHERE request_id=?1 OR substr(request_id,1,length(?1)+1)=?1||':'
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![corr])?;
+        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+    }
+
     pub fn run_caller(&self, id: &str) -> Result<Option<String>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare("SELECT caller FROM runs WHERE id=?1")?;
