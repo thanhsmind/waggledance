@@ -92,11 +92,6 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Find or start the supervisor agent, or hand a report to the OpenClaw agent.
-    Supervisor {
-        #[command(subcommand)]
-        action: SupervisorAction,
-    },
     #[command(about = "Send one message to wd's inbox (leaders use this to report back).")]
     Mail {
         #[command(subcommand)]
@@ -109,28 +104,6 @@ pub enum Command {
     },
     /// Print the version (same value as `--version`).
     Version,
-}
-
-#[derive(Subcommand)]
-pub enum SupervisorAction {
-    /// Find the supervisor agent by label, or start it when absent.
-    Ensure {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Hand one report to the OpenClaw agent's main session through the OpenClaw CLI.
-    Report {
-        #[arg(long)]
-        kind: String,
-        #[arg(long)]
-        project: String,
-        #[arg(long)]
-        corr: String,
-        #[arg(long)]
-        text: String,
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -188,7 +161,6 @@ pub fn run(cli: Cli) -> Result<()> {
             remove,
             json,
         } => crate::setup::run(target, remove, json),
-        Command::Supervisor { action } => crate::seat::run(action),
         Command::Mail { action } => crate::mail::run(action),
         Command::Config { action } => match action {
             ConfigAction::Edit => cmd_config_edit(),

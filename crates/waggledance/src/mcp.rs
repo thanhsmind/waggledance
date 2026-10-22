@@ -229,9 +229,8 @@ fn ask_state_schema() -> Value {
     project's own orchestration opt-in. `leaders` lists the Paseo agents labelled \
     waggledance.role=leader whose cwd sits in the project's root or one of its worktrees, \
     oldest first: {agent_id, status, cwd, created, via, labels, waiting_on, \
-    last_daemon_run}, where `via` is `supervisor` for a leader carrying \
-    waggledance.via=supervisor, `wd` for one carrying waggledance.via=wd, and `daemon` \
-    otherwise. `leaders` is ABSENT when \
+    last_daemon_run}, where `via` is `wd` for a leader carrying \
+    waggledance.via=wd and `daemon` otherwise. `leaders` is ABSENT when \
     `[paseo] enabled = false`, `null` beside a `leaders_error` reason when Paseo cannot \
     be read, and an array (possibly empty) beside `leaders_skipped`, the count of \
     leaders under no registered project, otherwise.",
@@ -859,7 +858,6 @@ enum LeadersRead {
     Unreachable(String),
     Listed {
         all: Vec<paseo::ListedAgent>,
-        via: std::collections::HashSet<String>,
         wd: std::collections::HashSet<String>,
     },
 }
@@ -886,12 +884,10 @@ fn read_leaders(config: &waggledance_core::config::PaseoConfig) -> LeadersRead {
     runtime
         .block_on(async {
             let all = cli.list_labelled(&paseo::role_leaders_args()).await?;
-            let via = cli.list_labelled(&paseo::via_leaders_args()).await?;
             let wd = paseo::labelled(paseo::role_leaders_args(), paseo::WD_LABEL);
             let wd = cli.list_labelled(&wd).await?;
             Ok::<_, paseo::PaseoError>(LeadersRead::Listed {
                 all,
-                via: via.into_iter().map(|a| a.id).collect(),
                 wd: wd.into_iter().map(|a| a.id).collect(),
             })
         })
@@ -944,14 +940,14 @@ fn attach_leaders(
     let Some(object) = digest.as_object_mut() else {
         return;
     };
-    let (all, via, wd) = match leaders {
+    let (all, wd) = match leaders {
         LeadersRead::Off => return,
         LeadersRead::Unreachable(reason) => {
             object.insert("leaders".to_string(), Value::Null);
             object.insert("leaders_error".to_string(), json!(reason));
             return;
         }
-        LeadersRead::Listed { all, via, wd } => (all, via, wd),
+        LeadersRead::Listed { all, wd } => (all, wd),
     };
     let mut skipped = 0usize;
     let mut mine: Vec<(&paseo::ListedAgent, std::path::PathBuf)> = Vec::new();
@@ -991,11 +987,7 @@ fn attach_leaders(
     let entries: Vec<Value> = mine
         .into_iter()
         .map(|(agent, cwd)| {
-            let via = match (via.contains(&agent.id), wd.contains(&agent.id)) {
-                (true, _) => Some("supervisor"),
-                (_, true) => Some("wd"),
-                _ => None,
-            };
+            let via = wd.contains(&agent.id).then_some("wd");
             json!({
                 "agent_id": agent.id,
                 "status": agent.status,
@@ -2507,7 +2499,6 @@ mod tests {
                     "1 days ago",
                 ),
             ],
-            via: ["young".to_string()].into_iter().collect(),
             wd: Default::default(),
         };
         let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
@@ -2524,8 +2515,8 @@ mod tests {
         assert_eq!(digest["leaders_skipped"], 1, "{digest}");
         assert_eq!(leaders[0]["via"], "daemon");
         assert!(leaders[0]["labels"]["waggledance.via"].is_null());
-        assert_eq!(leaders[1]["via"], "supervisor");
-        assert_eq!(leaders[1]["labels"]["waggledance.via"], "supervisor");
+        assert_eq!(leaders[1]["via"], "daemon");
+        assert!(leaders[1]["labels"]["waggledance.via"].is_null());
         assert_eq!(leaders[1]["labels"]["waggledance.role"], "leader");
         assert_eq!(
             leaders[1]["labels"]["waggledance.project"],
@@ -2587,7 +2578,6 @@ mod tests {
         ];
         let read = LeadersRead::Listed {
             all: vec![listed("theirs", "/srv/elsewhere", "1 hours ago")],
-            via: Default::default(),
             wd: Default::default(),
         };
         let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
@@ -3593,7 +3583,6 @@ mod tests {
         let root = project.root_path.display().to_string();
         let read = LeadersRead::Listed {
             all: vec![listed("wd-lead", &root, "2 hours ago")],
-            via: Default::default(),
             wd: ["wd-lead".to_string()].into_iter().collect(),
         };
         let mut digest = ask_state_digest(&project.id, &rollup.snapshot);

@@ -10,7 +10,6 @@ use waggledance_core::domain::Project;
 use waggledance_core::project_settings::ProjectPaseo;
 
 pub const ROLE_LABEL: &str = "waggledance.role=leader";
-pub const VIA_LABEL: &str = "waggledance.via=supervisor";
 pub const WD_LABEL: &str = "waggledance.via=wd";
 pub const WD_CALLER: &str = "openclaw:wd";
 pub const PROJECT_LABEL_KEY: &str = "waggledance.project";
@@ -181,10 +180,6 @@ pub fn role_leaders_args() -> Vec<String> {
         ROLE_LABEL.into(),
         "--json".into(),
     ]
-}
-
-pub fn via_leaders_args() -> Vec<String> {
-    labelled(role_leaders_args(), VIA_LABEL)
 }
 
 pub fn labelled(mut args: Vec<String>, label: &str) -> Vec<String> {
@@ -2358,22 +2353,10 @@ mod tests {
     }
 
     #[test]
-    fn leaders_lists_filter_by_role_then_by_role_and_via() {
+    fn leaders_lists_filter_by_role() {
         assert_eq!(
             role_leaders_args(),
             ["ls", "-g", "--label", "waggledance.role=leader", "--json"]
-        );
-        assert_eq!(
-            via_leaders_args(),
-            [
-                "ls",
-                "-g",
-                "--label",
-                "waggledance.role=leader",
-                "--label",
-                "waggledance.via=supervisor",
-                "--json"
-            ]
         );
     }
 

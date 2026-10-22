@@ -59,10 +59,6 @@ fn frame(tag: &str, kind: &str, project: &str, text: &str) -> Result<String> {
     ))
 }
 
-pub fn framed_message(kind: &str, project: &str, corr: &str, text: &str) -> Result<String> {
-    frame(corr, kind, project, text)
-}
-
 pub fn inbox_frame(message: &InboxMessage, project: &str) -> Result<String> {
     frame(
         &format!("{} #{}", message.corr, message.seq),
