@@ -89,6 +89,26 @@ $ rg -a -c '^  <button type="button" class="term-create__pane">New shell' old-bu
 The give-away that the check was hollow: the freshly restarted daemon still
 served the old behaviour while every content check printed `1`.
 
+**Disguise 5 — the MCP server is not the daemon.** Every Claude Code session
+starts its own `waggledance mcp` stdio process and keeps it for the life of the
+session. `waggledance restart` replaces the daemon only. A rule enforced inside
+the MCP process — dispatch consent is one — keeps its old behaviour in every
+session opened before the install, however correctly the daemon was rebuilt,
+installed and proven.
+
+*This defeats every remedy above:* the installed binary was resolved, installed
+on the executed path and proven by content, and the daemon served the new
+rule. A sibling session still got the old refusal word for word
+(paseo-dispatch-default-on, 2026-10-23). The check that finds it:
+
+```
+$ for p in $(pgrep -f "waggledance mcp"); do readlink /proc/$p/exe; done
+/home/…/.cargo/bin/waggledance (deleted)   ← started before the install
+```
+
+A `(deleted)` exe is an MCP process running the replaced binary. The remedy is
+the session's own: `/mcp` → reconnect waggledance, or reopen the session.
+
 ## The tell
 
 Any of these, and the artifact is unverified:
