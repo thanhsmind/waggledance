@@ -1,0 +1,91 @@
+# Usage Dashboard — Context
+
+**Feature slug:** usage-dashboard
+**Date:** 2026-10-23
+**Shaping session:** complete
+**Scope:** Standard
+**Domain types:** SEE | READ
+
+## Feature Boundary
+
+A new **Usage** tab on the waggledance home page that shows, across every
+registered bee project, how many tokens each project spent, which models
+(main session and subagents) spent them, and which features were completed and
+how long they took — over a selectable 1-day, 7-day, 14-day or 30-day window.
+It reads data bee already writes; it never changes bee, never estimates money,
+and never writes to any project.
+
+## Locked Decisions
+
+| ID | Decision | Rationale (only if it changes implementation) |
+|----|----------|-----------------------------------------------|
+| D1 | Token spend is bucketed by each session's end time (`ended_ms` in `.bee/usage/<feature>.json`) into the window. A feature that spans several days spreads across the days its sessions ended. A feature not yet closed has no usage file and contributes no spend. (decision 892cf93d) | A session whose `ended_ms` is inside the window counts in full; sessions are not split mid-session. |
+| D2 | The dashboard is a new home tab named **Usage**, beside Board and Agents, aggregating every registered bee project, with a per-project filter. (decision 5239a98b) | New `HomeTab` variant and tab-bar entry. |
+| D3 | Tokens only — no USD, no price table. Tokens split into **new** (input + output + cache write) and **cache-read**, per model. (decision be26628f) | Use the `new` / `cached` fields the usage file already carries. |
+| D4 | Windows offered: 1 day, 7 days, 14 days, 30 days, measured back from now in the daemon's local time. | From the request. |
+| D5 | Main-session tokens and subagent tokens are shown separately per model (`models` vs `subagent_models`). | From the request: "mỗi model subagent dùng hết bao nhiêu token". |
+
+### Agent's Discretion
+
+- What a "completed task" row is: one closed feature (a usage file), showing
+  project, feature, close time, cells capped, active agent time (sum of session
+  durations), wall span (first session start to close), and its tokens by model.
+- Layout, charts, ordering and empty-state wording, within the existing atelier
+  design system and with no new JS dependency.
+- Whether the data also comes out as JSON at an `/api/...` route (useful for
+  tests and other consumers).
+
+## Terms
+
+| Term | Meaning in this feature |
+|------|-------------------------|
+| new tokens | `input + output + cache_write` — the usage file's `new` field |
+| cache-read tokens | the usage file's `cached` field |
+| active time | sum over sessions of `ended_ms - started_ms` |
+| completed feature | a feature with a `.bee/usage/<feature>.json` file (written at `bee close`) |
+
+## Existing Code Context
+
+### Reusable Assets
+
+- `crates/waggledance-core/src/bee.rs` — `read_snapshot` (~:1291), `read_rollup`
+  (~:1543), `read_archived_cells` (~:2596), `BeeVelocity` (~:514) as the one
+  existing time-window aggregate. Nothing reads `.bee/usage/` today.
+- `crates/waggledance/src/server.rs` — `BeeSnapshotCache` (~:1188),
+  `compute_bee_fingerprint` (~:1159), `cross_project_rollup` (~:1254),
+  `is_bee_project` (~:3520).
+
+### Established Patterns
+
+- Server-rendered HTML strings in `views.rs`, embedded `assets/app.css` /
+  `assets/app.js`, no frontend build step.
+- `waggledance-core` is synchronous and framework-free; the server fans reads
+  out over `spawn_blocking`.
+- Route tests inline in `server.rs` `mod bee_route_tests` with the `oneshot`
+  harness (`fresh_root`, `write`, `build_state`, `get`).
+
+### Integration Points
+
+- `views.rs` `enum HomeTab` (~:173) and `home_tabbar` (~:540).
+- `server.rs` `fn router` (~:424) and `index_page` (~:882).
+
+## Canonical References
+
+- `.bee/usage/<feature>.json` — schema `bee-usage/v1`: `feature`, `closed_at`,
+  `sessions[] {session_id, models, subagent_models, subagent_count, started_ms,
+  ended_ms, totals}`, `skipped`, `totals`.
+- `docs/knowledge/work/homepage-tabs/`, `docs/knowledge/work/agent-board/index.md`.
+
+## Outstanding Questions
+
+### Deferred To Planning
+
+- [ ] Whether the usage files join the existing `.bee/` fingerprint walk or get
+  their own cache — read `compute_bee_fingerprint`.
+- [ ] How live updates reach the Usage tab (the existing `/ws` reload covers it
+  if `.bee/usage/` is under the watched tree).
+
+## Deferred Ideas
+
+- Estimated USD cost per model — rejected for now by D3; would need a price table.
+- Spend of features still in flight — bee writes usage only at close.

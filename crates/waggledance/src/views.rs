@@ -19,6 +19,7 @@ use waggledance_core::git_diff::{
 };
 use waggledance_core::render::{HighlightedSource, RenderService};
 use waggledance_core::short_link::{path_hash, short_code};
+use waggledance_core::usage::{ModelSpend, UsageSummary};
 
 pub fn layout(title: &str, head_extra: &str, body: &str) -> String {
     let title = esc(title);
@@ -179,6 +180,7 @@ pub enum HomeTab {
     /// [`terminals_tab`] is what tells the herdr-off and no-agent empty
     /// causes apart once this section is actually selected.
     Terminals,
+    Usage,
 }
 
 /// cross-board (D1, superseded) / homepage-tabs: the home page `/` used to
@@ -244,6 +246,7 @@ pub fn home_page(
     // simply absent from the map and its row stays exactly as it was.
     bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
     leader_waits: &LeaderWaitsByProject,
+    usage_html: &str,
 ) -> String {
     // console-theme-kanban (ctk-12), retargeting homepage-tabs edge (b):
     // this line used to force the Projects tab, because that was the only
@@ -357,6 +360,31 @@ pub fn home_page(
                 ),
             ),
         ),
+        HomeTab::Usage => (
+            "Usage",
+            format!(
+                r#"<div class="home-shell">
+{toggle}
+{sidebar}
+{backdrop}
+<main class="fg-page">
+  {usage_html}
+</main>
+</div>"#,
+                toggle = HOME_RAIL_TOGGLE,
+                backdrop = HOME_RAIL_BACKDROP,
+                sidebar = project_sidebar(
+                    projects,
+                    unassigned_visible,
+                    suggestions,
+                    register_error,
+                    terminals_panes,
+                    None,
+                    bee_by_project,
+                    leader_waits,
+                ),
+            ),
+        ),
     };
     // console-rail-orchestrator (D1): the board's entry point is a real
     // anchor in the topbar's own right slot, not a strip under it. An
@@ -384,9 +412,24 @@ pub fn home_page(
     // it". A button and not an anchor — unlike Orchestrator it has no
     // destination to survive a reload to, and its whole behaviour is the
     // overlay below.
+    let on_usage = tab == HomeTab::Usage;
+    let usage = format!(
+        r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator{on_class}" href="/?tab=usage"{aria}>Usage</a>"#,
+        on_class = if on_usage {
+            " topbar__orchestrator--on"
+        } else {
+            ""
+        },
+        aria = if on_usage {
+            r#" aria-current="page""#
+        } else {
+            ""
+        },
+    );
     let actions = format!(
         r#"<button type="button" class="fg-btn fg-btn--ghost topbar__new-task" data-new-task-open>+ New task</button>
-    {orchestrator}"#
+    {orchestrator}
+    {usage}"#
     );
     let body = format!(
         r#"{topbar}
@@ -545,14 +588,16 @@ fn home_tabbar(tab: HomeTab) -> String {
             ("", "")
         }
     };
-    let (board_on, agents_on) = match tab {
-        HomeTab::Kanban => (mark(true), mark(false)),
-        HomeTab::Terminals => (mark(false), mark(true)),
+    let (board_on, agents_on, usage_on) = match tab {
+        HomeTab::Kanban => (mark(true), mark(false), mark(false)),
+        HomeTab::Terminals => (mark(false), mark(true), mark(false)),
+        HomeTab::Usage => (mark(false), mark(false), mark(true)),
     };
     format!(
         r#"<nav class="home-tabbar" id="home-tabbar" aria-label="Sections">
 <a class="home-tabbar__item{board_class}" href="/?tab=kanban"{board_aria}>{board_icon}<span class="home-tabbar__label">Board</span></a>
 <a class="home-tabbar__item{agents_class}" href="/?tab=terminals"{agents_aria}>{agents_icon}<span class="home-tabbar__label">Agents</span></a>
+<a class="home-tabbar__item{usage_class}" href="/?tab=usage"{usage_aria}>{usage_icon}<span class="home-tabbar__label">Usage</span></a>
 <label class="home-tabbar__item" for="rail-toggle">{projects_icon}<span class="home-tabbar__label">Projects</span></label>
 <a class="home-tabbar__item" href="/guide">{guide_icon}<span class="home-tabbar__label">Hướng dẫn</span></a>
 <a class="home-tabbar__item" href="/settings">{settings_icon}<span class="home-tabbar__label">Settings</span></a>
@@ -562,6 +607,9 @@ fn home_tabbar(tab: HomeTab) -> String {
         board_aria = board_on.1,
         agents_class = agents_on.0,
         agents_aria = agents_on.1,
+        usage_class = usage_on.0,
+        usage_aria = usage_on.1,
+        usage_icon = TABBAR_ICON_USAGE,
         board_icon = TABBAR_ICON_BOARD,
         agents_icon = TABBAR_ICON_AGENTS,
         projects_icon = TABBAR_ICON_PROJECTS,
@@ -581,6 +629,7 @@ const TABBAR_ICON_BOARD: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 2
 /// The terminal prompt of [`agent_toggle`], redrawn at this bar's weight —
 /// the same mark for the same thing (a live agent screen) in both places.
 const TABBAR_ICON_AGENTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>"#;
+const TABBAR_ICON_USAGE: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="20" x2="20" y2="20"></line><line x1="7" y1="16" x2="7" y2="11"></line><line x1="12" y1="16" x2="12" y2="6"></line><line x1="17" y1="16" x2="17" y2="9"></line></svg>"#;
 const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>"#;
 /// The topbar gear's own outline, so Settings is the same mark wherever the
 /// reader meets it.
@@ -597,6 +646,225 @@ const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 
 /// down means "hide it".
 const TABBAR_ICON_SHOW: &str = r#"<svg class="home-tabbar__toggle-icon home-tabbar__toggle-icon--show" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 15 12 9 18 15"></polyline></svg>"#;
 const TABBAR_ICON_HIDE: &str = r#"<svg class="home-tabbar__toggle-icon home-tabbar__toggle-icon--hide" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>"#;
+
+pub const USAGE_WINDOWS: [u32; 4] = [1, 7, 14, 30];
+
+pub fn usage_tab(
+    summary: &UsageSummary,
+    days: u32,
+    project: Option<&str>,
+    projects: &[(String, String)],
+) -> String {
+    let href = |d: u32, p: Option<&str>| match p {
+        Some(id) => format!("/?tab=usage&amp;days={d}&amp;project={}", query_escape(id)),
+        None => format!("/?tab=usage&amp;days={d}"),
+    };
+    let chip = |label: String, url: String, on: bool| {
+        let (class, aria) = if on {
+            (" usage__chip--on", r#" aria-current="true""#)
+        } else {
+            ("", "")
+        };
+        format!(r#"<a class="usage__chip{class}" href="{url}"{aria}>{label}</a>"#)
+    };
+    let windows: String = USAGE_WINDOWS
+        .iter()
+        .map(|&d| chip(format!("{d}d"), href(d, project), d == days))
+        .collect();
+    let mut filters = chip("All".to_string(), href(days, None), project.is_none());
+    for (id, name) in projects {
+        filters.push_str(&chip(
+            esc(name),
+            href(days, Some(id)),
+            project == Some(id.as_str()),
+        ));
+    }
+    let head = format!(
+        r#"<header class="usage__head">
+  <h1 class="usage__title">Token usage</h1>
+  <nav class="usage__chips" aria-label="Window">{windows}</nav>
+  <nav class="usage__chips" aria-label="Project">{filters}</nav>
+</header>"#
+    );
+    if summary.totals.all.total() == 0 {
+        return format!(
+            r#"<section class="usage">
+{head}
+<p class="fg-empty">No closed features in this window — token use is recorded when a feature closes.</p>
+</section>"#
+        );
+    }
+    let all = summary.totals.all.total();
+    let sub_share = summary.totals.subagents.total() * 100 / all;
+    let features_done: usize = summary.projects.iter().map(|p| p.features_done).sum();
+    let active_ms: i64 = summary.projects.iter().map(|p| p.active_ms).sum();
+    let kpi = |label: &str, value: String| {
+        format!(
+            r#"<div class="usage__kpi"><span class="usage__kpi-label">{label}</span><span class="usage__kpi-value">{value}</span></div>"#
+        )
+    };
+    let kpis = [
+        kpi("All tokens", compact(all)),
+        kpi("New", compact(summary.totals.all.new)),
+        kpi("Cache-read", compact(summary.totals.all.cached)),
+        kpi("Subagent share", format!("{sub_share}%")),
+        kpi("Features done", features_done.to_string()),
+        kpi("Active time", hours_minutes(active_ms)),
+    ]
+    .concat();
+    let peak = summary
+        .per_day
+        .iter()
+        .map(|d| d.spend.total())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let bars: String = summary
+        .per_day
+        .iter()
+        .map(|d| {
+            format!(
+                r#"<div class="usage__bar" style="height:{pct}%" title="{date} · {new} new · {cached} cache-read"></div>"#,
+                pct = d.spend.total() * 100 / peak,
+                date = esc(&d.date),
+                new = compact(d.spend.new),
+                cached = compact(d.spend.cached),
+            )
+        })
+        .collect();
+    let project_rows: String = summary
+        .projects
+        .iter()
+        .map(|p| {
+            format!(
+                "<tr><td>{name}</td><td>{all}</td><td>{new}</td><td>{cached}</td><td>{sub}</td><td>{done}</td><td>{active}</td></tr>",
+                name = esc(&p.name),
+                all = compact(p.spend.all.total()),
+                new = compact(p.spend.all.new),
+                cached = compact(p.spend.all.cached),
+                sub = compact(p.spend.subagents.total()),
+                done = p.features_done,
+                active = hours_minutes(p.active_ms),
+            )
+        })
+        .collect();
+    let feature_rows: String = summary
+        .features
+        .iter()
+        .map(|f| {
+            let breakdown: String = f
+                .models
+                .iter()
+                .map(|m| {
+                    format!(
+                        r#"<span class="usage__model">{name} {total}</span>"#,
+                        name = esc(&m.model),
+                        total = compact(m.main.total() + m.subagents.total()),
+                    )
+                })
+                .collect();
+            format!(
+                "<tr><td>{project}</td><td>{feature}</td><td>{closed}</td><td>{cells}</td><td>{active}</td><td>{span}</td><td>{all}</td><td>{breakdown}</td></tr>",
+                project = esc(&f.project_name),
+                feature = esc(&f.feature),
+                closed = f.closed_at_ms.map(local_date_time).unwrap_or_default(),
+                cells = f.cells_capped,
+                active = hours_minutes(f.active_ms),
+                span = f.span_ms.map(hours_minutes).unwrap_or_default(),
+                all = compact(f.spend.all.total()),
+            )
+        })
+        .collect();
+    format!(
+        r#"<section class="usage">
+{head}
+<div class="usage__kpis">{kpis}</div>
+<div class="usage__bars" aria-label="Tokens per day">{bars}</div>
+<h2 class="usage__h2">Projects</h2>
+<div class="usage__scroll"><table class="usage__table">
+<thead><tr><th>Project</th><th>All</th><th>New</th><th>Cache-read</th><th>Subagents</th><th>Features</th><th>Active</th></tr></thead>
+<tbody>{project_rows}</tbody>
+</table></div>
+<h2 class="usage__h2">Models</h2>
+{models}
+<h2 class="usage__h2">Finished features</h2>
+<div class="usage__scroll"><table class="usage__table">
+<thead><tr><th>Project</th><th>Feature</th><th>Closed</th><th>Cells</th><th>Active</th><th>Span</th><th>Tokens</th><th>By model</th></tr></thead>
+<tbody>{feature_rows}</tbody>
+</table></div>
+</section>"#,
+        models = usage_model_table(&summary.models),
+    )
+}
+
+fn usage_model_table(models: &[ModelSpend]) -> String {
+    let rows: String = models
+        .iter()
+        .map(|m| {
+            format!(
+                "<tr><td>{name}</td><td>{mn}</td><td>{mc}</td><td>{sn}</td><td>{sc}</td></tr>",
+                name = esc(&m.model),
+                mn = compact(m.main.new),
+                mc = compact(m.main.cached),
+                sn = compact(m.subagents.new),
+                sc = compact(m.subagents.cached),
+            )
+        })
+        .collect();
+    format!(
+        r#"<div class="usage__scroll"><table class="usage__table">
+<thead><tr><th>Model</th><th>Main new</th><th>Main cache-read</th><th>Subagent new</th><th>Subagent cache-read</th></tr></thead>
+<tbody>{rows}</tbody>
+</table></div>"#
+    )
+}
+
+fn compact(n: u64) -> String {
+    let scaled = |div: f64, unit: &str| format!("{:.1}{unit}", n as f64 / div);
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => scaled(1e3, "k"),
+        1_000_000..=999_999_999 => scaled(1e6, "M"),
+        _ => scaled(1e9, "B"),
+    }
+}
+
+fn hours_minutes(ms: i64) -> String {
+    let minutes = ms.max(0) / 60_000;
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("{m}m"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+fn local_date_time(ms: i64) -> String {
+    let offset = time::UtcOffset::from_whole_seconds(waggledance_core::usage::local_offset_secs())
+        .unwrap_or(time::UtcOffset::UTC);
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .map(|t| {
+            let t = t.to_offset(offset);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute()
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn query_escape(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
 
 /// Rail-icons: the leading glyphs the rail and the board cards carry so a
 /// row reads by shape before by word — a pin on the Agents eyebrow, a
@@ -11779,6 +12047,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
@@ -11810,6 +12079,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             terminals.contains(
@@ -11845,6 +12115,7 @@ mod tests {
                 &[],
                 &std::collections::HashMap::new(),
                 &std::collections::HashMap::new(),
+                "",
             );
             assert!(
                 body.contains(
@@ -11909,6 +12180,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
         let select = body
             .split(r#"<select class="fg-input" name="project" aria-label="Project">"#)
@@ -12028,6 +12300,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
         for hook in [
             "data-new-task-open",
@@ -12077,6 +12350,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             home_html.contains("data-agent-drawer-homepage"),
@@ -12122,6 +12396,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             body.contains(
@@ -12277,6 +12552,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
 
         // The board itself is still here — the rail joined the Kanban tab,
@@ -12396,6 +12672,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
 
         let shell_at = body
@@ -12628,6 +12905,7 @@ mod tests {
             &[],
             &bee_by_project,
             &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             page.contains(
@@ -12874,6 +13152,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &leader_waits,
+            "",
         );
         assert!(
             page.contains(LEADER_WAIT_BLOCKED) && page.contains(LEADER_WAIT_LOST),
@@ -13007,6 +13286,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             body.contains(r#"<p class="fg-empty">This terminal is gone.</p>"#),
@@ -14850,6 +15130,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             page_html.contains(r#"<main class="fg-page fg-page--tight">"#),
@@ -23861,22 +24142,99 @@ mod tests {
         }
     }
 
-    /// dcfbda20 records that adding the guide widened the handset tab bar from
-    /// four columns to five, stylesheet grid included. bi-2 does not widen it
-    /// again: the inbox is reached from the menu instead, and this test is the
-    /// guard that keeps a later edit from quietly making it six.
     #[test]
-    fn the_handset_tab_bar_keeps_the_five_destinations_it_was_widened_to() {
+    fn the_handset_tab_bar_keeps_the_six_destinations_it_was_widened_to() {
         let bar = home_tabbar(HomeTab::Kanban);
         let items =
             bar.matches("home-tabbar__item").count() - bar.matches("home-tabbar__item--on").count();
         assert_eq!(
-            items, 5,
-            "the tab bar's five columns are a recorded layout decision (dcfbda20): {bar}"
+            items, 6,
+            "the tab bar's six columns are a recorded layout decision (dcfbda20, usage-dashboard D2): {bar}"
         );
         assert!(
             !bar.contains("/inbox"),
-            "the inbox lives in the top bar menu, not as a sixth column: {bar}"
+            "the inbox lives in the top bar menu, not as a column: {bar}"
+        );
+    }
+
+    fn usage_summary_with(models: Vec<ModelSpend>) -> UsageSummary {
+        use waggledance_core::usage::{SpendSplit, Tokens};
+        let main = Tokens {
+            new: 1_200_000,
+            cached: 34_500,
+        };
+        let subagents = Tokens {
+            new: 700,
+            cached: 0,
+        };
+        let mut all = main;
+        all.new += subagents.new;
+        UsageSummary {
+            days: 7,
+            since_ms: 0,
+            now_ms: 0,
+            totals: SpendSplit {
+                main,
+                subagents,
+                all,
+            },
+            projects: Vec::new(),
+            models,
+            per_day: Vec::new(),
+            features: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn usage_tab_shows_the_empty_state_when_nothing_closed_in_the_window() {
+        let mut summary = usage_summary_with(Vec::new());
+        summary.totals = Default::default();
+        let html = usage_tab(&summary, 14, Some("p&1"), &[("p&1".into(), "<One>".into())]);
+        assert!(
+            html.contains(
+                "No closed features in this window — token use is recorded when a feature closes."
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"href="/?tab=usage&amp;days=14&amp;project=p%261" aria-current="true">14d</a>"#
+            ),
+            "the current window chip keeps the project filter: {html}"
+        );
+        assert!(
+            html.contains("&lt;One&gt;") && !html.contains("<One>"),
+            "{html}"
+        );
+        assert!(!html.contains("usage__table"), "{html}");
+    }
+
+    #[test]
+    fn usage_tab_splits_main_and_subagent_tokens_per_model() {
+        use waggledance_core::usage::Tokens;
+        let html = usage_tab(
+            &usage_summary_with(vec![ModelSpend {
+                model: "claude-opus-5-5".into(),
+                main: Tokens {
+                    new: 1_200_000,
+                    cached: 34_500,
+                },
+                subagents: Tokens {
+                    new: 700,
+                    cached: 0,
+                },
+            }]),
+            7,
+            None,
+            &[],
+        );
+        assert!(
+            html.contains("<th>Main new</th><th>Main cache-read</th><th>Subagent new</th><th>Subagent cache-read</th>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<tr><td>claude-opus-5-5</td><td>1.2M</td><td>34.5k</td><td>700</td><td>0</td></tr>"),
+            "{html}"
         );
     }
 

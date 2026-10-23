@@ -427,6 +427,7 @@ fn router(state: AppState) -> Router {
         .route("/api/status", get(status))
         .route("/api/projects", get(api_projects))
         .route("/api/board", get(api_board))
+        .route("/api/usage", get(api_usage))
         // agent-switch-drawer: the cross-project pane switcher's own feed —
         // every agent-backed pane on the host, from every registered
         // project plus the Unassigned group, gated the same as the rest of
@@ -795,6 +796,8 @@ struct RegisterFlag {
     /// terminal is gone" case, resolved once `index_page` has the actual
     /// pane inventory to check it against, not at parse time.
     pane: Option<String>,
+    days: u32,
+    project: Option<String>,
 }
 
 // `#[derive(Deserialize)]`'s generated struct visitor refuses a repeated
@@ -831,6 +834,8 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                 let mut register_error = None;
                 let mut tab = views::HomeTab::default();
                 let mut pane = None;
+                let mut days = 7;
+                let mut project = None;
                 while let Some((key, value)) = map.next_entry::<String, String>()? {
                     match key.as_str() {
                         "register_error" => register_error = Some(value),
@@ -853,6 +858,7 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                             tab = match value.as_str() {
                                 "kanban" | "projects" => views::HomeTab::Kanban,
                                 "terminals" => views::HomeTab::Terminals,
+                                "usage" => views::HomeTab::Usage,
                                 _ => views::HomeTab::default(),
                             }
                         }
@@ -864,6 +870,14 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                         // this can only ever resolve to D7's not-found case,
                         // never accidentally to the D4 default.
                         "pane" => pane = Some(value),
+                        "days" => {
+                            days = value
+                                .parse()
+                                .ok()
+                                .filter(|d| views::USAGE_WINDOWS.contains(d))
+                                .unwrap_or(7)
+                        }
+                        "project" => project = Some(value).filter(|v| !v.is_empty()),
                         _ => {}
                     }
                 }
@@ -871,6 +885,8 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                     register_error,
                     tab,
                     pane,
+                    days,
+                    project,
                 })
             }
         }
@@ -1086,6 +1102,12 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
             // `terminal_page_inner` already threads into `terminal_page`, so
             // the Terminals tab's own create controls offer the same set.
             let terminals_presets = configured_preset_labels(&st);
+            let usage_html = if flag.tab == views::HomeTab::Usage {
+                let (summary, names) = usage_summary(&st, flag.days, flag.project.as_deref()).await;
+                views::usage_tab(&summary, flag.days, flag.project.as_deref(), &names)
+            } else {
+                String::new()
+            };
             Html(views::home_page(
                 &with_counts,
                 unassigned_visible,
@@ -1099,6 +1121,7 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 &terminals_presets,
                 &bee_by_project,
                 &leader_waits,
+                &usage_html,
             ))
             .into_response()
         }
@@ -1303,6 +1326,57 @@ async fn api_projects(State(st): State<AppState>) -> impl IntoResponse {
         })
         .collect();
     Json(json!({ "projects": arr }))
+}
+
+async fn usage_summary(
+    st: &AppState,
+    days: u32,
+    project: Option<&str>,
+) -> (waggledance_core::usage::UsageSummary, Vec<(String, String)>) {
+    use waggledance_core::usage;
+    let bee_projects: Vec<waggledance_core::domain::Project> = st
+        .engine
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_bee_project)
+        .collect();
+    let names = bee_projects
+        .iter()
+        .map(|p| (p.id.clone(), p.name.clone()))
+        .collect();
+    let selected: Vec<_> = bee_projects
+        .into_iter()
+        .filter(|p| project.is_none_or(|id| p.id == id))
+        .collect();
+    let inputs = tokio::task::spawn_blocking(move || {
+        selected
+            .into_iter()
+            .map(|p| usage::ProjectUsageInput {
+                features: usage::read_usage(&p.root_path).0,
+                id: p.id,
+                name: p.name,
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+    (
+        usage::summarize(&inputs, now_ms, days, usage::local_offset_secs()),
+        names,
+    )
+}
+
+async fn api_usage(
+    State(st): State<AppState>,
+    Query(flag): Query<RegisterFlag>,
+) -> impl IntoResponse {
+    Json(
+        usage_summary(&st, flag.days, flag.project.as_deref())
+            .await
+            .0,
+    )
 }
 
 async fn api_board(State(st): State<AppState>) -> impl IntoResponse {
@@ -7636,6 +7710,70 @@ mod bee_route_tests {
     async fn body_string(resp: Response) -> String {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn usage_fixture(name: &str) -> (AppState, Project) {
+        let root = fresh_root(name);
+        let now = time::OffsetDateTime::now_utc();
+        let ended = now - time::Duration::hours(1);
+        let ended_ms = (ended.unix_timestamp_nanos() / 1_000_000) as i64;
+        let closed_at = ended
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        write(
+            &root,
+            ".bee/usage/usage-shipped.json",
+            &format!(
+                r#"{{"schema":"bee-usage/v1","feature":"usage-shipped","closed_at":"{closed_at}","sessions":[{{"models":{{"claude-opus-5-5":{{"new":1000,"cached":5000}}}},"subagent_models":{{"claude-fable-5-1":{{"new":200,"cached":0}}}},"started_ms":{started},"ended_ms":{ended_ms}}}]}}"#,
+                started = ended_ms - 3_600_000,
+            ),
+        );
+        let st = build_state();
+        let project = register(&st, &root, name);
+        (st, project)
+    }
+
+    #[tokio::test]
+    async fn api_usage_returns_totals_and_the_closed_feature() {
+        let (st, _) = usage_fixture("usage-api");
+        let resp = get(router(st), "/api/usage?days=7").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["days"], 7);
+        assert_eq!(v["totals"]["main"]["new"], 1000);
+        assert_eq!(v["totals"]["subagents"]["new"], 200);
+        assert_eq!(v["features"][0]["feature"], "usage-shipped");
+    }
+
+    #[tokio::test]
+    async fn api_usage_falls_back_to_seven_days_and_empties_on_an_unknown_project() {
+        let (st, _) = usage_fixture("usage-api-fallback");
+        let app = router(st);
+        let resp = get(app.clone(), "/api/usage?days=99").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["days"], 7);
+        let resp = get(app, "/api/usage?project=nope").await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["totals"]["all"]["new"], 0);
+    }
+
+    #[tokio::test]
+    async fn usage_tab_renders_current_and_names_the_closed_feature() {
+        let (st, project) = usage_fixture("usage-tab");
+        let resp = get(
+            router(st),
+            &format!("/?tab=usage&days=30&project={}", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_string(resp).await;
+        assert!(
+            html.contains(r#"href="/?tab=usage" aria-current="page"><svg"#),
+            "{html}"
+        );
+        assert!(html.contains("usage-shipped"), "{html}");
+        assert!(html.contains(r#"aria-current="true">30d</a>"#), "{html}");
     }
 
     /// The home page with the "+ New task" dialog removed (board-new-task
