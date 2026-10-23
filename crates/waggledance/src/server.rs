@@ -7846,7 +7846,7 @@ mod bee_route_tests {
         let mut st = build_state();
         st.agent_homes = Arc::new(agent_homes_fixture("usage-non-bee", &root));
         let project = register(&st, &root, "plain");
-        let resp = get(router(st), "/api/usage?days=1").await;
+        let resp = get(router(st), "/api/usage?days=7").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(v["projects"][0]["id"], project.id.as_str(), "{v}");

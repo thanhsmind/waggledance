@@ -1,13 +1,18 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::hash_map::Entry as MapEntry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+const HEAD_BYTES: usize = 1024;
+const DAY_MS: i64 = 86_400_000;
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct UsageEvent {
@@ -94,31 +99,47 @@ fn finish(mut run: AgentRun) -> AgentRun {
     run
 }
 
-fn read_claude(text: &str) -> AgentRun {
-    let mut run = AgentRun {
-        provider: "claude".into(),
-        ..Default::default()
-    };
-    let mut seen: HashMap<(String, String), usize> = HashMap::new();
-    for v in json_lines(text) {
+#[derive(Clone, Default)]
+struct LogState {
+    run: AgentRun,
+    seen: HashMap<(String, String), usize>,
+    model: Option<String>,
+    prev_total: u64,
+    prev_cached: u64,
+}
+
+impl LogState {
+    fn feed(&mut self, kind: Kind, text: &str) {
+        for v in json_lines(text) {
+            match kind {
+                Kind::Claude | Kind::ClaudeSubagent => self.claude(&v),
+                Kind::Pi => self.pi(&v),
+                Kind::Codex => self.codex(&v),
+                Kind::Paseo => {}
+            }
+        }
+    }
+
+    fn claude(&mut self, v: &Value) {
+        let run = &mut self.run;
         if run.cwd.is_empty() {
-            if let Some(cwd) = str_of(&v, "cwd") {
+            if let Some(cwd) = str_of(v, "cwd") {
                 run.cwd = cwd.into();
             }
         }
         if run.title.is_empty() {
-            let summary = (str_of(&v, "type") == Some("summary"))
-                .then(|| str_of(&v, "summary"))
+            let summary = (str_of(v, "type") == Some("summary"))
+                .then(|| str_of(v, "summary"))
                 .flatten();
-            if let Some(t) = str_of(&v, "aiTitle").or(summary) {
+            if let Some(t) = str_of(v, "aiTitle").or(summary) {
                 run.title = t.into();
             }
         }
         let Some(msg) = v.get("message") else {
-            continue;
+            return;
         };
-        let (Some(u), Some(ts)) = (msg.get("usage"), ts_ms(&v)) else {
-            continue;
+        let (Some(u), Some(ts)) = (msg.get("usage"), ts_ms(v)) else {
+            return;
         };
         let event = UsageEvent {
             ts_ms: ts,
@@ -130,10 +151,10 @@ fn read_claude(text: &str) -> AgentRun {
         };
         let Some(id) = str_of(msg, "id") else {
             run.events.push(event);
-            continue;
+            return;
         };
-        let request = str_of(&v, "requestId").unwrap_or_default();
-        match seen.entry((id.into(), request.into())) {
+        let request = str_of(v, "requestId").unwrap_or_default();
+        match self.seen.entry((id.into(), request.into())) {
             MapEntry::Occupied(at) => run.events[*at.get()] = event,
             MapEntry::Vacant(slot) => {
                 slot.insert(run.events.len());
@@ -141,57 +162,21 @@ fn read_claude(text: &str) -> AgentRun {
             }
         }
     }
-    run
-}
 
-pub fn parse_claude(session_id: &str, text: &str) -> AgentRun {
-    let mut run = read_claude(text);
-    run.key = format!("claude:{session_id}");
-    run.session_id = session_id.into();
-    finish(run)
-}
-
-pub fn parse_claude_subagent(
-    session_id: &str,
-    agent: &str,
-    text: &str,
-    meta: Option<&str>,
-) -> AgentRun {
-    let meta: Value = meta
-        .and_then(|m| serde_json::from_str(m).ok())
-        .unwrap_or(Value::Null);
-    let mut run = read_claude(text);
-    if let Some(model) = str_of(&meta, "model") {
-        for e in run.events.iter_mut().filter(|e| e.model.is_empty()) {
-            e.model = model.into();
-        }
-    }
-    run.title = str_of(&meta, "description").unwrap_or_default().into();
-    run.key = format!("claude:{session_id}/{agent}");
-    run.session_id = session_id.into();
-    run.parent_key = Some(format!("claude:{session_id}"));
-    run.subagent = true;
-    finish(run)
-}
-
-pub fn parse_pi(text: &str) -> Option<AgentRun> {
-    let mut run = AgentRun {
-        provider: "pi".into(),
-        ..Default::default()
-    };
-    for v in json_lines(text) {
-        if str_of(&v, "type") == Some("session") {
+    fn pi(&mut self, v: &Value) {
+        let run = &mut self.run;
+        if str_of(v, "type") == Some("session") {
             if run.session_id.is_empty() {
-                run.session_id = str_of(&v, "id").unwrap_or_default().into();
-                run.cwd = str_of(&v, "cwd").unwrap_or_default().into();
+                run.session_id = str_of(v, "id").unwrap_or_default().into();
+                run.cwd = str_of(v, "cwd").unwrap_or_default().into();
             }
-            continue;
+            return;
         }
         let Some(msg) = v.get("message") else {
-            continue;
+            return;
         };
-        let (Some(u), Some(ts)) = (msg.get("usage"), ts_ms(&v)) else {
-            continue;
+        let (Some(u), Some(ts)) = (msg.get("usage"), ts_ms(v)) else {
+            return;
         };
         let model = match (str_of(msg, "provider"), str_of(msg, "model")) {
             (Some(p), Some(m)) => format!("{p}/{m}"),
@@ -205,62 +190,121 @@ pub fn parse_pi(text: &str) -> Option<AgentRun> {
             cached: num(u, "cacheRead"),
         });
     }
-    if run.session_id.is_empty() {
-        return None;
-    }
-    run.key = format!("pi:{}", run.session_id);
-    Some(finish(run))
-}
 
-pub fn parse_codex(text: &str) -> Option<AgentRun> {
-    let mut run = AgentRun {
-        provider: "codex".into(),
-        ..Default::default()
-    };
-    let mut model: Option<String> = None;
-    let (mut prev_total, mut prev_cached) = (0u64, 0u64);
-    for v in json_lines(text) {
+    fn codex(&mut self, v: &Value) {
         let Some(p) = v.get("payload") else {
-            continue;
+            return;
         };
-        let kind = str_of(&v, "type");
-        if kind == Some("session_meta") && run.session_id.is_empty() {
-            run.session_id = str_of(p, "id").unwrap_or_default().into();
-            run.cwd = str_of(p, "cwd").unwrap_or_default().into();
+        let kind = str_of(v, "type");
+        if kind == Some("session_meta") && self.run.session_id.is_empty() {
+            self.run.session_id = str_of(p, "id").unwrap_or_default().into();
+            self.run.cwd = str_of(p, "cwd").unwrap_or_default().into();
         }
-        if matches!(kind, Some("session_meta" | "turn_context")) && model.is_none() {
-            model = str_of(p, "model").filter(|m| !m.is_empty()).map(Into::into);
+        if matches!(kind, Some("session_meta" | "turn_context")) && self.model.is_none() {
+            self.model = str_of(p, "model").filter(|m| !m.is_empty()).map(Into::into);
         }
         if kind != Some("event_msg") || str_of(p, "type") != Some("token_count") {
-            continue;
+            return;
         }
         let Some(t) = p.get("info").and_then(|i| i.get("total_token_usage")) else {
-            continue;
+            return;
         };
         let (total, cached) = (num(t, "total_tokens"), num(t, "cached_input_tokens"));
-        let delta = total.saturating_sub(prev_total);
-        let delta_cached = cached.saturating_sub(prev_cached);
-        prev_total = total;
-        prev_cached = cached;
-        let Some(ts) = ts_ms(&v).filter(|_| delta > 0) else {
-            continue;
+        let delta = total.saturating_sub(self.prev_total);
+        let delta_cached = cached.saturating_sub(self.prev_cached);
+        self.prev_total = total;
+        self.prev_cached = cached;
+        let Some(ts) = ts_ms(v).filter(|_| delta > 0) else {
+            return;
         };
-        run.events.push(UsageEvent {
+        self.run.events.push(UsageEvent {
             ts_ms: ts,
             model: String::new(),
             new: delta.saturating_sub(delta_cached),
             cached: delta_cached,
         });
     }
-    if run.session_id.is_empty() {
+}
+
+fn fed(kind: Kind, text: &str) -> LogState {
+    let mut state = LogState::default();
+    state.feed(kind, text);
+    state
+}
+
+fn claude_run(state: &LogState, session_id: &str) -> AgentRun {
+    let mut run = state.run.clone();
+    run.provider = "claude".into();
+    run.key = format!("claude:{session_id}");
+    run.session_id = session_id.into();
+    finish(run)
+}
+
+fn claude_subagent_run(
+    state: &LogState,
+    session_id: &str,
+    agent: &str,
+    meta: Option<&str>,
+) -> AgentRun {
+    let meta: Value = meta
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or(Value::Null);
+    let mut run = claude_run(state, session_id);
+    if let Some(model) = str_of(&meta, "model") {
+        for e in run.events.iter_mut().filter(|e| e.model.is_empty()) {
+            e.model = model.into();
+        }
+    }
+    run.title = str_of(&meta, "description").unwrap_or_default().into();
+    run.key = format!("claude:{session_id}/{agent}");
+    run.parent_key = Some(format!("claude:{session_id}"));
+    run.subagent = true;
+    run
+}
+
+fn pi_run(state: &LogState) -> Option<AgentRun> {
+    if state.run.session_id.is_empty() {
         return None;
     }
-    let model = model.unwrap_or_else(|| "codex".into());
-    for e in &mut run.events {
-        e.model = model.clone();
+    let mut run = state.run.clone();
+    run.provider = "pi".into();
+    run.key = format!("pi:{}", run.session_id);
+    Some(finish(run))
+}
+
+fn codex_run(state: &LogState) -> Option<AgentRun> {
+    if state.run.session_id.is_empty() {
+        return None;
     }
+    let mut run = state.run.clone();
+    let model = state.model.as_deref().unwrap_or("codex");
+    for e in &mut run.events {
+        e.model = model.into();
+    }
+    run.provider = "codex".into();
     run.key = format!("codex:{}", run.session_id);
     Some(finish(run))
+}
+
+pub fn parse_claude(session_id: &str, text: &str) -> AgentRun {
+    claude_run(&fed(Kind::Claude, text), session_id)
+}
+
+pub fn parse_claude_subagent(
+    session_id: &str,
+    agent: &str,
+    text: &str,
+    meta: Option<&str>,
+) -> AgentRun {
+    claude_subagent_run(&fed(Kind::ClaudeSubagent, text), session_id, agent, meta)
+}
+
+pub fn parse_pi(text: &str) -> Option<AgentRun> {
+    pi_run(&fed(Kind::Pi, text))
+}
+
+pub fn parse_codex(text: &str) -> Option<AgentRun> {
+    codex_run(&fed(Kind::Codex, text))
 }
 
 pub fn parse_paseo(text: &str) -> Option<PaseoAgent> {
@@ -285,7 +329,7 @@ pub fn parse_paseo(text: &str) -> Option<PaseoAgent> {
     })
 }
 
-pub fn apply_paseo(runs: &mut [AgentRun], agents: &[PaseoAgent]) {
+pub fn apply_paseo(runs: &mut [Arc<AgentRun>], agents: &[PaseoAgent]) {
     let by_id: HashMap<&str, &PaseoAgent> = agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let index: HashMap<String, usize> = runs
         .iter()
@@ -296,12 +340,17 @@ pub fn apply_paseo(runs: &mut [AgentRun], agents: &[PaseoAgent]) {
         let Some(&i) = index.get(&a.run_key()) else {
             continue;
         };
-        if !a.title.is_empty() {
-            runs[i].title = a.title.clone();
+        let parent = a.parent_id.as_deref().and_then(|id| by_id.get(id));
+        if a.title.is_empty() && parent.is_none() {
+            continue;
         }
-        if let Some(parent) = a.parent_id.as_deref().and_then(|id| by_id.get(id)) {
-            runs[i].parent_key = Some(parent.run_key());
-            runs[i].subagent = true;
+        let run = Arc::make_mut(&mut runs[i]);
+        if !a.title.is_empty() {
+            run.title = a.title.clone();
+        }
+        if let Some(parent) = parent {
+            run.parent_key = Some(parent.run_key());
+            run.subagent = true;
         }
     }
 }
@@ -349,8 +398,17 @@ enum Kind {
     Paseo,
 }
 
+#[derive(Clone, Default)]
+struct Log {
+    state: LogState,
+    offset: u64,
+    head: Vec<u8>,
+    run: Option<Arc<AgentRun>>,
+}
+
+#[derive(Clone)]
 enum Parsed {
-    Run(Option<AgentRun>),
+    Log(Arc<Log>),
     Paseo(Option<PaseoAgent>),
 }
 
@@ -363,6 +421,9 @@ struct CacheEntry {
 #[derive(Default)]
 pub struct AgentLogCache {
     files: Mutex<HashMap<PathBuf, CacheEntry>>,
+    parsed_bytes: AtomicU64,
+    #[cfg(test)]
+    read_hook: Option<fn(&AgentLogCache)>,
 }
 
 fn subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -429,22 +490,37 @@ fn discover(homes: &AgentHomes) -> Vec<(PathBuf, Kind)> {
     found
 }
 
-fn parse_file(path: &Path, kind: Kind, text: &str) -> Parsed {
+fn build(path: &Path, kind: Kind, state: &LogState) -> Option<AgentRun> {
     match kind {
-        Kind::Claude => Parsed::Run(Some(parse_claude(&stem_of(path), text))),
+        Kind::Claude => Some(claude_run(state, &stem_of(path))),
         Kind::ClaudeSubagent => {
             let session = name_of(path.parent().and_then(Path::parent));
             let meta = fs::read_to_string(path.with_extension("meta.json")).ok();
-            Parsed::Run(Some(parse_claude_subagent(
+            Some(claude_subagent_run(
+                state,
                 &session,
                 &stem_of(path),
-                text,
                 meta.as_deref(),
-            )))
+            ))
         }
-        Kind::Pi => Parsed::Run(parse_pi(text)),
-        Kind::Codex => Parsed::Run(parse_codex(text)),
-        Kind::Paseo => Parsed::Paseo(parse_paseo(text)),
+        Kind::Pi => pi_run(state),
+        Kind::Codex => codex_run(state),
+        Kind::Paseo => None,
+    }
+}
+
+fn starts_with(file: &mut fs::File, head: &[u8]) -> bool {
+    let mut buf = vec![0; head.len()];
+    file.read_exact(&mut buf).is_ok() && buf == head
+}
+
+fn complete_prefix(buf: &[u8]) -> usize {
+    let end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let tail = &buf[end..];
+    if !tail.is_empty() && serde_json::from_slice::<Value>(tail).is_ok() {
+        buf.len()
+    } else {
+        end
     }
 }
 
@@ -459,42 +535,101 @@ impl AgentLogCache {
         Self::default()
     }
 
-    pub fn runs(&self, homes: &AgentHomes, since_ms: i64) -> Vec<AgentRun> {
-        let mut runs = Vec::new();
-        let mut agents = Vec::new();
-        let mut cache = self.files.lock().unwrap_or_else(|e| e.into_inner());
+    fn read_log(&self, path: &Path, kind: Kind, len: u64, prev: Option<&Log>) -> Option<Log> {
+        let mut file = fs::File::open(path).ok()?;
+        let mut log = match prev {
+            Some(p) if p.offset <= len && starts_with(&mut file, &p.head) => p.clone(),
+            _ => Log::default(),
+        };
+        file.seek(SeekFrom::Start(log.offset)).ok()?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).ok()?;
+        let used = complete_prefix(&buf);
+        let take = HEAD_BYTES.saturating_sub(log.head.len()).min(used);
+        log.head.extend_from_slice(&buf[..take]);
+        self.parsed_bytes.fetch_add(used as u64, Ordering::Relaxed);
+        log.state.feed(kind, &String::from_utf8_lossy(&buf[..used]));
+        log.offset += used as u64;
+        log.run = build(path, kind, &log.state).map(Arc::new);
+        Some(log)
+    }
+
+    fn read(&self, path: &Path, kind: Kind, len: u64, prev: Option<Parsed>) -> Option<Parsed> {
+        #[cfg(test)]
+        if let Some(hook) = self.read_hook {
+            hook(self);
+        }
+        if matches!(kind, Kind::Paseo) {
+            let text = fs::read_to_string(path).ok()?;
+            return Some(Parsed::Paseo(parse_paseo(&text)));
+        }
+        let prev = match prev {
+            Some(Parsed::Log(log)) => Some(log),
+            _ => None,
+        };
+        let log = self.read_log(path, kind, len, prev.as_deref())?;
+        Some(Parsed::Log(Arc::new(log)))
+    }
+
+    pub fn runs(&self, homes: &AgentHomes, since_ms: i64) -> Vec<Arc<AgentRun>> {
+        let mut keep = HashSet::new();
+        let mut found = Vec::new();
         for (path, kind) in discover(homes) {
             let Ok(md) = fs::metadata(&path) else {
                 continue;
             };
             let mtime = md.modified().unwrap_or(UNIX_EPOCH);
-            if !matches!(kind, Kind::Paseo) && millis(mtime) < since_ms {
-                continue;
+            let paseo = matches!(kind, Kind::Paseo);
+            if paseo || millis(mtime) >= since_ms - DAY_MS {
+                keep.insert(path.clone());
             }
-            let fresh = cache
-                .get(&path)
-                .is_some_and(|e| e.mtime == mtime && e.len == md.len());
-            if !fresh {
-                let Ok(bytes) = fs::read(&path) else {
-                    continue;
-                };
-                let parsed = parse_file(&path, kind, &String::from_utf8_lossy(&bytes));
-                cache.insert(
-                    path.clone(),
-                    CacheEntry {
-                        mtime,
-                        len: md.len(),
-                        parsed,
-                    },
-                );
-            }
-            match &cache[&path].parsed {
-                Parsed::Run(Some(r)) if !r.events.is_empty() => runs.push(r.clone()),
-                Parsed::Paseo(Some(a)) => agents.push(a.clone()),
-                _ => {}
+            if paseo || millis(mtime) >= since_ms {
+                found.push((path, kind, mtime, md.len()));
             }
         }
-        drop(cache);
+        let prior: Vec<Option<(SystemTime, u64, Parsed)>> = {
+            let mut cache = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            cache.retain(|path, _| keep.contains(path));
+            found
+                .iter()
+                .map(|(path, ..)| cache.get(path).map(|e| (e.mtime, e.len, e.parsed.clone())))
+                .collect()
+        };
+        let mut parsed = Vec::new();
+        let mut fresh = Vec::new();
+        for ((path, kind, mtime, len), prior) in found.into_iter().zip(prior) {
+            match prior {
+                Some((m, l, p)) if m == mtime && l == len => parsed.push(p),
+                prior => {
+                    if let Some(p) = self.read(&path, kind, len, prior.map(|(.., p)| p)) {
+                        parsed.push(p.clone());
+                        fresh.push((path, mtime, len, p));
+                    }
+                }
+            }
+        }
+        if !fresh.is_empty() {
+            let mut cache = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            for (path, mtime, len, parsed) in fresh {
+                if cache
+                    .get(&path)
+                    .is_none_or(|e| (mtime, len) > (e.mtime, e.len))
+                {
+                    cache.insert(path, CacheEntry { mtime, len, parsed });
+                }
+            }
+        }
+        let mut runs = Vec::new();
+        let mut agents = Vec::new();
+        for p in parsed {
+            match p {
+                Parsed::Log(log) => {
+                    runs.extend(log.run.as_ref().filter(|r| !r.events.is_empty()).cloned())
+                }
+                Parsed::Paseo(Some(a)) => agents.push(a),
+                Parsed::Paseo(None) => {}
+            }
+        }
         apply_paseo(&mut runs, &agents);
         runs
     }
@@ -634,12 +769,12 @@ mod tests {
         assert_eq!(parse_paseo("{\"id\":\"x\"}"), None);
 
         let mut runs = vec![
-            parse_claude("s1", CLAUDE_MAIN),
-            parse_pi(PI).unwrap(),
-            AgentRun {
+            Arc::new(parse_claude("s1", CLAUDE_MAIN)),
+            Arc::new(parse_pi(PI).unwrap()),
+            Arc::new(AgentRun {
                 key: "pi:p2".into(),
                 ..Default::default()
-            },
+            }),
         ];
         apply_paseo(&mut runs, &[parent, child, plain]);
         assert_eq!(runs[0].title, "lead the feature");
@@ -677,6 +812,165 @@ mod tests {
         assert_eq!(project_for(Path::new("/no/such/place"), &roots), None);
     }
 
+    fn homes_in(dir: &Path) -> AgentHomes {
+        AgentHomes {
+            claude: dir.join("claude"),
+            pi: dir.join("pi"),
+            codex: dir.join("codex"),
+            paseo: dir.join("paseo"),
+        }
+    }
+
+    fn append(path: &Path, text: &str) -> u64 {
+        use std::io::Write;
+        fs::File::options()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        text.len() as u64
+    }
+
+    fn logs_fixture(dir: &Path) -> (AgentHomes, PathBuf, PathBuf) {
+        let homes = homes_in(dir);
+        let claude = homes.claude.join("projects/-work-proj");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("s1.jsonl"), CLAUDE_MAIN).unwrap();
+        let codex = homes.codex.join("sessions/2026/10/23");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(codex.join("rollout-c1.jsonl"), CODEX).unwrap();
+        (
+            homes,
+            claude.join("s1.jsonl"),
+            codex.join("rollout-c1.jsonl"),
+        )
+    }
+
+    fn run_of(runs: &[Arc<AgentRun>], key: &str) -> Arc<AgentRun> {
+        runs.iter().find(|r| r.key == key).unwrap().clone()
+    }
+
+    #[test]
+    fn appended_lines_are_the_only_bytes_parsed_and_keep_dedupe_and_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let (homes, main, rollout) = logs_fixture(dir.path());
+        let cache = AgentLogCache::new();
+        let since = ms("2026-01-01T00:00:00Z");
+        cache.runs(&homes, since);
+        let first = cache.parsed_bytes.load(Ordering::Relaxed);
+        assert_eq!(first, (CLAUDE_MAIN.len() + CODEX.len()) as u64);
+
+        let dup = |n: u64| {
+            format!(
+                r#"{{"type":"assistant","requestId":"r3","timestamp":"2026-10-23T02:00:0{n}Z","message":{{"id":"m3","model":"claude-sonnet-5-5","usage":{{"input_tokens":{n}00,"cache_read_input_tokens":7}}}}}}
+"#
+            )
+        };
+        let mut grown = append(&main, &dup(1));
+        grown += append(
+            &rollout,
+            r#"{"type":"event_msg","timestamp":"2026-10-23T01:00:07Z","payload":{"type":"token_count","info":{"total_token_usage":{"cached_input_tokens":100,"total_tokens":400}}}}
+"#,
+        );
+        let runs = cache.runs(&homes, since);
+        assert_eq!(cache.parsed_bytes.load(Ordering::Relaxed), first + grown);
+        let claude = run_of(&runs, "claude:s1");
+        assert_eq!(claude.events.len(), 2);
+        assert_eq!(claude.events[1].new, 100);
+        let codex = run_of(&runs, "codex:c1");
+        assert_eq!(
+            codex.events.last(),
+            Some(&ev("2026-10-23T01:00:07Z", "gpt-5.5", 150, 0))
+        );
+        assert_eq!(codex.events.len(), 3);
+
+        append(&main, &dup(2));
+        let runs = cache.runs(&homes, since);
+        let claude = run_of(&runs, "claude:s1");
+        assert_eq!(claude.events.len(), 2);
+        assert_eq!(claude.events[1].new, 200);
+        assert_eq!(
+            *claude,
+            parse_claude("s1", &fs::read_to_string(&main).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_partial_line_waits_until_it_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let (homes, _, rollout) = logs_fixture(dir.path());
+        let cache = AgentLogCache::new();
+        let since = ms("2026-01-01T00:00:00Z");
+        cache.runs(&homes, since);
+        let line = r#"{"type":"event_msg","timestamp":"2026-10-23T01:00:07Z","payload":{"type":"token_count","info":{"total_token_usage":{"cached_input_tokens":100,"total_tokens":400}}}}"#;
+        let (start, end) = line.split_at(40);
+        append(&rollout, start);
+        assert_eq!(
+            run_of(&cache.runs(&homes, since), "codex:c1").events.len(),
+            2
+        );
+        append(&rollout, end);
+        assert_eq!(
+            run_of(&cache.runs(&homes, since), "codex:c1").events.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_shrunk_log_is_reparsed_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (homes, _, rollout) = logs_fixture(dir.path());
+        let cache = AgentLogCache::new();
+        let since = ms("2026-01-01T00:00:00Z");
+        cache.runs(&homes, since);
+        let before = cache.parsed_bytes.load(Ordering::Relaxed);
+        let short: String = CODEX.lines().take(4).map(|l| format!("{l}\n")).collect();
+        fs::write(&rollout, &short).unwrap();
+        let runs = cache.runs(&homes, since);
+        assert_eq!(
+            cache.parsed_bytes.load(Ordering::Relaxed),
+            before + short.len() as u64
+        );
+        assert_eq!(
+            run_of(&runs, "codex:c1").events,
+            vec![ev("2026-10-23T01:00:03Z", "gpt-5.5", 60, 40)]
+        );
+    }
+
+    #[test]
+    fn deleted_and_stale_logs_leave_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (homes, main, rollout) = logs_fixture(dir.path());
+        let cache = AgentLogCache::new();
+        let since = ms("2026-01-01T00:00:00Z");
+        cache.runs(&homes, since);
+        assert_eq!(cache.files.lock().unwrap().len(), 2);
+        fs::remove_file(&main).unwrap();
+        touch(&rollout, UNIX_EPOCH + Duration::from_secs(1_000));
+        assert!(cache.runs(&homes, since).is_empty());
+        assert!(cache.files.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_cache_lock_is_free_while_a_log_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (homes, main, _) = logs_fixture(dir.path());
+        let cache = AgentLogCache {
+            read_hook: Some(|c| assert!(c.files.try_lock().is_ok())),
+            ..Default::default()
+        };
+        let since = ms("2026-01-01T00:00:00Z");
+        cache.runs(&homes, since);
+        append(&main, "\n");
+        std::thread::scope(|s| {
+            let other = s.spawn(|| cache.runs(&homes, since).len());
+            assert_eq!(cache.runs(&homes, since).len(), 2);
+            assert_eq!(other.join().unwrap(), 2);
+        });
+        assert!(cache.parsed_bytes.load(Ordering::Relaxed) > 0);
+    }
+
     fn touch(path: &Path, at: SystemTime) {
         fs::File::options()
             .write(true)
@@ -689,12 +983,7 @@ mod tests {
     #[test]
     fn cache_reads_every_source_and_reparses_only_a_changed_file() {
         let dir = tempfile::tempdir().unwrap();
-        let homes = AgentHomes {
-            claude: dir.path().join("claude"),
-            pi: dir.path().join("pi"),
-            codex: dir.path().join("codex"),
-            paseo: dir.path().join("paseo"),
-        };
+        let homes = homes_in(dir.path());
         let claude = homes.claude.join("projects/-work-proj");
         fs::create_dir_all(claude.join("s1/subagents")).unwrap();
         fs::write(claude.join("s1.jsonl"), CLAUDE_MAIN).unwrap();

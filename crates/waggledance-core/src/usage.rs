@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use time::{Date, Duration, OffsetDateTime, UtcOffset};
 
 const DAY_MS: i64 = 86_400_000;
@@ -280,7 +280,7 @@ pub fn summarize(
 
 pub fn summarize_runs(
     projects: &[ProjectUsageInput],
-    runs: &[(Option<String>, AgentRun)],
+    runs: &[(Option<String>, Arc<AgentRun>)],
     now_ms: i64,
     days: u32,
     offset_secs: i32,
@@ -290,7 +290,7 @@ pub fn summarize_runs(
 
 fn summarize_with(
     projects: &[ProjectUsageInput],
-    runs: Option<&[(Option<String>, AgentRun)]>,
+    runs: Option<&[(Option<String>, Arc<AgentRun>)]>,
     now_ms: i64,
     days: u32,
     offset_secs: i32,
@@ -793,7 +793,7 @@ mod tests {
         provider: &str,
         subagent: bool,
         events: &[(&str, &str, u64, u64)],
-    ) -> AgentRun {
+    ) -> Arc<AgentRun> {
         let events: Vec<crate::agent_usage::UsageEvent> = events
             .iter()
             .map(|(ts, model, new, cached)| crate::agent_usage::UsageEvent {
@@ -803,7 +803,7 @@ mod tests {
                 cached: *cached,
             })
             .collect();
-        AgentRun {
+        Arc::new(AgentRun {
             key: key.into(),
             provider: provider.into(),
             title: format!("{key} task"),
@@ -813,7 +813,7 @@ mod tests {
             ended_ms: events.iter().map(|e| e.ts_ms).max().unwrap(),
             events,
             ..Default::default()
-        }
+        })
     }
 
     #[test]
