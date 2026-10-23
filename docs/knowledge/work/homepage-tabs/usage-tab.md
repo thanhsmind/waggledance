@@ -12,6 +12,8 @@ bee:
 
 # homepage-tabs — the Usage tab
 
+Locked decisions: usage-dashboard D1-D7 (`docs/history/usage-dashboard/CONTEXT.md`).
+
 ## What it is
 
 The third home tab, after Kanban and Terminals, reached at `/?tab=usage`
@@ -57,6 +59,7 @@ them or to a project.
   import, where only `total_tokens` is set. The model is the first one
   named by `turn_context`, else by `session_meta`, else any payload
   `model`; `codex` only when no line names one.
+<!-- bee:not-a-deferral: describes how the parser treats a marker that arrives in a later append, not a promise to act later -->
 - **Imported Codex sessions are skipped.** Codex Desktop can import Claude
   Code history into a new rollout file; that file replays the other agent's
   tool calls as text marked `[external_agent_tool_call …]` or
@@ -65,6 +68,7 @@ them or to a project.
   and bill it to the wrong provider, so a session whose agent message or
   response text carries either marker yields no run at all — including when
   the marker arrives in a later append.
+<!-- /bee:not-a-deferral -->
 - A line that does not parse, or a message without a timestamp, is skipped.
 - **`.bee/usage/<feature>.json`** (schema `bee-usage/v1`, written by
   `bee close`) now feeds only the finished-features list. Its sessions add

@@ -81,14 +81,15 @@ and never writes to any project.
 
 ## Outstanding Questions
 
-### Deferred To Planning
+### Resolved In Planning
 
-- [ ] Whether the usage files join the existing `.bee/` fingerprint walk or get
-  their own cache — read `compute_bee_fingerprint`.
-- [ ] How live updates reach the Usage tab (the existing `/ws` reload covers it
-  if `.bee/usage/` is under the watched tree).
+- [x] Cache: the bee-file path rides the existing `.bee/` fingerprint walk; the
+  agent-log path got its own per-file `AgentLogCache` (plan.md Revisions 2-3).
+- [x] Live updates: the Usage tab reloads with the existing `/ws` reload; agent
+  logs are re-read incrementally on each view.
 
-## Deferred Ideas
+## Rejected And Superseded Ideas
 
-- Estimated USD cost per model — rejected for now by D3; would need a price table.
-- Spend of features still in flight — bee writes usage only at close.
+- Estimated USD cost per model: rejected by D3; it would need a price table.
+- Spend of features still in flight: covered by D6, which reads the agent logs
+  directly instead of waiting for `bee close`.
