@@ -19,7 +19,7 @@ use waggledance_core::git_diff::{
 };
 use waggledance_core::render::{HighlightedSource, RenderService};
 use waggledance_core::short_link::{path_hash, short_code};
-use waggledance_core::usage::{ModelSpend, UsageSummary};
+use waggledance_core::usage::{ModelSpend, RunRow, UsageSummary};
 
 pub fn layout(title: &str, head_extra: &str, body: &str) -> String {
     let title = esc(title);
@@ -690,7 +690,7 @@ pub fn usage_tab(
         return format!(
             r#"<section class="usage">
 {head}
-<p class="fg-empty">No closed features in this window — token use is recorded when a feature closes.</p>
+<p class="fg-empty">No agent activity in this window.</p>
 </section>"#
         );
     }
@@ -787,6 +787,8 @@ pub fn usage_tab(
 </table></div>
 <h2 class="usage__h2">Models</h2>
 {models}
+<h2 class="usage__h2">Agent runs</h2>
+{runs}
 <h2 class="usage__h2">Finished features</h2>
 <div class="usage__scroll"><table class="usage__table">
 <thead><tr><th>Project</th><th>Feature</th><th>Closed</th><th>Cells</th><th>Active</th><th>Span</th><th>Tokens</th><th>By model</th></tr></thead>
@@ -794,6 +796,76 @@ pub fn usage_tab(
 </table></div>
 </section>"#,
         models = usage_model_table(&summary.models),
+        runs = usage_runs_table(&summary.runs),
+    )
+}
+
+const USAGE_RUNS_CAP: usize = 300;
+
+fn usage_runs_table(runs: &[RunRow]) -> String {
+    let by_key: std::collections::HashMap<&str, &RunRow> =
+        runs.iter().map(|r| (r.key.as_str(), r)).collect();
+    let parent_of = |r: &RunRow| r.parent_key.as_deref().and_then(|k| by_key.get(k).copied());
+    let mut ordered: Vec<(&RunRow, usize)> = Vec::new();
+    fn walk<'a>(
+        run: &'a RunRow,
+        depth: usize,
+        runs: &'a [RunRow],
+        out: &mut Vec<(&'a RunRow, usize)>,
+    ) {
+        out.push((run, depth));
+        for child in runs
+            .iter()
+            .filter(|c| c.parent_key.as_deref() == Some(run.key.as_str()))
+        {
+            walk(child, depth + 1, runs, out);
+        }
+    }
+    for run in runs.iter().filter(|r| parent_of(r).is_none()) {
+        walk(run, 0, runs, &mut ordered);
+    }
+    let task = |r: &RunRow| {
+        if r.title.is_empty() {
+            let id = r.key.split_once(':').map_or(r.key.as_str(), |(_, id)| id);
+            id.chars().take(8).collect()
+        } else {
+            r.title.clone()
+        }
+    };
+    let rows: String = ordered
+        .iter()
+        .take(USAGE_RUNS_CAP)
+        .map(|&(r, depth)| {
+            let marker = match (r.subagent, parent_of(r)) {
+                (false, _) => String::new(),
+                (true, Some(parent)) => format!(
+                    r#" <span class="usage__sub">subagent of {}</span>"#,
+                    esc(&task(parent))
+                ),
+                (true, None) => r#" <span class="usage__sub">subagent</span>"#.to_string(),
+            };
+            format!(
+                r#"<tr class="usage__run" style="--usage-depth:{depth}"><td class="usage__task">{name}{marker}</td><td>{project}</td><td>{provider}</td><td>{model}</td><td>{started}</td><td>{duration}</td><td>{new}</td><td>{cached}</td></tr>"#,
+                name = esc(&task(r)),
+                project = esc(&r.project_name),
+                provider = esc(&r.provider),
+                model = esc(&r.model),
+                started = local_date_time(r.started_ms),
+                duration = hours_minutes(r.duration_ms),
+                new = compact(r.spend.new),
+                cached = compact(r.spend.cached),
+            )
+        })
+        .collect();
+    let more = match ordered.len().saturating_sub(USAGE_RUNS_CAP) {
+        0 => String::new(),
+        n => format!(r#"<p class="usage__more">{n} more runs not shown.</p>"#),
+    };
+    format!(
+        r#"<div class="usage__scroll"><table class="usage__table">
+<thead><tr><th>Task</th><th>Project</th><th>Provider</th><th>Model</th><th>Started</th><th>Duration</th><th>New</th><th>Cache-read</th></tr></thead>
+<tbody>{rows}</tbody>
+</table></div>{more}"#
     )
 }
 
@@ -24182,20 +24254,16 @@ mod tests {
             models,
             per_day: Vec::new(),
             features: Vec::new(),
+            runs: Vec::new(),
         }
     }
 
     #[test]
-    fn usage_tab_shows_the_empty_state_when_nothing_closed_in_the_window() {
+    fn usage_tab_shows_the_empty_state_when_no_agent_ran_in_the_window() {
         let mut summary = usage_summary_with(Vec::new());
         summary.totals = Default::default();
         let html = usage_tab(&summary, 14, Some("p&1"), &[("p&1".into(), "<One>".into())]);
-        assert!(
-            html.contains(
-                "No closed features in this window — token use is recorded when a feature closes."
-            ),
-            "{html}"
-        );
+        assert!(html.contains("No agent activity in this window."), "{html}");
         assert!(
             html.contains(
                 r#"href="/?tab=usage&amp;days=14&amp;project=p%261" aria-current="true">14d</a>"#
@@ -24207,6 +24275,58 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("usage__table"), "{html}");
+    }
+
+    #[test]
+    fn usage_tab_lists_agent_runs_with_subagents_under_their_parent() {
+        use waggledance_core::usage::Tokens;
+        let run = |key: &str, title: &str, parent: Option<&str>, started_ms: i64| RunRow {
+            key: key.into(),
+            project_id: "p1".into(),
+            project_name: "Hive".into(),
+            provider: key.split(':').next().unwrap().into(),
+            title: title.into(),
+            model: "claude-opus-5-5".into(),
+            parent_key: parent.map(Into::into),
+            subagent: parent.is_some(),
+            started_ms,
+            duration_ms: 90 * 60_000,
+            spend: Tokens {
+                new: 1_500,
+                cached: 20_000,
+            },
+        };
+        let mut summary = usage_summary_with(Vec::new());
+        summary.runs = vec![
+            run("pi:child", "ud-<6>", Some("claude:lead"), 3),
+            run("claude:orphan", "", Some("claude:gone"), 2),
+            run("claude:lead", "Lead task", None, 1),
+        ];
+        let html = usage_tab(&summary, 7, None, &[]);
+        let lead = html.find(">Lead task<").expect(&html);
+        let child = html.find("ud-&lt;6&gt;").expect(&html);
+        assert!(
+            lead < child,
+            "the subagent row sits under its parent: {html}"
+        );
+        assert!(
+            html.contains(r#"style="--usage-depth:1"><td class="usage__task">ud-&lt;6&gt; <span class="usage__sub">subagent of Lead task</span></td><td>Hive</td><td>pi</td><td>claude-opus-5-5</td>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"style="--usage-depth:0"><td class="usage__task">orphan <span class="usage__sub">subagent</span></td>"#),
+            "a subagent whose parent is absent stays flat: {html}"
+        );
+        assert!(
+            html.contains("<td>1h 30m</td><td>1.5k</td><td>20.0k</td>"),
+            "{html}"
+        );
+        assert!(!html.contains("usage__more"), "{html}");
+        summary.runs = (0..302)
+            .map(|i| run(&format!("pi:r{i}"), "t", None, i))
+            .collect();
+        let html = usage_tab(&summary, 7, None, &[]);
+        assert!(html.contains("2 more runs not shown."), "{html}");
     }
 
     #[test]
