@@ -1,3 +1,4 @@
+use crate::agent_usage::AgentRun;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -76,14 +77,21 @@ pub struct SpendSplit {
 }
 
 impl SpendSplit {
+    fn add_tokens(&mut self, subagent: bool, t: &Tokens) {
+        if subagent {
+            self.subagents.add(t);
+        } else {
+            self.main.add(t);
+        }
+        self.all.add(t);
+    }
+
     fn add_session(&mut self, s: &SessionUsage) {
         for t in s.models.values() {
-            self.main.add(t);
-            self.all.add(t);
+            self.add_tokens(false, t);
         }
         for t in s.subagent_models.values() {
-            self.subagents.add(t);
-            self.all.add(t);
+            self.add_tokens(true, t);
         }
     }
 }
@@ -124,6 +132,21 @@ pub struct FeatureRow {
 }
 
 #[derive(Serialize, Clone, Debug)]
+pub struct RunRow {
+    pub key: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub provider: String,
+    pub title: String,
+    pub model: String,
+    pub parent_key: Option<String>,
+    pub subagent: bool,
+    pub started_ms: i64,
+    pub duration_ms: i64,
+    pub spend: Tokens,
+}
+
+#[derive(Serialize, Clone, Debug)]
 pub struct UsageSummary {
     pub days: u32,
     pub since_ms: i64,
@@ -133,6 +156,7 @@ pub struct UsageSummary {
     pub models: Vec<ModelSpend>,
     pub per_day: Vec<DaySpend>,
     pub features: Vec<FeatureRow>,
+    pub runs: Vec<RunRow>,
 }
 
 pub fn read_usage(root: &Path) -> (Vec<FeatureUsage>, usize) {
@@ -251,6 +275,26 @@ pub fn summarize(
     days: u32,
     offset_secs: i32,
 ) -> UsageSummary {
+    summarize_with(projects, None, now_ms, days, offset_secs)
+}
+
+pub fn summarize_runs(
+    projects: &[ProjectUsageInput],
+    runs: &[(Option<String>, AgentRun)],
+    now_ms: i64,
+    days: u32,
+    offset_secs: i32,
+) -> UsageSummary {
+    summarize_with(projects, Some(runs), now_ms, days, offset_secs)
+}
+
+fn summarize_with(
+    projects: &[ProjectUsageInput],
+    runs: Option<&[(Option<String>, AgentRun)]>,
+    now_ms: i64,
+    days: u32,
+    offset_secs: i32,
+) -> UsageSummary {
     let offset = UtcOffset::from_whole_seconds(offset_secs).unwrap_or(UtcOffset::UTC);
 
     let mut per_day: Vec<DaySpend> = Vec::new();
@@ -277,18 +321,29 @@ pub fn summarize(
         .map(|d| (d.midnight().assume_offset(offset).unix_timestamp_nanos() / 1_000_000) as i64)
         .unwrap_or(now_ms - i64::from(days) * DAY_MS);
     let in_window = |t: i64| t >= since_ms && t <= now_ms;
+    let day_of = |t: i64| {
+        local_date(t, offset)
+            .and_then(|d| day_index.get(&d))
+            .copied()
+    };
 
     let mut totals = SpendSplit::default();
     let mut models: BTreeMap<String, (Tokens, Tokens)> = BTreeMap::new();
-    let mut project_rows = Vec::new();
+    let mut project_rows: Vec<ProjectSpend> = projects
+        .iter()
+        .map(|p| ProjectSpend {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            spend: SpendSplit::default(),
+            features_done: 0,
+            active_ms: 0,
+        })
+        .collect();
     let mut features = Vec::new();
 
-    for p in projects {
-        let mut spend = SpendSplit::default();
-        let mut active_ms = 0;
-        let mut features_done = 0;
+    for (p, row) in projects.iter().zip(project_rows.iter_mut()) {
         for f in &p.features {
-            for s in &f.sessions {
+            for s in f.sessions.iter().filter(|_| runs.is_none()) {
                 let Some(at) = s.ended_ms.or(f.closed_at_ms) else {
                     continue;
                 };
@@ -297,16 +352,16 @@ pub fn summarize(
                 }
                 let mut one = SpendSplit::default();
                 one.add_session(s);
-                spend.add_session(s);
+                row.spend.add_session(s);
                 totals.add_session(s);
                 add_models(&mut models, s);
-                active_ms += s.active_ms();
-                if let Some(&i) = local_date(at, offset).and_then(|d| day_index.get(&d)) {
+                row.active_ms += s.active_ms();
+                if let Some(i) = day_of(at) {
                     per_day[i].spend.add(&one.all);
                 }
             }
             if f.closed_at_ms.is_some_and(in_window) {
-                features_done += 1;
+                row.features_done += 1;
                 let mut row_spend = SpendSplit::default();
                 let mut row_models = BTreeMap::new();
                 for s in &f.sessions {
@@ -327,14 +382,73 @@ pub fn summarize(
                 });
             }
         }
-        project_rows.push(ProjectSpend {
-            id: p.id.clone(),
-            name: p.name.clone(),
+    }
+
+    let mut run_rows = Vec::new();
+    for (project_id, run) in runs.unwrap_or_default() {
+        let events: Vec<_> = run.events.iter().filter(|e| in_window(e.ts_ms)).collect();
+        if events.is_empty() {
+            continue;
+        }
+        let at = project_id
+            .as_deref()
+            .and_then(|id| project_rows.iter().position(|r| r.id == id))
+            .or_else(|| project_rows.iter().position(|r| r.id.is_empty()))
+            .unwrap_or_else(|| {
+                project_rows.push(ProjectSpend {
+                    id: String::new(),
+                    name: "Other".into(),
+                    spend: SpendSplit::default(),
+                    features_done: 0,
+                    active_ms: 0,
+                });
+                project_rows.len() - 1
+            });
+        let row = &mut project_rows[at];
+        let mut spend = Tokens::default();
+        let mut by_model: BTreeMap<&str, u64> = BTreeMap::new();
+        for e in events {
+            let t = Tokens {
+                new: e.new,
+                cached: e.cached,
+            };
+            spend.add(&t);
+            *by_model.entry(&e.model).or_default() += t.total();
+            row.spend.add_tokens(run.subagent, &t);
+            totals.add_tokens(run.subagent, &t);
+            let m = models.entry(e.model.clone()).or_default();
+            if run.subagent { &mut m.1 } else { &mut m.0 }.add(&t);
+            if let Some(i) = day_of(e.ts_ms) {
+                per_day[i].spend.add(&t);
+            }
+        }
+        let duration_ms = (run.ended_ms - run.started_ms).max(0);
+        if !run.subagent {
+            row.active_ms += duration_ms;
+        }
+        run_rows.push(RunRow {
+            key: run.key.clone(),
+            project_id: row.id.clone(),
+            project_name: row.name.clone(),
+            provider: run.provider.clone(),
+            title: run.title.clone(),
+            model: by_model
+                .into_iter()
+                .max_by_key(|(_, n)| *n)
+                .map(|(m, _)| m.to_string())
+                .unwrap_or_default(),
+            parent_key: run.parent_key.clone(),
+            subagent: run.subagent,
+            started_ms: run.started_ms,
+            duration_ms,
             spend,
-            features_done,
-            active_ms,
         });
     }
+    run_rows.sort_by(|a, b| {
+        b.started_ms
+            .cmp(&a.started_ms)
+            .then_with(|| a.key.cmp(&b.key))
+    });
 
     project_rows.sort_by(|a, b| {
         b.spend
@@ -358,6 +472,7 @@ pub fn summarize(
         models: model_list(models),
         per_day,
         features,
+        runs: run_rows,
     }
 }
 
@@ -671,6 +786,154 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn run(
+        key: &str,
+        provider: &str,
+        subagent: bool,
+        events: &[(&str, &str, u64, u64)],
+    ) -> AgentRun {
+        let events: Vec<crate::agent_usage::UsageEvent> = events
+            .iter()
+            .map(|(ts, model, new, cached)| crate::agent_usage::UsageEvent {
+                ts_ms: ms(ts),
+                model: (*model).into(),
+                new: *new,
+                cached: *cached,
+            })
+            .collect();
+        AgentRun {
+            key: key.into(),
+            provider: provider.into(),
+            title: format!("{key} task"),
+            parent_key: subagent.then(|| "claude:main".to_string()),
+            subagent,
+            started_ms: events.iter().map(|e| e.ts_ms).min().unwrap(),
+            ended_ms: events.iter().map(|e| e.ts_ms).max().unwrap(),
+            events,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn runs_feed_totals_projects_models_and_days_while_features_stay_from_bee_files() {
+        let now = ms("2026-10-23T12:00:00Z");
+        let input = project(vec![feature(
+            "f",
+            Some(now - 1000),
+            vec![session(Some(now - 2000), 500, 500)],
+        )]);
+        let runs = vec![
+            (
+                Some("p1".to_string()),
+                run(
+                    "claude:main",
+                    "claude",
+                    false,
+                    &[
+                        ("2026-10-22T10:00:00Z", "opus", 10, 1),
+                        ("2026-10-23T10:00:00Z", "opus", 20, 2),
+                        ("2026-10-23T10:30:00Z", "sonnet", 1, 0),
+                    ],
+                ),
+            ),
+            (
+                Some("p1".to_string()),
+                run(
+                    "pi:child",
+                    "pi",
+                    true,
+                    &[("2026-10-23T11:00:00Z", "hive/flash", 7, 3)],
+                ),
+            ),
+            (
+                None,
+                run(
+                    "codex:x",
+                    "codex",
+                    false,
+                    &[("2026-10-23T09:00:00Z", "gpt", 100, 0)],
+                ),
+            ),
+            (
+                Some("unregistered".to_string()),
+                run(
+                    "claude:old",
+                    "claude",
+                    false,
+                    &[("2026-10-10T09:00:00Z", "opus", 9, 9)],
+                ),
+            ),
+        ];
+        let sum = summarize_runs(&input, &runs, now, 2, 0);
+
+        assert_eq!(sum.totals.main, tok(131, 3));
+        assert_eq!(sum.totals.subagents, tok(7, 3));
+        assert_eq!(per_day_sum(&sum), sum.totals.all);
+        assert_eq!(sum.per_day[0].spend, tok(10, 1));
+
+        let ids: Vec<(&str, &str)> = sum
+            .projects
+            .iter()
+            .map(|p| (p.id.as_str(), p.name.as_str()))
+            .collect();
+        assert_eq!(ids, vec![("", "Other"), ("p1", "one")]);
+        assert_eq!(sum.projects[1].spend.main, tok(31, 3));
+        assert_eq!(sum.projects[1].spend.subagents, tok(7, 3));
+        assert_eq!(sum.projects[1].features_done, 1);
+        assert_eq!(sum.projects[0].spend.all, tok(100, 0));
+
+        let opus = sum.models.iter().find(|m| m.model == "opus").unwrap();
+        assert_eq!(opus.main, tok(30, 3));
+        let flash = sum.models.iter().find(|m| m.model == "hive/flash").unwrap();
+        assert_eq!(flash.subagents, tok(7, 3));
+        assert_eq!(flash.main, Tokens::default());
+
+        assert_eq!(sum.features.len(), 1);
+        assert_eq!(sum.features[0].spend.all, tok(1000, 0));
+
+        let keys: Vec<&str> = sum.runs.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["pi:child", "codex:x", "claude:main"]);
+        let child = &sum.runs[0];
+        assert!(child.subagent);
+        assert_eq!(child.parent_key.as_deref(), Some("claude:main"));
+        assert_eq!(child.project_name, "one");
+        assert_eq!(child.title, "pi:child task");
+        let main = &sum.runs[2];
+        assert_eq!(main.model, "opus");
+        assert_eq!(main.spend, tok(31, 3));
+        assert_eq!(
+            main.duration_ms,
+            ms("2026-10-23T10:30:00Z") - ms("2026-10-22T10:00:00Z")
+        );
+        assert_eq!(sum.runs[1].project_id, "");
+    }
+
+    #[test]
+    fn run_events_bucket_by_their_own_local_day() {
+        let now = ms("2026-10-23T05:00:00Z");
+        let runs = vec![(
+            Some("p1".to_string()),
+            run(
+                "claude:main",
+                "claude",
+                false,
+                &[
+                    ("2026-10-22T16:59:59Z", "opus", 1, 0),
+                    ("2026-10-22T17:00:00Z", "opus", 20, 0),
+                    ("2026-10-23T04:00:00Z", "opus", 300, 0),
+                    ("2026-10-23T05:00:01Z", "opus", 4000, 0),
+                ],
+            ),
+        )];
+        let sum = summarize_runs(&project(Vec::new()), &runs, now, 2, 25200);
+        assert_eq!(sum.per_day[0].spend, tok(1, 0));
+        assert_eq!(sum.per_day[1].spend, tok(320, 0));
+        assert_eq!(sum.totals.all, tok(321, 0));
+        assert_eq!(per_day_sum(&sum), sum.totals.all);
+        assert_eq!(sum.runs[0].spend, tok(321, 0));
+        assert!(summarize(&project(Vec::new()), now, 2, 0).runs.is_empty());
     }
 
     #[test]
