@@ -1,24 +1,24 @@
 ---
 type: bee.pattern
-title: An opt-in that blocks the live proof is not a coverage gap
-description: "Practice: when a deliberate per-project opt-in refuses the end-to-end run that would prove a feature, the refusal is the safety feature working — prove what can be proved, name what stayed unproven, and treat flipping the opt-in as the owner's call rather than the agent's."
+title: A safety switch that blocks the live proof is not a coverage gap
+description: "Practice: when a deliberate safety switch — a per-project off switch, a consent setting — refuses the end-to-end run that would prove a feature, the refusal is the safety feature working — prove what can be proved, name what stayed unproven, and treat flipping the switch as the owner's call rather than the agent's."
 timestamp: 2026-08-25
 bee:
   id: an-opt-in-that-blocks-the-live-proof
   lifecycle: active
   areas: [orchestration, workflow-state]
-  sources: [.bee/cells/archive/dispatch-project-presets/dpp-2.json, .bee/cells/archive/herdr-protocol-20/hp20-4.json, docs/knowledge/work/dispatch-project-presets/delivery.md]
+  sources: [.bee/cells/archive/dispatch-project-presets/dpp-2.json, .bee/cells/archive/herdr-protocol-20/hp20-4.json, docs/knowledge/work/dispatch-project-presets/delivery.md, docs/history/paseo-dispatch-default-on/CONTEXT.md]
   polarity: practice
-  signature: live proof stops at the opt-in
+  signature: live proof stops at a safety switch
 ---
 
-# An opt-in that blocks the live proof is not a coverage gap
+# A safety switch that blocks the live proof is not a coverage gap
 
 ## The situation
 
 A feature is meant to be proved end to end against something real, and the real
-thing is guarded by a deliberate opt-in that is switched off — a per-project
-enable flag, a consent setting, a safety default. The proof stops at the guard.
+thing is guarded by a deliberate switch that is off — a per-project off switch, a
+consent setting, a safety default. The proof stops at the guard.
 
 The tempting readings are both wrong. Reading the refusal as a hole in the feature
 sends someone hunting a bug that is not there. Flipping the switch to get a green
@@ -35,6 +35,12 @@ flipping it was the owner's call. A terminal-protocol port needed one real spawn
 prove anything at all, so it turned the same opt-in on for a single dispatch, gave
 the spawned agent a task that touched no file, turned it straight back off, and
 re-verified that the refusal had returned.
+
+Per-project orchestration has since become on by default (paseo-dispatch-default-on
+D1, decision `fb1b49ab`): the guard a live dispatch meets today is a project's own
+`orchestration = false` in its `.waggledance.toml`, or a file there that cannot be
+parsed. That line is the owner's, in the owner's repo, and the practice below applies
+to it unchanged.
 
 The difference is not that one was careful and the other was not. It is how much
 the proof was worth: the port had no other way to know the protocol worked, and the

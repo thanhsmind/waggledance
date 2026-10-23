@@ -1,13 +1,13 @@
 ---
 type: bee.pattern
 title: A request for a project reaches its one Paseo leader through waggledance_dispatch
-description: "Practice: with a working Paseo CLI found and the project opted into orchestration (its .waggledance.toml or its settings page), waggledance_dispatch with leader: true queues the task for the project's labelled Paseo leader; the daemon delivers it once, in order, only while the leader is idle, marks it done when Paseo reports that turn completed, and tells the caller."
+description: "Practice: with a working Paseo CLI found and a registered project whose .waggledance.toml does not say orchestration = false, waggledance_dispatch with leader: true queues the task for the project's labelled Paseo leader; the daemon delivers it once, in order, only while the leader is idle, marks it done when Paseo reports that turn completed, and tells the caller."
 timestamp: 2026-10-16
 bee:
   id: paseo-leader-dispatch
   lifecycle: active
   areas: [orchestration]
-  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md, docs/history/paseo-leader-mode/CONTEXT.md, docs/history/paseo-leader-mode/plan.md]
+  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md, docs/history/paseo-leader-mode/CONTEXT.md, docs/history/paseo-leader-mode/plan.md, docs/history/paseo-dispatch-default-on/CONTEXT.md, docs/history/paseo-dispatch-default-on/plan.md]
   polarity: practice
   signature: request for a project running in Paseo
 ---
@@ -19,7 +19,9 @@ Locked by paseo-leader-dispatch D1/D2/D3/D4/D5/D6/D8/D9/D10
 leader-delivery D1/D2/D3/D4/D5/D6/D7/D8 (`docs/history/leader-delivery/CONTEXT.md`), and
 paseo-auto-wiring D1/D2/D3/D4/D5/D6/D7 (`docs/history/paseo-auto-wiring/CONTEXT.md`), and
 paseo-leader-mode D2/D3/D4 (`docs/history/paseo-leader-mode/CONTEXT.md`), which narrows
-paseo-auto-wiring D8 for `mode` only.
+paseo-auto-wiring D8 for `mode` only, and paseo-dispatch-default-on D1/D2/D4/D5
+(`docs/history/paseo-dispatch-default-on/CONTEXT.md`, decision `fb1b49ab`), which
+supersedes paseo-auto-wiring D2 and D5: dispatch is on by default.
 Leader-delivery D3 supersedes paseo-leader-dispatch D7: a busy leader no longer refuses a
 request. Paseo-auto-wiring D3 removes paseo-leader-dispatch D8's two-workspace refusal,
 and paseo-auto-wiring D4 makes the global `[paseo]` block optional.
@@ -34,9 +36,13 @@ workspace (paseo-auto-wiring D1/D4). Three things turn a project's leader path o
    one candidate answers `ls -g --json` with a JSON list.
 2. **The project is registered.** The daemon registers every Paseo workspace root it
    finds; see [Workspace discovery](#workspace-discovery).
-3. **The project opts in.** Commit a `.waggledance.toml` with `orchestration = true` at
-   the repo root, or turn orchestration on from the project's settings page (D2). A
-   project that is not opted in is refused before anything is stored.
+3. **The project has not turned dispatch off.** Every registered project takes
+   dispatched work by default. `orchestration = false` in its `.waggledance.toml` is
+   the only per-project off switch, and a file that exists but cannot be read or
+   parsed also counts as off (decision `4b745240`). The Orchestration section of the
+   settings page lists each project as on or off and why. An off project is refused
+   before anything is stored. Paseo leader dispatch is not gated by
+   `terminal.enabled`; that switch gates pane dispatch only.
 
 The waggledance daemon (`waggledance serve`) must be running. It discovers workspaces
 and delivers queued requests; `waggledance mcp` only accepts them.
@@ -47,7 +53,7 @@ The per-project settings file sits at the repo root and is committed with the co
 (paseo-auto-wiring D2). Every key is optional:
 
 ```toml
-orchestration = true
+orchestration = false
 
 [paseo]
 workspace = "wks_0123456789ab"
@@ -56,10 +62,9 @@ mode = "bypassPermissions"
 thinking = "high"
 ```
 
-- `orchestration` — `true` opts the project into dispatched work with exactly the scope
-  of the settings-page opt-in, triggers included: the project is opted in when either
-  the settings page or the file says so (D5). Absent or `false` leaves the settings page
-  as the only switch.
+- `orchestration` — `false` turns dispatched work off for this project, triggers and
+  board actions included. Absent or `true` leaves it on. The settings page shows the
+  result and no longer switches it.
 - `[paseo] workspace` — the Paseo workspace id a new leader starts in. It wins over
   every other rule in [Workspace resolution](#workspace-resolution).
 - `[paseo] provider`, `mode`, `thinking` — passed to `paseo run` for a new leader. A
@@ -74,14 +79,22 @@ thinking = "high"
   (paseo-auto-wiring D8). Paseo reports such CLI errors as a JSON `error` object on
   stderr; waggledance shows its code and message.
 
-The file is re-read when its modification time changes. A file that fails to parse is
-ignored as a whole, and the not-opted-in refusal names the settings page, the file path,
-and the parse error. An unknown key is ignored with a warning; the rest of the file
-still counts.
+The file is re-read when its modification time changes, so an edit applies on the next
+dispatch without a restart. A file that exists but cannot be read or parsed turns
+dispatch off, never fails open. An unknown key is ignored with a warning; the rest of
+the file still counts. The refusal for an off project reads:
 
-**Accepted risk (D5):** anyone who can change a repo checkout can opt that project into
-dispatched work by writing this file. The owner chose in-repo consent; there is no
-second confirmation on the host.
+> project `<id>` has turned off orchestrator dispatch with `orchestration = false` in
+> `<path>` — remove that line to allow it
+
+and for a broken file:
+
+> project `<id>` has a .waggledance.toml at `<path>` that could not be read, so dispatch
+> is off: `<warning>`
+
+**Accepted risk (paseo-dispatch-default-on D1):** every agent that can reach the MCP
+surface can dispatch into every registered project that has not turned dispatch off.
+The owner chose default-on; nothing is written into any repo to opt it out.
 
 ### The global [paseo] block
 
@@ -120,7 +133,7 @@ sent unchanged. `request_id` is optional; pass one on every call.
 
 1. If a run of this project already carries the same `request_id`, the call returns
    `{run_id, status, duplicate: true}` for that run and sends nothing (D1).
-2. The orchestration opt-in and Paseo availability are checked, in that order.
+2. The project's dispatch switch and Paseo availability are checked, in that order.
 3. The request is stored as a run with status `queued`, pane id `paseo:pending`, and the
    caller's `PASEO_AGENT_ID` when the dispatch came from a Paseo agent. No `paseo`
    command runs inside the call.
@@ -295,8 +308,8 @@ A workspace root is registered only when all of these hold (D6):
 - it is not `$HOME`, not `/`, and not under `/tmp`;
 - no registered project's root contains it or sits inside it.
 
-A discovered project is not opted in. It receives dispatched work only once its
-`.waggledance.toml` or its settings page turns orchestration on (D2).
+A discovered project takes dispatched work at once, unless its `.waggledance.toml`
+says `orchestration = false` (paseo-dispatch-default-on D1).
 
 ## Workspace resolution
 
@@ -370,7 +383,8 @@ Each source names the project itself:
   `turn_timeout_secs`), `PaseoLeader`, `workspace_for`.
 - `crates/waggledance-core/src/project_settings.rs` — `.waggledance.toml`: keys, parse,
   warnings. `Engine::orchestration_allowed` and `Engine::project_settings` in
-  `crates/waggledance-core/src/engine.rs` combine it with the settings-page flag.
+  `crates/waggledance-core/src/engine.rs` turn it into the effective dispatch switch.
+  `dispatch_off` in `crates/waggledance/src/mcp.rs` writes the refusal.
 - `crates/waggledance/src/discovery.rs` — workspace discovery and its filters.
 - `crates/waggledance/src/setup.rs` — `waggledance setup paseo` and its leftover-line
   warnings.

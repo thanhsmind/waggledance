@@ -121,8 +121,9 @@ launcher — CLI, MCP, future desktop — coordinates through `~/.waggledance/da
     publishes as startable, so the tool can never advertise a label and then
     reject it.
 
-    A project that has not opted into orchestration still refuses the dispatch,
-    before any label is resolved.
+    Every managed project accepts dispatch by default. One whose
+    `.waggledance.toml` says `orchestration = false`, or holds a file that cannot be
+    read or parsed, refuses it before any label is resolved.
 - **CLI** — `serve` (daemon), plus `register / open / list / search / status /
   refresh / unregister / stop`, `doctor`, and `version` (prints the single-source
   app version, same as `--version`).
