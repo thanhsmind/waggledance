@@ -66,10 +66,27 @@ them or to a project.
 ## Agent runs (D7)
 
 A run is one log file: a Claude Code session, a Claude Code subagent
-transcript, a pi session or a Codex session. The **Agent runs** table shows
-one row per run with spend in the window, with task, project, provider,
-model, start, duration, new and cache-read tokens. Subagents nest under their
-parent, and the table shows at most 300 rows with a count of the rest.
+transcript, a pi session or a Codex session. The **Agent runs** list
+(`views::usage_runs_table`) shows every run with spend in the window, folded
+by task (decision 4ddb1112):
+
+- **Grouping**: with no project filter, runs sit under one heading per
+  project, with that project's total run tokens; projects run by total,
+  largest first, and Other comes last. With a filter there are no headings,
+  and the list has no Project column either way.
+- **Top-level row**: one row per run with no parent in the list: task,
+  provider, model, start (local date-time), duration, new and cache-read.
+  The tokens are the run's own plus those of all its subagents, at any depth.
+- **Subagents**: a run with subagents is a `<details>` disclosure, closed by
+  default, its row adding a muted "N subagents" count. Opened, it lists every
+  descendant, flattened and ordered by start, in the shape of Paseo's
+  subagent list: the title on one line, then muted
+  `provider · model · duration · <new> new · <cache-read> cache`. A run
+  with no subagents is a plain row with no disclosure marker. A subagent
+  whose parent has no spend in the window is a top-level row tagged
+  "subagent".
+- **Cap**: at most 300 top-level rows, then "N more runs not shown.".
+  Subagents inside a disclosure do not count toward the cap.
 
 - **Task name**: a Paseo agent whose provider and session id match the run
   supplies the name. That name is its `bee_cell` label when present, else its
@@ -138,4 +155,7 @@ so the first open of the tab does not parse every log.
   the startup warm-up, and the `days` / `project` parsing in `RegisterFlag`
 - `crates/waggledance/src/views.rs` — `usage_tab`, `usage_runs_table`,
   `USAGE_WINDOWS`, `HomeTab::Usage`
+- `crates/waggledance/assets/app.css` — the `.usage__runs` grid rows, the
+  `.usage__group` headings and the `.usage__subagents` list; a grid
+  `<summary>` drops the native marker, so `.usage__task::before` draws it
 - `docs/history/usage-dashboard/CONTEXT.md` — decisions D1 to D7

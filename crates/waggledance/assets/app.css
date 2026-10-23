@@ -4081,8 +4081,95 @@ html:has(.nav-only) {
   font-size: var(--type-caption-size);
   color: var(--color-text-muted);
 }
-.usage__run .usage__task {
-  padding-left: calc(var(--space-2) + var(--usage-depth, 0) * var(--space-4));
+.usage__runs {
+  display: flex;
+  flex-direction: column;
+  font-size: var(--type-body-sm-size);
+}
+.usage__group {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--type-body-sm-size);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+.usage__group-total {
+  font-family: var(--font-mono);
+  color: var(--color-text-muted);
+}
+.usage__run-row {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) 4.5rem minmax(6rem, 10rem) 8.5rem 4.5rem 4.5rem 5rem;
+  gap: var(--space-2);
+  align-items: baseline;
+  padding: var(--space-1) var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+}
+.usage__run-row > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage__runs-head {
+  color: var(--color-text-subtle);
+  font-weight: var(--weight-semibold);
+}
+details.usage__run > summary {
+  cursor: pointer;
+  list-style: none;
+}
+details.usage__run > summary::-webkit-details-marker {
+  display: none;
+}
+details.usage__run > summary .usage__task::before {
+  content: "▸ ";
+  color: var(--color-text-subtle);
+}
+details.usage__run[open] > summary .usage__task::before {
+  content: "▾ ";
+}
+details.usage__run > summary:hover {
+  background: var(--color-surface-hover);
+}
+.usage__subagents {
+  margin: 0;
+  padding: var(--space-1) var(--space-2) var(--space-2) var(--space-5);
+  list-style: none;
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  background: var(--color-surface-sunken);
+}
+.usage__subagent {
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1) 0;
+  min-width: 0;
+}
+.usage__subagent-title {
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+.usage__subagent-meta {
+  font-size: var(--type-caption-size);
+  color: var(--color-text-subtle);
+  overflow-wrap: anywhere;
+}
+@media (max-width: 720px) {
+  .usage__run-row {
+    grid-template-columns: repeat(3, auto);
+    justify-content: start;
+    column-gap: var(--space-3);
+  }
+  .usage__run-row > .usage__task {
+    grid-column: 1 / -1;
+    white-space: normal;
+  }
+  .usage__runs-head {
+    display: none;
+  }
 }
 .usage__sub {
   margin-left: var(--space-1);
