@@ -76,6 +76,19 @@ impl Default for AgentHomes {
     }
 }
 
+pub fn paseo_project_roots(paseo_home: &Path) -> Option<Vec<PathBuf>> {
+    let text = fs::read_to_string(paseo_home.join("projects").join("projects.json")).ok()?;
+    let projects: Vec<Value> = serde_json::from_str(&text).ok()?;
+    Some(
+        projects
+            .iter()
+            .filter(|p| p.get("archivedAt").is_none_or(Value::is_null))
+            .filter_map(|p| p.get("rootPath")?.as_str())
+            .map(|root| canonical(Path::new(root)))
+            .collect(),
+    )
+}
+
 fn json_lines(text: &str) -> impl Iterator<Item = Value> + '_ {
     text.lines().filter_map(|l| serde_json::from_str(l).ok())
 }
@@ -838,6 +851,28 @@ mod tests {
         assert_eq!(project_for(&base.join("link/inner"), &roots), Some("i"));
         assert_eq!(project_for(&base.join("elsewhere"), &roots), None);
         assert_eq!(project_for(Path::new("/no/such/place"), &roots), None);
+    }
+
+    #[test]
+    fn paseo_project_roots_keeps_live_projects_and_needs_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        assert_eq!(paseo_project_roots(&base.join("paseo")), None);
+        fs::create_dir_all(base.join("live")).unwrap();
+        fs::create_dir_all(base.join("paseo/projects")).unwrap();
+        std::os::unix::fs::symlink(base.join("live"), base.join("link")).unwrap();
+        let store = serde_json::json!([
+            {"projectId": "a", "rootPath": base.join("link"), "archivedAt": null},
+            {"projectId": "b", "rootPath": base.join("gone"), "archivedAt": "2026-10-12T05:19:27.204Z"},
+            {"projectId": "c"}
+        ]);
+        fs::write(base.join("paseo/projects/projects.json"), store.to_string()).unwrap();
+        assert_eq!(
+            paseo_project_roots(&base.join("paseo")),
+            Some(vec![fs::canonicalize(base.join("live")).unwrap()])
+        );
+        fs::write(base.join("paseo/projects/projects.json"), "not json").unwrap();
+        assert_eq!(paseo_project_roots(&base.join("paseo")), None);
     }
 
     fn homes_in(dir: &Path) -> AgentHomes {
