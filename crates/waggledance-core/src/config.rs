@@ -38,7 +38,7 @@ impl Default for PaseoConfig {
             enabled: None,
             binary: String::new(),
             provider: String::new(),
-            mode: String::new(),
+            mode: "bypassPermissions".into(),
             thinking: String::new(),
             turn_timeout_secs: 3600,
             leaders: Vec::new(),
@@ -967,9 +967,8 @@ mod tests {
         assert_eq!(c.paseo.enabled, None);
         assert!(c.paseo.binary.is_empty());
         assert_eq!(c.paseo.turn_timeout_secs, 3600);
-        assert!(
-            c.paseo.provider.is_empty() && c.paseo.mode.is_empty() && c.paseo.thinking.is_empty()
-        );
+        assert!(c.paseo.provider.is_empty() && c.paseo.thinking.is_empty());
+        assert_eq!(c.paseo.mode, "bypassPermissions");
 
         let parsed: Config = toml::from_str(
             "[paseo]\nenabled = true\nbinary = \"/opt/paseo\"\n\n[[paseo.leaders]]\nproject = \"waggledance\"\nworkspace = \"wks_a\"\n\n[[paseo.leaders]]\nproject = \"p-2\"\nworkspace = \"wks_b\"\n",
@@ -991,7 +990,9 @@ mod tests {
         );
         assert_eq!(parsed.paseo.workspace_for("p-2", "other"), Some("wks_b"));
         assert_eq!(parsed.paseo.workspace_for("p-3", "other"), None);
-        assert!(parsed.paseo.mode.is_empty());
+        assert_eq!(parsed.paseo.mode, "bypassPermissions");
+        let unset: Config = toml::from_str("[paseo]\nmode = \"\"\n").unwrap();
+        assert!(unset.paseo.mode.is_empty());
     }
 
     #[test]

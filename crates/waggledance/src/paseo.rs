@@ -107,11 +107,28 @@ pub struct StoredWorkspace {
     pub is_paseo_owned_worktree: bool,
 }
 
-pub fn store_path(paseo_home: Option<OsString>) -> Option<PathBuf> {
+pub fn paseo_home(paseo_home: Option<OsString>) -> Option<PathBuf> {
     paseo_home
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".paseo")))
-        .map(|home| home.join("projects").join("workspaces.json"))
+}
+
+pub fn store_path(home: Option<OsString>) -> Option<PathBuf> {
+    paseo_home(home).map(|home| home.join("projects").join("workspaces.json"))
+}
+
+pub fn record_mode(home: &Path, id: &str) -> Option<String> {
+    if id.is_empty() || id.contains(['/', '\\']) || id.starts_with('.') {
+        return None;
+    }
+    std::fs::read_dir(home.join("agents"))
+        .ok()?
+        .flatten()
+        .find_map(|dir| std::fs::read_to_string(dir.path().join(format!("{id}.json"))).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())?
+        .pointer("/runtimeInfo/modeId")?
+        .as_str()
+        .map(str::to_string)
 }
 
 pub fn read_store(path: &Path) -> Vec<StoredWorkspace> {
@@ -150,6 +167,61 @@ pub trait Paseo: Send + Sync {
     async fn archive(&self, id: &str) -> Result<()>;
     async fn permit(&self, id: &str, req_id: &str, allow: bool) -> Result<()>;
     async fn permits(&self) -> Result<Vec<Permit>>;
+    async fn runtime_mode(&self, id: &str) -> Result<Option<String>>;
+    async fn set_mode(&self, id: &str, mode: &str) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeCheck {
+    Skipped,
+    Matched,
+    Repaired,
+    Mismatch { runtime: Option<String> },
+}
+
+async fn settled_mode(
+    paseo: &dyn Paseo,
+    id: &str,
+    mode: &str,
+    settle: Duration,
+    poll: Duration,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + settle;
+    loop {
+        let runtime = paseo.runtime_mode(id).await.unwrap_or_else(|e| {
+            tracing::warn!("could not read leader {id}'s runtime mode: {e}");
+            None
+        });
+        if runtime.as_deref() == Some(mode) || tokio::time::Instant::now() >= deadline {
+            return runtime;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+pub async fn ensure_mode(
+    paseo: &dyn Paseo,
+    id: &str,
+    mode: &str,
+    settle: Duration,
+    poll: Duration,
+) -> ModeCheck {
+    if mode.is_empty() {
+        return ModeCheck::Skipped;
+    }
+    let runtime = settled_mode(paseo, id, mode, settle, poll).await;
+    if runtime.as_deref() == Some(mode) {
+        return ModeCheck::Matched;
+    }
+    if let Err(e) = paseo.set_mode(id, mode).await {
+        tracing::warn!("could not set leader {id} to mode {mode}: {e}");
+        return ModeCheck::Mismatch { runtime };
+    }
+    let runtime = settled_mode(paseo, id, mode, settle, poll).await;
+    match runtime.as_deref() == Some(mode) {
+        true => ModeCheck::Repaired,
+        false => ModeCheck::Mismatch { runtime },
+    }
 }
 
 pub fn delivery_heartbeat_path(data_dir: &Path) -> PathBuf {
@@ -910,6 +982,21 @@ impl Paseo for PaseoCli {
             .await?;
         parse_document(&out).map_err(|e| unparsable(&binary, "permit", e))
     }
+
+    async fn runtime_mode(&self, id: &str) -> Result<Option<String>> {
+        Ok(paseo_home(std::env::var_os("PASEO_HOME")).and_then(|home| record_mode(&home, id)))
+    }
+
+    async fn set_mode(&self, id: &str, mode: &str) -> Result<()> {
+        let args = [
+            "agent".into(),
+            "mode".into(),
+            id.into(),
+            mode.into(),
+            "--json".into(),
+        ];
+        self.exec(&args, TIMEOUT).await.map(|_| ())
+    }
 }
 
 struct PromptFile(PathBuf);
@@ -1018,6 +1105,29 @@ fn realpath(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn either(file: &Option<String>, global: &str) -> String {
+    file.clone()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| global.to_string())
+}
+
+pub fn leader_mode(config: &PaseoConfig, settings: &ProjectPaseo) -> String {
+    either(&settings.mode, &config.mode)
+}
+
+pub async fn leader_ids(paseo: &dyn Paseo, project_id: &str, wd: bool) -> Result<Vec<String>> {
+    let wd_ids = paseo.wd_leaders(project_id).await?;
+    Ok(match wd {
+        true => wd_ids,
+        false => paseo
+            .leaders(project_id)
+            .await?
+            .into_iter()
+            .filter(|id| !wd_ids.contains(id))
+            .collect(),
+    })
+}
+
 pub async fn resolve_leader(
     paseo: &dyn Paseo,
     config: &PaseoConfig,
@@ -1025,28 +1135,13 @@ pub async fn resolve_leader(
     project: &Project,
     wd: bool,
 ) -> Result<Leader> {
-    let wd_ids = paseo.wd_leaders(&project.id).await?;
-    let ids = match wd {
-        true => wd_ids,
-        false => paseo
-            .leaders(&project.id)
-            .await?
-            .into_iter()
-            .filter(|id| !wd_ids.contains(id))
-            .collect(),
-    };
-    for id in ids {
+    for id in leader_ids(paseo, &project.id, wd).await? {
         let state = paseo.inspect(&id).await?;
         if !state.archived {
             let busy = matches!(state.status.as_str(), "running" | "initializing");
             return Ok(Leader::Existing { id, busy });
         }
     }
-    let either = |file: &Option<String>, global: &str| {
-        file.clone()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| global.to_string())
-    };
     let mut provider = either(&settings.provider, &config.provider);
     if provider.is_empty() {
         provider = paseo
@@ -1080,7 +1175,7 @@ pub async fn resolve_leader(
             .collect(),
         reason,
         provider,
-        mode: either(&settings.mode, &config.mode),
+        mode: leader_mode(config, settings),
         thinking: either(&settings.thinking, &config.thinking),
     }))
 }
@@ -1133,6 +1228,9 @@ pub mod fake {
         Archive(String),
         Permit(String, String, bool),
         Permits,
+        RuntimeMode(String),
+        SetMode(String, String),
+        RunDone(String),
     }
 
     #[derive(Default)]
@@ -1147,6 +1245,10 @@ pub mod fake {
         pub logs: HashMap<String, String>,
         pub turn_ends: VecDeque<TurnEnd>,
         pub permits: Vec<Permit>,
+        pub modes: HashMap<String, VecDeque<Option<String>>>,
+        pub stuck: std::collections::HashSet<String>,
+        pub appear_after: Duration,
+        pub run_after: Duration,
         pub calls: Vec<Call>,
     }
 
@@ -1176,6 +1278,20 @@ pub mod fake {
                     updated_at: None,
                 },
             );
+            s.modes
+                .entry(id.to_string())
+                .or_insert_with(|| VecDeque::from([Some("bypassPermissions".to_string())]));
+        }
+
+        pub fn script_modes(&self, id: &str, modes: &[Option<&str>], stuck: bool) {
+            let mut s = self.state.lock().unwrap();
+            s.modes.insert(
+                id.to_string(),
+                modes.iter().map(|m| m.map(str::to_string)).collect(),
+            );
+            if stuck {
+                s.stuck.insert(id.to_string());
+            }
         }
 
         pub fn add_wd_leader(&self, project_id: &str, id: &str, status: &str) {
@@ -1294,7 +1410,20 @@ pub mod fake {
         ) -> Result<(String, TurnEnd)> {
             self.record(Call::Run(spec.clone()));
             tokio::task::yield_now().await;
+            let (appear_after, run_after) = {
+                let s = self.state.lock().unwrap();
+                (s.appear_after, s.run_after)
+            };
+            tokio::time::sleep(appear_after).await;
             let id = format!("agent-{}", self.state.lock().unwrap().agents.len() + 1);
+            if !spec.mode.is_empty() {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .modes
+                    .entry(id.clone())
+                    .or_insert_with(|| VecDeque::from([Some(spec.mode.clone())]));
+            }
             if let Some(project) = spec
                 .labels
                 .iter()
@@ -1305,6 +1434,8 @@ pub mod fake {
             if spec.labels.iter().any(|l| l == WD_LABEL) {
                 self.state.lock().unwrap().wd.insert(id.clone());
             }
+            tokio::time::sleep(run_after).await;
+            self.record(Call::RunDone(id.clone()));
             Ok((id, self.next_turn_end()))
         }
 
@@ -1351,6 +1482,26 @@ pub mod fake {
         async fn permits(&self) -> Result<Vec<Permit>> {
             self.record(Call::Permits);
             Ok(self.state.lock().unwrap().permits.clone())
+        }
+
+        async fn runtime_mode(&self, id: &str) -> Result<Option<String>> {
+            self.record(Call::RuntimeMode(id.to_string()));
+            let mut s = self.state.lock().unwrap();
+            Ok(match s.modes.get_mut(id) {
+                Some(q) if q.len() > 1 => q.pop_front().flatten(),
+                Some(q) => q.front().cloned().flatten(),
+                None => None,
+            })
+        }
+
+        async fn set_mode(&self, id: &str, mode: &str) -> Result<()> {
+            self.record(Call::SetMode(id.to_string(), mode.to_string()));
+            let mut s = self.state.lock().unwrap();
+            if !s.stuck.contains(id) {
+                s.modes
+                    .insert(id.to_string(), VecDeque::from([Some(mode.to_string())]));
+            }
+            Ok(())
         }
     }
 }
@@ -2470,6 +2621,7 @@ mod tests {
         cli.archive("lead-1").await.unwrap();
         cli.permit("lead-1", "req-7", true).await.unwrap();
         cli.permit("lead-1", "req-8", false).await.unwrap();
+        cli.set_mode("lead-1", "bypassPermissions").await.unwrap();
         let lines: Vec<String> = std::fs::read_to_string(&argv)
             .unwrap()
             .lines()
@@ -2482,6 +2634,7 @@ mod tests {
                 "archive lead-1 --json",
                 "permit allow lead-1 req-7 --json",
                 "permit deny lead-1 req-8 --json",
+                "agent mode lead-1 bypassPermissions --json",
             ]
         );
     }
@@ -2503,6 +2656,142 @@ mod tests {
                 name: "Bash".into(),
                 description: "ls -la".into(),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_leader_mode_defaults_to_bypass_a_file_mode_wins_and_an_empty_global_passes_no_flag(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakePaseo::default();
+        fake.add_workspace("wks_root", "local", dir.path());
+        let argv = |config: &PaseoConfig, settings: &ProjectPaseo| {
+            let fake = &fake;
+            let root = dir.path().to_path_buf();
+            let (config, settings) = (config.clone(), settings.clone());
+            async move {
+                let s = start(
+                    resolve_leader(fake, &config, &settings, &project(&root), false)
+                        .await
+                        .unwrap(),
+                );
+                run_args(&s.spec("t"))
+            }
+        };
+        let pair = |args: &[String], value: &str| {
+            args.windows(2).any(|w| w[0] == "--mode" && w[1] == value)
+        };
+        let none = ProjectPaseo::default();
+        let args = argv(&PaseoConfig::default(), &none).await;
+        assert!(pair(&args, "bypassPermissions"), "{args:?}");
+        let file = ProjectPaseo {
+            mode: Some("acceptEdits".into()),
+            ..ProjectPaseo::default()
+        };
+        assert!(pair(
+            &argv(&PaseoConfig::default(), &file).await,
+            "acceptEdits"
+        ));
+        let empty = PaseoConfig {
+            mode: String::new(),
+            ..PaseoConfig::default()
+        };
+        assert_eq!(leader_mode(&empty, &none), "");
+        let args = argv(&empty, &none).await;
+        assert!(!args.iter().any(|a| a == "--mode"), "{args:?}");
+    }
+
+    fn set_modes(fake: &FakePaseo) -> Vec<(String, String)> {
+        fake.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::SetMode(id, mode) => Some((id, mode)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ensure_mode_skips_matches_repairs_once_and_reports_a_mode_that_stays_wrong() {
+        let (settle, poll) = (Duration::from_millis(20), Duration::from_millis(1));
+        let bypass = "bypassPermissions";
+        let fake = FakePaseo::default();
+        assert_eq!(
+            ensure_mode(&fake, "x", "", settle, poll).await,
+            ModeCheck::Skipped
+        );
+        assert!(fake.calls().is_empty());
+
+        fake.add_leader("proj-1", "ok", "idle", false);
+        assert_eq!(
+            ensure_mode(&fake, "ok", bypass, settle, poll).await,
+            ModeCheck::Matched
+        );
+        fake.script_modes(
+            "late",
+            &[Some("default"), Some("default"), Some(bypass)],
+            false,
+        );
+        assert_eq!(
+            ensure_mode(&fake, "late", bypass, Duration::from_secs(5), poll).await,
+            ModeCheck::Matched
+        );
+        assert!(set_modes(&fake).is_empty());
+
+        fake.script_modes("fixable", &[Some("default")], false);
+        assert_eq!(
+            ensure_mode(&fake, "fixable", bypass, settle, poll).await,
+            ModeCheck::Repaired
+        );
+        assert_eq!(set_modes(&fake), [("fixable".into(), bypass.into())]);
+
+        let fake = FakePaseo::default();
+        fake.script_modes("stuck", &[Some("default")], true);
+        assert_eq!(
+            ensure_mode(&fake, "stuck", bypass, settle, poll).await,
+            ModeCheck::Mismatch {
+                runtime: Some("default".into())
+            }
+        );
+        fake.state.lock().unwrap().stuck.insert("gone".into());
+        assert_eq!(
+            ensure_mode(&fake, "gone", bypass, settle, poll).await,
+            ModeCheck::Mismatch { runtime: None }
+        );
+        assert_eq!(
+            set_modes(&fake),
+            [
+                ("stuck".to_string(), bypass.to_string()),
+                ("gone".to_string(), bypass.to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_runtime_mode_is_runtime_info_mode_id_in_the_agent_record_under_paseo_home() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join("home-u-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ff24c29b.json"),
+            r#"{"id":"ff24c29b","currentModeId":"bypassPermissions","runtimeInfo":{"provider":"claude","modeId":"default"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("bare.json"), r#"{"id":"bare"}"#).unwrap();
+        assert_eq!(
+            record_mode(home.path(), "ff24c29b").as_deref(),
+            Some("default")
+        );
+        assert_eq!(record_mode(home.path(), "bare"), None);
+        assert_eq!(record_mode(home.path(), "missing"), None);
+        assert_eq!(
+            record_mode(home.path(), "../agents/home-u-proj/ff24c29b"),
+            None
+        );
+        assert_eq!(record_mode(Path::new("/nonexistent"), "ff24c29b"), None);
+        assert_eq!(
+            paseo_home(Some("/srv/ph".into())),
+            Some(PathBuf::from("/srv/ph"))
         );
     }
 }
