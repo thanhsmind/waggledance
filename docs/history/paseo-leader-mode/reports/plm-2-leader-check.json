@@ -1,0 +1,1 @@
+{"schema":"leader-check/1","answers":[{"requirement":"The concept names bypassPermissions as the default and describes the runtime check","artifact":"docs/knowledge/patterns/paseo-leader-dispatch.md"},{"requirement":"Leader mode check section","artifact":"docs/knowledge/patterns/paseo-leader-dispatch.md"}]}

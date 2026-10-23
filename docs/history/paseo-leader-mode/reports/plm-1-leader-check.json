@@ -1,0 +1,12 @@
+{
+  "schema": "leader-check/1",
+  "answers": [
+    {"requirement": "With no mode set anywhere the paseo run argv carries --mode bypassPermissions", "artifact": "crates/waggledance-core/src/config.rs"},
+    {"requirement": "A runtime mode that differs triggers exactly one paseo agent mode call", "artifact": "crates/waggledance/src/paseo.rs"},
+    {"requirement": "A mode still wrong after the set is named in the run reply header and the run still ends done", "artifact": "crates/waggledance/src/delivery.rs"},
+    {"requirement": "An existing leader is checked before the task is sent", "artifact": "crates/waggledance/src/delivery.rs"},
+    {"requirement": "Global mode empty skips the flag and the check", "artifact": "crates/waggledance/src/delivery.rs"},
+    {"requirement": "ensure_mode, runtime_mode reading runtimeInfo.modeId, set_mode via paseo agent mode", "artifact": "crates/waggledance/src/paseo.rs"},
+    {"requirement": "delivery.rs Leader::Start and Leader::Existing both call ensure_mode", "artifact": "crates/waggledance/src/delivery.rs"}
+  ]
+}
