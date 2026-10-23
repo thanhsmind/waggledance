@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 
 const HEAD_BYTES: usize = 1024;
 const DAY_MS: i64 = 86_400_000;
+const KEEP_DAYS: i64 = 31;
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct UsageEvent {
@@ -572,6 +573,7 @@ impl AgentLogCache {
     }
 
     pub fn runs(&self, homes: &AgentHomes, since_ms: i64) -> Vec<Arc<AgentRun>> {
+        let horizon = since_ms.min(millis(SystemTime::now()) - KEEP_DAYS * DAY_MS);
         let mut keep = HashSet::new();
         let mut found = Vec::new();
         for (path, kind) in discover(homes) {
@@ -580,7 +582,7 @@ impl AgentLogCache {
             };
             let mtime = md.modified().unwrap_or(UNIX_EPOCH);
             let paseo = matches!(kind, Kind::Paseo);
-            if paseo || millis(mtime) >= since_ms - DAY_MS {
+            if paseo || millis(mtime) >= horizon {
                 keep.insert(path.clone());
             }
             if paseo || millis(mtime) >= since_ms {
@@ -953,11 +955,34 @@ mod tests {
     }
 
     #[test]
+    fn a_shorter_window_keeps_older_logs_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (homes, _, rollout) = logs_fixture(dir.path());
+        let now = SystemTime::now();
+        touch(&rollout, now - Duration::from_secs(20 * 86_400));
+        let since = |days: u64| millis(now - Duration::from_secs((days + 1) * 86_400));
+        let cache = AgentLogCache::new();
+        assert_eq!(cache.runs(&homes, since(30)).len(), 2);
+        let warm = cache.parsed_bytes.load(Ordering::Relaxed);
+        let week = cache.runs(&homes, since(7));
+        assert_eq!(week.len(), 1);
+        assert_eq!(week[0].key, "claude:s1");
+        assert_eq!(cache.runs(&homes, since(30)).len(), 2);
+        assert_eq!(cache.parsed_bytes.load(Ordering::Relaxed), warm);
+    }
+
+    #[test]
     fn the_cache_lock_is_free_while_a_log_is_read() {
         let dir = tempfile::tempdir().unwrap();
         let (homes, main, _) = logs_fixture(dir.path());
         let cache = AgentLogCache {
-            read_hook: Some(|c| assert!(c.files.try_lock().is_ok())),
+            read_hook: Some(|c| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while c.files.try_lock().is_err() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }),
             ..Default::default()
         };
         let since = ms("2026-01-01T00:00:00Z");
