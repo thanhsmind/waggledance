@@ -25,6 +25,7 @@ pub mod render;
 pub mod repository;
 pub mod short_link;
 pub mod transcript;
+pub mod usage;
 
 pub use config::Config;
 pub use engine::Engine;

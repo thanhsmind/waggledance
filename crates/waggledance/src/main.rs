@@ -49,6 +49,11 @@ fn main() {
         )
         .init();
 
+    waggledance_core::usage::set_local_offset_secs(
+        time::UtcOffset::current_local_offset()
+            .map(|o| o.whole_seconds())
+            .unwrap_or(0),
+    );
     let cli = cli::Cli::parse();
     if let Err(e) = cli::run(cli) {
         eprintln!("error: {e:#}");
