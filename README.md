@@ -253,7 +253,8 @@ workspace = "wks_0123456789ab"
 ```
 
 Only `orchestration` is needed. `[paseo]` optionally names the workspace a new leader
-starts in, and takes `provider`, `mode`, and `thinking` for it. Anyone who can
+starts in, and takes `provider`, `mode`, and `thinking` for it. `mode` defaults to
+`bypassPermissions`. Anyone who can
 change the checkout can opt it in with this file. Every key is described in
 [.waggledance.toml](docs/knowledge/patterns/paseo-leader-dispatch.md#waggledancetoml).
 
