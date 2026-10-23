@@ -1107,10 +1107,7 @@ html[data-scheme="dark"] .topbar .home {
   }
   .home-tabbar {
     display: grid;
-    /* guide-vi: five destinations now, not four — Board, Agents, Projects,
-       Hướng dẫn, Settings. At the 320px floor that is 64px a target, still
-       above the 44px minimum, and the labels are 11px. */
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(6, 1fr);
     position: fixed;
     left: 0;
     right: 0;
@@ -3974,4 +3971,113 @@ html:has(.nav-only) {
 .layout--panel > .content {
   width: 100%;
   max-width: none;
+}
+
+.usage {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.usage__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+.usage__title {
+  margin: 0;
+  margin-right: auto;
+}
+.usage__h2 {
+  margin: 0;
+  font-size: var(--type-body-sm-size);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text-muted);
+}
+.usage__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.usage__chip {
+  padding: var(--space-1) var(--space-2);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-pill);
+  color: var(--color-text-muted);
+  font-size: var(--type-caption-size);
+  text-decoration: none;
+}
+.usage__chip:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+.usage__chip--on {
+  border-color: var(--color-action);
+  color: var(--color-action);
+  font-weight: var(--weight-semibold);
+}
+.usage__kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-2);
+}
+.usage__kpi {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+}
+.usage__kpi-label {
+  color: var(--color-text-subtle);
+  font-size: var(--type-caption-size);
+}
+.usage__kpi-value {
+  font-family: var(--font-mono);
+  font-size: 1.25rem;
+  color: var(--color-text);
+}
+.usage__bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 96px;
+  padding: var(--space-2);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+}
+.usage__bar {
+  flex: 1 1 0;
+  min-height: 1px;
+  background: var(--color-action);
+  border-radius: 2px 2px 0 0;
+}
+.usage__scroll {
+  overflow-x: auto;
+}
+.usage__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--type-body-sm-size);
+}
+.usage__table th,
+.usage__table td {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  text-align: left;
+  white-space: nowrap;
+}
+.usage__table th {
+  color: var(--color-text-subtle);
+  font-weight: var(--weight-semibold);
+}
+.usage__model {
+  margin-right: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
 }
