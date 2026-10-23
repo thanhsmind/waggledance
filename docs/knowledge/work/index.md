@@ -66,7 +66,7 @@ never a generation timestamp or any other wall-clock value.
 - [home-terminal-new-shell/](home-terminal-new-shell/index.md) — 1 concept(s)
 - [home-terminal-panel/](home-terminal-panel/index.md) — 1 concept(s)
 - [home-terminal-parity/](home-terminal-parity/index.md) — 1 concept(s)
-- [homepage-tabs/](homepage-tabs/index.md) — 1 concept(s)
+- [homepage-tabs/](homepage-tabs/index.md) — 2 concept(s)
 - [homepage-terminal-full/](homepage-terminal-full/index.md) — 1 concept(s)
 - [homepage-terminals/](homepage-terminals/index.md) — 1 concept(s)
 - [hub-card-title-size/](hub-card-title-size/index.md) — 1 concept(s)
