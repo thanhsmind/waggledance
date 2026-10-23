@@ -44,19 +44,27 @@ them or to a project.
 |---|---|---|---|
 | Claude Code | `~/.claude/projects/<dir>/<session>.jsonl`, plus native subagent transcripts at `<dir>/<session>/subagents/agent-*.jsonl` with their `agent-*.meta.json` | `input_tokens` + `output_tokens` + `cache_creation_input_tokens` | `cache_read_input_tokens` |
 | pi | `~/.pi/agent/sessions/<dir>/*.jsonl` | `input` + `output` + `cacheWrite` | `cacheRead` |
-| Codex | `~/.codex/sessions/**/*.jsonl` | the rest of the delta | the delta of `cached_input_tokens` |
+| Codex | `~/.codex/sessions/**/*.jsonl`, minus sessions imported from another agent | `last_token_usage`: `input_tokens` − `cached_input_tokens` + `output_tokens` + `cache_write_input_tokens` | `last_token_usage.cached_input_tokens` |
 | Paseo | `$PASEO_HOME/agents/<dir>/*.json` (default `~/.paseo`) | names runs only, no tokens | — |
 
 - **Claude Code** repeats one message across several log lines; the parser
   keeps the last line per message id and request id. A subagent's events
   take the model from its meta file when the line carries none.
 - **pi** names the model `<provider>/<model>`.
-- **Codex** reports only running totals (`total_token_usage.total_tokens`
-  and `cached_input_tokens`), never the input/output/cache-write split. Each
-  `token_count` event that raises the total becomes one event: cache-read is
-  the rise in cached input, and new is the rise in total minus that. The
-  model is the first one named by `session_meta` or `turn_context`, else
-  `codex`.
+- **Codex** writes one `token_count` event per turn; its `last_token_usage`
+  is that turn's own spend and becomes one event. A `token_count` whose
+  input and output are both zero adds nothing — that is the shape of an
+  import, where only `total_tokens` is set. The model is the first one
+  named by `turn_context`, else by `session_meta`, else any payload
+  `model`; `codex` only when no line names one.
+- **Imported Codex sessions are skipped.** Codex Desktop can import Claude
+  Code history into a new rollout file; that file replays the other agent's
+  tool calls as text marked `[external_agent_tool_call …]` or
+  `[external_agent_tool_result …]` and carries a running total for tokens
+  Claude Code already spent and logged. Counting it would double the spend
+  and bill it to the wrong provider, so a session whose agent message or
+  response text carries either marker yields no run at all — including when
+  the marker arrives in a later append.
 - A line that does not parse, or a message without a timestamp, is skipped.
 - **`.bee/usage/<feature>.json`** (schema `bee-usage/v1`, written by
   `bee close`) now feeds only the finished-features list. Its sessions add
