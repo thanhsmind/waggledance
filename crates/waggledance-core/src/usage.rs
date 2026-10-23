@@ -251,8 +251,6 @@ pub fn summarize(
     days: u32,
     offset_secs: i32,
 ) -> UsageSummary {
-    let since_ms = now_ms - i64::from(days) * DAY_MS;
-    let in_window = |t: i64| t > since_ms && t <= now_ms;
     let offset = UtcOffset::from_whole_seconds(offset_secs).unwrap_or(UtcOffset::UTC);
 
     let mut per_day: Vec<DaySpend> = Vec::new();
@@ -273,6 +271,12 @@ pub fn summarize(
             }
         }
     }
+    let since_ms = day_index
+        .keys()
+        .next()
+        .map(|d| (d.midnight().assume_offset(offset).unix_timestamp_nanos() / 1_000_000) as i64)
+        .unwrap_or(now_ms - i64::from(days) * DAY_MS);
+    let in_window = |t: i64| t >= since_ms && t <= now_ms;
 
     let mut totals = SpendSplit::default();
     let mut models: BTreeMap<String, (Tokens, Tokens)> = BTreeMap::new();
@@ -471,13 +475,13 @@ mod tests {
     #[test]
     fn window_edge_counts_inside_in_full_and_outside_zero() {
         let now = ms("2026-10-23T12:00:00Z");
-        let since = now - 7 * DAY_MS;
+        let since = ms("2026-10-17T00:00:00Z");
         let input = project(vec![feature(
             "f",
             Some(now),
             vec![
-                session(Some(since + 1), 10, 5),
-                session(Some(since), 100, 50),
+                session(Some(since), 10, 5),
+                session(Some(since - 1), 100, 50),
                 session(Some(now), 1000, 0),
                 session(Some(now + 1), 7, 7),
             ],
@@ -594,6 +598,75 @@ mod tests {
         assert_eq!(row.span_ms, Some(9 * DAY_MS + 60_000));
         assert_eq!(sum.projects[0].features_done, 2);
         assert_eq!(sum.totals.all, tok(8, 0));
+    }
+
+    fn per_day_sum(sum: &UsageSummary) -> Tokens {
+        let mut acc = Tokens::default();
+        for d in &sum.per_day {
+            acc.add(&d.spend);
+        }
+        acc
+    }
+
+    #[test]
+    fn window_starts_at_local_midnight_of_the_oldest_day() {
+        let now = ms("2026-10-23T05:00:00Z");
+        let input = project(vec![feature(
+            "f",
+            Some(now),
+            vec![
+                session(Some(ms("2026-10-16T18:00:00Z")), 3, 0),
+                session(Some(ms("2026-10-16T16:00:00Z")), 40, 0),
+                session(Some(ms("2026-10-16T17:00:00Z")), 500, 0),
+            ],
+        )]);
+        let sum = summarize(&input, now, 7, 25200);
+        assert_eq!(sum.since_ms, ms("2026-10-16T17:00:00Z"));
+        assert_eq!(sum.per_day[0].date, "2026-10-17");
+        assert_eq!(sum.per_day[0].spend, tok(503, 0));
+        assert_eq!(sum.totals.all, tok(503, 0));
+        assert_eq!(per_day_sum(&sum), sum.totals.all);
+    }
+
+    #[test]
+    fn one_day_window_covers_only_today_local() {
+        let now = ms("2026-10-23T05:00:00Z");
+        let input = project(vec![feature(
+            "f",
+            Some(now),
+            vec![
+                session(Some(ms("2026-10-22T17:00:00Z")), 2, 0),
+                session(Some(ms("2026-10-22T16:59:59Z")), 30, 0),
+            ],
+        )]);
+        let sum = summarize(&input, now, 1, 25200);
+        assert_eq!(sum.since_ms, ms("2026-10-22T17:00:00Z"));
+        assert_eq!(sum.per_day.len(), 1);
+        assert_eq!(sum.totals.all, tok(2, 0));
+        assert_eq!(per_day_sum(&sum), sum.totals.all);
+    }
+
+    #[test]
+    fn per_day_bars_sum_to_totals() {
+        let now = ms("2026-10-23T05:00:00Z");
+        let ends = [
+            "2026-09-23T16:59:59Z",
+            "2026-09-23T17:00:00Z",
+            "2026-10-01T00:00:00Z",
+            "2026-10-16T16:00:00Z",
+            "2026-10-16T18:00:00Z",
+            "2026-10-22T23:59:59Z",
+            "2026-10-23T05:00:00Z",
+            "2026-10-23T05:00:01Z",
+        ];
+        let sessions = ends.iter().map(|e| session(Some(ms(e)), 7, 3)).collect();
+        let input = project(vec![feature("f", Some(now), sessions)]);
+        for days in [1, 7, 14, 30] {
+            for offset in [0, 25200, -18000] {
+                let sum = summarize(&input, now, days, offset);
+                assert_eq!(per_day_sum(&sum), sum.totals.all, "days {days} offset {offset}");
+            }
+        }
     }
 
     #[test]

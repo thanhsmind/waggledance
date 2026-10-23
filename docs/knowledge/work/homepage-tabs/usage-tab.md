@@ -40,8 +40,11 @@ The tab only reads these files and never writes to a project.
 
 ## How spend is counted
 
-- **Window**: rolling, measured back from now. It covers
-  `(now - days × 24h, now]`.
+- **Window**: whole calendar days in the daemon's local time. A `days`-day
+  window is today plus the `days - 1` local dates before it, and covers
+  `[local midnight starting the oldest of those dates, now]`. So `1` means
+  today since local midnight, and a session ending exactly at that midnight
+  counts. `since_ms` in the JSON is that midnight.
 - **Session-end bucketing (D1)**: a session counts in full when its `ended_ms`
   falls inside the window. Sessions are never split. A session without
   `ended_ms` falls back to the feature's `closed_at`. A session with neither
@@ -54,9 +57,9 @@ The tab only reads these files and never writes to a project.
   model.
 - **Per-day strip (D4)**: the strip has exactly `days` entries, one per
   calendar day ending today. Days use the daemon's local time: the offset is
-  read once at startup (`usage::set_local_offset_secs`). The window is a
-  rolling `days × 24h` and the strip has whole local days, so a session that
-  ended on the partial oldest day counts in the totals but appears in no bar.
+  read once at startup (`usage::set_local_offset_secs`). The window and the
+  strip cover the same local days, so every counted session lands in a bar
+  and the bars add up to the totals (decision 48a185e4).
 - **Feature rows**: one row per feature whose `closed_at` is inside the
   window. Each row shows the project, feature, close time, cells capped
   (counted from the archived cells) and active time (the sum of its session
