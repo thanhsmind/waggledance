@@ -664,7 +664,11 @@ mod tests {
         for days in [1, 7, 14, 30] {
             for offset in [0, 25200, -18000] {
                 let sum = summarize(&input, now, days, offset);
-                assert_eq!(per_day_sum(&sum), sum.totals.all, "days {days} offset {offset}");
+                assert_eq!(
+                    per_day_sum(&sum),
+                    sum.totals.all,
+                    "days {days} offset {offset}"
+                );
             }
         }
     }
