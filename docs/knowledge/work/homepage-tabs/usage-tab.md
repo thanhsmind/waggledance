@@ -127,6 +127,13 @@ by task (decision 4ddb1112):
   A `<root>--wt--<feature>` worktree folds into `<root>` first. A cwd under
   no registered project lands in **Other**. Bee and non-bee projects count
   alike, so today's work in an unclosed feature shows.
+- **Paseo-managed projects only (decision e24c8d4b)**: before mapping, the
+  registered projects narrow to those whose canonical root is a live entry
+  (`archivedAt` null) of Paseo's project store,
+  `<paseo home>/projects/projects.json` (`agent_usage::paseo_project_roots`).
+  A run in a registered project that Paseo does not manage lands in
+  **Other**, so totals stay whole. When the store is missing or unreadable,
+  every registered project stays in the list.
 - **New vs cache-read (D3)**: `new` is input + output + cache write, and
   `cached` is cache-read, per the source table above.
 - **Main vs subagent (D5, D7)**: a subagent run's events count as subagent

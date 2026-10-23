@@ -1349,6 +1349,17 @@ async fn usage_summary(
     let since = now_ms - (i64::from(days) + 1) * 86_400_000;
     let (logs, homes) = (st.agent_logs.clone(), st.agent_homes.clone());
     let (inputs, runs) = tokio::task::spawn_blocking(move || {
+        let projects: Vec<_> = match agent_usage::paseo_project_roots(&homes.paseo) {
+            Some(managed) => projects
+                .into_iter()
+                .filter(|p| {
+                    let root =
+                        std::fs::canonicalize(&p.root_path).unwrap_or_else(|_| p.root_path.clone());
+                    managed.contains(&root)
+                })
+                .collect(),
+            None => projects,
+        };
         let roots: Vec<_> = projects
             .iter()
             .map(|p| (p.id.clone(), p.name.clone(), p.root_path.clone()))
@@ -7842,6 +7853,40 @@ mod bee_route_tests {
         assert_eq!(child["parent_key"], "claude:sess-main");
         assert_eq!(child["model"], "hive/flash");
         assert_eq!(child["project_id"], project.id.as_str());
+    }
+
+    #[tokio::test]
+    async fn api_usage_lists_only_paseo_managed_projects_and_folds_the_rest_into_other() {
+        let root = fresh_root("usage-paseo-managed");
+        let managed_root = fresh_root("usage-paseo-managed-kept");
+        let mut st = build_state();
+        let homes = agent_homes_fixture("usage-paseo-managed", &root);
+        let store = serde_json::json!([
+            {"projectId": "prj_kept", "rootPath": managed_root, "archivedAt": null},
+            {"projectId": "prj_old", "rootPath": root, "archivedAt": "2026-10-01T00:00:00Z"}
+        ]);
+        write(&homes.paseo, "projects/projects.json", &store.to_string());
+        st.agent_homes = Arc::new(homes);
+        let unmanaged = register(&st, &root, "unmanaged");
+        let kept = register(&st, &managed_root, "kept");
+        let resp = get(router(st), "/api/usage?days=7").await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let ids: Vec<_> = v["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&kept.id), "{v}");
+        assert!(!ids.contains(&unmanaged.id), "{v}");
+        let other = v["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "")
+            .unwrap();
+        assert_eq!(other["spend"]["main"]["new"], 120, "{v}");
+        assert_eq!(v["totals"]["main"]["new"], 120, "{v}");
     }
 
     #[tokio::test]
