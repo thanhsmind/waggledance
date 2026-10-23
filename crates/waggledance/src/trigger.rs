@@ -382,13 +382,10 @@ impl Trigger {
             }
         }
 
-        // (2) D7 + D6 — the per-project opt-in and the global family switch,
-        // both false by default, both re-read on every dispatch rather than
-        // captured once at construction.
         if !self.engine.orchestration_allowed(project) || !self.engine.config.terminal.enabled {
             tracing::debug!(
                 project = %project.id,
-                "observer tick skipped: this project has not opted into orchestration"
+                "observer tick skipped: this project turned orchestration off or the terminal surface is off"
             );
             return GateOutcome::NotConsented;
         }
@@ -966,6 +963,9 @@ mod tests {
     }
 
     fn test_engine(consented: bool, root: &std::path::Path) -> Arc<Engine> {
+        if !consented {
+            std::fs::write(root.join(".waggledance.toml"), "orchestration = false\n").unwrap();
+        }
         let mut config = Config::default();
         config.terminal.enabled = true;
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
@@ -977,7 +977,7 @@ mod tests {
                 root_path: root.to_path_buf(),
                 created_at: now_rfc3339(),
                 last_seen_at: now_rfc3339(),
-                orchestration_enabled: consented,
+                orchestration_enabled: false,
             })
             .unwrap();
         Arc::new(engine)

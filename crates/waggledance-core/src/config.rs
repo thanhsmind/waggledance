@@ -184,11 +184,6 @@ pub struct TerminalConfig {
     /// class — nothing here fires until the owner made a deliberate act — and
     /// is mastered by [`enabled`](Self::enabled) on top of its own switch,
     /// like the reaper.
-    ///
-    /// Two further gates stand behind this one and are never widened by it:
-    /// the target project's own `orchestration_enabled` (D7), and the
-    /// per-project cooldown that bounds how often one project can be woken
-    /// (D8).
     pub trigger_enabled: bool,
     /// observer-tick-trigger (D10): measure before arming. With this on,
     /// every trigger detector runs exactly as it would in production and

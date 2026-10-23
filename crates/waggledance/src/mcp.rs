@@ -225,8 +225,8 @@ fn ask_state_schema() -> Value {
     which is how you find an idle pane to reuse instead of spawning a new one. `panes` \
     is ABSENT when the terminal surface is switched off, `null` beside a `panes_error` \
     reason when herdr cannot be read — the bee state is complete either way — and an \
-    array otherwise. Seeing a pane grants nothing: dispatching still requires the \
-    project's own orchestration opt-in. `leaders` lists the Paseo agents labelled \
+    array otherwise. Seeing a pane grants nothing: dispatch is refused in a project \
+    whose .waggledance.toml says `orchestration = false`. `leaders` lists the Paseo agents labelled \
     waggledance.role=leader whose cwd sits in the project's root or one of its worktrees, \
     oldest first: {agent_id, status, cwd, created, via, labels, waiting_on, \
     last_daemon_run}, where `via` is `wd` for a leader carrying \
@@ -246,9 +246,9 @@ fn ask_state_schema() -> Value {
 fn dispatch_schema() -> Value {
     json!({
         "name": "waggledance_dispatch",
-        "description": "Dispatch a task to an agent pane in a project that has opted into \
-    orchestrator dispatch (D6 — refused, naming the remedy, when the project or the terminal \
-    surface has not been switched on). Either spawn a fresh agent via an operator-configured \
+        "description": "Dispatch a task to an agent pane in a managed project. Every \
+    project takes dispatch unless its .waggledance.toml says `orchestration = false`; pane \
+    dispatch also needs terminal.enabled, and a refusal names the remedy. Either spawn a fresh agent via an operator-configured \
     preset label, target an already-running pane by id, or hand the task to the project's Paseo \
     leader with `leader: true` (queued and delivered by the waggledance daemon once the leader is \
     idle) — exactly one of `preset`/`pane_id`/`leader`, and never a raw command. Returns a \
@@ -1191,7 +1191,7 @@ fn handle_dispatch(
         );
     }
     if !engine.orchestration_allowed(&project) {
-        return tool_error(id, &not_opted_in(engine, &project));
+        return tool_error(id, &dispatch_off(engine, &project));
     }
 
     // Resolved before any herdr call so an unresolvable label never touches
@@ -1244,19 +1244,22 @@ fn handle_dispatch(
     }
 }
 
-fn not_opted_in(engine: &Engine, project: &Project) -> String {
+fn dispatch_off(engine: &Engine, project: &Project) -> String {
     let file = waggledance_core::project_settings::settings_path(&project.root_path);
-    let mut text = format!(
-        "project {} has not opted into orchestrator dispatch — enable it from the project's \
-         settings page, or set `orchestration = true` in {}",
-        project.id,
-        file.display()
-    );
-    for warning in engine.project_settings(project).1 {
-        text.push_str("; ");
-        text.push_str(&warning);
+    match engine.project_settings(project).0.unreadable {
+        Some(warning) => format!(
+            "project {} has a .waggledance.toml at {} that could not be read, so dispatch is \
+             off: {warning}",
+            project.id,
+            file.display()
+        ),
+        None => format!(
+            "project {} has turned off orchestrator dispatch with `orchestration = false` in {} \
+             — remove that line to allow it",
+            project.id,
+            file.display()
+        ),
     }
-    text
 }
 
 const DELIVERY_PAUSED: &str =
@@ -1300,7 +1303,7 @@ fn dispatch_to_leader(
     data_dir: &Path,
 ) -> Value {
     if !engine.orchestration_allowed(project) {
-        return tool_error(id, &not_opted_in(engine, project));
+        return tool_error(id, &dispatch_off(engine, project));
     }
     if let Some(why) = paseo::paseo_unavailable(&engine.config.paseo) {
         return tool_error(id, &why);
@@ -2829,34 +2832,55 @@ mod tests {
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 
-    /// D6: terminal family on, but this project never opted in — the
-    /// refusal must name the remedy (the project's own settings page).
     #[test]
-    fn dispatch_refuses_a_project_that_has_not_opted_in() {
-        let (engine, pa) = dispatch_engine("dispatch-not-opted-in");
+    fn dispatch_accepts_a_project_with_no_settings_file() {
+        let (engine, pa) = dispatch_engine("dispatch-no-file");
+        assert!(!pa.root_path.join(".waggledance.toml").exists());
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "preset": "nope" }),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("dispatch is off"), "{text}");
+        assert!(!text.contains("turned off"), "{text}");
+        assert!(text.contains("unknown agent preset: nope"), "{text}");
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_refuses_a_project_that_turned_it_off_naming_the_file_and_line() {
+        let (engine, pa) = dispatch_engine("dispatch-turned-off");
+        engine.set_orchestration_enabled(&pa.id, true).unwrap();
+        write(
+            &pa.root_path,
+            ".waggledance.toml",
+            "orchestration = false\n",
+        );
         let resp = call_tool(
             &engine,
             "waggledance_dispatch",
             json!({ "project": pa.id, "task": "go", "pane_id": "w1:p1" }),
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("has not opted into orchestrator dispatch"),
-            "{text}"
-        );
-        assert!(text.contains("settings page"), "{text}");
         let file = pa.root_path.join(".waggledance.toml");
         assert!(file.is_absolute());
-        assert!(
-            text.contains(&format!("`orchestration = true` in {}", file.display())),
-            "{text}"
+        assert_eq!(
+            text,
+            format!(
+                "project {} has turned off orchestrator dispatch with `orchestration = false` \
+                 in {} — remove that line to allow it",
+                pa.id,
+                file.display()
+            )
         );
 
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
 
     #[test]
-    fn dispatch_refusal_reports_a_project_file_that_fails_to_parse() {
+    fn dispatch_refuses_a_project_whose_settings_file_fails_to_parse() {
         let (engine, pa) = dispatch_engine("dispatch-bad-settings-file");
         write(&pa.root_path, ".waggledance.toml", "orchestration = tru\n");
         let resp = call_tool(
@@ -2865,24 +2889,17 @@ mod tests {
             json!({ "project": pa.id, "task": "go", "pane_id": "w1:p1" }),
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("has not opted into"), "{text}");
-        assert!(text.contains("failed to parse"), "{text}");
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-    }
-
-    #[test]
-    fn dispatch_accepts_the_project_file_opt_in() {
-        let (engine, pa) = dispatch_engine("dispatch-file-opt-in");
-        write(&pa.root_path, ".waggledance.toml", "orchestration = true\n");
-        let resp = call_tool(
-            &engine,
-            "waggledance_dispatch",
-            json!({ "project": pa.id, "task": "go", "preset": "nope" }),
+        let file = pa.root_path.join(".waggledance.toml");
+        assert!(
+            text.starts_with(&format!(
+                "project {} has a .waggledance.toml at {} that could not be read, so dispatch \
+                 is off: ",
+                pa.id,
+                file.display()
+            )),
+            "{text}"
         );
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(!text.contains("has not opted into"), "{text}");
-        assert!(text.contains("unknown agent preset: nope"), "{text}");
+        assert!(text.contains("failed to parse"), "{text}");
 
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
@@ -3329,11 +3346,10 @@ mod tests {
         config.terminal.enabled = terminal;
         config.paseo.enabled = Some(paseo_on);
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
+        if !opted_in {
+            write(&dir, ".waggledance.toml", "orchestration = false\n");
+        }
         let project = engine.register(&dir, None).unwrap();
-        engine
-            .set_orchestration_enabled(&project.id, opted_in)
-            .unwrap();
-        let project = engine.get_project(&project.id).unwrap().unwrap();
         let data_dir = dir.join(".data");
         (engine, project, data_dir)
     }
@@ -3401,7 +3417,7 @@ mod tests {
         assert_eq!(resp["result"]["isError"], true);
         let text = text_of(&resp);
         assert!(
-            text.contains(&project.id) && text.contains("has not opted into"),
+            text.contains(&project.id) && text.contains("`orchestration = false` in"),
             "{text}"
         );
         assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());

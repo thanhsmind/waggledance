@@ -47,7 +47,7 @@ browsing daemon is up first, so the address it returns is one a person can open.
 | 10 | Timeout | How long to wait for a run | seconds, clamped to 60 | no | 60 |
 | 11 | Run status | Where a dispatched run stands | `working` · `done` · `blocked` — stopped on something only a person can clear · `timeout` — the wait ended, the run did not | — | — |
 | — | Terminal switch (config, not shown) | Whether this installation offers agent terminals at all | on/off | — | off |
-| — | Per-project dispatch opt-in (config, not shown) | Whether this project accepts dispatched work | on/off | — | off |
+| — | Per-project dispatch off switch (`orchestration = false` in the project's `.waggledance.toml`, not shown) | Whether this project accepts dispatched work | on/off | — | on |
 
 ## Behaviors & Operations
 
@@ -114,8 +114,9 @@ browsing daemon is up first, so the address it returns is one a person can open.
 
 - **Blocked when:** agent terminals are switched off for this installation — the
   refusal names the settings page that turns them on. Or the target project has
-  not opted into dispatch — the refusal names that project and its own settings
-  page. Both refusals are cheap and come before anything is started.
+  turned dispatch off — the refusal names that project, its `.waggledance.toml` path
+  and the `orchestration = false` line to remove; a file that exists but cannot be
+  read or parsed also turns dispatch off, and the refusal quotes why. Both refusals are cheap and come before anything is started.
 - **Blocked when (continued):** neither a preset label nor a pane is given, or
   both are. Exactly one is right: start a fresh agent, or send work to one already
   running. A raw command is never accepted from the caller in either case.
@@ -149,20 +150,21 @@ browsing daemon is up first, so the address it returns is one a person can open.
 
 ## Actors & Access
 
-| Capability | Calling agent | Calling agent, terminals off | Calling agent, project not opted in | Operator (via settings) |
+| Capability | Calling agent | Calling agent, terminals off | Calling agent, project turned off | Operator (via settings) |
 |---|---|---|---|---|
 | View a document, search, list projects | ✓ | ✓ | ✓ | ✓ |
 | Ask a project's work state | ✓ | ✓ | ✓ | ✓ |
 | See the agent kinds and pane inventory | ✓ | — (absent from the answer) | ✓ | ✓ |
-| Dispatch work | ✓ | — (refused) | — (refused) | turns both switches on |
+| Dispatch work | ✓ | — (refused) | — (refused) | turns terminals on; sees each project's dispatch state |
 | Wait on, and list, runs | ✓ | ✓ | ✓ | ✓ |
 | Learn the command behind an agent kind | — | — | — | ✓ (it is their own config) |
 
 ## Business Rules
 
 - **R1.** The two switches — this installation's terminal surface, and the target
-  project's own dispatch opt-in — are the only gate on dispatching, and reading
-  the fleet never widens them (per `f0719967`).
+  project's own `orchestration = false` in its `.waggledance.toml` — are the only gate
+  on dispatching, and reading the fleet never widens them (per `f0719967`). A project
+  with no such line takes dispatched work by default (per `fb1b49ab`).
 - **R2.** A caller names an agent kind by label and never supplies a command,
   arguments, environment or directory, from any source.
 - **R3.** The published agent registry carries labels only; the commands behind
@@ -217,9 +219,9 @@ browsing daemon is up first, so the address it returns is one a person can open.
 flowchart TD
     A[Agent calls dispatch] --> B{Terminal surface on?}
     B -- no --> R1[Refused: turn on terminals in settings]
-    B -- yes --> C{Project opted into dispatch?}
-    C -- no --> R2[Refused: opt this project in]
-    C -- yes --> D{Preset label or running pane?}
+    B -- yes --> C{Project turned dispatch off in .waggledance.toml?}
+    C -- yes --> R2[Refused: names the file and the line to remove]
+    C -- no --> D{Preset label or running pane?}
     D -- neither, or both --> R3[Refused: name exactly one]
     D -- pane --> G[Task sent to that pane]
     D -- label --> E{Label in the operator's list?}
@@ -236,7 +238,8 @@ flowchart TD
 ## Visuals
 
 Not applicable — no screen. The operator-facing halves of this area are the
-settings pages that hold the two switches, which belong to the settings area.
+settings page that holds the terminal switch and lists each project's dispatch
+state, which belongs to the settings area.
 
 ## Pointers (implementation)
 

@@ -180,15 +180,20 @@ and the project's `.waggledance.toml` own them. The queue, statuses, and notices
 These are the shapes an operator or a lead actually meets running this skill, in either
 mode unless noted. Recognize each one for what it is — most are not failures.
 
-- **Project not opted in.** `waggledance_dispatch` refuses with:
+- **Project turned dispatch off.** Every managed project takes dispatched work by
+  default. `waggledance_dispatch` refuses one whose `.waggledance.toml` says
+  `orchestration = false` with:
 
-  > project `<id>` has not opted into orchestrator dispatch — enable it from the
-  > project's settings page, or set `orchestration = true` in `<root>/.waggledance.toml`
+  > project `<id>` has turned off orchestrator dispatch with `orchestration = false` in
+  > `<root>/.waggledance.toml` — remove that line to allow it
 
-  This is not a bug and not retryable from here — the target project's owner must opt
-  it in first, from its settings page or by committing `orchestration = true` in that
-  repo's `.waggledance.toml`. A file that failed to parse is named after the refusal.
-  Surface it to the human; do not write that file yourself.
+  or one whose file exists but cannot be read or parsed with:
+
+  > project `<id>` has a .waggledance.toml at `<root>/.waggledance.toml` that could not
+  > be read, so dispatch is off: `<warning>`
+
+  This is not a bug and not retryable from here — the project's owner turned it off, or
+  must fix the file. Surface it to the human; do not edit that file yourself.
 
 - **Preset label does not resolve.** The dispatch call refuses, naming the label that
   was searched for and the project whose preset registry (global, then that project's

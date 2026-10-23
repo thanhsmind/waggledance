@@ -517,11 +517,6 @@ fn router(state: AppState) -> Router {
         .route("/p/:id/_bee/pbi/:pbi_id", get(bee_pbi_detail))
         // D8: the read-only Runs view — no mutating route in this family.
         .route("/p/:id/_runs", get(runs_page_handler))
-        // D6: the settings-page Orchestration section's per-project toggle.
-        .route(
-            "/api/projects/:id/orchestration",
-            post(update_project_orchestration),
-        )
         // board-new-task (N2): the home board's "+ New task" dialog files
         // its task into this project's own backlog — see
         // `create_project_pbi` for why the project's own `.bee/bin/bee` is
@@ -1993,9 +1988,16 @@ async fn settings_page_handler(
         st.config_data_dir.as_deref(),
     ));
     let notify_credential_view = current_notify_credential_view(&st);
-    // D6: the Orchestration section's own per-project rows — every
-    // registered project, same source `api_projects`/the homepage read.
-    let projects = st.engine.list_projects().unwrap_or_default();
+    let projects: Vec<_> = st
+        .engine
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| {
+            let unreadable = st.engine.project_settings(&p).0.unreadable;
+            (p, unreadable)
+        })
+        .collect();
     Html(views::settings_page(
         &cfg,
         flag.saved.is_some(),
@@ -2004,33 +2006,6 @@ async fn settings_page_handler(
         &projects,
     ))
     .into_response()
-}
-
-#[derive(serde::Deserialize, Default)]
-struct OrchestrationForm {
-    /// Presence/absence, matching every other checkbox-backed form on this
-    /// page (`SettingsForm::open_browser`'s own doc comment) — a submission
-    /// that omits the key means the box was left unchecked.
-    #[serde(default)]
-    enabled: Option<String>,
-}
-
-/// `POST /api/projects/:id/orchestration` — the settings page's per-project
-/// D6 toggle. Flips `Project::orchestration_enabled` through the cell-1
-/// engine accessor and redirects back to `/settings`, reusing the same
-/// `saved=1` banner `update_config`/`update_terminal_config` already use. An
-/// unknown project id is a no-op write (`set_orchestration_enabled` updates
-/// zero rows) followed by the same redirect — the settings page's own
-/// re-render is the truth a reader checks, not this response.
-async fn update_project_orchestration(
-    State(st): State<AppState>,
-    Path(id): Path<String>,
-    Form(form): Form<OrchestrationForm>,
-) -> Response {
-    let _ = st
-        .engine
-        .set_orchestration_enabled(&id, form.enabled.is_some());
-    Redirect::to("/settings?saved=1").into_response()
 }
 
 /// `POST /api/projects/:id/pbi` body (board-new-task N2) — one free-text
@@ -3091,7 +3066,10 @@ async fn bee_action(
     if !project.orchestration_enabled {
         return action_error(
             StatusCode::FORBIDDEN,
-            "this project does not take board actions — enable orchestration for this project on the settings page",
+            format!(
+                "this project turned off board actions in its .waggledance.toml at {} — remove `orchestration = false` there, or fix the file if it does not parse, to allow them",
+                waggledance_core::project_settings::settings_path(&project.root_path).display()
+            ),
         );
     }
     if let Some(run) = kind.run() {
@@ -14407,71 +14385,73 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// D6: `POST /api/projects/:id/orchestration` flips
-    /// `Project::orchestration_enabled`, and the change is visible on the
-    /// settings page's own re-render — the must-have this cell names in
-    /// full: "the settings toggle flips orchestration_enabled and the
-    /// change is visible on reload".
     #[tokio::test]
-    async fn orchestration_toggle_route_flips_the_flag_and_is_visible_on_reload() {
-        let dir = fresh_root("orchestration-toggle");
-        let settings_dir = fresh_root("orchestration-toggle-settings");
+    async fn settings_lists_each_projects_effective_orchestration_without_a_toggle() {
+        let on_root = fresh_root("orchestration-state-on");
+        let off_root = fresh_root("orchestration-state-off");
+        let broken_root = fresh_root("orchestration-state-broken");
+        std::fs::write(
+            off_root.join(".waggledance.toml"),
+            "orchestration = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            broken_root.join(".waggledance.toml"),
+            "orchestration = tru\n",
+        )
+        .unwrap();
+        let settings_dir = fresh_root("orchestration-state-settings");
         let st = build_state_with_dir(&settings_dir);
-        let project = register(&st, &dir, "orch-proj");
-        assert!(
-            !project.orchestration_enabled,
-            "a freshly registered project must default to opted-out (D6)"
-        );
+        let on = register(&st, &on_root, "orch-on");
+        let off = register(&st, &off_root, "orch-off");
+        register(&st, &broken_root, "orch-broken");
+        st.engine.set_orchestration_enabled(&off.id, true).unwrap();
+        assert!(on.orchestration_enabled);
 
         let app = router(st.clone());
-        let on_req = Request::builder()
+        let html = body_string(get(app.clone(), "/settings").await).await;
+        let off_file = off.root_path.join(".waggledance.toml");
+        assert!(
+            html.contains("orch-on</span> <span class=\"fg-orch-state\">on</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "orch-off</span> <span class=\"fg-orch-state\">off — orchestration = false in {}</span>",
+                off_file.display()
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "orch-broken</span> <span class=\"fg-orch-state\">off — .waggledance.toml could not be read: "
+            ) && html.contains("failed to parse"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "Every project takes dispatched work unless its <code>.waggledance.toml</code> says <code>orchestration = false</code>"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("/orchestration\""), "{html}");
+
+        let old_route = Request::builder()
             .header(header::HOST, "127.0.0.1")
             .method("POST")
-            .uri(format!("/api/projects/{}/orchestration", project.id))
+            .uri(format!("/api/projects/{}/orchestration", on.id))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(Body::from("enabled=on"))
             .unwrap();
-        let resp = app.clone().oneshot(on_req).await.unwrap();
-        assert!(resp.status().is_redirection());
-
-        let reloaded = st.engine.get_project(&project.id).unwrap().unwrap();
+        let status = app.oneshot(old_route).await.unwrap().status();
         assert!(
-            reloaded.orchestration_enabled,
-            "the toggle route must flip the flag on"
+            status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "{status}"
         );
 
-        let settings_html = body_string(get(app.clone(), "/settings").await).await;
-        let row_start = settings_html
-            .find(&format!(
-                "action=\"/api/projects/{}/orchestration\"",
-                project.id
-            ))
-            .expect("the settings page must render this project's own toggle row");
-        let row = &settings_html[row_start..row_start + 200];
-        assert!(
-            row.contains(r#"name="enabled" checked"#),
-            "the reloaded settings page must show the flag as checked: {row}"
-        );
-
-        // Submitting the row with the box unchecked (no `enabled` key) must
-        // flip it back off — matching every other checkbox-backed form on
-        // this page.
-        let off_req = Request::builder()
-            .header(header::HOST, "127.0.0.1")
-            .method("POST")
-            .uri(format!("/api/projects/{}/orchestration", project.id))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(Body::empty())
-            .unwrap();
-        app.oneshot(off_req).await.unwrap();
-        let reloaded_off = st.engine.get_project(&project.id).unwrap().unwrap();
-        assert!(
-            !reloaded_off.orchestration_enabled,
-            "an unchecked submission must flip the flag back off"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&settings_dir).ok();
+        for d in [on_root, off_root, broken_root, settings_dir] {
+            std::fs::remove_dir_all(&d).ok();
+        }
     }
 
     /// P3: `POST /api/config` is unauthenticated (D4 leaves it that way), so
@@ -30219,39 +30199,45 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// D3, the must-have: a project that never opted in answers 403 with the
-    /// remedy in words, and NOTHING runs — the stub bee is right there on
-    /// disk and is never reached.
     #[cfg(unix)]
     #[tokio::test]
-    async fn bee_action_refuses_a_project_that_never_opted_in() {
+    async fn bee_action_refuses_a_project_that_turned_orchestration_off_and_runs_by_default() {
         let dir = fresh_root("action-optout-cfg");
         let root = fresh_root("action-optout-root");
         let log = fresh_root("action-optout-log").join("argv");
         write_cross_project_live_feature(&root, "feat-out", "live-out");
         fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+        let file = root.join(".waggledance.toml");
+        std::fs::write(&file, "orchestration = false\n").unwrap();
 
         let st = build_state_with_dir(&dir);
         let project = register(&st, &root, "action-optout");
-        assert!(
-            !project.orchestration_enabled,
-            "a freshly registered project must default to opted-out (D3/D6)"
-        );
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
 
-        let resp = router(st)
+        let resp = router(st.clone())
             .oneshot(action_req(&project.id, "uat-approve", "feat-out"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let msg = error_of(resp).await;
         assert!(
-            msg.contains("enable orchestration for this project on the settings page"),
-            "the 403 must name the one thing that fixes it: {msg}"
+            msg.contains(&format!(
+                "turned off board actions in its .waggledance.toml at {} — remove `orchestration = false` there",
+                file.display()
+            )),
+            "{msg}"
         );
-        assert!(
-            !log.exists(),
-            "an opted-out project must never reach its own bee at all"
-        );
+        assert!(!log.exists());
+
+        std::fs::remove_file(&file).unwrap();
+        let resp = router(st)
+            .oneshot(action_req(&project.id, "uat-approve", "feat-out"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(log.exists());
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
@@ -30862,9 +30848,6 @@ mod bee_route_tests {
 
         let st = build_state();
         let project = register(&st, &root, "board-uat-round-trip");
-        st.engine
-            .set_orchestration_enabled(&project.id, true)
-            .unwrap();
 
         let before =
             body_string(get(router(st.clone()), &format!("/p/{}/_bee", project.id)).await).await;
@@ -31945,7 +31928,8 @@ mod bee_route_tests {
         write_herding_config(&root);
         write_cross_project_live_feature(&root, "feat-switch", "live-switch");
 
-        // Terminal family ON, project opted OUT.
+        let off_file = root.join(".waggledance.toml");
+        std::fs::write(&off_file, "orchestration = false\n").unwrap();
         let dir = fresh_root("action-run-switch-on-cfg");
         enable_terminal(&dir);
         let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
@@ -31964,11 +31948,11 @@ mod bee_route_tests {
             assert_eq!(
                 resp.status(),
                 StatusCode::FORBIDDEN,
-                "{kind} on a project that never opted in"
+                "{kind} on a project that turned orchestration off"
             );
         }
 
-        // Project opted IN, terminal family OFF.
+        std::fs::remove_file(&off_file).unwrap();
         let dir_off = fresh_root("action-run-switch-off-cfg");
         let herdr_off = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
             &root,
@@ -31978,10 +31962,6 @@ mod bee_route_tests {
         let mut st_off = build_state_with_dir(&dir_off);
         st_off.herdr = herdr_off.clone();
         let project_off = register(&st_off, &root, "action-run-switch-on");
-        st_off
-            .engine
-            .set_orchestration_enabled(&project_off.id, true)
-            .unwrap();
         for kind in ["run-review", "run-compound", "start-todo"] {
             let resp = router(st_off.clone())
                 .oneshot(action_req(&project_off.id, kind, "feat-switch"))

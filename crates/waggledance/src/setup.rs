@@ -570,8 +570,8 @@ fn paseo_unneeded_lines(config: &waggledance_core::config::PaseoConfig) -> Vec<S
     if config.enabled.is_some() {
         lines.push(format!(
             "`enabled` under [paseo] in {file} is no longer needed: Paseo support turns on when a \
-             working CLI is found; a project accepts dispatched work with `orchestration = true` \
-             in its own .waggledance.toml"
+             working CLI is found; every project accepts dispatched work unless its own \
+             .waggledance.toml says `orchestration = false`"
         ));
     }
     if !config.binary.is_empty() {
@@ -1135,9 +1135,7 @@ mod tests {
         };
         let lines = paseo_unneeded_lines(&old);
         assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(
-            lines[0].contains("orchestration = true") && lines[0].contains(".waggledance.toml")
-        );
+        assert!(lines[0].contains("unless its own .waggledance.toml says `orchestration = false`"));
         assert!(lines[1].contains("`binary`"));
         assert!(
             lines[2].contains("[[paseo.leaders]]") && lines[2].contains("workspace = \"<id>\"")
