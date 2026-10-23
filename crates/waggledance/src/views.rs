@@ -796,33 +796,20 @@ pub fn usage_tab(
 </table></div>
 </section>"#,
         models = usage_model_table(&summary.models),
-        runs = usage_runs_table(&summary.runs),
+        runs = usage_runs_table(&summary.runs, project.is_some()),
     )
 }
 
 const USAGE_RUNS_CAP: usize = 300;
 
-fn usage_runs_table(runs: &[RunRow]) -> String {
-    let by_key: std::collections::HashMap<&str, &RunRow> =
-        runs.iter().map(|r| (r.key.as_str(), r)).collect();
-    let parent_of = |r: &RunRow| r.parent_key.as_deref().and_then(|k| by_key.get(k).copied());
-    let mut ordered: Vec<(&RunRow, usize)> = Vec::new();
-    fn walk<'a>(
-        run: &'a RunRow,
-        depth: usize,
-        runs: &'a [RunRow],
-        out: &mut Vec<(&'a RunRow, usize)>,
-    ) {
-        out.push((run, depth));
-        for child in runs
-            .iter()
-            .filter(|c| c.parent_key.as_deref() == Some(run.key.as_str()))
-        {
-            walk(child, depth + 1, runs, out);
+fn usage_runs_table(runs: &[RunRow], filtered: bool) -> String {
+    use std::collections::HashMap;
+    let by_key: HashMap<&str, &RunRow> = runs.iter().map(|r| (r.key.as_str(), r)).collect();
+    let mut children: HashMap<&str, Vec<&RunRow>> = HashMap::new();
+    for r in runs {
+        if let Some(parent) = r.parent_key.as_deref().filter(|k| by_key.contains_key(k)) {
+            children.entry(parent).or_default().push(r);
         }
-    }
-    for run in runs.iter().filter(|r| parent_of(r).is_none()) {
-        walk(run, 0, runs, &mut ordered);
     }
     let task = |r: &RunRow| {
         if r.title.is_empty() {
@@ -832,40 +819,113 @@ fn usage_runs_table(runs: &[RunRow]) -> String {
             r.title.clone()
         }
     };
-    let rows: String = ordered
-        .iter()
-        .take(USAGE_RUNS_CAP)
-        .map(|&(r, depth)| {
-            let marker = match (r.subagent, parent_of(r)) {
-                (false, _) => String::new(),
-                (true, Some(parent)) => format!(
-                    r#" <span class="usage__sub">subagent of {}</span>"#,
-                    esc(&task(parent))
-                ),
-                (true, None) => r#" <span class="usage__sub">subagent</span>"#.to_string(),
+    type Item<'a> = (&'a RunRow, u64, u64, Vec<&'a RunRow>);
+    let mut groups: Vec<(&RunRow, u64, Vec<Item>)> = Vec::new();
+    for root in runs.iter().filter(|r| {
+        r.parent_key
+            .as_deref()
+            .is_none_or(|k| !by_key.contains_key(k))
+    }) {
+        let mut subs = Vec::new();
+        let mut stack = vec![root.key.as_str()];
+        while let Some(key) = stack.pop() {
+            for c in children.get(key).into_iter().flatten() {
+                subs.push(*c);
+                stack.push(c.key.as_str());
+            }
+        }
+        subs.sort_by(|a, b| {
+            a.started_ms
+                .cmp(&b.started_ms)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        let new = root.spend.new + subs.iter().map(|s| s.spend.new).sum::<u64>();
+        let cached = root.spend.cached + subs.iter().map(|s| s.spend.cached).sum::<u64>();
+        let item = (root, new, cached, subs);
+        match groups
+            .iter_mut()
+            .find(|g| g.0.project_id == root.project_id)
+        {
+            Some(g) => {
+                g.1 += new + cached;
+                g.2.push(item);
+            }
+            None => groups.push((root, new + cached, vec![item])),
+        }
+    }
+    groups.sort_by(|a, b| {
+        a.0.project_id
+            .is_empty()
+            .cmp(&b.0.project_id.is_empty())
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.project_name.cmp(&b.0.project_name))
+    });
+    let top_level: usize = groups.iter().map(|g| g.2.len()).sum();
+    let mut left = USAGE_RUNS_CAP;
+    let mut body = String::new();
+    for (first, total, items) in &groups {
+        if left == 0 {
+            break;
+        }
+        if !filtered {
+            body.push_str(&format!(
+                r#"<h3 class="usage__group"><span>{name}</span><span class="usage__group-total">{total}</span></h3>"#,
+                name = esc(&first.project_name),
+                total = compact(*total),
+            ));
+        }
+        for (r, new, cached, subs) in items.iter().take(left) {
+            let tag = match (subs.len(), r.subagent) {
+                (0, true) => r#" <span class="usage__sub">subagent</span>"#.to_string(),
+                (0, false) => String::new(),
+                (1, _) => r#" <span class="usage__sub">1 subagent</span>"#.to_string(),
+                (n, _) => format!(r#" <span class="usage__sub">{n} subagents</span>"#),
             };
-            format!(
-                r#"<tr class="usage__run" style="--usage-depth:{depth}"><td class="usage__task">{name}{marker}</td><td>{project}</td><td>{provider}</td><td>{model}</td><td>{started}</td><td>{duration}</td><td>{new}</td><td>{cached}</td></tr>"#,
+            let row = format!(
+                r#"<span class="usage__task">{name}{tag}</span><span>{provider}</span><span>{model}</span><span>{started}</span><span>{duration}</span><span>{new}</span><span>{cached}</span>"#,
                 name = esc(&task(r)),
-                project = esc(&r.project_name),
                 provider = esc(&r.provider),
                 model = esc(&r.model),
                 started = local_date_time(r.started_ms),
                 duration = hours_minutes(r.duration_ms),
-                new = compact(r.spend.new),
-                cached = compact(r.spend.cached),
-            )
-        })
-        .collect();
-    let more = match ordered.len().saturating_sub(USAGE_RUNS_CAP) {
+                new = compact(*new),
+                cached = compact(*cached),
+            );
+            if subs.is_empty() {
+                body.push_str(&format!(
+                    r#"<div class="usage__run usage__run-row">{row}</div>"#
+                ));
+                continue;
+            }
+            let lines: String = subs
+                .iter()
+                .map(|s| {
+                    format!(
+                        r#"<li class="usage__subagent"><span class="usage__subagent-title">{title}</span><span class="usage__subagent-meta">{provider} · {model} · {duration} · {new} new · {cached} cache</span></li>"#,
+                        title = esc(&task(s)),
+                        provider = esc(&s.provider),
+                        model = esc(&s.model),
+                        duration = hours_minutes(s.duration_ms),
+                        new = compact(s.spend.new),
+                        cached = compact(s.spend.cached),
+                    )
+                })
+                .collect();
+            body.push_str(&format!(
+                r#"<details class="usage__run"><summary class="usage__run-row">{row}</summary><ul class="usage__subagents">{lines}</ul></details>"#
+            ));
+        }
+        left = left.saturating_sub(items.len());
+    }
+    let more = match top_level.saturating_sub(USAGE_RUNS_CAP) {
         0 => String::new(),
         n => format!(r#"<p class="usage__more">{n} more runs not shown.</p>"#),
     };
     format!(
-        r#"<div class="usage__scroll"><table class="usage__table">
-<thead><tr><th>Task</th><th>Project</th><th>Provider</th><th>Model</th><th>Started</th><th>Duration</th><th>New</th><th>Cache-read</th></tr></thead>
-<tbody>{rows}</tbody>
-</table></div>{more}"#
+        r#"<div class="usage__runs">
+<div class="usage__run-row usage__runs-head"><span>Task</span><span>Provider</span><span>Model</span><span>Started</span><span>Duration</span><span>New</span><span>Cache-read</span></div>
+{body}
+</div>{more}"#
     )
 }
 
@@ -24278,12 +24338,17 @@ mod tests {
     }
 
     #[test]
-    fn usage_tab_lists_agent_runs_with_subagents_under_their_parent() {
+    fn usage_tab_folds_subagents_into_their_parent_run_grouped_by_project() {
         use waggledance_core::usage::Tokens;
         let run = |key: &str, title: &str, parent: Option<&str>, started_ms: i64| RunRow {
             key: key.into(),
-            project_id: "p1".into(),
-            project_name: "Hive".into(),
+            project_id: if key.contains("other") { "" } else { "p1" }.into(),
+            project_name: if key.contains("other") {
+                "Other"
+            } else {
+                "Hive"
+            }
+            .into(),
             provider: key.split(':').next().unwrap().into(),
             title: title.into(),
             model: "claude-opus-5-5".into(),
@@ -24297,36 +24362,66 @@ mod tests {
             },
         };
         let mut summary = usage_summary_with(Vec::new());
+        let mut other = run("claude:other", "Elsewhere", None, 6);
+        other.spend.new = 9_000_000;
         summary.runs = vec![
-            run("pi:child", "ud-<6>", Some("claude:lead"), 3),
+            other,
+            run("pi:grand", "Nested", Some("pi:child"), 5),
+            run("pi:child", "ud-<6>", Some("claude:lead"), 4),
             run("claude:orphan", "", Some("claude:gone"), 2),
             run("claude:lead", "Lead task", None, 1),
         ];
         let html = usage_tab(&summary, 7, None, &[]);
-        let lead = html.find(">Lead task<").expect(&html);
-        let child = html.find("ud-&lt;6&gt;").expect(&html);
+        let hive = html
+            .find(r#"<h3 class="usage__group"><span>Hive</span><span class="usage__group-total">86.0k</span></h3>"#)
+            .expect(&html);
+        let elsewhere = html
+            .find(r#"<h3 class="usage__group"><span>Other</span>"#)
+            .expect(&html);
         assert!(
-            lead < child,
-            "the subagent row sits under its parent: {html}"
+            hive < elsewhere,
+            "Other sorts last whatever its size: {html}"
         );
         assert!(
-            html.contains(r#"style="--usage-depth:1"><td class="usage__task">ud-&lt;6&gt; <span class="usage__sub">subagent of Lead task</span></td><td>Hive</td><td>pi</td><td>claude-opus-5-5</td>"#),
-            "{html}"
+            html.contains(r#"<details class="usage__run"><summary class="usage__run-row"><span class="usage__task">Lead task <span class="usage__sub">2 subagents</span></span><span>claude</span><span>claude-opus-5-5</span>"#),
+            "a parent folds its subagents, closed by default: {html}"
         );
         assert!(
-            html.contains(r#"style="--usage-depth:0"><td class="usage__task">orphan <span class="usage__sub">subagent</span></td>"#),
-            "a subagent whose parent is absent stays flat: {html}"
+            html.contains("<span>1h 30m</span><span>4.5k</span><span>60.0k</span></summary>"),
+            "the parent's tokens include every descendant's: {html}"
+        );
+        let child = html
+            .find(r#"<li class="usage__subagent"><span class="usage__subagent-title">ud-&lt;6&gt;</span><span class="usage__subagent-meta">pi · claude-opus-5-5 · 1h 30m · 1.5k new · 20.0k cache</span></li>"#)
+            .expect(&html);
+        let grand = html.find(">Nested</span>").expect(&html);
+        assert!(child < grand, "nested subagents flatten by start: {html}");
+        assert!(
+            html.contains(r#"<div class="usage__run usage__run-row"><span class="usage__task">orphan <span class="usage__sub">subagent</span></span>"#),
+            "a subagent whose parent is absent is a tagged top-level row: {html}"
         );
         assert!(
-            html.contains("<td>1h 30m</td><td>1.5k</td><td>20.0k</td>"),
+            html.contains("<span>Task</span><span>Provider</span>")
+                && !html.contains("<span>Project</span>")
+                && !html.contains("subagent of"),
             "{html}"
         );
         assert!(!html.contains("usage__more"), "{html}");
+        let filtered = usage_tab(&summary, 7, Some("p1"), &[]);
+        assert!(
+            !filtered.contains("usage__group") && filtered.contains("Lead task"),
+            "a project filter drops the headings: {filtered}"
+        );
         summary.runs = (0..302)
             .map(|i| run(&format!("pi:r{i}"), "t", None, i))
             .collect();
+        summary.runs.push(run("pi:sub", "s", Some("pi:r0"), 0));
         let html = usage_tab(&summary, 7, None, &[]);
         assert!(html.contains("2 more runs not shown."), "{html}");
+        assert_eq!(
+            html.matches(r#"<span class="usage__task">"#).count(),
+            300,
+            "{html}"
+        );
     }
 
     #[test]
