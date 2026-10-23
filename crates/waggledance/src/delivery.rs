@@ -12,7 +12,7 @@ use waggledance_core::Engine;
 
 use crate::discovery::{self, Bounds};
 use crate::orchestrate::{self, PASEO_PANE_PREFIX};
-use crate::paseo::{self, Leader, LeaderLock, Paseo, PaseoError, TurnEnd};
+use crate::paseo::{self, Leader, LeaderLock, ModeCheck, Paseo, PaseoError, TurnEnd};
 
 pub const TICK: Duration = Duration::from_secs(2);
 const MAX_ATTEMPTS: i64 = 5;
@@ -32,6 +32,8 @@ pub struct Delivery {
     state: Arc<Mutex<State>>,
     backoff: [Duration; 4],
     permission_poll: Duration,
+    mode_settle: Duration,
+    mode_poll: Duration,
     bounds: Bounds,
 }
 
@@ -117,6 +119,8 @@ impl Delivery {
             state: Arc::default(),
             backoff: [10, 30, 60, 300].map(Duration::from_secs),
             permission_poll: Duration::from_secs(10),
+            mode_settle: Duration::from_secs(10),
+            mode_poll: Duration::from_secs(1),
             bounds: Bounds::host(),
         }
     }
@@ -293,6 +297,7 @@ impl Delivery {
             Ok(leader) => leader,
             Err(e) => return self.presend_failed(&name, run, &e.to_string()),
         };
+        let mode = paseo::leader_mode(config, &settings.paseo);
         let sent_at = now_rfc3339();
         let (agent, outcome) = match leader {
             Leader::Existing { busy: true, .. } => {
@@ -301,6 +306,7 @@ impl Delivery {
                 return;
             }
             Leader::Existing { id, .. } => {
+                self.check_mode(run, &id, &mode).await;
                 self.sent(run, &id, wd, &sent_at);
                 let outcome = self.paseo.send_and_wait(&id, &run.task, timeout).await;
                 (Some(id), outcome)
@@ -319,12 +325,28 @@ impl Delivery {
                         start.workspace, start.reason
                     ),
                 );
-                match self
-                    .paseo
-                    .run_and_wait(&start.spec(&run.task), timeout)
+                let known = paseo::leader_ids(paseo, &project.id, wd)
                     .await
-                {
+                    .unwrap_or_default();
+                let spec = start.spec(&run.task);
+                let started = paseo.run_and_wait(&spec, timeout);
+                let finder = async {
+                    let id = self.new_leader(&project.id, wd, &known).await;
+                    self.check_mode(run, &id, &mode).await;
+                };
+                tokio::pin!(started, finder);
+                let mut checked = false;
+                let result = loop {
+                    tokio::select! {
+                        result = &mut started => break result,
+                        () = &mut finder, if !checked => checked = true,
+                    }
+                };
+                match result {
                     Ok((id, end)) => {
+                        if !checked {
+                            self.check_mode(run, &id, &mode).await;
+                        }
                         self.sent(run, &id, wd, &sent_at);
                         (Some(id), Ok(end))
                     }
@@ -353,6 +375,46 @@ impl Delivery {
                 agent,
                 &format!("paseo reported {status}: {message}"),
             ),
+        }
+    }
+
+    async fn new_leader(&self, project_id: &str, wd: bool, known: &[String]) -> String {
+        loop {
+            if let Ok(ids) = paseo::leader_ids(self.paseo.as_ref(), project_id, wd).await {
+                if let Some(id) = ids.into_iter().find(|id| !known.contains(id)) {
+                    return id;
+                }
+            }
+            tokio::time::sleep(self.mode_poll).await;
+        }
+    }
+
+    async fn check_mode(&self, run: &Run, id: &str, mode: &str) {
+        let check = paseo::ensure_mode(
+            self.paseo.as_ref(),
+            id,
+            mode,
+            self.mode_settle,
+            self.mode_poll,
+        )
+        .await;
+        let ModeCheck::Mismatch { runtime } = check else {
+            return;
+        };
+        let runtime = runtime.as_deref().unwrap_or("unknown");
+        tracing::warn!(run = %run.id, agent = id, asked = mode, runtime, "delivery leader runs in the wrong mode");
+        let line = format!(
+            "[waggledance] leader {id} runs in mode {runtime}, asked {mode}; set it in Paseo"
+        );
+        let mut s = self.state.lock().unwrap();
+        match s.headers.get_mut(&run.id) {
+            Some(header) => {
+                header.push('\n');
+                header.push_str(&line);
+            }
+            None => {
+                s.headers.insert(run.id.clone(), line);
+            }
         }
     }
 
@@ -599,8 +661,11 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_with(Config::default())
+    }
+
+    fn rig_with(mut config: Config) -> Rig {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
         config.paseo.enabled = Some(true);
         let engine = Arc::new(Engine::new(SqliteStore::open_in_memory().unwrap(), config));
         for id in ["proj-1", "proj-2"] {
@@ -627,6 +692,8 @@ mod tests {
         );
         delivery.backoff = [Duration::ZERO; 4];
         delivery.permission_poll = Duration::from_millis(1);
+        delivery.mode_settle = Duration::from_millis(10);
+        delivery.mode_poll = Duration::from_millis(1);
         Rig {
             fake,
             engine,
@@ -810,6 +877,118 @@ mod tests {
         assert!(r
             .transcript("run-1")
             .starts_with("[waggledance] leader started in Paseo workspace wks (lowest-id)"));
+    }
+
+    fn root_workspace(r: &Rig) {
+        r.fake.add_workspace(
+            "wks",
+            "local",
+            &r.engine.get_project("proj-1").unwrap().unwrap().root_path,
+        );
+    }
+
+    fn set_modes(r: &Rig) -> Vec<(String, String)> {
+        r.fake
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::SetMode(id, mode) => Some((id, mode)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn at(r: &Rig, call: &Call) -> usize {
+        r.fake
+            .calls()
+            .iter()
+            .position(|c| c == call)
+            .unwrap_or_else(|| panic!("{call:?} never called"))
+    }
+
+    #[tokio::test]
+    async fn a_new_leader_still_in_the_wrong_mode_is_named_in_the_reply_and_the_run_ends_done() {
+        let r = rig();
+        root_workspace(&r);
+        r.fake.script_modes("agent-1", &[Some("default")], true);
+        r.set_logs("agent-1", "[User] build it\nbuilt\n");
+        r.queue("proj-1", "run-1", "build it", None);
+        r.tick().await;
+        let spec = r
+            .fake
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                Call::Run(spec) => Some(spec),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(spec.mode, "bypassPermissions");
+        assert_eq!(
+            set_modes(&r),
+            [("agent-1".to_string(), "bypassPermissions".to_string())]
+        );
+        assert_eq!(r.status("run-1"), "done");
+        assert_eq!(
+            r.transcript("run-1"),
+            "[waggledance] leader started in Paseo workspace wks (lowest-id)\n\
+             [waggledance] leader agent-1 runs in mode default, asked bypassPermissions; \
+             set it in Paseo\n\nbuilt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_leader_that_appears_late_is_repaired_while_its_first_turn_runs() {
+        let r = rig();
+        root_workspace(&r);
+        {
+            let mut s = r.fake.state.lock().unwrap();
+            s.appear_after = Duration::from_millis(20);
+            s.run_after = Duration::from_millis(200);
+        }
+        r.fake.script_modes("agent-1", &[Some("default")], false);
+        r.queue("proj-1", "run-1", "build it", None);
+        r.tick().await;
+        let set = Call::SetMode("agent-1".into(), "bypassPermissions".into());
+        assert_eq!(set_modes(&r).len(), 1);
+        assert!(at(&r, &set) < at(&r, &Call::RunDone("agent-1".into())));
+        assert_eq!(r.status("run-1"), "done");
+        assert!(!r.transcript("run-1").contains("runs in mode"));
+    }
+
+    #[tokio::test]
+    async fn an_existing_leader_is_set_to_the_asked_mode_before_the_task_is_sent() {
+        let r = rig();
+        r.fake.add_leader("proj-1", "lead", "idle", false);
+        r.fake.script_modes("lead", &[Some("default")], false);
+        r.queue("proj-1", "run-1", "one", None);
+        r.tick().await;
+        let set = Call::SetMode("lead".into(), "bypassPermissions".into());
+        assert_eq!(set_modes(&r).len(), 1);
+        assert!(at(&r, &set) < at(&r, &Call::SendAndWait("lead".into(), "one".into())));
+        assert_eq!(r.status("run-1"), "done");
+    }
+
+    #[tokio::test]
+    async fn an_empty_global_mode_starts_without_a_mode_and_checks_nothing() {
+        let mut config = Config::default();
+        config.paseo.mode = String::new();
+        let r = rig_with(config);
+        root_workspace(&r);
+        r.fake.add_leader("proj-2", "lead", "idle", false);
+        r.fake.script_modes("lead", &[Some("default")], true);
+        r.queue("proj-1", "run-1", "build it", None);
+        r.queue("proj-2", "run-2", "two", None);
+        r.tick().await;
+        assert_eq!(
+            (r.status("run-1"), r.status("run-2")),
+            ("done".into(), "done".into())
+        );
+        assert!(r.fake.calls().iter().all(|c| match c {
+            Call::Run(spec) => spec.mode.is_empty(),
+            Call::RuntimeMode(_) | Call::SetMode(..) => false,
+            _ => true,
+        }));
     }
 
     #[tokio::test]

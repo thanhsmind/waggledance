@@ -7,7 +7,7 @@ bee:
   id: paseo-leader-dispatch
   lifecycle: active
   areas: [orchestration]
-  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md]
+  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md, docs/history/paseo-leader-mode/CONTEXT.md, docs/history/paseo-leader-mode/plan.md]
   polarity: practice
   signature: request for a project running in Paseo
 ---
@@ -17,7 +17,9 @@ bee:
 Locked by paseo-leader-dispatch D1/D2/D3/D4/D5/D6/D8/D9/D10
 (`docs/history/paseo-leader-dispatch/CONTEXT.md`),
 leader-delivery D1/D2/D3/D4/D5/D6/D7/D8 (`docs/history/leader-delivery/CONTEXT.md`), and
-paseo-auto-wiring D1/D2/D3/D4/D5/D6/D7 (`docs/history/paseo-auto-wiring/CONTEXT.md`).
+paseo-auto-wiring D1/D2/D3/D4/D5/D6/D7 (`docs/history/paseo-auto-wiring/CONTEXT.md`), and
+paseo-leader-mode D2/D3/D4 (`docs/history/paseo-leader-mode/CONTEXT.md`), which narrows
+paseo-auto-wiring D8 for `mode` only.
 Leader-delivery D3 supersedes paseo-leader-dispatch D7: a busy leader no longer refuses a
 request. Paseo-auto-wiring D3 removes paseo-leader-dispatch D8's two-workspace refusal,
 and paseo-auto-wiring D4 makes the global `[paseo]` block optional.
@@ -62,7 +64,10 @@ thinking = "high"
   every other rule in [Workspace resolution](#workspace-resolution).
 - `[paseo] provider`, `mode`, `thinking` — passed to `paseo run` for a new leader. A
   value set here wins over the same key in the global `[paseo]` block; an unset one
-  falls back to it. `mode` and `thinking` unset are left to Paseo. `provider` is never
+  falls back to it. `mode` unset in both defaults to `bypassPermissions`; `mode = ""` in
+  the global block leaves it to Paseo when the project file sets none, and skips the
+  [leader mode check](#leader-mode-check) (paseo-leader-mode D2). `thinking` unset is
+  left to Paseo. `provider` is never
   left unset, because `paseo run` refuses without one (`MISSING_PROVIDER`): with no
   provider set anywhere, waggledance uses the first provider `paseo provider ls --json`
   reports as available and enabled, and Paseo picks that provider's default model
@@ -161,6 +166,30 @@ A delivery finds the leader by its labels (`waggledance.role=leader`,
   <task>`. The task is the leader's first turn; there is no bootstrap turn (D8).
 
 The run's pane id becomes `paseo:<agent id>` as soon as the agent id is known.
+
+### Leader mode check
+
+A leader runs in the mode waggledance asked for, checked from the agent's runtime mode
+(paseo-leader-mode D3/D4). The check runs before a task is sent to an existing leader,
+and while a new leader's first turn runs, as soon as its agent id appears.
+
+1. waggledance reads `runtimeInfo.modeId` from Paseo's agent record,
+   `<PASEO_HOME>/agents/<cwd-slug>/<id>.json`, read only. It reads once a second for
+   up to 10 seconds until the value equals the asked mode.
+2. When it still differs, waggledance runs `paseo agent mode <id> <mode> --json` once
+   and reads again the same way.
+3. When it differs after that, the daemon log carries the warning "delivery leader runs
+   in the wrong mode", and the run's reply opens with `[waggledance] leader <id> runs in
+   mode <runtime>, asked <mode>; set it in Paseo`. An unreadable record reports the
+   runtime mode as `unknown`.
+
+The task is delivered either way. With no mode asked, nothing is read or set.
+
+The check reads the agent record because `paseo inspect` prints `Mode` from
+`currentModeId`, the configured mode, and that value can lie. The leader `ff24c29b` was
+started with no `--mode`: it showed `currentModeId=bypassPermissions` while its
+`runtimeInfo.modeId` was `default`, and it asked the human for every Bash call for about
+9 hours.
 
 ### When a run is done
 
@@ -354,11 +383,12 @@ Each source names the project itself:
   `leader_wait_label`.
 - `crates/waggledance/src/paseo.rs` — the `paseo` CLI client, `candidates`, `detect`,
   `paseo_available`, the environment scrub, `TurnEnd`, labels, lock, `resolve_leader`,
-  `pick_workspace`, and `delivery_heartbeat_path`.
+  `pick_workspace`, `delivery_heartbeat_path`, and the mode check: `leader_mode`,
+  `record_mode`, `ensure_mode`, `ModeCheck`.
 - `crates/waggledance/src/mcp.rs` — `request_id`, `dispatch_to_leader`, and the paused
   warning.
-- `crates/waggledance/src/delivery.rs` — the delivery loop, restart recovery, and caller
-  notices.
+- `crates/waggledance/src/delivery.rs` — the delivery loop, restart recovery, caller
+  notices, and `check_mode`, which reports a leader still in the wrong mode.
 - `crates/waggledance/testdata/fixtures/paseo-0.11.2/` — the captured Paseo answers the
   client is tested against, with a README per file.
 - `integrations/paseo/server/dispatch.ts` and `integrations/paseo/client/composer.tsx` —
