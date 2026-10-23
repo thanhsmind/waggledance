@@ -67,7 +67,7 @@ impl Engine {
         if let Some(mut p) = self.store.find_project_by_root(&root)? {
             p.last_seen_at = indexer::now_rfc3339();
             self.store.upsert_project(&p)?;
-            return Ok(p);
+            return Ok(self.with_consent(p));
         }
         let id = self.unique_id(&indexer::slug_from_root(&root))?;
         let name = name.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -93,7 +93,7 @@ impl Engine {
             self.max_bytes(),
         )?;
         self.reindex_links(&project)?;
-        Ok(project)
+        Ok(self.with_consent(project))
     }
 
     fn unique_id(&self, base: &str) -> Result<String> {
@@ -371,26 +371,30 @@ impl Engine {
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        self.store.list_projects()
+        Ok(self
+            .store
+            .list_projects()?
+            .into_iter()
+            .map(|p| self.with_consent(p))
+            .collect())
     }
 
     pub fn get_project(&self, id: &str) -> Result<Option<Project>> {
-        self.store.get_project(id)
+        Ok(self.store.get_project(id)?.map(|p| self.with_consent(p)))
     }
 
-    /// D6: flip a project's orchestrator-dispatch opt-in flag.
+    fn with_consent(&self, mut project: Project) -> Project {
+        project.orchestration_enabled = self.orchestration_allowed(&project);
+        project
+    }
+
     pub fn set_orchestration_enabled(&self, project_id: &str, enabled: bool) -> Result<()> {
         self.store.set_orchestration_enabled(project_id, enabled)
     }
 
-    /// D6 gating predicate: true only when this project has opted into
-    /// orchestrator dispatch. This is the per-project half of the check —
-    /// the caller combines it with the global `terminal.enabled` switch
-    /// (`self.config.terminal.enabled`) before allowing a dispatch, since a
-    /// project can be opted in while the terminal family itself is off.
     pub fn orchestration_allowed(&self, project: &Project) -> bool {
-        project.orchestration_enabled
-            || self.project_settings(project).0.orchestration == Some(true)
+        let settings = self.project_settings(project).0;
+        settings.unreadable.is_none() && settings.orchestration != Some(false)
     }
 
     pub fn project_settings(&self, project: &Project) -> (ProjectSettings, Vec<String>) {
@@ -1302,25 +1306,40 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn write_bumped(file: &Path, text: &str, secs: u64) {
+        std::fs::write(file, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
     #[test]
-    fn orchestration_allowed_is_gated_by_the_per_project_flag() {
+    fn orchestration_is_on_without_a_project_file_whatever_the_stored_flag() {
         let dir = std::env::temp_dir().join(format!("waggledance-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
         let project = engine.register(&dir, None).unwrap();
-        assert!(!engine.orchestration_allowed(&project));
+        assert!(engine.orchestration_allowed(&project));
+        assert!(project.orchestration_enabled);
 
-        engine.set_orchestration_enabled(&project.id, true).unwrap();
+        engine
+            .set_orchestration_enabled(&project.id, false)
+            .unwrap();
         let reloaded = engine.get_project(&project.id).unwrap().unwrap();
+        assert!(reloaded.orchestration_enabled);
         assert!(engine.orchestration_allowed(&reloaded));
+        assert!(engine.list_projects().unwrap()[0].orchestration_enabled);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn orchestration_allowed_by_the_project_file_without_the_db_flag() {
+    fn orchestration_is_off_only_when_the_project_file_says_false_or_is_broken() {
         let dir =
             std::env::temp_dir().join(format!("waggledance-gate-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1329,23 +1348,52 @@ mod tests {
 
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
         let project = engine.register(&dir, None).unwrap();
-        assert!(!engine.orchestration_allowed(&project));
+        engine.set_orchestration_enabled(&project.id, true).unwrap();
 
-        std::fs::write(&file, "orchestration = true\n").unwrap();
+        write_bumped(&file, "orchestration = false\n", 5);
+        assert!(!engine.orchestration_allowed(&project));
+        assert!(
+            !engine
+                .get_project(&project.id)
+                .unwrap()
+                .unwrap()
+                .orchestration_enabled
+        );
+        assert!(!engine.list_projects().unwrap()[0].orchestration_enabled);
+        assert!(
+            !engine
+                .ensure_project(&dir, None)
+                .unwrap()
+                .orchestration_enabled
+        );
+        assert!(!engine.register(&dir, None).unwrap().orchestration_enabled);
+
+        write_bumped(&file, "orchestration = true\n", 10);
         assert!(engine.orchestration_allowed(&project));
-        assert!(!project.orchestration_enabled);
+        assert!(
+            engine
+                .get_project(&project.id)
+                .unwrap()
+                .unwrap()
+                .orchestration_enabled
+        );
 
-        std::fs::write(&file, "orchestration = tru\n").unwrap();
-        let bumped = SystemTime::now() + std::time::Duration::from_secs(5);
-        std::fs::File::options()
-            .write(true)
-            .open(&file)
-            .unwrap()
-            .set_modified(bumped)
-            .unwrap();
+        write_bumped(&file, "[paseo]\nprovider = \"claude\"\n", 15);
+        assert!(engine.orchestration_allowed(&project));
+
+        write_bumped(&file, "orchestration = tru\n", 20);
         assert!(!engine.orchestration_allowed(&project));
-        let (_, warnings) = engine.project_settings(&project);
-        assert!(warnings[0].contains("failed to parse"), "{warnings:?}");
+        assert!(
+            !engine
+                .get_project(&project.id)
+                .unwrap()
+                .unwrap()
+                .orchestration_enabled
+        );
+        let (settings, warnings) = engine.project_settings(&project);
+        let unreadable = settings.unreadable.expect("a broken file is named");
+        assert!(unreadable.contains("failed to parse"), "{unreadable}");
+        assert_eq!(warnings, vec![unreadable]);
 
         std::fs::remove_dir_all(&dir).ok();
     }

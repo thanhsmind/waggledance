@@ -11,6 +11,8 @@ const PASEO_KEYS: [&str; 4] = ["workspace", "provider", "mode", "thinking"];
 pub struct ProjectSettings {
     pub orchestration: Option<bool>,
     pub paseo: ProjectPaseo,
+    #[serde(skip)]
+    pub unreadable: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -31,10 +33,7 @@ pub fn load(root: &Path) -> (ProjectSettings, Vec<String>) {
     match std::fs::read_to_string(&path) {
         Ok(text) => parse(&text, &path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (ProjectSettings::default(), vec![]),
-        Err(e) => (
-            ProjectSettings::default(),
-            vec![format!("{} could not be read: {e}", path.display())],
-        ),
+        Err(e) => unreadable(format!("{} could not be read: {e}", path.display())),
     }
 }
 
@@ -54,13 +53,20 @@ pub fn parse(text: &str, path: &Path) -> (ProjectSettings, Vec<String>) {
 }
 
 fn invalid(path: &Path, e: impl std::fmt::Display) -> (ProjectSettings, Vec<String>) {
+    unreadable(format!(
+        "{} failed to parse: {}",
+        path.display(),
+        e.to_string().trim()
+    ))
+}
+
+fn unreadable(warning: String) -> (ProjectSettings, Vec<String>) {
     (
-        ProjectSettings::default(),
-        vec![format!(
-            "{} failed to parse and is ignored: {}",
-            path.display(),
-            e.to_string().trim()
-        )],
+        ProjectSettings {
+            unreadable: Some(warning.clone()),
+            ..ProjectSettings::default()
+        },
+        vec![warning],
     )
 }
 
@@ -129,7 +135,8 @@ mod tests {
     fn project_settings_invalid_toml_is_off_with_a_warning() {
         let p = Path::new("/r/.waggledance.toml");
         let (s, warnings) = parse("orchestration = tru", p);
-        assert_eq!(s, ProjectSettings::default());
+        assert_eq!(s.orchestration, None);
+        assert_eq!(s.unreadable.as_ref(), warnings.first());
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].contains("/r/.waggledance.toml failed to parse"),

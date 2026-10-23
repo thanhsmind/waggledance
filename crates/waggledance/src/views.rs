@@ -11287,7 +11287,7 @@ pub fn settings_page(
     saved: bool,
     notify_credential_save_failed: bool,
     notify_credential_view: NotifyCredentialView,
-    projects: &[Project],
+    projects: &[(Project, Option<String>)],
 ) -> String {
     // agent-terminal-24: checked first, so a failed credential save is never
     // shadowed by `saved=1` also being set on the same redirect — a user
@@ -11306,27 +11306,28 @@ pub fn settings_page(
     let sel = |v: &str, opt: &str| if v == opt { "selected" } else { "" };
     let excludes = cfg.indexing.exclude_patterns.join("\n");
 
-    // D6: one row per registered project, each its own tiny form posting to
-    // that project's own toggle endpoint — a plain checkbox + Save, no
-    // JavaScript, the same no-script-required posture every other form on
-    // this page already keeps. `checked` here is the row's own boolean
-    // reflecting `Project::orchestration_enabled`, not the outer `checked`
-    // closure's `saved` flag.
     let orchestration_rows = if projects.is_empty() {
         r#"<p class="fg-empty">No projects registered yet.</p>"#.to_string()
     } else {
-        let mut out = String::new();
-        for p in projects {
+        let mut out = String::from(r#"<ul class="fg-orch-list">"#);
+        for (p, unreadable) in projects {
+            let state = match (p.orchestration_enabled, unreadable) {
+                (true, _) => "on".to_string(),
+                (false, Some(warning)) => {
+                    format!("off — .waggledance.toml could not be read: {warning}")
+                }
+                (false, None) => format!(
+                    "off — orchestration = false in {}",
+                    waggledance_core::project_settings::settings_path(&p.root_path).display()
+                ),
+            };
             out.push_str(&format!(
-                r#"<form class="fg-orch-row" method="post" action="/api/projects/{id}/orchestration">
-      <label class="fg-check"><input type="checkbox" name="enabled" {checked}><span class="fg-check__text">{name}</span></label>
-      <button type="submit" class="fg-btn fg-btn--ghost">Save</button>
-    </form>"#,
-                id = esc(&p.id),
-                checked = checked(p.orchestration_enabled),
+                r#"<li class="fg-orch-row"><span class="fg-check__text">{name}</span> <span class="fg-orch-state">{state}</span></li>"#,
                 name = esc(&p.name),
+                state = esc(&state),
             ));
         }
+        out.push_str("</ul>");
         out
     };
 
@@ -11445,10 +11446,10 @@ pub fn settings_page(
     </fieldset>
     <button type="submit" class="fg-btn fg-btn--primary">Save terminal settings</button>
   </form>
-  <style>.fg-orch-row {{ display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }}</style>
+  <style>.fg-orch-list {{ list-style: none; padding: 0; margin: 0; }} .fg-orch-row {{ display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }}</style>
   <section class="fg-settings">
     <fieldset><legend>Orchestration</legend>
-      <span class="fg-field__hint">Per-project opt-in for orchestrator dispatch (the MCP dispatch/await tools). Flags below only take effect while Terminal, above, is enabled.</span>
+      <span class="fg-field__hint">Every project takes dispatched work unless its <code>.waggledance.toml</code> says <code>orchestration = false</code>. Edits apply on the next dispatch, no restart. Terminal, above, still gates pane dispatch. The observer trigger, when on, acts on every project that is on.</span>
       {orchestration_rows}
     </fieldset>
   </section>
@@ -16105,58 +16106,59 @@ mod tests {
         );
     }
 
-    /// D6: the settings page's Orchestration section renders one row per
-    /// registered project, each posting to that project's own toggle
-    /// endpoint, checked exactly when `Project::orchestration_enabled` is
-    /// true — never the other project's value.
     #[test]
-    fn settings_page_orchestration_section_reflects_each_projects_own_flag() {
+    fn settings_page_orchestration_section_lists_each_projects_effective_state() {
         let mut on = sample_project();
-        on.id = "proj-on".into();
         on.name = "Proj On".into();
         on.orchestration_enabled = true;
         let mut off = sample_project();
-        off.id = "proj-off".into();
         off.name = "Proj Off".into();
+        off.root_path = std::path::PathBuf::from("/srv/off");
         off.orchestration_enabled = false;
+        let mut broken = sample_project();
+        broken.name = "Proj Broken".into();
+        broken.orchestration_enabled = false;
 
         let html = settings_page(
             &Config::default(),
             false,
             false,
             NotifyCredentialView::NotConfigured,
-            &[on, off],
+            &[
+                (on, None),
+                (off, None),
+                (
+                    broken,
+                    Some("/srv/b/.waggledance.toml failed to parse: x".into()),
+                ),
+            ],
         );
         assert!(
-            html.contains("Orchestration"),
-            "the settings page must carry an Orchestration section: {html}"
+            html.contains(r#"Proj On</span> <span class="fg-orch-state">on</span>"#),
+            "{html}"
         );
         assert!(
-            html.contains(r#"action="/api/projects/proj-on/orchestration""#),
-            "each project row must post to its own toggle endpoint: {html}"
+            html.contains(
+                r#"Proj Off</span> <span class="fg-orch-state">off — orchestration = false in /srv/off/.waggledance.toml</span>"#
+            ),
+            "{html}"
         );
         assert!(
-            html.contains(r#"action="/api/projects/proj-off/orchestration""#),
-            "each project row must post to its own toggle endpoint: {html}"
+            html.contains(
+                r#"Proj Broken</span> <span class="fg-orch-state">off — .waggledance.toml could not be read: /srv/b/.waggledance.toml failed to parse: x</span>"#
+            ),
+            "{html}"
         );
-
-        let on_row_start = html
-            .find(r#"action="/api/projects/proj-on/orchestration""#)
-            .expect("the on project's row must exist");
-        let on_row = &html[on_row_start..on_row_start + 200];
-        assert!(
-            on_row.contains(r#"name="enabled" checked"#),
-            "the opted-in project's checkbox must render checked: {on_row}"
-        );
-
-        let off_row_start = html
-            .find(r#"action="/api/projects/proj-off/orchestration""#)
-            .expect("the off project's row must exist");
-        let off_row = &html[off_row_start..off_row_start + 200];
-        assert!(
-            !off_row.contains(r#"name="enabled" checked"#),
-            "the opted-out project's checkbox must render unchecked: {off_row}"
-        );
+        for hint in [
+            "Every project takes dispatched work unless its <code>.waggledance.toml</code> says <code>orchestration = false</code>.",
+            "Edits apply on the next dispatch, no restart.",
+            "Terminal, above, still gates pane dispatch.",
+            "The observer trigger, when on, acts on every project that is on.",
+        ] {
+            assert!(html.contains(hint), "{hint}: {html}");
+        }
+        assert!(!html.contains("/orchestration\""), "{html}");
+        assert!(!html.contains("fg-orch-row\" method"), "{html}");
     }
 
     /// D8: with no projects registered the Orchestration section renders an
@@ -22469,7 +22471,7 @@ mod tests {
     /// since a project the board cannot start a run on has no board run to
     /// report.
     #[test]
-    fn bee_hub_run_row_renders_nothing_to_press_without_the_project_opt_in() {
+    fn bee_hub_run_row_renders_nothing_to_press_when_the_project_turned_orchestration_off() {
         let project = sample_project();
         assert!(!project.orchestration_enabled);
         let data = BeeHubFinishedData {
@@ -22488,7 +22490,7 @@ mod tests {
             let row = bee_hub_run_row(&project, group, &data, None, None, &live_runs);
             assert!(
                 !row.contains("bee-hub__actions") && !row.contains("bee-hub__running"),
-                "a project without the opt-in renders the bare {group} row: {row}"
+                "a project that turned orchestration off renders the bare {group} row: {row}"
             );
         }
     }
@@ -22562,7 +22564,7 @@ mod tests {
     /// alike render exactly as they did before this feature — the
     /// waiting-on reading, and nothing to press.
     #[test]
-    fn bee_hub_renders_no_action_pair_without_the_project_opt_in() {
+    fn bee_hub_renders_no_action_pair_when_the_project_turned_orchestration_off() {
         let project = sample_project();
         assert!(!project.orchestration_enabled);
         let data = BeeHubFinishedData {
@@ -22577,7 +22579,7 @@ mod tests {
         let row = bee_hub_ready_to_merge_row(&project, &data, &merge, None, None);
         assert!(
             !row.contains("bee-hub__actions"),
-            "a project without the opt-in never renders a button: {row}"
+            "a project that turned orchestration off never renders a button: {row}"
         );
 
         // The card side of the same rule, with a stop on every input that
@@ -22606,7 +22608,7 @@ mod tests {
         });
         assert!(
             !card_html.contains("bee-hub__actions"),
-            "a card on a project without the opt-in never renders a button: {card_html}"
+            "a card on a project that turned orchestration off never renders a button: {card_html}"
         );
     }
 

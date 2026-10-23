@@ -106,9 +106,6 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// D6: flip a project's opt-in flag. Effective only alongside the global
-    /// `terminal.enabled` — the caller (`Engine::orchestration_allowed`)
-    /// combines the two.
     pub fn set_orchestration_enabled(&self, project_id: &str, enabled: bool) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(

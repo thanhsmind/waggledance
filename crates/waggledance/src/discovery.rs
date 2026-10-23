@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_registers_a_new_local_repo_root_once_without_opting_it_in() {
+    async fn discovery_registers_a_new_local_repo_root_once_and_it_takes_dispatch() {
         let r = rig();
         let root = r.repo("repo");
         r.workspace("wks_1", "local", &root);
@@ -158,7 +158,8 @@ mod tests {
         assert!(r.discover().await.is_empty());
         assert_eq!(r.roots(), vec![root]);
         let project = r.engine.list_projects().unwrap().remove(0);
-        assert!(!project.orchestration_enabled);
+        assert!(project.orchestration_enabled);
+        assert!(r.engine.orchestration_allowed(&project));
     }
 
     #[tokio::test]
