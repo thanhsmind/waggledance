@@ -104,9 +104,8 @@ fn finish(mut run: AgentRun) -> AgentRun {
 struct LogState {
     run: AgentRun,
     seen: HashMap<(String, String), usize>,
-    model: Option<String>,
-    prev_total: u64,
-    prev_cached: u64,
+    model: Option<(u8, String)>,
+    imported: bool,
 }
 
 impl LogState {
@@ -201,28 +200,43 @@ impl LogState {
             self.run.session_id = str_of(p, "id").unwrap_or_default().into();
             self.run.cwd = str_of(p, "cwd").unwrap_or_default().into();
         }
-        if matches!(kind, Some("session_meta" | "turn_context")) && self.model.is_none() {
-            self.model = str_of(p, "model").filter(|m| !m.is_empty()).map(Into::into);
+        let rank = match kind {
+            Some("turn_context") => 0,
+            Some("session_meta") => 1,
+            _ => 2,
+        };
+        if let Some(m) = str_of(p, "model").filter(|m| !m.is_empty()) {
+            if self.model.as_ref().is_none_or(|(r, _)| rank < *r) {
+                self.model = Some((rank, m.into()));
+            }
         }
+        let content = p
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        self.imported |= str_of(p, "message")
+            .into_iter()
+            .chain(content.filter_map(|c| str_of(c, "text")))
+            .any(|t| {
+                t.contains("[external_agent_tool_call") || t.contains("[external_agent_tool_result")
+            });
         if kind != Some("event_msg") || str_of(p, "type") != Some("token_count") {
             return;
         }
-        let Some(t) = p.get("info").and_then(|i| i.get("total_token_usage")) else {
+        let Some(u) = p.get("info").and_then(|i| i.get("last_token_usage")) else {
             return;
         };
-        let (total, cached) = (num(t, "total_tokens"), num(t, "cached_input_tokens"));
-        let delta = total.saturating_sub(self.prev_total);
-        let delta_cached = cached.saturating_sub(self.prev_cached);
-        self.prev_total = total;
-        self.prev_cached = cached;
-        let Some(ts) = ts_ms(v).filter(|_| delta > 0) else {
+        let (input, output) = (num(u, "input_tokens"), num(u, "output_tokens"));
+        let Some(ts) = ts_ms(v).filter(|_| input > 0 || output > 0) else {
             return;
         };
+        let cached = num(u, "cached_input_tokens");
         self.run.events.push(UsageEvent {
             ts_ms: ts,
             model: String::new(),
-            new: delta.saturating_sub(delta_cached),
-            cached: delta_cached,
+            new: input.saturating_sub(cached) + output + num(u, "cache_write_input_tokens"),
+            cached,
         });
     }
 }
@@ -274,11 +288,11 @@ fn pi_run(state: &LogState) -> Option<AgentRun> {
 }
 
 fn codex_run(state: &LogState) -> Option<AgentRun> {
-    if state.run.session_id.is_empty() {
+    if state.run.session_id.is_empty() || state.imported {
         return None;
     }
     let mut run = state.run.clone();
-    let model = state.model.as_deref().unwrap_or("codex");
+    let model = state.model.as_ref().map_or("codex", |(_, m)| m);
     for e in &mut run.events {
         e.model = model.into();
     }
@@ -659,13 +673,13 @@ mod tests {
 {"type":"message","id":"b","timestamp":"2026-10-23T02:59:00Z","message":{"role":"user","content":"x"}}
 "#;
 
-    const CODEX: &str = r#"{"type":"session_meta","timestamp":"2026-10-23T01:00:00Z","payload":{"id":"c1","cwd":"/work/proj","model":null}}
+    const CODEX: &str = r#"{"type":"session_meta","timestamp":"2026-10-23T01:00:00Z","payload":{"id":"c1","cwd":"/work/proj","model":"gpt-meta"}}
 {"type":"turn_context","timestamp":"2026-10-23T01:00:01Z","payload":{"model":"gpt-5.5","cwd":"/work/proj"}}
 {"type":"event_msg","timestamp":"2026-10-23T01:00:02Z","payload":{"type":"token_count","info":null}}
-{"type":"event_msg","timestamp":"2026-10-23T01:00:03Z","payload":{"type":"token_count","info":{"total_token_usage":{"cached_input_tokens":40,"total_tokens":100}}}}
-{"type":"event_msg","timestamp":"2026-10-23T01:00:04Z","payload":{"type":"token_count","info":{"total_token_usage":{"cached_input_tokens":40,"total_tokens":100}}}}
+{"type":"event_msg","timestamp":"2026-10-23T01:00:03Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":50,"total_tokens":1050}}}}
+{"type":"event_msg","timestamp":"2026-10-23T01:00:04Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":78768}}}}
 {"type":"turn_context","timestamp":"2026-10-23T01:00:05Z","payload":{"model":"gpt-other"}}
-{"type":"event_msg","timestamp":"2026-10-23T01:00:06Z","payload":{"type":"token_count","info":{"total_token_usage":{"cached_input_tokens":100,"total_tokens":250}}}}
+{"type":"event_msg","timestamp":"2026-10-23T01:00:06Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200,"cached_input_tokens":100,"cache_write_input_tokens":5,"output_tokens":10}}}}
 "#;
 
     fn ms(s: &str) -> i64 {
@@ -735,17 +749,29 @@ mod tests {
     }
 
     #[test]
-    fn codex_emits_positive_deltas_of_cumulative_totals() {
+    fn codex_counts_last_token_usage_with_the_cache_split() {
         let run = parse_codex(CODEX).unwrap();
         assert_eq!(run.key, "codex:c1");
         assert_eq!(run.cwd, "/work/proj");
         assert_eq!(
             run.events,
             vec![
-                ev("2026-10-23T01:00:03Z", "gpt-5.5", 60, 40),
-                ev("2026-10-23T01:00:06Z", "gpt-5.5", 90, 60),
+                ev("2026-10-23T01:00:03Z", "gpt-5.5", 650, 400),
+                ev("2026-10-23T01:00:06Z", "gpt-5.5", 115, 100),
             ]
         );
+        let meta_only = CODEX.replace("\"turn_context\"", "\"other\"");
+        assert_eq!(parse_codex(&meta_only).unwrap().events[0].model, "gpt-meta");
+    }
+
+    const IMPORT_MARK: &str = r#"{"type":"event_msg","timestamp":"2026-10-23T01:00:08Z","payload":{"type":"agent_message","message":"[external_agent_tool_call: Bash]\ncommand: ls\n[/external_agent_tool_call]"}}
+"#;
+
+    #[test]
+    fn codex_skips_a_session_imported_from_another_agent() {
+        assert_eq!(parse_codex(&format!("{CODEX}{IMPORT_MARK}")), None);
+        let result = r#"{"type":"response_item","payload":{"type":"message","content":[{"type":"input_text","text":"[external_agent_tool_result: ok]"}]}}"#;
+        assert_eq!(parse_codex(&format!("{CODEX}{result}")), None);
     }
 
     fn paseo(id: &str, provider: &str, session: &str, title: &str, labels: &str) -> String {
@@ -872,7 +898,7 @@ mod tests {
         let mut grown = append(&main, &dup(1));
         grown += append(
             &rollout,
-            r#"{"type":"event_msg","timestamp":"2026-10-23T01:00:07Z","payload":{"type":"token_count","info":{"total_token_usage":{"cached_input_tokens":100,"total_tokens":400}}}}
+            r#"{"type":"event_msg","timestamp":"2026-10-23T01:00:07Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150,"cached_input_tokens":0,"output_tokens":0}}}}
 "#,
         );
         let runs = cache.runs(&homes, since);
@@ -899,13 +925,38 @@ mod tests {
     }
 
     #[test]
+    fn an_import_marker_in_an_appended_chunk_drops_the_codex_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (homes, _, rollout) = logs_fixture(dir.path());
+        let cache = AgentLogCache::new();
+        let since = ms("2026-01-01T00:00:00Z");
+        assert!(cache
+            .runs(&homes, since)
+            .iter()
+            .any(|r| r.key == "codex:c1"));
+        append(&rollout, IMPORT_MARK);
+        assert!(!cache
+            .runs(&homes, since)
+            .iter()
+            .any(|r| r.key == "codex:c1"));
+        append(
+            &rollout,
+            &CODEX.lines().nth(3).map(|l| format!("{l}\n")).unwrap(),
+        );
+        assert!(!cache
+            .runs(&homes, since)
+            .iter()
+            .any(|r| r.key == "codex:c1"));
+    }
+
+    #[test]
     fn a_partial_line_waits_until_it_is_complete() {
         let dir = tempfile::tempdir().unwrap();
         let (homes, _, rollout) = logs_fixture(dir.path());
         let cache = AgentLogCache::new();
         let since = ms("2026-01-01T00:00:00Z");
         cache.runs(&homes, since);
-        let line = r#"{"type":"event_msg","timestamp":"2026-10-23T01:00:07Z","payload":{"type":"token_count","info":{"total_token_usage":{"cached_input_tokens":100,"total_tokens":400}}}}"#;
+        let line = r#"{"type":"event_msg","timestamp":"2026-10-23T01:00:07Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150,"cached_input_tokens":0,"output_tokens":0}}}}"#;
         let (start, end) = line.split_at(40);
         append(&rollout, start);
         assert_eq!(
@@ -936,7 +987,7 @@ mod tests {
         );
         assert_eq!(
             run_of(&runs, "codex:c1").events,
-            vec![ev("2026-10-23T01:00:03Z", "gpt-5.5", 60, 40)]
+            vec![ev("2026-10-23T01:00:03Z", "gpt-5.5", 650, 400)]
         );
     }
 
