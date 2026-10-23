@@ -89,6 +89,8 @@ pub struct AppState {
     /// `terminal_background`/`scroll_tracker` already use for their own
     /// interior state.
     pub bee_cache: BeeSnapshotCache,
+    pub agent_logs: Arc<waggledance_core::agent_usage::AgentLogCache>,
+    pub agent_homes: Arc<waggledance_core::agent_usage::AgentHomes>,
 }
 
 /// scroll-keep-position: one pane's remembered position in the
@@ -273,7 +275,16 @@ pub async fn serve() -> Result<()> {
         notify_store,
         scroll_tracker: Arc::new(PaneScrollTracker::new()),
         bee_cache: BeeSnapshotCache::default(),
+        agent_logs: Arc::default(),
+        agent_homes: Arc::default(),
     };
+    {
+        let (logs, homes) = (state.agent_logs.clone(), state.agent_homes.clone());
+        tokio::task::spawn_blocking(move || {
+            let since = now_ms() - 30 * 86_400_000;
+            logs.runs(&homes, since);
+        });
+    }
 
     // D7: reconcile the live background against whatever the config already
     // says, once at startup — a config that already had a switch on before
@@ -1328,42 +1339,69 @@ async fn api_projects(State(st): State<AppState>) -> impl IntoResponse {
     Json(json!({ "projects": arr }))
 }
 
+fn now_ms() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}
+
 async fn usage_summary(
     st: &AppState,
     days: u32,
     project: Option<&str>,
 ) -> (waggledance_core::usage::UsageSummary, Vec<(String, String)>) {
-    use waggledance_core::usage;
-    let bee_projects: Vec<waggledance_core::domain::Project> = st
-        .engine
-        .list_projects()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(is_bee_project)
-        .collect();
-    let names = bee_projects
-        .iter()
-        .map(|p| (p.id.clone(), p.name.clone()))
-        .collect();
-    let selected: Vec<_> = bee_projects
-        .into_iter()
-        .filter(|p| project.is_none_or(|id| p.id == id))
-        .collect();
-    let inputs = tokio::task::spawn_blocking(move || {
-        selected
+    use waggledance_core::{agent_usage, usage};
+    let projects = st.engine.list_projects().unwrap_or_default();
+    let now_ms = now_ms();
+    let since = now_ms - (i64::from(days) + 1) * 86_400_000;
+    let (logs, homes) = (st.agent_logs.clone(), st.agent_homes.clone());
+    let (inputs, runs) = tokio::task::spawn_blocking(move || {
+        let roots: Vec<_> = projects
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone(), p.root_path.clone()))
+            .collect();
+        let runs: Vec<_> = logs
+            .runs(&homes, since)
+            .into_iter()
+            .map(|r| {
+                let id = agent_usage::project_for(std::path::Path::new(&r.cwd), &roots)
+                    .map(String::from);
+                (id, r)
+            })
+            .collect();
+        let inputs: Vec<_> = projects
             .into_iter()
             .map(|p| usage::ProjectUsageInput {
                 features: usage::read_usage(&p.root_path).0,
                 id: p.id,
                 name: p.name,
             })
-            .collect::<Vec<_>>()
+            .collect();
+        (inputs, runs)
     })
     .await
     .unwrap_or_default();
-    let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+    let offset = usage::local_offset_secs();
+    let all = usage::summarize_runs(&inputs, &runs, now_ms, days, offset);
+    let mut names: Vec<_> = all
+        .projects
+        .iter()
+        .filter(|p| !p.id.is_empty() && p.spend.all.total() > 0)
+        .map(|p| (p.id.clone(), p.name.clone()))
+        .collect();
+    names.push(("other".into(), "Other".into()));
+    let Some(id) = project else {
+        return (all, names);
+    };
+    let wanted = (id != "other").then_some(id);
+    let inputs: Vec<_> = inputs
+        .into_iter()
+        .filter(|p| Some(p.id.as_str()) == wanted)
+        .collect();
+    let runs: Vec<_> = runs
+        .into_iter()
+        .filter(|(p, _)| p.as_deref() == wanted)
+        .collect();
     (
-        usage::summarize(&inputs, now_ms, days, usage::local_offset_secs()),
+        usage::summarize_runs(&inputs, &runs, now_ms, days, offset),
         names,
     )
 }
@@ -7678,6 +7716,18 @@ mod bee_route_tests {
             // shares a cached rollup across states, matching every other
             // per-state fixture above.
             bee_cache: BeeSnapshotCache::default(),
+            agent_logs: Arc::default(),
+            agent_homes: Arc::new(no_agent_homes()),
+        }
+    }
+
+    fn no_agent_homes() -> waggledance_core::agent_usage::AgentHomes {
+        let none = std::env::temp_dir().join("waggledance-test-no-agent-homes");
+        waggledance_core::agent_usage::AgentHomes {
+            claude: none.clone(),
+            pi: none.clone(),
+            codex: none.clone(),
+            paseo: none,
         }
     }
 
@@ -7728,9 +7778,54 @@ mod bee_route_tests {
                 started = ended_ms - 3_600_000,
             ),
         );
-        let st = build_state();
+        let mut st = build_state();
+        st.agent_homes = Arc::new(agent_homes_fixture(name, &root));
         let project = register(&st, &root, name);
         (st, project)
+    }
+
+    fn agent_homes_fixture(name: &str, cwd: &Path) -> waggledance_core::agent_usage::AgentHomes {
+        let dir = fresh_root(&format!("{name}-agent-homes"));
+        let ts = (time::OffsetDateTime::now_utc() - time::Duration::minutes(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let cwd = serde_json::to_string(&cwd.to_string_lossy()).unwrap();
+        write(
+            &dir,
+            "claude/projects/-work/sess-main.jsonl",
+            &format!(
+                r#"{{"type":"assistant","cwd":{cwd},"timestamp":"{ts}","requestId":"r1","message":{{"id":"m1","model":"claude-opus-5-5","usage":{{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":500}}}}}}"#
+            ),
+        );
+        write(
+            &dir,
+            "pi/agent/sessions/-work/run.jsonl",
+            &format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"type":"session","id":"pi-sess","cwd":{cwd},"timestamp":"{ts}"}}"#
+                ),
+                format_args!(
+                    r#"{{"type":"message","timestamp":"{ts}","message":{{"provider":"hive","model":"flash","usage":{{"input":30,"output":5,"cacheRead":7,"cacheWrite":0}}}}}}"#
+                ),
+            ),
+        );
+        write(
+            &dir,
+            "paseo/agents/work/parent.json",
+            r#"{"id":"paseo-parent","title":"Lead task","persistence":{"provider":"claude","sessionId":"sess-main"}}"#,
+        );
+        write(
+            &dir,
+            "paseo/agents/work/child.json",
+            r#"{"id":"paseo-child","title":"child","labels":{"bee_cell":"ud-x","paseo.parent-agent-id":"paseo-parent"},"persistence":{"provider":"pi","sessionId":"pi-sess"}}"#,
+        );
+        waggledance_core::agent_usage::AgentHomes {
+            claude: dir.join("claude"),
+            pi: dir.join("pi"),
+            codex: dir.join("codex"),
+            paseo: dir.join("paseo"),
+        }
     }
 
     #[tokio::test]
@@ -7740,9 +7835,35 @@ mod bee_route_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(v["days"], 7);
-        assert_eq!(v["totals"]["main"]["new"], 1000);
-        assert_eq!(v["totals"]["subagents"]["new"], 200);
+        assert_eq!(v["totals"]["main"]["new"], 120);
+        assert_eq!(v["totals"]["subagents"]["new"], 35);
         assert_eq!(v["features"][0]["feature"], "usage-shipped");
+    }
+
+    #[tokio::test]
+    async fn api_usage_counts_agent_logs_in_a_non_bee_project_with_paseo_parents() {
+        let root = fresh_root("usage-non-bee");
+        let mut st = build_state();
+        st.agent_homes = Arc::new(agent_homes_fixture("usage-non-bee", &root));
+        let project = register(&st, &root, "plain");
+        let resp = get(router(st), "/api/usage?days=7").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["projects"][0]["id"], project.id.as_str(), "{v}");
+        assert_eq!(v["projects"][0]["spend"]["main"]["new"], 120, "{v}");
+        assert_eq!(v["projects"][0]["spend"]["subagents"]["cached"], 7, "{v}");
+        let runs = v["runs"].as_array().unwrap();
+        let run = |key: &str| runs.iter().find(|r| r["key"] == key).unwrap().clone();
+        let main = run("claude:sess-main");
+        assert_eq!(main["title"], "Lead task");
+        assert_eq!(main["project_id"], project.id.as_str());
+        assert_eq!(main["subagent"], false);
+        let child = run("pi:pi-sess");
+        assert_eq!(child["title"], "ud-x");
+        assert_eq!(child["subagent"], true);
+        assert_eq!(child["parent_key"], "claude:sess-main");
+        assert_eq!(child["model"], "hive/flash");
+        assert_eq!(child["project_id"], project.id.as_str());
     }
 
     #[tokio::test]

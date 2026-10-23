@@ -4081,3 +4081,16 @@ html:has(.nav-only) {
   font-size: var(--type-caption-size);
   color: var(--color-text-muted);
 }
+.usage__run .usage__task {
+  padding-left: calc(var(--space-2) + var(--usage-depth, 0) * var(--space-4));
+}
+.usage__sub {
+  margin-left: var(--space-1);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-subtle);
+}
+.usage__more {
+  margin: 0;
+  font-size: var(--type-caption-size);
+  color: var(--color-text-subtle);
+}

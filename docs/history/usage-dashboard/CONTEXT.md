@@ -24,6 +24,8 @@ and never writes to any project.
 | D3 | Tokens only — no USD, no price table. Tokens split into **new** (input + output + cache write) and **cache-read**, per model. (decision be26628f) | Use the `new` / `cached` fields the usage file already carries. |
 | D4 | Windows offered: 1 day, 7 days, 14 days, 30 days, measured back from now in the daemon's local time. | From the request. |
 | D5 | Main-session tokens and subagent tokens are shown separately per model (`models` vs `subagent_models`). | From the request: "mỗi model subagent dùng hết bao nhiêu token". |
+| D6 | Supersedes D1 (uat feedback, decision fc8c944a). Token spend comes from the agent runtimes' own session logs, per message: Claude Code (`~/.claude/projects`, native subagent transcripts included), pi (`~/.pi/agent/sessions`) and Codex (`~/.codex/sessions`). Each message counts on the local day of its timestamp and on the registered project whose canonical root contains its canonical cwd; a `<root>--wt--<feature>` worktree folds into `<root>`; anything else is **Other**. Bee usage files only feed the completed-features list. | Today's work in unclosed features and non-bee projects must show. |
+| D7 | The tab lists agent runs as tasks: one row per Paseo agent or Claude Code subagent, named by the Paseo title (the `bee_cell` label when present) or the subagent description, with provider, model, project, parent, start, duration and tokens. A run is a subagent when Paseo records `paseo.parent-agent-id` or it is a Claude Code subagent transcript. (decision eac8b0f9) | User wants Paseo-level per-task, per-subagent model detail. |
 
 ### Agent's Discretion
 
@@ -42,6 +44,7 @@ and never writes to any project.
 | new tokens | `input + output + cache_write` — the usage file's `new` field |
 | cache-read tokens | the usage file's `cached` field |
 | active time | sum over sessions of `ended_ms - started_ms` |
+| agent run | one provider session: a Paseo agent, a Claude Code session or subagent transcript, a pi session, or a Codex session |
 | completed feature | a feature with a `.bee/usage/<feature>.json` file (written at `bee close`) |
 
 ## Existing Code Context
