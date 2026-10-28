@@ -1,21 +1,20 @@
 ---
-title: Cổng kiểm tra mã xanh trên nhánh chính — đã làm, chờ anh đồng ý đóng
+title: Bỏ mục trùng về cổng kiểm tra mã — việc còn lại nằm ở mục song sinh
 audience: internal
 size: S
-ask: test
+ask: drop
 ---
 
-**Là gì:** Trước đây ai chạy hai bước kiểm tra mã (rustfmt và clippy) trên nhánh chính sạch cũng thấy đỏ vì lỗi cũ. Ngày 31/8 một tính năng riêng đã dọn hết và hợp nhất; từ đó đỏ nghĩa là thay đổi mới gây ra.
+**Là gì:** Mục này và một mục khác có cùng tiêu đề, cùng yêu cầu: ai chạy hai bước kiểm tra mã (định dạng và cảnh báo chất lượng) trên nhánh chính sạch thì phải thấy xanh. Đợt sửa cuối tháng 8 đã làm xanh cả hai bước, nhưng hôm nay bước cảnh báo chất lượng lại đỏ vì một dòng thừa do thay đổi sau này để lại.
 
-**Vì sao:** Người làm, kể cả agent, mất thời gian truy lỗi không phải của mình. Mục này thuộc chính tính năng đã làm đó.
+**Vì sao:** Giữ hai mục giống hệt nhau khiến bảng việc báo một việc hai lần, và anh phải đọc hai thẻ để hiểu một chuyện.
 
-**Nguồn gốc:** Ghi nhận cuối tháng 8 khi nhiều tính năng liên tiếp vấp lỗi cũ; tính năng đã hợp nhất nhưng mục chưa đóng.
+**Nguồn gốc:** Ghi cuối tháng 8 khi nhiều tính năng liên tiếp vấp lỗi cũ; cùng yêu cầu được ghi hai lần.
 
-**Chi phí và rủi ro:** Không tốn thêm. Hôm nay kiểm tra định dạng vẫn sạch. Lưu ý: dự án là bản fork nên GitHub Actions chưa từng chạy các bước này; muốn giữ xanh lâu dài cần bật chạy tự động.
+**Chi phí và rủi ro:** Không tốn gì. Phần sửa một dòng cho lỗi đỏ hôm nay được đề xuất làm ở mục song sinh, nên bỏ mục này không mất việc nào.
 
-**Anh cần làm:** (a) Đồng ý đóng (b) Giữ mở tới khi bật chạy tự động. **Đề xuất:** (a), vì phần sửa đã vào nhánh chính, anh không cần làm gì.
+**Anh cần làm:** (a) Bỏ vì trùng (b) Giữ lại. **Đề xuất:** (a), vì mục song sinh đã mang đúng phần việc còn lại và đang xin anh duyệt làm.
 
 **Chuẩn xong:**
-- Mục này được đóng
-- Hai bước kiểm tra mã chạy sạch trên nhánh chính
-- Mục báo lỗi trùng nội dung được đóng cùng lúc
+- Mục này được đóng với lý do trùng
+- Mục song sinh là thẻ duy nhất còn nói về cổng kiểm tra mã
