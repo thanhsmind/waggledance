@@ -40,8 +40,9 @@ owner sees is `owner`. Merged-but-unclosed and built-awaiting-acceptance work
 asks `test`; stale or superseded work asks `drop` with its reason; a proposed
 item worth doing asks `build` or `park` with a recommendation; a blocking open
 question asks `answer` (wd-briefs D5). A PBI bound to an active feature keeps
-its own brief (D6); a PBI whose id equals a feature slug shares that feature's
-brief (D8); the brief-writing feature itself gets none (D7).
+its own brief (wd-briefs D6); a PBI whose id equals a feature slug shares that
+feature's brief (wd-briefs D8); the brief-writing feature itself gets none
+(wd-briefs D7).
 
 ## Keeping them true
 
