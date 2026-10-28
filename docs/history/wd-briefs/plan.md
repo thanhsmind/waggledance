@@ -33,6 +33,8 @@ features in two.
 7. **brf-6 — briefs for 12 features from 2026-08-25,** the agent-mark cluster.
 
 
+8. **brf-8 — reconcile the lint briefs** with clippy red on main today, found by the leader completeness check.
+
 ```json
 [
  {
@@ -757,6 +759,52 @@ features in two.
     "No PBI, workflow, cell or decision state changed",
     "No file outside the listed brief paths",
     "No id, path, slug or function name in a brief body"
+   ]
+  },
+  "affects_skills": [],
+  "affects_specs": [],
+  "deps": []
+ },
+ {
+  "id": "brf-8",
+  "feature": "wd-briefs",
+  "title": "Reconcile the lint briefs with clippy red on main today",
+  "lane": "tiny",
+  "role": "docs",
+  "files": [
+   "docs/briefs/p-ebd4ce69.md",
+   "docs/briefs/p-950905ce.md",
+   "docs/briefs/lint-gates-green.md"
+  ],
+  "read_first": [
+   "docs/briefs/p-6fab30aa.md"
+  ],
+  "action": "Leader completeness check found three lint briefs claiming the gates are green, while cargo clippy -p waggledance --all-targets -- -D warnings is red on this tree at crates/waggledance/src/views.rs:2094 (needless borrow). p-6fab30aa (build, the one-line fix) is the surviving item; p-ebd4ce69 is the same request filed twice -> drop as duplicate; p-950905ce -> drop as duplicate with the correct reason; lint-gates-green -> keep test (agree to close the August record) but state the new red and point to the backlog item.",
+  "verify": "python3 .bee/spikes/wd-briefs/check_briefs.py p-ebd4ce69 p-950905ce lint-gates-green",
+  "must_haves": {
+   "truths": [
+    "No brief claims clippy is green on main today",
+    "Exactly one lint item asks to build the fix"
+   ],
+   "artifacts": [
+    {
+     "path": "docs/briefs/p-ebd4ce69.md",
+     "substantive": "drop as duplicate"
+    },
+    {
+     "path": "docs/briefs/p-950905ce.md",
+     "substantive": "drop as duplicate, correct reason"
+    },
+    {
+     "path": "docs/briefs/lint-gates-green.md",
+     "substantive": "names the new red"
+    }
+   ],
+   "key_links": [
+    "The surviving fix is the build brief for the same lint request"
+   ],
+   "prohibitions": [
+    "No code change"
    ]
   },
   "affects_skills": [],
