@@ -59,12 +59,11 @@
 //! no-disclosure rule.
 
 use crate::code_source::{self, SourceContent};
+use crate::process::{run_with_deadline, RunError, RunOutput};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 /// Wall-clock budget for one git call. Past it the child is killed and the
 /// whole page falls back to the unavailable state — a hung subprocess must
@@ -84,8 +83,6 @@ pub const MAX_SECTIONS: usize = 100;
 /// Cap on how much stdout one git call may produce. Past it the read stops,
 /// the child is closed out, and the page says the diff was truncated.
 pub const MAX_STDOUT_BYTES: usize = 48 * 1024 * 1024;
-
-const MAX_STDERR_BYTES: usize = 8 * 1024;
 
 /// Cap on the commit-list call's stdout. Fifty one-line records cannot
 /// approach it; a repository with a pathological subject line still cannot
@@ -1068,21 +1065,6 @@ fn parse_range(field: &str) -> Option<(usize, usize)> {
     Some((start, count))
 }
 
-// ---------------------------------------------------------------------------
-// subprocess plumbing
-// ---------------------------------------------------------------------------
-
-struct RunOutput {
-    stdout: Vec<u8>,
-    stderr: String,
-    ok: bool,
-    truncated: bool,
-}
-
-/// Run one git call with a hard deadline. stdout and stderr are drained by
-/// their own threads, so a child that writes more than a pipe buffer can
-/// hold never deadlocks against our own wait; the wait itself polls, so the
-/// deadline is honoured even when the child never exits on its own.
 fn run_git(
     git: &str,
     cwd: &Path,
@@ -1094,75 +1076,21 @@ fn run_git(
     cmd.arg("-C")
         .arg(cwd)
         .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // A pager would never exit; a lock write would touch the user's
-        // repository; a localized error message would defeat the stderr
-        // checks above.
         .env("GIT_PAGER", "cat")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C");
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| GitDiffError::GitUnavailable(e.to_string()))?;
-    let mut out_pipe = child.stdout.take().expect("stdout was piped");
-    let mut err_pipe = child.stderr.take().expect("stderr was piped");
-    let out_reader = thread::spawn(move || read_capped(&mut out_pipe, cap));
-    let err_reader = thread::spawn(move || read_capped(&mut err_pipe, MAX_STDERR_BYTES));
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(e) => return Err(GitDiffError::GitUnavailable(e.to_string())),
-        }
-        if Instant::now() >= deadline {
-            break None;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let Some(status) = status else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(GitDiffError::Timeout(timeout.as_secs()));
-    };
-
-    let (stdout, truncated) = out_reader.join().unwrap_or_else(|_| (Vec::new(), false));
-    let (stderr, _) = err_reader.join().unwrap_or_else(|_| (Vec::new(), false));
-    Ok(RunOutput {
-        stdout,
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        ok: status.success(),
-        truncated,
+    run_with_deadline(&mut cmd, None, timeout, cap).map_err(|e| match e {
+        RunError::Spawn(msg) => GitDiffError::GitUnavailable(msg),
+        RunError::Timeout(secs) => GitDiffError::Timeout(secs),
     })
-}
-
-fn read_capped<R: Read>(reader: &mut R, cap: usize) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => return (buf, false),
-            Ok(n) => {
-                if buf.len() + n > cap {
-                    let room = cap.saturating_sub(buf.len());
-                    buf.extend_from_slice(&chunk[..room]);
-                    return (buf, true);
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Err(_) => return (buf, false),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Stdio;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     /// Every test here drives the real `git` binary against a real fixture
