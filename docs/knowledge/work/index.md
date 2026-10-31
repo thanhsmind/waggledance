@@ -25,6 +25,7 @@ never a generation timestamp or any other wall-clock value.
 - [bee-agent-activity/](bee-agent-activity/index.md) — 1 concept(s)
 - [bee-artifact-rename/](bee-artifact-rename/index.md) — 1 concept(s)
 - [bee-board-pm/](bee-board-pm/index.md) — 1 concept(s)
+- [bee-bulk-upgrade/](bee-bulk-upgrade/index.md) — 1 concept(s)
 - [board-approve-actions/](board-approve-actions/index.md) — 1 concept(s)
 - [board-declutter/](board-declutter/index.md) — 1 concept(s)
 - [board-drop-live/](board-drop-live/index.md) — 1 concept(s)
