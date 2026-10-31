@@ -7,6 +7,7 @@
 pub mod agent_usage;
 pub mod ansi;
 pub mod bee;
+pub mod bee_upgrade;
 pub mod code_source;
 pub mod config;
 pub mod daemon;

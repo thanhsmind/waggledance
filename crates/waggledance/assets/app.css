@@ -1107,7 +1107,7 @@ html[data-scheme="dark"] .topbar .home {
   }
   .home-tabbar {
     display: grid;
-    grid-template-columns: repeat(6, 1fr);
+    grid-template-columns: repeat(7, 1fr);
     position: fixed;
     left: 0;
     right: 0;
@@ -4180,4 +4180,57 @@ details.usage__run > summary:hover {
   margin: 0;
   font-size: var(--type-caption-size);
   color: var(--color-text-subtle);
+}
+.bee-upgrade {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.bee-upgrade__title,
+.bee-upgrade__source,
+.bee-upgrade__note,
+.bee-upgrade__error {
+  margin: 0;
+}
+.bee-upgrade__note {
+  color: var(--color-text-subtle);
+  font-size: var(--type-caption-size);
+}
+.bee-upgrade__dirty,
+.bee-upgrade__error {
+  color: var(--color-danger);
+}
+.bee-upgrade__scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+.bee-upgrade__table {
+  border-collapse: collapse;
+  font-size: var(--type-caption-size);
+  white-space: nowrap;
+}
+.bee-upgrade__table th,
+.bee-upgrade__table td {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  text-align: left;
+}
+.bee-upgrade__status {
+  font-family: var(--font-mono, monospace);
+}
+.bee-upgrade__row--pending .bee-upgrade__status {
+  color: var(--color-action);
+}
+.bee-upgrade__row--failed .bee-upgrade__status,
+.bee-upgrade__row--applied_not_committed .bee-upgrade__status {
+  color: var(--color-danger);
+}
+.bee-upgrade__detail {
+  white-space: normal;
+  min-width: 16rem;
+}
+.bee-upgrade__form {
+  margin: 0;
 }

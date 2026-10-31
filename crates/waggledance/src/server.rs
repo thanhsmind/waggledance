@@ -483,6 +483,7 @@ fn router(state: AppState) -> Router {
         // stale-index-refresh-2: the 404 page's own "Refresh index" button
         // target — see `refresh_project`'s doc comment.
         .route("/api/projects/:id/refresh", post(refresh_project))
+        .route("/api/bee/upgrade", post(bee_upgrade_apply))
         // D7/D8: the add-project form's target. Mounted with its one true
         // method (toa-1), so an unauthenticated GET here answers axum's
         // ordinary 405 rather than reaching the handler.
@@ -865,6 +866,7 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                                 "kanban" | "projects" => views::HomeTab::Kanban,
                                 "terminals" => views::HomeTab::Terminals,
                                 "usage" => views::HomeTab::Usage,
+                                "bee" => views::HomeTab::Bee,
                                 _ => views::HomeTab::default(),
                             }
                         }
@@ -902,6 +904,10 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
 }
 
 async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>) -> Response {
+    render_home(st, flag, None).await
+}
+
+async fn render_home(st: AppState, flag: RegisterFlag, bee_html: Option<String>) -> Response {
     match st.engine.list_projects() {
         Ok(projects) => {
             // D1/D1a/D2/D5/D6: badges are gated on the same single switch as
@@ -1108,11 +1114,15 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
             // `terminal_page_inner` already threads into `terminal_page`, so
             // the Terminals tab's own create controls offer the same set.
             let terminals_presets = configured_preset_labels(&st);
-            let usage_html = if flag.tab == views::HomeTab::Usage {
-                let (summary, names) = usage_summary(&st, flag.days, flag.project.as_deref()).await;
-                views::usage_tab(&summary, flag.days, flag.project.as_deref(), &names)
-            } else {
-                String::new()
+            let tab_html = match (flag.tab, bee_html) {
+                (views::HomeTab::Usage, _) => {
+                    let (summary, names) =
+                        usage_summary(&st, flag.days, flag.project.as_deref()).await;
+                    views::usage_tab(&summary, flag.days, flag.project.as_deref(), &names)
+                }
+                (views::HomeTab::Bee, Some(html)) => html,
+                (views::HomeTab::Bee, None) => bee_upgrade_html(all_projects, None).await,
+                _ => String::new(),
             };
             Html(views::home_page(
                 &with_counts,
@@ -1127,12 +1137,95 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 &terminals_presets,
                 &bee_by_project,
                 &leader_waits,
-                &usage_html,
+                &tab_html,
             ))
             .into_response()
         }
         Err(e) => internal_error(&e.to_string()),
     }
+}
+
+async fn bee_upgrade_html(
+    projects: Vec<waggledance_core::domain::Project>,
+    apply: Option<Option<String>>,
+) -> String {
+    use waggledance_core::bee_upgrade::{run, Outcome, UpgradeOptions};
+    let outcome = tokio::task::spawn_blocking(move || {
+        let dry = UpgradeOptions::default();
+        let only = match apply {
+            None => return run(&projects, &dry),
+            Some(Some(id)) => vec![id],
+            Some(None) => {
+                let report = run(&projects, &dry)?;
+                let pending: Vec<String> = report
+                    .projects
+                    .iter()
+                    .filter(|p| matches!(p.outcome, Outcome::Pending { .. }))
+                    .map(|p| p.id.clone())
+                    .collect();
+                if pending.is_empty() {
+                    return Ok(report);
+                }
+                pending
+            }
+        };
+        run(
+            &projects,
+            &UpgradeOptions {
+                apply: true,
+                only,
+                ..dry
+            },
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok(report)) => views::bee_tab(Some(&report), None),
+        Ok(Err(e)) => views::bee_tab(None, Some(&e.to_string())),
+        Err(e) => views::bee_tab(None, Some(&e.to_string())),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BeeUpgradeForm {
+    project: Option<String>,
+    all: Option<String>,
+}
+
+async fn bee_upgrade_apply(
+    State(st): State<AppState>,
+    Form(form): Form<BeeUpgradeForm>,
+) -> Response {
+    let target = match (
+        form.project.filter(|p| !p.is_empty()),
+        form.all.filter(|a| !a.is_empty()),
+    ) {
+        (Some(id), _) => Some(id),
+        (None, Some(_)) => None,
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(views::bee_tab(
+                    None,
+                    Some("name a project or all; nothing was upgraded"),
+                )),
+            )
+                .into_response()
+        }
+    };
+    let projects = match st.engine.list_projects() {
+        Ok(p) => p,
+        Err(e) => return internal_error(&e.to_string()),
+    };
+    let html = bee_upgrade_html(projects, Some(target)).await;
+    let flag = RegisterFlag {
+        register_error: None,
+        tab: views::HomeTab::Bee,
+        pane: None,
+        days: 7,
+        project: None,
+    };
+    render_home(st, flag, Some(html)).await
 }
 
 /// home-board-perf D1: a cheap stat-only measure of a project's `.bee/`
@@ -7900,6 +7993,60 @@ mod bee_route_tests {
         let resp = get(app, "/api/usage?project=nope").await;
         let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(v["totals"]["all"]["new"], 0);
+    }
+
+    #[tokio::test]
+    async fn bee_tab_renders_current_with_the_no_source_message_on_an_empty_registry() {
+        let resp = get(router(build_state()), "/?tab=bee").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_string(resp).await;
+        assert!(
+            html.contains(r#"href="/?tab=bee" aria-current="page"><svg"#),
+            "{html}"
+        );
+        assert!(html.contains("no registered project holds"), "{html}");
+    }
+
+    async fn post_bee_upgrade(body: &'static str) -> Response {
+        router(build_state())
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .method("POST")
+                    .uri("/api/bee/upgrade")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bee_upgrade_post_without_project_or_all_is_refused_with_400() {
+        assert_eq!(post_bee_upgrade("").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post_bee_upgrade("project=").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn bee_upgrade_post_naming_a_project_renders_the_bee_tab() {
+        let resp = post_bee_upgrade("project=nope").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_string(resp).await;
+        assert!(
+            html.contains(r#"href="/?tab=bee" aria-current="page"><svg"#),
+            "{html}"
+        );
+        assert!(html.contains("no registered project holds"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn bee_upgrade_get_is_method_not_allowed() {
+        let resp = get(router(build_state()), "/api/bee/upgrade").await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

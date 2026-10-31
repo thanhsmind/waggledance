@@ -6,6 +6,7 @@ use crate::runtime;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use waggledance_core::bee_upgrade::{self, Outcome, UpgradeOptions, UpgradeReport};
 use waggledance_core::indexer;
 use waggledance_core::Config;
 
@@ -102,6 +103,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    #[command(about = "Manage bee across registered projects.")]
+    Bee {
+        #[command(subcommand)]
+        action: BeeAction,
+    },
     /// Print the version (same value as `--version`).
     Version,
 }
@@ -118,6 +124,19 @@ pub enum MailAction {
         kind: String,
         #[arg(long)]
         body_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BeeAction {
+    #[command(about = "Upgrade bee in every registered project; a dry run unless --apply.")]
+    Upgrade {
+        #[arg(long)]
+        apply: bool,
+        #[arg(long = "project")]
+        project: Vec<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -164,6 +183,13 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Mail { action } => crate::mail::run(action),
         Command::Config { action } => match action {
             ConfigAction::Edit => cmd_config_edit(),
+        },
+        Command::Bee { action } => match action {
+            BeeAction::Upgrade {
+                apply,
+                project,
+                json,
+            } => cmd_bee_upgrade(apply, project, json),
         },
         Command::Version => {
             // Single source of truth: the workspace Cargo package version.
@@ -245,6 +271,85 @@ fn cmd_config_edit() -> Result<()> {
         classify_config_edit_outcome(&path, std::fs::read_to_string(&path))
     );
     Ok(())
+}
+
+fn cmd_bee_upgrade(apply: bool, only: Vec<String>, json: bool) -> Result<()> {
+    let engine = runtime::build_engine()?;
+    let projects = engine.list_projects()?;
+    let opts = UpgradeOptions {
+        apply,
+        only,
+        ..Default::default()
+    };
+    let report = bee_upgrade::run(&projects, &opts).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_upgrade_text(&report));
+    }
+    Ok(())
+}
+
+fn status_word(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::UpToDate => "up_to_date",
+        Outcome::Pending { .. } => "pending",
+        Outcome::Upgraded { .. } => "upgraded",
+        Outcome::AppliedNotCommitted { .. } => "applied_not_committed",
+        Outcome::Skipped { .. } => "skipped",
+        Outcome::Failed { .. } => "failed",
+    }
+}
+
+fn render_upgrade_text(report: &UpgradeReport) -> String {
+    let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+    let mut out = format!(
+        "bee source: {} @ {} {}{}\ntarget: {}\n",
+        report.source_root.display(),
+        dash(&report.source_branch),
+        dash(&report.source_head),
+        if report.source_dirty { " (dirty)" } else { "" },
+        dash(&report.target_version),
+    );
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for p in &report.projects {
+        let word = status_word(&p.outcome);
+        let (files, detail) = match &p.outcome {
+            Outcome::UpToDate => (None, ""),
+            Outcome::Pending { files } => (Some(files.len()), ""),
+            Outcome::Upgraded { commit, files } => (Some(files.len()), commit.as_str()),
+            Outcome::AppliedNotCommitted { files, error } => (Some(files.len()), error.as_str()),
+            Outcome::Skipped { reason, files } => (Some(files.len()), reason.as_str()),
+            Outcome::Failed { error } => (None, error.as_str()),
+        };
+        out.push_str(&format!(
+            "{}  {}  {}  {word}",
+            p.id,
+            dash(&p.branch),
+            dash(&p.from_version)
+        ));
+        if let Some(n) = files {
+            out.push_str(&format!("  {n} files"));
+        }
+        if !detail.is_empty() {
+            out.push_str(&format!("  {detail}"));
+        }
+        if !p.notices.is_empty() {
+            out.push_str(&format!("  {} notices", p.notices.len()));
+        }
+        out.push('\n');
+        match counts.iter_mut().find(|(w, _)| *w == word) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((word, 1)),
+        }
+    }
+    for (word, c) in counts {
+        out.push_str(&format!("{word}: {c}\n"));
+    }
+    if !report.applied {
+        out.push_str("dry run — re-run with --apply to upgrade and commit\n");
+    }
+    out
 }
 
 fn cmd_serve(port: Option<u16>, host: Option<String>) -> Result<()> {
@@ -773,5 +878,119 @@ mod open_url_shape_tests {
             text,
             "Viewable at (pick a reachable IP):\n  http://192.168.1.5:7700\n  http://10.0.0.2:7700"
         );
+    }
+}
+
+#[cfg(test)]
+mod bee_upgrade_text_tests {
+    use super::*;
+    use waggledance_core::bee_upgrade::{Outcome, ProjectUpgrade, UpgradeReport};
+
+    fn project(id: &str, outcome: Outcome) -> ProjectUpgrade {
+        ProjectUpgrade {
+            id: id.to_string(),
+            name: id.to_string(),
+            root: PathBuf::from(format!("/r/{id}")),
+            branch: Some("main".to_string()),
+            from_version: Some("0.9.0".to_string()),
+            to_version: Some("1.0.0".to_string()),
+            notices: Vec::new(),
+            outside_repo: Vec::new(),
+            outcome,
+        }
+    }
+
+    fn report(applied: bool, dirty: bool, projects: Vec<ProjectUpgrade>) -> UpgradeReport {
+        UpgradeReport {
+            source_root: PathBuf::from("/src/bee"),
+            source_head: Some("abc1234".to_string()),
+            source_branch: Some("main".to_string()),
+            source_dirty: dirty,
+            target_version: Some("1.0.0".to_string()),
+            applied,
+            projects,
+        }
+    }
+
+    #[test]
+    fn dry_run_ends_with_the_apply_hint() {
+        let text = render_upgrade_text(&report(
+            false,
+            false,
+            vec![project(
+                "p1",
+                Outcome::Pending {
+                    files: vec!["a".into()],
+                },
+            )],
+        ));
+        assert_eq!(
+            text.lines().last(),
+            Some("dry run — re-run with --apply to upgrade and commit")
+        );
+        assert!(text.starts_with("bee source: /src/bee @ main abc1234\ntarget: 1.0.0\n"));
+        assert!(text.contains("pending: 1"));
+    }
+
+    #[test]
+    fn upgraded_line_carries_its_commit_sha() {
+        let text = render_upgrade_text(&report(
+            true,
+            false,
+            vec![project(
+                "p1",
+                Outcome::Upgraded {
+                    commit: "deadbeef".into(),
+                    files: vec!["a".into(), "b".into()],
+                },
+            )],
+        ));
+        let line = text.lines().find(|l| l.starts_with("p1")).unwrap();
+        assert!(line.contains("upgraded"), "{line}");
+        assert!(line.contains("2 files"), "{line}");
+        assert!(line.contains("deadbeef"), "{line}");
+        assert!(!text.contains("dry run"));
+    }
+
+    #[test]
+    fn skipped_line_carries_its_reason() {
+        let mut p = project(
+            "p2",
+            Outcome::Skipped {
+                reason: "linked worktree".into(),
+                files: Vec::new(),
+            },
+        );
+        p.branch = None;
+        p.from_version = None;
+        let text = render_upgrade_text(&report(false, false, vec![p]));
+        let line = text.lines().find(|l| l.starts_with("p2")).unwrap();
+        assert!(line.contains("  -  -  skipped"), "{line}");
+        assert!(line.contains("linked worktree"), "{line}");
+        assert!(text.contains("skipped: 1"));
+    }
+
+    #[test]
+    fn applied_not_committed_line_carries_its_error() {
+        let text = render_upgrade_text(&report(
+            true,
+            false,
+            vec![project(
+                "p3",
+                Outcome::AppliedNotCommitted {
+                    files: vec!["a".into()],
+                    error: "commit hook rejected".into(),
+                },
+            )],
+        ));
+        let line = text.lines().find(|l| l.starts_with("p3")).unwrap();
+        assert!(line.contains("applied_not_committed"), "{line}");
+        assert!(line.contains("commit hook rejected"), "{line}");
+    }
+
+    #[test]
+    fn dirty_source_is_marked_in_the_header() {
+        let text = render_upgrade_text(&report(true, true, Vec::new()));
+        assert!(text.starts_with("bee source: /src/bee @ main abc1234 (dirty)\n"));
     }
 }
