@@ -9,6 +9,7 @@ use waggledance_core::bee::{
     BeeProjectRollup, BeeReview, BeeReviewStatus, BeeSession, BeeShippedFeature, BeeSignal,
     BeeSnapshot, BeeWorkspace, BeeWorktree,
 };
+use waggledance_core::bee_upgrade::{Outcome, UpgradeReport};
 use waggledance_core::code_source::DirListing;
 use waggledance_core::config::Config;
 use waggledance_core::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
@@ -181,6 +182,7 @@ pub enum HomeTab {
     /// causes apart once this section is actually selected.
     Terminals,
     Usage,
+    Bee,
 }
 
 /// cross-board (D1, superseded) / homepage-tabs: the home page `/` used to
@@ -246,7 +248,7 @@ pub fn home_page(
     // simply absent from the map and its row stays exactly as it was.
     bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
     leader_waits: &LeaderWaitsByProject,
-    usage_html: &str,
+    tab_html: &str,
 ) -> String {
     // console-theme-kanban (ctk-12), retargeting homepage-tabs edge (b):
     // this line used to force the Projects tab, because that was the only
@@ -360,15 +362,15 @@ pub fn home_page(
                 ),
             ),
         ),
-        HomeTab::Usage => (
-            "Usage",
+        HomeTab::Usage | HomeTab::Bee => (
+            if tab == HomeTab::Bee { "Bee" } else { "Usage" },
             format!(
                 r#"<div class="home-shell">
 {toggle}
 {sidebar}
 {backdrop}
 <main class="fg-page">
-  {usage_html}
+  {tab_html}
 </main>
 </div>"#,
                 toggle = HOME_RAIL_TOGGLE,
@@ -412,24 +414,23 @@ pub fn home_page(
     // it". A button and not an anchor — unlike Orchestrator it has no
     // destination to survive a reload to, and its whole behaviour is the
     // overlay below.
-    let on_usage = tab == HomeTab::Usage;
-    let usage = format!(
-        r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator{on_class}" href="/?tab=usage"{aria}>Usage</a>"#,
-        on_class = if on_usage {
-            " topbar__orchestrator--on"
+    let tab_link = |on: bool, slug: &str, label: &str| {
+        let (on_class, aria) = if on {
+            (" topbar__orchestrator--on", r#" aria-current="page""#)
         } else {
-            ""
-        },
-        aria = if on_usage {
-            r#" aria-current="page""#
-        } else {
-            ""
-        },
-    );
+            ("", "")
+        };
+        format!(
+            r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator{on_class}" href="/?tab={slug}"{aria}>{label}</a>"#
+        )
+    };
+    let usage = tab_link(tab == HomeTab::Usage, "usage", "Usage");
+    let bee = tab_link(tab == HomeTab::Bee, "bee", "Bee");
     let actions = format!(
         r#"<button type="button" class="fg-btn fg-btn--ghost topbar__new-task" data-new-task-open>+ New task</button>
     {orchestrator}
-    {usage}"#
+    {usage}
+    {bee}"#
     );
     let body = format!(
         r#"{topbar}
@@ -588,16 +589,16 @@ fn home_tabbar(tab: HomeTab) -> String {
             ("", "")
         }
     };
-    let (board_on, agents_on, usage_on) = match tab {
-        HomeTab::Kanban => (mark(true), mark(false), mark(false)),
-        HomeTab::Terminals => (mark(false), mark(true), mark(false)),
-        HomeTab::Usage => (mark(false), mark(false), mark(true)),
-    };
+    let board_on = mark(tab == HomeTab::Kanban);
+    let agents_on = mark(tab == HomeTab::Terminals);
+    let usage_on = mark(tab == HomeTab::Usage);
+    let bee_on = mark(tab == HomeTab::Bee);
     format!(
         r#"<nav class="home-tabbar" id="home-tabbar" aria-label="Sections">
 <a class="home-tabbar__item{board_class}" href="/?tab=kanban"{board_aria}>{board_icon}<span class="home-tabbar__label">Board</span></a>
 <a class="home-tabbar__item{agents_class}" href="/?tab=terminals"{agents_aria}>{agents_icon}<span class="home-tabbar__label">Agents</span></a>
 <a class="home-tabbar__item{usage_class}" href="/?tab=usage"{usage_aria}>{usage_icon}<span class="home-tabbar__label">Usage</span></a>
+<a class="home-tabbar__item{bee_class}" href="/?tab=bee"{bee_aria}>{bee_icon}<span class="home-tabbar__label">Bee</span></a>
 <label class="home-tabbar__item" for="rail-toggle">{projects_icon}<span class="home-tabbar__label">Projects</span></label>
 <a class="home-tabbar__item" href="/guide">{guide_icon}<span class="home-tabbar__label">Hướng dẫn</span></a>
 <a class="home-tabbar__item" href="/settings">{settings_icon}<span class="home-tabbar__label">Settings</span></a>
@@ -610,6 +611,9 @@ fn home_tabbar(tab: HomeTab) -> String {
         usage_class = usage_on.0,
         usage_aria = usage_on.1,
         usage_icon = TABBAR_ICON_USAGE,
+        bee_class = bee_on.0,
+        bee_aria = bee_on.1,
+        bee_icon = TABBAR_ICON_BEE,
         board_icon = TABBAR_ICON_BOARD,
         agents_icon = TABBAR_ICON_AGENTS,
         projects_icon = TABBAR_ICON_PROJECTS,
@@ -630,6 +634,7 @@ const TABBAR_ICON_BOARD: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 2
 /// the same mark for the same thing (a live agent screen) in both places.
 const TABBAR_ICON_AGENTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>"#;
 const TABBAR_ICON_USAGE: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="20" x2="20" y2="20"></line><line x1="7" y1="16" x2="7" y2="11"></line><line x1="12" y1="16" x2="12" y2="6"></line><line x1="17" y1="16" x2="17" y2="9"></line></svg>"#;
+const TABBAR_ICON_BEE: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 3 19 7 19 17 12 21 5 17 5 7"></polygon><polyline points="9 12 12 9 15 12"></polyline><line x1="12" y1="9" x2="12" y2="16"></line></svg>"#;
 const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>"#;
 /// The topbar gear's own outline, so Settings is the same mark wherever the
 /// reader meets it.
@@ -646,6 +651,91 @@ const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 
 /// down means "hide it".
 const TABBAR_ICON_SHOW: &str = r#"<svg class="home-tabbar__toggle-icon home-tabbar__toggle-icon--show" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 15 12 9 18 15"></polyline></svg>"#;
 const TABBAR_ICON_HIDE: &str = r#"<svg class="home-tabbar__toggle-icon home-tabbar__toggle-icon--hide" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>"#;
+
+pub fn bee_tab(report: Option<&UpgradeReport>, error: Option<&str>) -> String {
+    let report = match (report, error) {
+        (Some(r), None) => r,
+        (_, e) => {
+            return format!(
+                r#"<section class="bee-upgrade">
+<h1 class="bee-upgrade__title">Bee upgrade</h1>
+<p class="bee-upgrade__error">{}</p>
+</section>"#,
+                esc(e.unwrap_or("no report"))
+            )
+        }
+    };
+    let opt = |v: &Option<String>| esc(v.as_deref().unwrap_or("-"));
+    let offer = !report.applied;
+    let mut any_pending = false;
+    let mut rows = String::new();
+    for p in &report.projects {
+        let (word, files, detail) = match &p.outcome {
+            Outcome::UpToDate => ("up_to_date", 0, String::new()),
+            Outcome::Pending { files } => ("pending", files.len(), String::new()),
+            Outcome::Upgraded { commit, files } => ("upgraded", files.len(), esc(commit)),
+            Outcome::AppliedNotCommitted { files, error } => {
+                ("applied_not_committed", files.len(), esc(error))
+            }
+            Outcome::Skipped { reason, files } if files.is_empty() => ("skipped", 0, esc(reason)),
+            Outcome::Skipped { reason, files } => (
+                "skipped",
+                files.len(),
+                format!("{}: {}", esc(reason), esc(&files.join(", "))),
+            ),
+            Outcome::Failed { error } => ("failed", 0, esc(error)),
+        };
+        let action = if offer && word == "pending" {
+            any_pending = true;
+            format!(
+                r#"<form class="bee-upgrade__form" method="post" action="/api/bee/upgrade"><input type="hidden" name="project" value="{}"><button type="submit" class="fg-btn fg-btn--ghost">Upgrade</button></form>"#,
+                esc(&p.id)
+            )
+        } else {
+            String::new()
+        };
+        rows.push_str(&format!(
+            r#"<tr class="bee-upgrade__row bee-upgrade__row--{word}"><td>{name}</td><td>{branch}</td><td>{from}</td><td>{to}</td><td class="bee-upgrade__status">{word}</td><td>{files}</td><td class="bee-upgrade__detail">{detail}</td><td>{notices}</td><td>{action}</td></tr>
+"#,
+            name = esc(&p.name),
+            branch = opt(&p.branch),
+            from = opt(&p.from_version),
+            to = opt(&p.to_version),
+            notices = p.notices.len(),
+        ));
+    }
+    let all = if any_pending {
+        r#"<form class="bee-upgrade__form" method="post" action="/api/bee/upgrade"><input type="hidden" name="all" value="1"><button type="submit" class="fg-btn fg-btn--primary">Upgrade all pending</button></form>"#
+    } else {
+        ""
+    };
+    let dirty = if report.source_dirty {
+        r#" <span class="bee-upgrade__dirty">source has uncommitted changes</span>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<section class="bee-upgrade">
+<header class="bee-upgrade__head">
+<h1 class="bee-upgrade__title">Bee upgrade</h1>
+<p class="bee-upgrade__source">source <code>{root}</code> @ {branch} {sha}{dirty} · target {target}</p>
+</header>
+<p class="bee-upgrade__note">An upgrade commits only bee's files, and skips projects with overlapping uncommitted edits or a live bee session.</p>
+{all}
+<div class="bee-upgrade__scroll">
+<table class="bee-upgrade__table">
+<thead><tr><th>Project</th><th>Branch</th><th>From</th><th>To</th><th>Status</th><th>Files</th><th>Detail</th><th>Notices</th><th></th></tr></thead>
+<tbody>
+{rows}</tbody>
+</table>
+</div>
+</section>"#,
+        root = esc(&report.source_root.to_string_lossy()),
+        branch = opt(&report.source_branch),
+        sha = opt(&report.source_head),
+        target = opt(&report.target_version),
+    )
+}
 
 pub const USAGE_WINDOWS: [u32; 4] = [1, 7, 14, 30];
 
@@ -24277,18 +24367,119 @@ mod tests {
     }
 
     #[test]
-    fn the_handset_tab_bar_keeps_the_six_destinations_it_was_widened_to() {
+    fn the_handset_tab_bar_keeps_the_seven_destinations_it_was_widened_to() {
         let bar = home_tabbar(HomeTab::Kanban);
         let items =
             bar.matches("home-tabbar__item").count() - bar.matches("home-tabbar__item--on").count();
         assert_eq!(
-            items, 6,
-            "the tab bar's six columns are a recorded layout decision (dcfbda20, usage-dashboard D2): {bar}"
+            items, 7,
+            "the tab bar's seven columns are a recorded layout decision (dcfbda20, usage-dashboard D2, bee-bulk-upgrade D1): {bar}"
         );
         assert!(
             !bar.contains("/inbox"),
             "the inbox lives in the top bar menu, not as a column: {bar}"
         );
+    }
+
+    fn upgrade_report(applied: bool, outcomes: Vec<(&str, Outcome)>) -> UpgradeReport {
+        UpgradeReport {
+            source_root: std::path::PathBuf::from("/src/<bee>"),
+            source_head: Some("abc1234".into()),
+            source_branch: Some("main".into()),
+            source_dirty: true,
+            target_version: Some("9.9.9".into()),
+            applied,
+            projects: outcomes
+                .into_iter()
+                .map(|(id, outcome)| waggledance_core::bee_upgrade::ProjectUpgrade {
+                    id: id.into(),
+                    name: format!("name-{id}"),
+                    root: std::path::PathBuf::from(format!("/p/{id}")),
+                    branch: Some("main".into()),
+                    from_version: Some("1.0.0".into()),
+                    to_version: Some("9.9.9".into()),
+                    notices: vec!["n1".into()],
+                    outside_repo: Vec::new(),
+                    outcome,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bee_tab_pending_row_carries_an_upgrade_form_for_its_own_id() {
+        let report = upgrade_report(
+            false,
+            vec![(
+                "p&1",
+                Outcome::Pending {
+                    files: vec!["AGENTS.md".into()],
+                },
+            )],
+        );
+        let html = bee_tab(Some(&report), None);
+        assert!(html.contains(r#"action="/api/bee/upgrade""#), "{html}");
+        assert!(
+            html.contains(r#"<input type="hidden" name="project" value="p&amp;1">"#),
+            "{html}"
+        );
+        assert!(html.contains(">Upgrade</button>"), "{html}");
+        assert!(html.contains(r#"<input type="hidden" name="all" value="1">"#), "{html}");
+        assert!(html.contains("Upgrade all pending"), "{html}");
+        assert!(html.contains("/src/&lt;bee&gt;"), "{html}");
+        assert!(html.contains("abc1234"), "{html}");
+        assert!(html.contains("9.9.9"), "{html}");
+        assert!(html.contains("uncommitted"), "{html}");
+    }
+
+    #[test]
+    fn bee_tab_skipped_row_shows_its_reason_and_no_form() {
+        let report = upgrade_report(
+            false,
+            vec![(
+                "s1",
+                Outcome::Skipped {
+                    reason: "live bee session".into(),
+                    files: Vec::new(),
+                },
+            )],
+        );
+        let html = bee_tab(Some(&report), None);
+        assert!(html.contains("live bee session"), "{html}");
+        assert!(html.contains("skipped"), "{html}");
+        assert!(!html.contains("<form"), "{html}");
+    }
+
+    #[test]
+    fn bee_tab_applied_report_renders_no_forms_and_shows_the_commit() {
+        let report = upgrade_report(
+            true,
+            vec![
+                (
+                    "u1",
+                    Outcome::Upgraded {
+                        commit: "def5678".into(),
+                        files: vec!["AGENTS.md".into()],
+                    },
+                ),
+                (
+                    "p1",
+                    Outcome::Pending {
+                        files: vec!["AGENTS.md".into()],
+                    },
+                ),
+            ],
+        );
+        let html = bee_tab(Some(&report), None);
+        assert!(html.contains("def5678"), "{html}");
+        assert!(!html.contains("<form"), "{html}");
+    }
+
+    #[test]
+    fn bee_tab_error_renders_the_error_instead_of_the_table() {
+        let html = bee_tab(None, Some("no <source>"));
+        assert!(html.contains("no &lt;source&gt;"), "{html}");
+        assert!(!html.contains("<table"), "{html}");
     }
 
     fn usage_summary_with(models: Vec<ModelSpend>) -> UsageSummary {
