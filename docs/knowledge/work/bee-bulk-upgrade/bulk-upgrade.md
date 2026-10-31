@@ -12,7 +12,8 @@ bee:
 
 # bee-bulk-upgrade — upgrading bee across registered projects
 
-Locked decisions: bee-bulk-upgrade D1-D10 (`docs/history/bee-bulk-upgrade/CONTEXT.md`).
+Locked decisions: bee-bulk-upgrade D1-D10 (`docs/history/bee-bulk-upgrade/CONTEXT.md`),
+and bdc40074 (bee-managed paths, `docs/history/bee-upgrade-managed-paths/plan.md`).
 
 ## What it does
 
@@ -93,10 +94,20 @@ the exact string in the row's `outcome`.
 | `detached HEAD` | D10 | every run |
 | `live bee session` | D8 | every run |
 | `merge or rebase in progress` | D3 | apply only |
-| `uncommitted edits in files bee would write` | D4, D7 | apply only |
+| `uncommitted edits in files bee would write` | D4, D7, bdc40074 | apply only |
 
-The `no bee` skip never calls `bee onboard`, so it never installs bee. The
-overlap skip names the overlapping files in the row's `files`.
+The `no bee` skip never calls `bee onboard`, so it never installs bee.
+
+The overlap skip splits the uncommitted files that fall `under` a planned path
+into two sets (bdc40074). `is_managed` marks a file as bee-managed when it is:
+
+- a path starting with `.claude/skills/bee-`, `.agents/skills/bee-`,
+  `.opencode/skills/bee-` or `.pi/extensions/bee-guard` (`MANAGED_PREFIXES`)
+- the exact path `.bee/onboarding.json`
+
+Any other overlapping file skips the project, and the row's `files` names only
+those other files. Bee-managed overlaps alone never skip: bee overwrites them,
+and they are committed with the upgrade.
 
 ## Path expansion
 
@@ -106,18 +117,24 @@ the `skills/targets` entry whose `kind` matches the item's `target`. Any other
 item uses its `path` as given. `repo_relative` drops an item that falls outside
 the repo, and the item is listed in `outside_repo` only. `under` matches a
 dirty path to a planned path by equality or by a directory prefix, so a skill
-folder covers every file inside it.
+folder covers every file inside it. The bee-managed prefixes of bdc40074 are
+matched against these expanded paths, never against the raw plan items.
 
 ## Commit isolation
 
 On apply, `dirty_paths` reads `git status` before and after `bee onboard` with
-apply. The commit set is the paths newly dirty after apply that fall `under` a
-planned path (D3, D7). Those paths go to git on stdin, NUL-separated, through
+apply. The commit set is the paths newly dirty after apply, plus the
+bee-managed overlap paths still dirty after apply, kept only where they fall
+`under` a planned path (D3, D7, bdc40074). `Upgraded` lists that set. Those paths go to git on stdin, NUL-separated, through
 `--pathspec-from-file=-` and `--pathspec-file-nul`, first for add and then for
 commit. `--literal-pathspecs` is passed as a top-level git option, so a path
 is never read as a glob. The commit message is `Upgrade bee to` plus the
-version. Because the commit names its pathspecs, work the user already staged
-stays staged and out of the commit.
+version. The commit passes `--only` with its pathspecs, so work the user
+already staged stays staged and out of the commit.
+
+Every git call sets `GIT_OPTIONAL_LOCKS=0`, so a read-only call such as
+status never refreshes and rewrites a project's `.git/index`; a dry run leaves
+the index untouched.
 
 ## Outcomes
 
