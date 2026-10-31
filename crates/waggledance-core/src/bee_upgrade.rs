@@ -11,6 +11,12 @@ use std::time::Duration;
 
 const SOURCE_MARKER: &str = "packages/bee/AGENTS.block.md";
 const OUTPUT_CAP: usize = 16 * 1024 * 1024;
+const MANAGED_PREFIXES: [&str; 4] = [
+    ".claude/skills/bee-",
+    ".agents/skills/bee-",
+    ".opencode/skills/bee-",
+    ".pi/extensions/bee-guard",
+];
 
 #[derive(Serialize, Debug, Clone)]
 pub struct UpgradeOptions {
@@ -234,15 +240,15 @@ fn apply(
         Ok(set) => set,
         Err(error) => return Outcome::Failed { error },
     };
-    let overlap: Vec<String> = before
+    let (managed, other): (BTreeSet<String>, BTreeSet<String>) = before
         .iter()
         .filter(|p| under(p, planned))
         .cloned()
-        .collect();
-    if !overlap.is_empty() {
+        .partition(|p| is_managed(p));
+    if !other.is_empty() {
         return Outcome::Skipped {
             reason: "uncommitted edits in files bee would write".to_string(),
-            files: overlap,
+            files: other.into_iter().collect(),
         };
     }
     match onboard(source, root, true, t) {
@@ -259,8 +265,8 @@ fn apply(
         Err(error) => return Outcome::Failed { error },
     };
     let files: Vec<String> = after
-        .difference(&before)
-        .filter(|p| under(p, planned))
+        .iter()
+        .filter(|p| (!before.contains(*p) || managed.contains(*p)) && under(p, planned))
         .cloned()
         .collect();
     if files.is_empty() {
@@ -290,6 +296,7 @@ fn apply(
                 "--literal-pathspecs",
                 "commit",
                 "-q",
+                "--only",
                 "-m",
                 &message,
                 "--pathspec-from-file=-",
@@ -405,6 +412,10 @@ fn repo_relative(path: &Path, root: &Path) -> Option<String> {
         return None;
     }
     Some(rel.to_string())
+}
+
+fn is_managed(path: &str) -> bool {
+    path == ".bee/onboarding.json" || MANAGED_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
 fn under(path: &str, prefixes: &[String]) -> bool {
@@ -533,7 +544,8 @@ fn git(
         .arg(root)
         .args(args)
         .env("GIT_PAGER", "cat")
-        .env("LC_ALL", "C");
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0");
     run_with_deadline(&mut cmd, stdin, t, OUTPUT_CAP).map_err(|e| describe("git", e))
 }
 
@@ -915,17 +927,101 @@ JSON
         assert!(git_in(&a.root_path, &["status", "--porcelain=v1"]).contains("?? stray.txt"));
     }
 
+    fn dirty_skill(root: &Path) {
+        fs::create_dir_all(root.join(".claude/skills/bee-hive")).unwrap();
+        fs::write(root.join(".claude/skills/bee-hive/SKILL.md"), "mine\n").unwrap();
+    }
+
     #[test]
-    fn a_user_edit_inside_a_synced_skill_skips_the_project() {
+    fn an_uncommitted_bee_managed_file_is_overwritten_and_committed() {
         let tmp = TempDir::new().unwrap();
         let src = source(tmp.path());
         let a = repo(tmp.path(), "a");
-        fs::create_dir_all(a.root_path.join(".claude/skills/bee-hive")).unwrap();
-        fs::write(
-            a.root_path.join(".claude/skills/bee-hive/SKILL.md"),
-            "mine\n",
+        dirty_skill(&a.root_path);
+        let row = one(
+            &[src, a.clone()],
+            &UpgradeOptions {
+                only: strings(&["a"]),
+                ..opts(true)
+            },
+        );
+        let Outcome::Upgraded { files, .. } = &row.outcome else {
+            panic!("expected upgraded, got {:?}", row.outcome);
+        };
+        assert_eq!(files, &strings(&COMMITTED));
+        assert_eq!(head_files(&a.root_path), strings(&COMMITTED));
+        assert_eq!(
+            git_in(&a.root_path, &["status", "--porcelain=v1", "-uall"]),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_dry_run_leaves_the_git_index_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let src = source(tmp.path());
+        let a = repo(tmp.path(), "a");
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut roots = vec![a.root_path.clone()];
+        let s = &src.root_path;
+        git_in(s, &["init", "-q", "-b", "main"]);
+        git_in(s, &["add", "packages"]);
+        git_in(
+            s,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-q",
+                "-m",
+                "i",
+            ],
+        );
+        roots.push(s.clone());
+        let marks: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                fs::File::options()
+                    .write(true)
+                    .open(root.join(".git/index"))
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+                root.join(".git/index")
+            })
+            .collect();
+        fs::File::options()
+            .write(true)
+            .open(s.join(SOURCE_MARKER))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        run(
+            &[src.clone(), a],
+            &UpgradeOptions {
+                only: strings(&["a"]),
+                ..opts(false)
+            },
         )
         .unwrap();
+        for index in marks {
+            assert_eq!(
+                fs::metadata(&index).unwrap().modified().unwrap(),
+                old,
+                "{index:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_edit_beside_a_bee_managed_file_skips_naming_only_it() {
+        let tmp = TempDir::new().unwrap();
+        let src = source(tmp.path());
+        let a = repo(tmp.path(), "a");
+        dirty_skill(&a.root_path);
+        fs::write(a.root_path.join("AGENTS.md"), "mine\n").unwrap();
         let row = one(
             &[src.clone(), a.clone()],
             &UpgradeOptions {
@@ -937,12 +1033,12 @@ JSON
             row.outcome,
             Outcome::Skipped {
                 reason: "uncommitted edits in files bee would write".to_string(),
-                files: strings(&[".claude/skills/bee-hive/SKILL.md"]),
+                files: strings(&["AGENTS.md"]),
             }
         );
         assert_eq!(
-            fs::read_to_string(a.root_path.join("AGENTS.md")).unwrap(),
-            "old\n"
+            fs::read_to_string(a.root_path.join(".claude/skills/bee-hive/SKILL.md")).unwrap(),
+            "mine\n"
         );
         assert!(!calls(&src).contains("--apply"));
     }
