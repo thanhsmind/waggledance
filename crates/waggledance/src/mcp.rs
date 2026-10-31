@@ -138,6 +138,7 @@ pub fn run() -> Result<()> {
                         view_file_schema(),
                         search_schema(),
                         projects_schema(),
+                        bee_upgrade_schema(),
                         ask_state_schema(),
                         dispatch_schema(),
                         await_schema(),
@@ -207,6 +208,23 @@ fn projects_schema() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {}
+        }
+    })
+}
+
+fn bee_upgrade_schema() -> Value {
+    json!({
+        "name": "waggledance_bee_upgrade",
+        "description": "Upgrade bee in the registered projects that already use bee. \
+    Previews by default. With `apply: true` it runs `bee onboard --apply` and \
+    commits only bee's files. `apply` requires a non-empty `projects` list the \
+    human has approved.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "apply": { "type": "boolean", "default": false, "description": "Run the upgrade and commit; false previews" },
+                "projects": { "type": "array", "items": { "type": "string" }, "description": "Project ids to narrow the run to; required with apply" }
+            }
         }
     })
 }
@@ -342,6 +360,7 @@ fn handle_tool_call(
         "waggledance_view_file" => handle_view_file(id, engine, &args),
         "waggledance_search" => handle_search(id, engine, &args),
         "waggledance_projects" => handle_projects(id, engine),
+        "waggledance_bee_upgrade" => handle_bee_upgrade(id, engine, &args),
         "waggledance_ask_state" => handle_ask_state(id, engine, orchestration, &args),
         "waggledance_dispatch" => handle_dispatch(id, engine, orchestration, &args),
         "waggledance_await" => {
@@ -553,6 +572,64 @@ fn handle_projects(id: Option<Value>, engine: &Engine) -> Value {
         json!({
             "content": [{ "type": "text", "text": text }],
             "structuredContent": { "projects": entries }
+        }),
+    )
+}
+
+fn handle_bee_upgrade(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
+    let apply = match args.get("apply") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return tool_error(id, "apply must be a boolean"),
+    };
+    let only: Vec<String> = match args.get("projects") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => match items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(ids) => ids,
+            None => return tool_error(id, "projects must be an array of project id strings"),
+        },
+        Some(_) => return tool_error(id, "projects must be an array of project id strings"),
+    };
+    if apply && only.is_empty() {
+        return tool_error(
+            id,
+            "apply true needs a non-empty projects list the human has approved",
+        );
+    }
+    let projects = match engine.list_projects() {
+        Ok(p) => p,
+        Err(e) => return tool_error(id, &format!("could not list registered projects: {e}")),
+    };
+    let opts = waggledance_core::bee_upgrade::UpgradeOptions {
+        apply,
+        only,
+        ..Default::default()
+    };
+    let report = match waggledance_core::bee_upgrade::run(&projects, &opts) {
+        Ok(r) => r,
+        Err(e) => return tool_error(id, &e.to_string()),
+    };
+    let structured = serde_json::to_value(&report).unwrap_or(Value::Null);
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for row in structured["projects"].as_array().into_iter().flatten() {
+        let status = row["outcome"]["status"].as_str().unwrap_or("unknown");
+        *counts.entry(status.to_string()).or_default() += 1;
+    }
+    let per_status = counts
+        .iter()
+        .map(|(status, n)| format!("{status} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!("{} project(s): {per_status}", report.projects.len());
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": structured
         }),
     )
 }
@@ -1940,11 +2017,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_eight_schemas() {
+    fn tools_list_has_nine_schemas() {
         let tools = [
             view_file_schema(),
             search_schema(),
             projects_schema(),
+            bee_upgrade_schema(),
             ask_state_schema(),
             dispatch_schema(),
             await_schema(),
@@ -1958,6 +2036,7 @@ mod tests {
                 "waggledance_view_file",
                 "waggledance_search",
                 "waggledance_projects",
+                "waggledance_bee_upgrade",
                 "waggledance_ask_state",
                 "waggledance_dispatch",
                 "waggledance_await",
@@ -1965,6 +2044,45 @@ mod tests {
                 "waggledance_task"
             ]
         );
+    }
+
+    fn empty_engine() -> Engine {
+        let mut config = Config::default();
+        config.paseo.enabled = Some(false);
+        Engine::new(SqliteStore::open_in_memory().unwrap(), config)
+    }
+
+    #[test]
+    fn bee_upgrade_apply_without_projects_is_refused() {
+        let engine = empty_engine();
+        for args in [json!({ "apply": true }), json!({ "apply": true, "projects": [] })] {
+            let resp = call_tool(&engine, "waggledance_bee_upgrade", args);
+            assert_eq!(resp["result"]["isError"], true, "{resp}");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("projects"), "{text}");
+        }
+    }
+
+    #[test]
+    fn bee_upgrade_non_boolean_apply_is_refused() {
+        let engine = empty_engine();
+        let resp = call_tool(
+            &engine,
+            "waggledance_bee_upgrade",
+            json!({ "apply": "yes", "projects": ["x"] }),
+        );
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("apply"), "{text}");
+    }
+
+    #[test]
+    fn bee_upgrade_empty_registry_reports_no_source() {
+        let engine = empty_engine();
+        let resp = call_tool(&engine, "waggledance_bee_upgrade", json!({}));
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no registered project holds"), "{text}");
     }
 
     #[test]
