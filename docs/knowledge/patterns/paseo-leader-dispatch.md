@@ -24,8 +24,9 @@ paseo-auto-wiring D8 for `mode` only, and paseo-dispatch-default-on D1/D2/D4/D5
 supersedes paseo-auto-wiring D2 and D5: dispatch is on by default, and
 leader-per-task D1/D2 (`docs/history/leader-per-task/CONTEXT.md`, decisions `a29369df`
 and `0398ca94`): every run starts its own leader, and a non-wd run's leader is archived
-when the run ends `done`. Leader-per-task D1 supersedes leader-delivery D3, which had
-superseded paseo-leader-dispatch D7: no run waits for, or goes to, an existing leader.
+when the run ends `done`, and leader-idle-close D1 (`docs/history/leader-idle-close/CONTEXT.md`,
+decision `af012b0b`): a leader idle for more than 24 hours is archived. Leader-per-task D1
+supersedes leader-delivery D3, which had superseded paseo-leader-dispatch D7: no run waits for, or goes to, an existing leader.
 Paseo-auto-wiring D3 removes paseo-leader-dispatch D8's two-workspace refusal, and
 paseo-auto-wiring D4 makes the global `[paseo]` block optional.
 
@@ -178,6 +179,9 @@ The run's pane id becomes `paseo:<agent id>` as soon as the agent id is known.
 When a run that is not a wd run ends `done`, the daemon archives its leader with `paseo
 archive <id>`. A wd run's leader stays for `reply` and `redo` until `accept` archives it.
 The leader of a `lost` or `blocked` run is left alone (leader-per-task D2).
+Every 5 minutes, the delivery loop also archives any waggledance leader, wd leaders
+included, that is not `running` or `initializing` and whose Paseo `UpdatedAt` is more
+than 24 hours old. A leader with no `UpdatedAt` is never archived (leader-idle-close D1).
 
 ### Leader mode check
 

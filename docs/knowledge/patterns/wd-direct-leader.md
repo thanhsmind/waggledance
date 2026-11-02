@@ -62,7 +62,9 @@ mail only what the advisor cannot decide, quoting the advisor's answer (D7).
 Each wd run, `reply` and `redo` included, starts its own new leader and never waits on
 another caller's leader; runs of one project go out in parallel (leader-per-task D1). A
 wd run's leader is not archived when the run ends `done`: it stays until `accept`
-(leader-per-task D2).
+(leader-per-task D2). An idle wd leader is still archived after 24 hours
+(leader-idle-close D1). Its task stays open: the heartbeat still lists it on the board,
+`reply` or `redo` starts a new leader for it, and `accept` closes it.
 
 ## The inbox
 
@@ -129,8 +131,8 @@ through `wd-bridge.py`.
 | `allow`, `deny` | runs `paseo permit allow|deny <leader_id> <req_id>`; without `req_id`, it takes the task's newest unanswered request; marks the request answered |
 
 An unknown corr, a closed task, or a task with no leader yet returns a tool error that
-names the cause. `accept` on a closed task is idempotent. A leader is archived only
-after `accept` (D10).
+names the cause. `accept` on a closed task is idempotent. Apart from the 24-hour idle
+archive, a leader is archived only after `accept` (D10).
 
 ## The heartbeat
 
