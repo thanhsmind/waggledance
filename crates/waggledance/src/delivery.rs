@@ -20,6 +20,8 @@ const NOTICE_WINDOW: Duration = Duration::from_secs(3600);
 const NOTICE_GAP: Duration = Duration::from_secs(30);
 const MAY_STILL_FINISH: &str = "the leader may still be finishing";
 const RESTARTED: &str = "daemon restarted — the leader may still be finishing; check its chat";
+const LEADER_IDLE_LIMIT: time::Duration = time::Duration::hours(24);
+const LEADER_RUNNING: [&str; 2] = ["running", "initializing"];
 
 pub type NotifySlot = Arc<Mutex<Option<Arc<NotifyStore>>>>;
 
@@ -41,6 +43,7 @@ pub struct Delivery {
 struct State {
     recovered: bool,
     discovering: bool,
+    sweeping: bool,
     headers: HashMap<String, String>,
     inflight: HashSet<String>,
     not_before: HashMap<String, Instant>,
@@ -72,6 +75,19 @@ fn notice_expired(until: &str) -> bool {
 
 fn pane(agent: Option<&str>) -> String {
     format!("{PASEO_PANE_PREFIX}{}", agent.unwrap_or("pending"))
+}
+
+fn idle_for(state: &paseo::AgentState, now: time::OffsetDateTime) -> Option<time::Duration> {
+    if state.archived || LEADER_RUNNING.contains(&state.status.as_str()) {
+        return None;
+    }
+    let updated = time::OffsetDateTime::parse(
+        state.updated_at.as_deref()?,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?;
+    let idle = now - updated;
+    (idle > LEADER_IDLE_LIMIT).then_some(idle)
 }
 
 fn notice_text(project: &str, run_id: &str, status: &str) -> String {
@@ -134,7 +150,10 @@ impl Delivery {
                     while deliveries.try_join_next().is_some() {}
                     self.tick(&mut deliveries).await;
                 }
-                _ = discoveries.tick() => self.discover(&mut deliveries),
+                _ = discoveries.tick() => {
+                    self.discover(&mut deliveries);
+                    self.sweep_idle_leaders(&mut deliveries);
+                }
             }
         }
     }
@@ -148,6 +167,66 @@ impl Delivery {
             discovery::discover(this.paseo.as_ref(), &this.engine, &this.bounds).await;
             this.state.lock().unwrap().discovering = false;
         });
+    }
+
+    fn sweep_idle_leaders(&self, tasks: &mut JoinSet<()>) {
+        if std::mem::replace(&mut self.state.lock().unwrap().sweeping, true) {
+            return;
+        }
+        let this = self.clone();
+        tasks.spawn(async move {
+            let now = time::OffsetDateTime::now_utc();
+            this.sweep_leaders(now).await;
+            this.state.lock().unwrap().sweeping = false;
+        });
+    }
+
+    async fn sweep_leaders(&self, now: time::OffsetDateTime) {
+        let leaders = match self.paseo.all_leaders().await {
+            Ok(leaders) => leaders,
+            Err(e) => {
+                tracing::warn!("idle sweep could not list the leaders: {e}");
+                return;
+            }
+        };
+        let busy = self.busy_leaders();
+        for id in leaders {
+            if busy.contains(&id) {
+                continue;
+            }
+            let state = match self.paseo.inspect(&id).await {
+                Ok(state) => state,
+                Err(e) => {
+                    tracing::warn!("idle sweep could not inspect leader {id}: {e}");
+                    continue;
+                }
+            };
+            let Some(idle) = idle_for(&state, now) else {
+                continue;
+            };
+            match self.paseo.archive(&id).await {
+                Ok(()) => tracing::info!(
+                    leader = %id,
+                    idle_hours = idle.whole_hours(),
+                    "idle sweep archived leader {id}"
+                ),
+                Err(e) => {
+                    tracing::warn!("idle sweep could not archive leader {id}: {e}")
+                }
+            }
+        }
+    }
+
+    fn busy_leaders(&self) -> HashSet<String> {
+        let runs = self.engine.list_inflight_paseo_runs().unwrap_or_else(|e| {
+            tracing::warn!("idle sweep could not list in-flight leader runs: {e}");
+            Vec::new()
+        });
+        runs.iter()
+            .filter_map(|run| run.pane_id.strip_prefix(PASEO_PANE_PREFIX))
+            .filter(|a| *a != "pending")
+            .map(str::to_string)
+            .collect()
     }
 
     async fn tick(&self, deliveries: &mut JoinSet<()>) {
@@ -712,6 +791,10 @@ mod tests {
             while let Some(r) = set.join_next().await {
                 r.unwrap();
             }
+        }
+
+        async fn sweep_at(&self, now: time::OffsetDateTime) {
+            self.delivery.sweep_leaders(now).await;
         }
 
         fn started_tasks(&self) -> Vec<String> {
@@ -1422,5 +1505,158 @@ mod tests {
         let logs = "[User] one\nold\n[User] one\nsecond line\nnew reply\n[User] other\n";
         assert_eq!(leader_reply(logs, "one\nsecond line"), "new reply");
         assert_eq!(leader_reply("[User] two\nx\n", "one"), "");
+    }
+
+    fn clock(text: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    const NOW: &str = "2026-11-02T12:00:00Z";
+
+    #[tokio::test]
+    async fn the_idle_sweep_archives_a_leader_idle_for_over_a_day() {
+        let r = rig();
+        r.fake
+            .add_listed_leader("stale-lead", "idle", Some("2026-11-01T11:00:00Z"));
+        r.sweep_at(clock(NOW)).await;
+        assert!(r.fake.archived("stale-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_keeps_a_leader_updated_within_a_day() {
+        let r = rig();
+        r.fake
+            .add_listed_leader("fresh-lead", "idle", Some("2026-11-01T13:00:00Z"));
+        r.sweep_at(clock(NOW)).await;
+        assert!(!r.fake.archived("fresh-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_keeps_a_leader_that_is_still_running() {
+        let r = rig();
+        r.fake
+            .add_listed_leader("busy-lead", "running", Some("2026-10-31T00:00:00Z"));
+        r.fake.add_listed_leader(
+            "starting-lead",
+            "initializing",
+            Some("2026-10-31T00:00:00Z"),
+        );
+        r.sweep_at(clock(NOW)).await;
+        assert!(!r.fake.archived("busy-lead"));
+        assert!(!r.fake.archived("starting-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_keeps_a_leader_with_no_timestamp_or_an_unreadable_one() {
+        let r = rig();
+        r.fake.add_listed_leader("undated-lead", "idle", None);
+        r.fake
+            .add_listed_leader("garbled-lead", "idle", Some("yesterday"));
+        r.sweep_at(clock(NOW)).await;
+        assert!(!r.fake.archived("undated-lead"));
+        assert!(!r.fake.archived("garbled-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_archives_a_via_wd_leader_too() {
+        let r = rig();
+        r.fake
+            .add_listed_leader("wd-lead", "idle", Some("2026-11-01T11:00:00Z"));
+        r.fake.label("wd-lead", paseo::WD_LABEL);
+        r.sweep_at(clock(NOW)).await;
+        assert!(r.fake.archived("wd-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_carries_on_past_a_leader_it_could_not_archive() {
+        let r = rig();
+        r.fake
+            .add_listed_leader("stuck-lead", "idle", Some("2026-11-01T11:00:00Z"));
+        r.fake
+            .add_listed_leader("next-lead", "idle", Some("2026-11-01T11:00:00Z"));
+        r.fake.fail_archive("stuck-lead");
+        r.sweep_at(clock(NOW)).await;
+        assert!(!r.fake.archived("stuck-lead"));
+        assert!(r.fake.archived("next-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_keeps_the_leader_of_a_run_in_flight() {
+        let r = rig();
+        root_workspace(&r);
+        r.fake
+            .add_listed_leader("working-lead", "idle", Some("2026-11-01T11:00:00Z"));
+        r.queue("proj-1", "run-1", "build it", None);
+        r.engine
+            .set_run_pane("run-1", &format!("{PASEO_PANE_PREFIX}working-lead"))
+            .unwrap();
+        r.engine.claim_queued_run("run-1").unwrap();
+        r.sweep_at(clock(NOW)).await;
+        assert!(
+            !r.fake.archived("working-lead"),
+            "a leader behind a live run is not archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_skips_a_leader_it_could_not_inspect_and_sweeps_the_rest() {
+        let r = rig();
+        r.fake
+            .add_listed_leader("ghost-lead", "idle", Some("2026-11-01T11:00:00Z"));
+        r.fake
+            .add_listed_leader("next-lead", "idle", Some("2026-11-01T11:00:00Z"));
+        r.fake.state.lock().unwrap().agents.remove("ghost-lead");
+        r.sweep_at(clock(NOW)).await;
+        assert!(r.fake.archived("next-lead"));
+    }
+
+    #[tokio::test]
+    async fn a_running_delivery_loop_archives_a_leader_left_idle_for_a_day() {
+        let r = rig();
+        let stale = (time::OffsetDateTime::now_utc() - time::Duration::hours(25))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        r.fake
+            .add_listed_leader("forgotten-lead", "idle", Some(&stale));
+        let task = tokio::spawn(r.delivery.clone().run());
+        let mut archived = false;
+        for _ in 0..200 {
+            archived = r.fake.archived("forgotten-lead");
+            if archived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert!(
+            archived,
+            "the delivery loop archives an idle leader with no dispatch and no OpenClaw"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_never_overlaps_itself() {
+        let r = rig();
+        let stale = (time::OffsetDateTime::now_utc() - time::Duration::hours(25))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        r.fake.add_listed_leader("stale-lead", "idle", Some(&stale));
+        let mut set = JoinSet::new();
+        r.delivery.sweep_idle_leaders(&mut set);
+        r.delivery.sweep_idle_leaders(&mut set);
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
+        assert!(r.fake.archived("stale-lead"));
+        assert!(
+            r.fake
+                .calls()
+                .iter()
+                .filter(|c| **c == Call::Archive("stale-lead".into()))
+                .count()
+                == 1,
+            "the second sweep waits instead of archiving twice"
+        );
+        assert!(!r.delivery.state.lock().unwrap().sweeping);
     }
 }

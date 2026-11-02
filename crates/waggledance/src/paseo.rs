@@ -154,6 +154,7 @@ pub struct RunSpec {
 #[async_trait]
 pub trait Paseo: Send + Sync {
     async fn run_leaders(&self, project_id: &str, run_id: &str) -> Result<Vec<String>>;
+    async fn all_leaders(&self) -> Result<Vec<String>>;
     async fn inspect(&self, id: &str) -> Result<AgentState>;
     async fn workspaces(&self) -> Result<Vec<Workspace>>;
     async fn providers(&self) -> Result<Vec<String>>;
@@ -848,6 +849,11 @@ impl Paseo for PaseoCli {
         parse_leaders(&out).map_err(|e| unparsable(&binary, "ls", e))
     }
 
+    async fn all_leaders(&self) -> Result<Vec<String>> {
+        let (binary, out) = self.exec(&role_leaders_args(), TIMEOUT).await?;
+        parse_leaders(&out).map_err(|e| unparsable(&binary, "ls", e))
+    }
+
     async fn inspect(&self, id: &str) -> Result<AgentState> {
         let (binary, out) = self
             .exec(&["inspect".into(), id.into(), "--json".into()], TIMEOUT)
@@ -1209,6 +1215,8 @@ pub mod fake {
         pub permits: Vec<Permit>,
         pub modes: HashMap<String, VecDeque<Option<String>>>,
         pub stuck: std::collections::HashSet<String>,
+        pub labelled: HashMap<String, Vec<String>>,
+        pub archive_fails: std::collections::HashSet<String>,
         pub appear_after: Duration,
         pub run_after: Duration,
         pub calls: Vec<Call>,
@@ -1255,6 +1263,35 @@ pub mod fake {
         pub fn archived(&self, id: &str) -> bool {
             let s = self.state.lock().unwrap();
             s.agents.get(id).is_some_and(|a| a.archived)
+        }
+
+        pub fn add_listed_leader(&self, id: &str, status: &str, updated_at: Option<&str>) {
+            self.add_leader(id, status, false);
+            self.set_updated_at(id, updated_at);
+            self.label(id, ROLE_LABEL);
+        }
+
+        pub fn set_updated_at(&self, id: &str, updated_at: Option<&str>) {
+            let mut s = self.state.lock().unwrap();
+            if let Some(a) = s.agents.get_mut(id) {
+                a.updated_at = updated_at.map(str::to_string);
+            }
+        }
+
+        pub fn label(&self, id: &str, label: &str) {
+            let mut s = self.state.lock().unwrap();
+            let labels = s.labelled.entry(id.to_string()).or_default();
+            if !labels.iter().any(|l| l == label) {
+                labels.push(label.to_string());
+            }
+        }
+
+        pub fn fail_archive(&self, id: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .archive_fails
+                .insert(id.to_string());
         }
 
         pub fn script_modes(&self, id: &str, modes: &[Option<&str>], stuck: bool) {
@@ -1324,6 +1361,18 @@ pub mod fake {
                 .get(&format!("{project_id}:{run_id}"))
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        async fn all_leaders(&self) -> Result<Vec<String>> {
+            let s = self.state.lock().unwrap();
+            let mut ids: Vec<String> = s
+                .labelled
+                .iter()
+                .filter(|(_, labels)| labels.iter().any(|l| l == ROLE_LABEL))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.sort();
+            Ok(ids)
         }
 
         async fn inspect(&self, id: &str) -> Result<AgentState> {
@@ -1405,6 +1454,11 @@ pub mod fake {
             self.state
                 .lock()
                 .unwrap()
+                .labelled
+                .insert(id.clone(), spec.labels.clone());
+            self.state
+                .lock()
+                .unwrap()
                 .runs
                 .entry(format!("{project}:{run}"))
                 .or_default()
@@ -1438,7 +1492,15 @@ pub mod fake {
 
         async fn archive(&self, id: &str) -> Result<()> {
             self.record(Call::Archive(id.to_string()));
-            if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
+            let mut s = self.state.lock().unwrap();
+            if s.archive_fails.contains(id) {
+                return Err(PaseoError::Failed {
+                    binary: "fake".into(),
+                    command: "archive".into(),
+                    status: "exit status: 1".into(),
+                });
+            }
+            if let Some(a) = s.agents.get_mut(id) {
                 a.archived = true;
             }
             Ok(())
@@ -2378,6 +2440,32 @@ mod tests {
             role_leaders_args(),
             ["ls", "-g", "--label", "waggledance.role=leader", "--json"]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn all_leaders_lists_every_role_leader_across_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = dir.path().join("argv");
+        let bin = script(
+            &dir.path().join("paseo"),
+            &format!(
+                "echo \"$*\" >> '{}'\nprintf '[{{\"id\":\"lead-a\"}},{{\"id\":\"lead-b\"}}]'",
+                argv.display()
+            ),
+        );
+        let cli = PaseoCli::with_binary(&lossy(&bin));
+        assert_eq!(
+            cli.all_leaders().await.unwrap(),
+            vec!["lead-a".to_string(), "lead-b".to_string()]
+        );
+        let lines: Vec<String> = std::fs::read_to_string(&argv)
+            .unwrap()
+            .lines()
+            .filter(|l| *l != "settle")
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines, ["ls -g --label waggledance.role=leader --json"]);
     }
 
     #[test]
