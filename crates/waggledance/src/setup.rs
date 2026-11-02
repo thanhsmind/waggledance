@@ -205,6 +205,8 @@ struct OpenClawPaths {
     home: PathBuf,
     agent_skills: PathBuf,
     workspace: PathBuf,
+    global_skills: PathBuf,
+    bee_source: Option<(PathBuf, String)>,
 }
 
 impl OpenClawPaths {
@@ -387,7 +389,101 @@ fn edit_openclaw_json(path: &Path, token: &str, now: u64) -> Result<Option<PathB
     Ok(Some(bak))
 }
 
-fn openclaw_install(p: &OpenClawPaths, now: u64) -> Result<Vec<String>> {
+fn bee_skills_source(start: &Path) -> Option<(PathBuf, String)> {
+    for root in start.ancestors() {
+        let onboarded = root.join(".bee").join("onboarding.json");
+        if !onboarded.is_file() {
+            continue;
+        }
+        let skills = root.join(".claude").join("skills");
+        if !skills.join("bee-hive").join("SKILL.md").is_file() {
+            return None;
+        }
+        let version = std::fs::read_to_string(&onboarded)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|doc| doc.get("bee_version")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        return Some((skills, version));
+    }
+    None
+}
+
+fn bee_skill_sets(src: &Path, version: &str) -> Result<BTreeMap<String, Files>> {
+    let mut sets = BTreeMap::new();
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let path = entry?.path();
+        let name = file_name(&path);
+        if !path.is_dir() || !name.starts_with("bee-") {
+            continue;
+        }
+        let mut want = Files::new();
+        read_tree(&path, &path, &mut want)
+            .with_context(|| format!("reading {}", path.display()))?;
+        want.insert("VERSION".into(), format!("{version}\n"));
+        sets.insert(name, want);
+    }
+    Ok(sets)
+}
+
+fn marked_bee_skills(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir() && file_name(path).starts_with("bee-") && path.join("VERSION").is_file()
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn install_bee_skills(p: &OpenClawPaths, now: u64) -> Result<(Vec<String>, Option<String>)> {
+    let Some((src, version)) = p.bee_source.as_ref() else {
+        return Ok((
+            Vec::new(),
+            Some(format!(
+                "bee skills skipped: run setup from inside a bee-onboarded repo to install them into {}",
+                p.global_skills.display()
+            )),
+        ));
+    };
+    let sets = bee_skill_sets(src, version)?;
+    let mut written = 0usize;
+    let mut done = Vec::new();
+    for (name, want) in &sets {
+        for line in install_skill(&p.global_skills.join(name), want, &p.backups(), now)? {
+            if line.starts_with("wrote ") {
+                written += 1;
+            } else {
+                done.push(line);
+            }
+        }
+    }
+    if written > 0 {
+        done.insert(
+            0,
+            format!(
+                "installed {written} bee skills into {}",
+                p.global_skills.display()
+            ),
+        );
+    }
+    for dst in marked_bee_skills(&p.global_skills) {
+        if sets.contains_key(&file_name(&dst)) {
+            continue;
+        }
+        if remove_tree(&dst)? {
+            done.push(format!("removed the stale {}", dst.display()));
+        }
+    }
+    Ok((done, None))
+}
+
+fn openclaw_install(p: &OpenClawPaths, now: u64) -> Result<(Vec<String>, Option<String>)> {
     let mut done = Vec::new();
     let token_path = waggledance_core::config::hook_token_path(&p.data);
     if waggledance_core::config::ensure_hook_token(&p.data)
@@ -416,7 +512,9 @@ fn openclaw_install(p: &OpenClawPaths, now: u64) -> Result<Vec<String>> {
             bak.display()
         ));
     }
-    Ok(done)
+    let (bee_done, bee_note) = install_bee_skills(p, now)?;
+    done.extend(bee_done);
+    Ok((done, bee_note))
 }
 
 fn openclaw_remove(p: &OpenClawPaths) -> Result<Vec<String>> {
@@ -424,6 +522,24 @@ fn openclaw_remove(p: &OpenClawPaths) -> Result<Vec<String>> {
     refuse_foreign(&p.supervisor_skill())?;
     let mut done = remove_skill(&p.skill(), &p.backups())?;
     done.extend(remove_skill(&p.supervisor_skill(), &p.backups())?);
+    let mut removed = 0usize;
+    let mut restores = Vec::new();
+    for dst in marked_bee_skills(&p.global_skills) {
+        for line in remove_skill(&dst, &p.backups())? {
+            if line.starts_with("removed ") {
+                removed += 1;
+            } else {
+                restores.push(line);
+            }
+        }
+    }
+    if removed > 0 {
+        done.push(format!(
+            "removed {removed} bee skills from {}",
+            p.global_skills.display()
+        ));
+    }
+    done.extend(restores);
     let json = p.json();
     if let Some(bak) = newest_backup(&p.home, &file_name(&json)) {
         std::fs::rename(&bak, &json)
@@ -664,11 +780,16 @@ pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
             let config = waggledance_core::Config::load();
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
             let openclaw_home = expand_home(&config.openclaw.home);
+            let global_skills = openclaw_home.join("skills");
             let paths = OpenClawPaths {
                 workspace: agent_workspace(&openclaw_home, &config.openclaw.agent_id),
                 data: waggledance_core::config::resolve_data_dir(None),
-                home: openclaw_home,
                 agent_skills: home.join(".agents").join("skills"),
+                global_skills,
+                bee_source: std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| bee_skills_source(&cwd)),
+                home: openclaw_home,
             };
             let done = if remove {
                 openclaw_remove(&paths)?
@@ -677,7 +798,8 @@ pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or_default();
-                let done = openclaw_install(&paths, now)?;
+                let (done, bee_note) = openclaw_install(&paths, now)?;
+                notes.extend(bee_note);
                 notes.extend(openclaw_notes(
                     &config.openclaw.hook_url,
                     &waggledance_core::config::hook_token_path(&paths.data),
@@ -875,6 +997,8 @@ mod tests {
         let p = OpenClawPaths {
             data: tmp.path().join("data"),
             agent_skills: tmp.path().join("agents").join("skills"),
+            global_skills: home.join("skills"),
+            bee_source: None,
             workspace: agent_workspace(&home, "wd"),
             home,
         };
@@ -883,8 +1007,9 @@ mod tests {
             p.workspace.join("skills/waggledance-orchestrator")
         );
         assert_eq!(p.workspace, tmp.path().join("openclaw/agent-wd"));
-        openclaw_install(&p, 100).unwrap();
+        let (done, note) = openclaw_install(&p, 100).unwrap();
         assert!(is_current(&p.skill(), &openclaw_files()));
+        assert!(note.unwrap().contains("bee skills skipped"), "{done:?}");
     }
 
     const OPENCLAW_JSON: &str = r#"{
@@ -915,6 +1040,8 @@ mod tests {
             data: root.join("data"),
             home: root.join("openclaw"),
             agent_skills: root.join("agents").join("skills"),
+            global_skills: root.join("openclaw").join("skills"),
+            bee_source: None,
             workspace: root.join("openclaw").join("workspace-main"),
         };
         std::fs::create_dir_all(&p.home).unwrap();
@@ -987,7 +1114,7 @@ mod tests {
         std::fs::create_dir_all(p.supervisor_skill()).unwrap();
         std::fs::write(p.supervisor_skill().join("SKILL.md"), "old supervisor").unwrap();
 
-        let done = openclaw_install(&p, 100).unwrap();
+        let done = openclaw_install(&p, 100).unwrap().0;
         assert!(done[0].contains("hook.token"), "{done:?}");
         let token = waggledance_core::config::read_hook_token(&p.data).unwrap();
         assert!(is_current(&p.skill(), &openclaw_files()));
@@ -1002,7 +1129,7 @@ mod tests {
             .join("waggledance-orchestrator.bak-100")
             .is_dir());
         assert!(p.backups().join("waggledance-supervisor.bak-100").is_dir());
-        assert!(openclaw_install(&p, 200).unwrap().is_empty());
+        assert!(openclaw_install(&p, 200).unwrap().0.is_empty());
 
         openclaw_remove(&p).unwrap();
         assert_eq!(std::fs::read_to_string(p.json()).unwrap(), OPENCLAW_JSON);
@@ -1027,6 +1154,195 @@ mod tests {
         assert!(openclaw_remove(&p).is_err());
         assert_eq!(
             std::fs::read_to_string(p.skill().join("SKILL.md")).unwrap(),
+            "mine"
+        );
+    }
+
+    fn bee_repo(root: &Path, version: &str) -> PathBuf {
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        std::fs::write(
+            root.join(".bee/onboarding.json"),
+            format!("{{\"bee_version\":\"{version}\"}}"),
+        )
+        .unwrap();
+        let skills = root.join(".claude/skills");
+        std::fs::create_dir_all(skills.join("bee-hive/references")).unwrap();
+        std::fs::write(skills.join("bee-hive/SKILL.md"), "hive").unwrap();
+        std::fs::write(skills.join("bee-hive/references/gates.md"), "gates").unwrap();
+        std::fs::create_dir_all(skills.join("bee-other")).unwrap();
+        std::fs::write(skills.join("bee-other/SKILL.md"), "other").unwrap();
+        skills
+    }
+
+    fn bee_paths(root: &Path, source: Option<(PathBuf, String)>) -> OpenClawPaths {
+        let mut p = openclaw_paths(root);
+        p.bee_source = source;
+        p
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut all: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        all.sort();
+        all
+    }
+
+    #[test]
+    fn bee_source_walks_up_from_a_nested_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skills = bee_repo(&repo, "2.67.0");
+        let nested = repo.join("crates/waggledance/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            bee_skills_source(&nested),
+            Some((skills.clone(), "2.67.0".to_string()))
+        );
+        assert_eq!(
+            bee_skills_source(&repo),
+            Some((skills, "2.67.0".to_string()))
+        );
+        assert!(bee_skills_source(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn bee_source_is_none_without_onboarding_or_without_the_hive_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skills = bee_repo(&repo, "2.67.0");
+        std::fs::remove_file(repo.join(".bee/onboarding.json")).unwrap();
+        assert!(bee_skills_source(&repo).is_none());
+        std::fs::write(repo.join(".bee/onboarding.json"), "{}").unwrap();
+        assert_eq!(
+            bee_skills_source(&repo),
+            Some((skills.clone(), env!("CARGO_PKG_VERSION").to_string()))
+        );
+        std::fs::remove_file(skills.join("bee-hive/SKILL.md")).unwrap();
+        assert!(bee_skills_source(&repo).is_none());
+    }
+
+    #[test]
+    fn fresh_install_writes_every_bee_skill_with_a_version_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = bee_repo(&tmp.path().join("repo"), "2.67.0");
+        let p = bee_paths(tmp.path(), Some((skills.clone(), "2.67.0".into())));
+        std::fs::create_dir_all(p.global_skills.join("deep-research")).unwrap();
+        std::fs::write(p.global_skills.join("deep-research/SKILL.md"), "keep").unwrap();
+        let (done, note) = openclaw_install(&p, 100).unwrap();
+        assert!(note.is_none());
+        assert_eq!(
+            names(&p.global_skills),
+            ["bee-hive", "bee-other", "deep-research"]
+        );
+        let hive = p.global_skills.join("bee-hive");
+        assert_eq!(
+            std::fs::read_to_string(hive.join("references/gates.md")).unwrap(),
+            "gates"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hive.join("VERSION")).unwrap(),
+            "2.67.0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.global_skills.join("deep-research/SKILL.md")).unwrap(),
+            "keep"
+        );
+        let installed: Vec<&String> = done
+            .iter()
+            .filter(|line| line.starts_with("installed "))
+            .collect();
+        assert_eq!(
+            installed,
+            [&format!(
+                "installed 2 bee skills into {}",
+                p.global_skills.display()
+            )]
+        );
+        assert_eq!(done.iter().filter(|l| l.contains("installed ")).count(), 1);
+        assert!(done.iter().all(|line| !line.contains("/bee-")));
+    }
+
+    #[test]
+    fn a_second_bee_install_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = bee_repo(&tmp.path().join("repo"), "2.67.0");
+        let p = bee_paths(tmp.path(), Some((skills, "2.67.0".into())));
+        openclaw_install(&p, 100).unwrap();
+        let (done, note) = openclaw_install(&p, 200).unwrap();
+        assert!(done.is_empty(), "{done:?}");
+        assert!(note.is_none());
+        assert!(!p.backups().exists() || names(&p.backups()).is_empty());
+    }
+
+    #[test]
+    fn a_marked_stale_bee_skill_is_removed_and_an_unmarked_one_is_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = bee_repo(&tmp.path().join("repo"), "2.67.0");
+        let p = bee_paths(tmp.path(), Some((skills, "2.67.0".into())));
+        let stale = p.global_skills.join("bee-gone");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("VERSION"), "1.0.0\n").unwrap();
+        let foreign = p.global_skills.join("bee-mine");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("SKILL.md"), "mine").unwrap();
+        let (done, _) = openclaw_install(&p, 100).unwrap();
+        assert!(!stale.exists());
+        assert_eq!(
+            std::fs::read_to_string(foreign.join("SKILL.md")).unwrap(),
+            "mine"
+        );
+        assert!(done
+            .iter()
+            .any(|line| line == &format!("removed the stale {}", stale.display())));
+    }
+
+    #[test]
+    fn an_unmarked_same_named_bee_skill_is_moved_to_backups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = bee_repo(&tmp.path().join("repo"), "2.67.0");
+        let p = bee_paths(tmp.path(), Some((skills, "2.67.0".into())));
+        let mine = p.global_skills.join("bee-hive");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("SKILL.md"), "mine").unwrap();
+        let (done, _) = openclaw_install(&p, 100).unwrap();
+        assert!(done.iter().any(|line| line
+            == &format!(
+                "moved the existing {} to {}",
+                mine.display(),
+                p.backups().join("bee-hive.bak-100").display()
+            )));
+        assert_eq!(
+            std::fs::read_to_string(p.backups().join("bee-hive.bak-100/SKILL.md")).unwrap(),
+            "mine"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mine.join("SKILL.md")).unwrap(),
+            "hive"
+        );
+    }
+
+    #[test]
+    fn remove_takes_only_the_marked_bee_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = bee_repo(&tmp.path().join("repo"), "2.67.0");
+        let p = bee_paths(tmp.path(), Some((skills, "2.67.0".into())));
+        let foreign = p.global_skills.join("bee-mine");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("SKILL.md"), "mine").unwrap();
+        openclaw_install(&p, 100).unwrap();
+        let done = openclaw_remove(&p).unwrap();
+        assert_eq!(names(&p.global_skills), ["bee-mine"]);
+        assert!(done.iter().any(
+            |line| line == &format!("removed 2 bee skills from {}", p.global_skills.display())
+        ));
+        assert_eq!(
+            std::fs::read_to_string(foreign.join("SKILL.md")).unwrap(),
             "mine"
         );
     }
