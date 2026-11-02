@@ -305,7 +305,7 @@ mod tests {
             })
             .unwrap();
         let fake = Arc::new(FakePaseo::default());
-        fake.add_wd_leader("proj-1", "lead", "idle");
+        fake.add_leader("lead", "idle", false);
         let heartbeat = Heartbeat::new(fake.clone(), engine.clone(), dir.path().join("data"));
         Rig {
             fake,

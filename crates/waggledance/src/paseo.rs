@@ -13,6 +13,7 @@ pub const ROLE_LABEL: &str = "waggledance.role=leader";
 pub const WD_LABEL: &str = "waggledance.via=wd";
 pub const WD_CALLER: &str = "openclaw:wd";
 pub const PROJECT_LABEL_KEY: &str = "waggledance.project";
+pub const RUN_LABEL_KEY: &str = "waggledance.run";
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
@@ -152,15 +153,13 @@ pub struct RunSpec {
 
 #[async_trait]
 pub trait Paseo: Send + Sync {
-    async fn leaders(&self, project_id: &str) -> Result<Vec<String>>;
-    async fn wd_leaders(&self, project_id: &str) -> Result<Vec<String>>;
+    async fn run_leaders(&self, project_id: &str, run_id: &str) -> Result<Vec<String>>;
     async fn inspect(&self, id: &str) -> Result<AgentState>;
     async fn workspaces(&self) -> Result<Vec<Workspace>>;
     async fn providers(&self) -> Result<Vec<String>>;
     fn stored_workspaces(&self) -> Vec<StoredWorkspace>;
     async fn create_workspace(&self, path: &Path) -> Result<String>;
     async fn run_and_wait(&self, spec: &RunSpec, timeout: Duration) -> Result<(String, TurnEnd)>;
-    async fn send_and_wait(&self, id: &str, text: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn send(&self, id: &str, text: &str) -> Result<()>;
     async fn wait(&self, id: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn logs_since(&self, id: &str, since: &str) -> Result<String>;
@@ -230,6 +229,10 @@ pub fn delivery_heartbeat_path(data_dir: &Path) -> PathBuf {
 
 pub fn project_label(project_id: &str) -> String {
     format!("{PROJECT_LABEL_KEY}={project_id}")
+}
+
+pub fn run_label(run_id: &str) -> String {
+    format!("{RUN_LABEL_KEY}={run_id}")
 }
 
 pub fn leaders_args(project_id: &str) -> Vec<String> {
@@ -839,13 +842,8 @@ struct TurnReport {
 
 #[async_trait]
 impl Paseo for PaseoCli {
-    async fn leaders(&self, project_id: &str) -> Result<Vec<String>> {
-        let (binary, out) = self.exec(&leaders_args(project_id), TIMEOUT).await?;
-        parse_leaders(&out).map_err(|e| unparsable(&binary, "ls", e))
-    }
-
-    async fn wd_leaders(&self, project_id: &str) -> Result<Vec<String>> {
-        let args = labelled(leaders_args(project_id), WD_LABEL);
+    async fn run_leaders(&self, project_id: &str, run_id: &str) -> Result<Vec<String>> {
+        let args = labelled(leaders_args(project_id), &run_label(run_id));
         let (binary, out) = self.exec(&args, TIMEOUT).await?;
         parse_leaders(&out).map_err(|e| unparsable(&binary, "ls", e))
     }
@@ -897,18 +895,6 @@ impl Paseo for PaseoCli {
 
     async fn run_and_wait(&self, spec: &RunSpec, timeout: Duration) -> Result<(String, TurnEnd)> {
         self.turn(&run_args(spec), timeout).await
-    }
-
-    async fn send_and_wait(&self, id: &str, text: &str, timeout: Duration) -> Result<TurnEnd> {
-        let file = PromptFile::write(text)?;
-        let args = [
-            "send".into(),
-            id.into(),
-            "--prompt-file".into(),
-            file.0.to_string_lossy().into_owned(),
-            "--json".into(),
-        ];
-        Ok(self.turn(&args, timeout).await?.1)
     }
 
     async fn send(&self, id: &str, text: &str) -> Result<()> {
@@ -1069,12 +1055,6 @@ impl LeaderLock {
 }
 
 #[derive(Debug)]
-pub enum Leader {
-    Existing { id: String, busy: bool },
-    Start(Start),
-}
-
-#[derive(Debug)]
 pub struct Start {
     pub workspace: String,
     pub cwd: PathBuf,
@@ -1115,33 +1095,14 @@ pub fn leader_mode(config: &PaseoConfig, settings: &ProjectPaseo) -> String {
     either(&settings.mode, &config.mode)
 }
 
-pub async fn leader_ids(paseo: &dyn Paseo, project_id: &str, wd: bool) -> Result<Vec<String>> {
-    let wd_ids = paseo.wd_leaders(project_id).await?;
-    Ok(match wd {
-        true => wd_ids,
-        false => paseo
-            .leaders(project_id)
-            .await?
-            .into_iter()
-            .filter(|id| !wd_ids.contains(id))
-            .collect(),
-    })
-}
-
 pub async fn resolve_leader(
     paseo: &dyn Paseo,
     config: &PaseoConfig,
     settings: &ProjectPaseo,
     project: &Project,
+    run_id: &str,
     wd: bool,
-) -> Result<Leader> {
-    for id in leader_ids(paseo, &project.id, wd).await? {
-        let state = paseo.inspect(&id).await?;
-        if !state.archived {
-            let busy = matches!(state.status.as_str(), "running" | "initializing");
-            return Ok(Leader::Existing { id, busy });
-        }
-    }
+) -> Result<Start> {
     let mut provider = either(&settings.provider, &config.provider);
     if provider.is_empty() {
         provider = paseo
@@ -1165,19 +1126,23 @@ pub async fn resolve_leader(
         Some(found) => found,
         None => pick_workspace(paseo, &project.root_path).await?,
     };
-    Ok(Leader::Start(Start {
+    Ok(Start {
         workspace,
         cwd: project.root_path.clone(),
         title: format!("{} leader", project.name),
-        labels: [ROLE_LABEL.to_string(), project_label(&project.id)]
-            .into_iter()
-            .chain(wd.then(|| WD_LABEL.to_string()))
-            .collect(),
+        labels: [
+            ROLE_LABEL.to_string(),
+            project_label(&project.id),
+            run_label(run_id),
+        ]
+        .into_iter()
+        .chain(wd.then(|| WD_LABEL.to_string()))
+        .collect(),
         reason,
         provider,
         mode: leader_mode(config, settings),
         thinking: either(&settings.thinking, &config.thinking),
-    }))
+    })
 }
 
 async fn pick_workspace(paseo: &dyn Paseo, root: &Path) -> Result<(String, &'static str)> {
@@ -1214,14 +1179,12 @@ pub mod fake {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
-        Leaders(String),
-        WdLeaders(String),
+        RunLeaders(String, String),
         Inspect(String),
         Workspaces,
         Providers,
         CreateWorkspace(PathBuf),
         Run(RunSpec),
-        SendAndWait(String, String),
         Send(String, String),
         Wait(String),
         LogsSince(String, String),
@@ -1235,8 +1198,7 @@ pub mod fake {
 
     #[derive(Default)]
     pub struct FakeState {
-        pub leaders: HashMap<String, Vec<String>>,
-        pub wd: std::collections::HashSet<String>,
+        pub runs: HashMap<String, Vec<String>>,
         pub agents: HashMap<String, AgentState>,
         pub workspaces: Vec<Workspace>,
         pub workspaces_fail: bool,
@@ -1262,12 +1224,8 @@ pub mod fake {
             self.state.lock().unwrap().calls.clone()
         }
 
-        pub fn add_leader(&self, project_id: &str, id: &str, status: &str, archived: bool) {
+        pub fn add_leader(&self, id: &str, status: &str, archived: bool) {
             let mut s = self.state.lock().unwrap();
-            s.leaders
-                .entry(project_id.to_string())
-                .or_default()
-                .push(id.to_string());
             s.agents.insert(
                 id.to_string(),
                 AgentState {
@@ -1283,6 +1241,22 @@ pub mod fake {
                 .or_insert_with(|| VecDeque::from([Some("bypassPermissions".to_string())]));
         }
 
+        pub fn add_run_leader(&self, project_id: &str, run_id: &str, id: &str, status: &str) {
+            self.add_leader(id, status, false);
+            self.state
+                .lock()
+                .unwrap()
+                .runs
+                .entry(format!("{project_id}:{run_id}"))
+                .or_default()
+                .push(id.to_string());
+        }
+
+        pub fn archived(&self, id: &str) -> bool {
+            let s = self.state.lock().unwrap();
+            s.agents.get(id).is_some_and(|a| a.archived)
+        }
+
         pub fn script_modes(&self, id: &str, modes: &[Option<&str>], stuck: bool) {
             let mut s = self.state.lock().unwrap();
             s.modes.insert(
@@ -1292,11 +1266,6 @@ pub mod fake {
             if stuck {
                 s.stuck.insert(id.to_string());
             }
-        }
-
-        pub fn add_wd_leader(&self, project_id: &str, id: &str, status: &str) {
-            self.add_leader(project_id, id, status, false);
-            self.state.lock().unwrap().wd.insert(id.to_string());
         }
 
         pub fn push_turn_end(&self, end: TurnEnd) {
@@ -1347,18 +1316,14 @@ pub mod fake {
 
     #[async_trait]
     impl Paseo for FakePaseo {
-        async fn leaders(&self, project_id: &str) -> Result<Vec<String>> {
-            self.record(Call::Leaders(project_id.to_string()));
+        async fn run_leaders(&self, project_id: &str, run_id: &str) -> Result<Vec<String>> {
+            self.record(Call::RunLeaders(project_id.to_string(), run_id.to_string()));
             tokio::task::yield_now().await;
             let s = self.state.lock().unwrap();
-            Ok(s.leaders.get(project_id).cloned().unwrap_or_default())
-        }
-
-        async fn wd_leaders(&self, project_id: &str) -> Result<Vec<String>> {
-            self.record(Call::WdLeaders(project_id.to_string()));
-            let s = self.state.lock().unwrap();
-            let all = s.leaders.get(project_id).cloned().unwrap_or_default();
-            Ok(all.into_iter().filter(|id| s.wd.contains(id)).collect())
+            Ok(s.runs
+                .get(&format!("{project_id}:{run_id}"))
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn inspect(&self, id: &str) -> Result<AgentState> {
@@ -1424,24 +1389,29 @@ pub mod fake {
                     .entry(id.clone())
                     .or_insert_with(|| VecDeque::from([Some(spec.mode.clone())]));
             }
-            if let Some(project) = spec
+            let project = spec
                 .labels
                 .iter()
                 .find_map(|l| l.strip_prefix(&format!("{PROJECT_LABEL_KEY}=")))
-            {
-                self.add_leader(project, &id, "idle", false);
-            }
-            if spec.labels.iter().any(|l| l == WD_LABEL) {
-                self.state.lock().unwrap().wd.insert(id.clone());
-            }
+                .unwrap_or_default()
+                .to_string();
+            let run = spec
+                .labels
+                .iter()
+                .find_map(|l| l.strip_prefix(&format!("{RUN_LABEL_KEY}=")))
+                .unwrap_or_default()
+                .to_string();
+            self.add_leader(&id, "idle", false);
+            self.state
+                .lock()
+                .unwrap()
+                .runs
+                .entry(format!("{project}:{run}"))
+                .or_default()
+                .push(id.clone());
             tokio::time::sleep(run_after).await;
             self.record(Call::RunDone(id.clone()));
             Ok((id, self.next_turn_end()))
-        }
-
-        async fn send_and_wait(&self, id: &str, text: &str, _timeout: Duration) -> Result<TurnEnd> {
-            self.record(Call::SendAndWait(id.to_string(), text.to_string()));
-            Ok(self.next_turn_end())
         }
 
         async fn send(&self, id: &str, text: &str) -> Result<()> {
@@ -1524,70 +1494,49 @@ mod tests {
         }
     }
 
-    fn start(leader: Leader) -> Start {
-        match leader {
-            Leader::Start(s) => s,
-            other => panic!("expected Start, got {other:?}"),
-        }
+    async fn leader(fake: &FakePaseo, root: &Path, run_id: &str, wd: bool) -> Start {
+        resolve_leader(
+            fake,
+            &PaseoConfig::default(),
+            &ProjectPaseo::default(),
+            &project(root),
+            run_id,
+            wd,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn a_non_archived_labelled_leader_is_existing_and_busy_follows_status() {
+    async fn an_idle_leader_is_never_reused_and_a_new_one_carries_the_run_label() {
         let dir = tempfile::tempdir().unwrap();
         let fake = FakePaseo::default();
-        fake.add_leader("proj-1", "a-idle", "idle", false);
-        let got = resolve_leader(
-            &fake,
-            &PaseoConfig::default(),
-            &ProjectPaseo::default(),
-            &project(dir.path()),
-            false,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(got, Leader::Existing { ref id, busy: false } if id == "a-idle"));
-
-        let fake = FakePaseo::default();
-        fake.add_leader("proj-1", "a-init", "initializing", false);
-        let got = resolve_leader(
-            &fake,
-            &PaseoConfig::default(),
-            &ProjectPaseo::default(),
-            &project(dir.path()),
-            false,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(got, Leader::Existing { ref id, busy: true } if id == "a-init"));
-    }
-
-    #[tokio::test]
-    async fn an_archived_leader_is_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = FakePaseo::default();
-        fake.add_leader("proj-1", "old", "idle", true);
+        fake.add_run_leader("proj-1", "run-0", "an-idle-leader", "idle");
         fake.add_workspace("wks_root", "local", dir.path());
-        let s = start(
-            resolve_leader(
-                &fake,
-                &PaseoConfig::default(),
-                &ProjectPaseo::default(),
-                &project(dir.path()),
-                false,
-            )
-            .await
-            .unwrap(),
-        );
+        let s = leader(&fake, dir.path(), "run-1", false).await;
         assert_eq!(s.workspace, "wks_root");
         assert_eq!(s.title, "proj leader");
         assert_eq!(
             s.labels,
             vec![
                 "waggledance.role=leader".to_string(),
-                "waggledance.project=proj-1".to_string()
+                "waggledance.project=proj-1".to_string(),
+                "waggledance.run=run-1".to_string()
             ]
         );
         assert_eq!(s.cwd, dir.path());
+        assert!(fake.calls().iter().all(|c| !matches!(c, Call::Inspect(_))));
+    }
+
+    #[tokio::test]
+    async fn each_run_of_one_project_resolves_its_own_start_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakePaseo::default();
+        fake.add_workspace("wks_root", "local", dir.path());
+        let one = leader(&fake, dir.path(), "run-1", false).await;
+        let two = leader(&fake, dir.path(), "run-2", false).await;
+        assert!(one.labels.iter().any(|l| l == "waggledance.run=run-1"));
+        assert!(two.labels.iter().any(|l| l == "waggledance.run=run-2"));
     }
 
     #[tokio::test]
@@ -1602,17 +1551,16 @@ mod tests {
             }],
             ..PaseoConfig::default()
         };
-        let s = start(
-            resolve_leader(
-                &fake,
-                &config,
-                &ProjectPaseo::default(),
-                &project(dir.path()),
-                false,
-            )
-            .await
-            .unwrap(),
-        );
+        let s = resolve_leader(
+            &fake,
+            &config,
+            &ProjectPaseo::default(),
+            &project(dir.path()),
+            "run-1",
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (s.workspace.as_str(), s.reason),
             ("wks_cfg", "deprecated-entry")
@@ -1629,17 +1577,7 @@ mod tests {
         }
         fake.add_workspace("wks_fixture_wt", "worktree", dir.path());
         fake.state.lock().unwrap().store = store_fixture();
-        let s = start(
-            resolve_leader(
-                &fake,
-                &PaseoConfig::default(),
-                &ProjectPaseo::default(),
-                &project(dir.path()),
-                false,
-            )
-            .await
-            .unwrap(),
-        );
+        let s = leader(&fake, dir.path(), "run-1", false).await;
         assert_eq!(
             (s.workspace.as_str(), s.reason),
             ("wks_fixture_b", "oldest")
@@ -1652,17 +1590,7 @@ mod tests {
         let fake = FakePaseo::default();
         fake.add_workspace("wks_b", "local", dir.path());
         fake.add_workspace("wks_a", "local", &dir.path().join("."));
-        let s = start(
-            resolve_leader(
-                &fake,
-                &PaseoConfig::default(),
-                &ProjectPaseo::default(),
-                &project(dir.path()),
-                false,
-            )
-            .await
-            .unwrap(),
-        );
+        let s = leader(&fake, dir.path(), "run-1", false).await;
         assert_eq!((s.workspace.as_str(), s.reason), ("wks_a", "lowest-id"));
     }
 
@@ -1686,11 +1614,16 @@ mod tests {
             provider: Some("claude".into()),
             ..ProjectPaseo::default()
         };
-        let s = start(
-            resolve_leader(&fake, &config, &settings, &project(dir.path()), false)
-                .await
-                .unwrap(),
-        );
+        let s = resolve_leader(
+            &fake,
+            &config,
+            &settings,
+            &project(dir.path()),
+            "run-1",
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!((s.workspace.as_str(), s.reason), ("wks_file", "file"));
         let spec = s.spec("t");
         assert_eq!(
@@ -1706,17 +1639,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake = FakePaseo::default();
         fake.add_workspace("wks_a", "local", dir.path());
-        let s = start(
-            resolve_leader(
-                &fake,
-                &PaseoConfig::default(),
-                &ProjectPaseo::default(),
-                &project(dir.path()),
-                false,
-            )
-            .await
-            .unwrap(),
-        );
+        let s = leader(&fake, dir.path(), "run-1", false).await;
         assert_eq!(s.spec("t").provider, "claude");
         fake.state.lock().unwrap().no_providers = true;
         let err = resolve_leader(
@@ -1724,6 +1647,7 @@ mod tests {
             &PaseoConfig::default(),
             &ProjectPaseo::default(),
             &project(dir.path()),
+            "run-1",
             false,
         )
         .await
@@ -1769,17 +1693,7 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         let fake = FakePaseo::default();
         fake.add_workspace("wks_other", "local", other.path());
-        let s = start(
-            resolve_leader(
-                &fake,
-                &PaseoConfig::default(),
-                &ProjectPaseo::default(),
-                &project(dir.path()),
-                false,
-            )
-            .await
-            .unwrap(),
-        );
+        let s = leader(&fake, dir.path(), "run-1", false).await;
         assert!(fake
             .calls()
             .contains(&Call::CreateWorkspace(dir.path().to_path_buf())));
@@ -1804,30 +1718,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_resolves_start_exactly_one_leader() {
+    async fn concurrent_runs_each_start_their_own_leader() {
         let dir = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakePaseo::default());
         fake.add_workspace("wks_root", "local", dir.path());
         let mut handles = Vec::new();
-        for _ in 0..4 {
+        for n in 0..4 {
             let fake = fake.clone();
             let root = dir.path().to_path_buf();
             handles.push(tokio::spawn(async move {
-                let _lock = LeaderLock::acquire(&root, "proj-1").await.unwrap();
-                let leader = resolve_leader(
+                let run_id = format!("run-{n}");
+                let s = resolve_leader(
                     &*fake,
                     &PaseoConfig::default(),
                     &ProjectPaseo::default(),
                     &project(&root),
+                    &run_id,
                     false,
                 )
                 .await
                 .unwrap();
-                if let Leader::Start(s) = leader {
-                    fake.run_and_wait(&s.spec("task"), Duration::from_secs(1))
-                        .await
-                        .unwrap();
-                }
+                fake.run_and_wait(&s.spec("task"), Duration::from_secs(1))
+                    .await
+                    .unwrap();
             }));
         }
         for h in handles {
@@ -1838,7 +1751,14 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, Call::Run(_)))
             .count();
-        assert_eq!(runs, 1);
+        assert_eq!(runs, 4);
+        for n in 0..4 {
+            let found = fake
+                .run_leaders("proj-1", &format!("run-{n}"))
+                .await
+                .unwrap();
+            assert_eq!(found.len(), 1, "run-{n} has its own leader: {found:?}");
+        }
     }
 
     fn spec(provider: &str, mode: &str, thinking: &str, task: &str) -> RunSpec {
@@ -1886,74 +1806,29 @@ mod tests {
     async fn a_wd_run_starts_a_via_wd_leader_beside_a_non_wd_one() {
         let dir = tempfile::tempdir().unwrap();
         let fake = FakePaseo::default();
-        fake.add_leader("proj-1", "plain", "idle", false);
+        fake.add_leader("an-existing-wd-leader", "idle", false);
         fake.add_workspace("wks_root", "local", dir.path());
-        let s = start(
-            resolve_leader(
-                &fake,
-                &PaseoConfig::default(),
-                &ProjectPaseo::default(),
-                &project(dir.path()),
-                true,
-            )
-            .await
-            .unwrap(),
-        );
+        let s = leader(&fake, dir.path(), "run-1", true).await;
         assert_eq!(
             s.labels,
             vec![
                 "waggledance.role=leader".to_string(),
                 "waggledance.project=proj-1".to_string(),
+                "waggledance.run=run-1".to_string(),
                 "waggledance.via=wd".to_string()
             ]
         );
-        assert!(!fake.calls().contains(&Call::Inspect("plain".into())));
-
-        let (id, _) = fake
-            .run_and_wait(&s.spec("t"), Duration::from_secs(1))
-            .await
-            .unwrap();
-        let again = resolve_leader(
-            &fake,
-            &PaseoConfig::default(),
-            &ProjectPaseo::default(),
-            &project(dir.path()),
-            true,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(again, Leader::Existing { id: ref got, .. } if *got == id));
+        assert!(fake.calls().iter().all(|c| !matches!(c, Call::Inspect(_))));
     }
 
     #[tokio::test]
     async fn a_non_wd_run_skips_a_via_wd_leader() {
         let dir = tempfile::tempdir().unwrap();
         let fake = FakePaseo::default();
-        fake.add_wd_leader("proj-1", "wd-lead", "idle");
+        fake.add_leader("wd-lead", "idle", false);
         fake.add_workspace("wks_root", "local", dir.path());
-        let s = start(
-            resolve_leader(
-                &fake,
-                &PaseoConfig::default(),
-                &ProjectPaseo::default(),
-                &project(dir.path()),
-                false,
-            )
-            .await
-            .unwrap(),
-        );
+        let s = leader(&fake, dir.path(), "run-1", false).await;
         assert!(!s.labels.iter().any(|l| l == WD_LABEL), "{:?}", s.labels);
-        fake.add_leader("proj-1", "plain", "idle", false);
-        let got = resolve_leader(
-            &fake,
-            &PaseoConfig::default(),
-            &ProjectPaseo::default(),
-            &project(dir.path()),
-            false,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(got, Leader::Existing { ref id, .. } if id == "plain"));
     }
 
     #[test]
@@ -2076,10 +1951,6 @@ mod tests {
             ("agent-9".to_string(), TurnEnd::Completed)
         );
         assert_eq!(
-            cli.send_and_wait("a", "x", turn).await.unwrap(),
-            TurnEnd::Permission
-        );
-        assert_eq!(
             cli.wait("a", turn).await.unwrap(),
             TurnEnd::Other {
                 status: "idle".into(),
@@ -2090,14 +1961,14 @@ mod tests {
             cli.logs_since("a", "2026-10-14T00:00:00Z").await.unwrap(),
             "[User] do it\n12:00:00 done\n"
         );
-        let err = cli.leaders("proj-1").await.unwrap_err();
-        assert!(matches!(err, PaseoError::Unparsable { .. }), "{err}");
-        assert!(err.to_string().contains("ls"), "{err}");
         cli.send("a", "hello $(not run)").await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("sent")).unwrap(),
             "hello $(not run)"
         );
+        let err = cli.run_leaders("proj-1", "run-1").await.unwrap_err();
+        assert!(matches!(err, PaseoError::Unparsable { .. }), "{err}");
+        assert!(err.to_string().contains("ls"), "{err}");
     }
 
     #[test]
@@ -2350,25 +2221,23 @@ mod tests {
     #[tokio::test]
     async fn the_fake_scripts_turn_ends_statuses_and_permissions_and_records_calls() {
         let fake = FakePaseo::default();
-        fake.add_leader("proj-1", "a", "idle", false);
+        fake.add_leader("a", "idle", false);
         fake.push_turn_end(TurnEnd::Permission);
+        fake.push_turn_end(TurnEnd::Completed);
         fake.set_status("a", "running");
         fake.set_permissions("a", &["Write"]);
         let turn = Duration::from_secs(1);
-        assert_eq!(
-            fake.send_and_wait("a", "go", turn).await.unwrap(),
-            TurnEnd::Permission
-        );
         let state = fake.inspect("a").await.unwrap();
         assert_eq!(state.status, "running");
         assert_eq!(state.pending_permissions, 1);
         assert_eq!(state.permissions[0].tool, "Write");
+        assert_eq!(fake.wait("a", turn).await.unwrap(), TurnEnd::Permission);
         assert_eq!(fake.wait("a", turn).await.unwrap(), TurnEnd::Completed);
         assert_eq!(
             fake.calls(),
             vec![
-                Call::SendAndWait("a".into(), "go".into()),
                 Call::Inspect("a".into()),
+                Call::Wait("a".into()),
                 Call::Wait("a".into()),
             ]
         );
@@ -2600,7 +2469,7 @@ mod tests {
         let cli = PaseoCli::new(&PaseoConfig::default());
         let workspaces = cli.workspaces().await.unwrap();
         let leaders = cli
-            .leaders("waggledance-probe-no-such-project")
+            .run_leaders("waggledance-probe-no-such-project", "no-such-run")
             .await
             .unwrap();
         println!("workspaces: {workspaces:?}");
@@ -2670,11 +2539,9 @@ mod tests {
             let root = dir.path().to_path_buf();
             let (config, settings) = (config.clone(), settings.clone());
             async move {
-                let s = start(
-                    resolve_leader(fake, &config, &settings, &project(&root), false)
-                        .await
-                        .unwrap(),
-                );
+                let s = resolve_leader(fake, &config, &settings, &project(&root), "run-1", false)
+                    .await
+                    .unwrap();
                 run_args(&s.spec("t"))
             }
         };
@@ -2722,7 +2589,7 @@ mod tests {
         );
         assert!(fake.calls().is_empty());
 
-        fake.add_leader("proj-1", "ok", "idle", false);
+        fake.add_leader("ok", "idle", false);
         assert_eq!(
             ensure_mode(&fake, "ok", bypass, settle, poll).await,
             ModeCheck::Matched
