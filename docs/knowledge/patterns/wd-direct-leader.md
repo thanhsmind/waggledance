@@ -30,7 +30,7 @@ at wd's main session: what wd writes on Telegram is wd's own turn.
 | Step | From → to | Carried by |
 |------|-----------|------------|
 | Hand-off | wd → daemon | `wd-bridge.py handoff --project <p> --task <t>`: `waggledance mcp` with `WAGGLEDANCE_CALLER=wd`, calling `waggledance_dispatch {project, task, leader: true, request_id: <corr>}` |
-| Delivery | daemon → leader | the daemon leader queue of [paseo-leader-dispatch](paseo-leader-dispatch.md), to a leader labelled `waggledance.via=wd` |
+| Delivery | daemon → leader | the daemon leader queue of [paseo-leader-dispatch](paseo-leader-dispatch.md), to a new leader labelled `waggledance.via=wd` |
 | Mail | leader → inbox | `waggledance mail send --to wd --corr <corr> --kind <kind>`, body on stdin or from a file |
 | Wake | inbox → wd | one `openclaw agent --agent <agent_id> --message <frame> --deliver --channel telegram --json` turn in wd's main session per message |
 | Follow-up | wd → daemon | `wd-bridge.py reply`, `redo`, `accept`, `permit allow|deny`, over the `waggledance_task` MCP tool |
@@ -43,11 +43,11 @@ dispatch `request_id`, so a retried hand-off returns the same run.
 `handle_dispatch` stores the caller `openclaw:wd` when `PASEO_AGENT_ID` is empty and
 `WAGGLEDANCE_CALLER` is `wd`. The dispatch tool schema has no wd field.
 
-- A wd run resolves only leaders labelled `waggledance.via=wd`. It creates leaders with
-  `waggledance.role=leader`, `waggledance.project=<project id>` and
+- A wd run starts its leader with `waggledance.role=leader`,
+  `waggledance.project=<project id>`, `waggledance.run=<run id>` and
   `waggledance.via=wd`.
-- Every other leader run skips a `via=wd` leader, so the Paseo plugin's request box and
-  other MCP callers never deliver into wd's leader (D2, D12).
+- No other caller's run is delivered into that leader, so the Paseo plugin's request
+  box and other MCP callers never reach wd's leader (D2, D12).
 - `waggledance_ask_state` reports each leader's `via` as `wd` or `daemon`. A leader
   still labelled `waggledance.via=supervisor` reads `daemon`.
 - A hand-off (a `request_id` with no `:`) inserts the task row `open`.
@@ -59,8 +59,10 @@ parts: `Done:`, `Proof:`, `Left:`, `Where:`. The advisor rule tells it to ask it
 project's bee advisor (`bee dispatch prepare --kind advisor`) before a `question`, and to
 mail only what the advisor cannot decide, quoting the advisor's answer (D7).
 
-The per-project hold is shared: a leader busy with another caller's task parks a wd
-task on the same project until it is idle.
+Each wd run, `reply` and `redo` included, starts its own new leader and never waits on
+another caller's leader; runs of one project go out in parallel (leader-per-task D1). A
+wd run's leader is not archived when the run ends `done`: it stays until `accept`
+(leader-per-task D2).
 
 ## The inbox
 
