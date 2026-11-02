@@ -24,8 +24,11 @@ paseo-auto-wiring D8 for `mode` only, and paseo-dispatch-default-on D1/D2/D4/D5
 supersedes paseo-auto-wiring D2 and D5: dispatch is on by default, and
 leader-per-task D1/D2 (`docs/history/leader-per-task/CONTEXT.md`, decisions `a29369df`
 and `0398ca94`): every run starts its own leader, and a non-wd run's leader is archived
-when the run ends `done`. Leader-per-task D1 supersedes leader-delivery D3, which had
-superseded paseo-leader-dispatch D7: no run waits for, or goes to, an existing leader.
+when the run ends `done`, and leader-idle-close D1 (`docs/history/leader-idle-close/CONTEXT.md`,
+decision `af012b0b`): a leader idle for more than 24 hours is archived, and
+leader-idle-close D2 (decision `12506149`): a wd `reply` or `redo` goes to its task's own
+leader while that leader is not archived. Leader-per-task D1
+supersedes leader-delivery D3, which had superseded paseo-leader-dispatch D7: no run waits for, or goes to, an existing leader, apart from the wd follow-up of leader-idle-close D2.
 Paseo-auto-wiring D3 removes paseo-leader-dispatch D8's two-workspace refusal, and
 paseo-auto-wiring D4 makes the global `[paseo]` block optional.
 
@@ -165,7 +168,8 @@ The same `request_id` in another project is a new request.
 The daemon runs the delivery loop when it finds Paseo available, and writes the
 heartbeat on every tick. It delivers queued requests oldest first, and the runs of one
 project are delivered in parallel, one leader each (leader-per-task D1). Delivery never
-looks up, reuses or waits on an existing leader.
+looks up, reuses or waits on an existing leader, with one exception: a wd follow-up run
+(leader-idle-close D2).
 
 Each delivery resolves the workspace and starts a new leader with a blocking `paseo run
 --json --workspace <id> --cwd <project root> --title "<project name> leader" --label
@@ -173,11 +177,31 @@ waggledance.role=leader --label waggledance.project=<project id> --label
 waggledance.run=<run id> -- <task>`. A wd run adds `--label waggledance.via=wd`. The
 task is the leader's first turn; there is no bootstrap turn (D8).
 
+### The follow-up exception
+
+A run that is not a wd follow-up starts its own new leader, always. A wd follow-up run
+is one whose `request_id` is `<corr>:<n>`, queued by `reply` or `redo`, and it is the one
+run that does not start a leader of its own (leader-idle-close D2):
+
+- The task's recorded leader — `leader_id` on the `tasks` row — is not archived and is
+  `running` or `initializing`: the run goes back to `queued` and is retried on a later
+  tick. Nothing is sent into a turn already running.
+- That leader is not archived and is idle: the run's task is sent to it with a blocking
+  `paseo send <id> --prompt-file <tmp> --json`, its mode is checked first, and its
+  outcome is handled as any other turn's.
+- That leader is archived, or cannot be inspected: a new leader starts as for any run,
+  and its prompt is the original task's text (the run whose `request_id` is the bare
+  corr), a blank line, then the follow-up's own text. The task then records the new
+  leader.
+
 The run's pane id becomes `paseo:<agent id>` as soon as the agent id is known.
 
 When a run that is not a wd run ends `done`, the daemon archives its leader with `paseo
 archive <id>`. A wd run's leader stays for `reply` and `redo` until `accept` archives it.
 The leader of a `lost` or `blocked` run is left alone (leader-per-task D2).
+Every 5 minutes, the delivery loop also archives any waggledance leader, wd leaders
+included, that is not `running` or `initializing` and whose Paseo `UpdatedAt` is more
+than 24 hours old. A leader with no `UpdatedAt` is never archived (leader-idle-close D1).
 
 ### Leader mode check
 

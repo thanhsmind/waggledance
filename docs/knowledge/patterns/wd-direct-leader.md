@@ -14,7 +14,9 @@ bee:
 
 # wd hands a task straight to a project's leader, and the leader answers through a waggledance inbox that wakes wd
 
-Locked by wd-direct-leader D1–D12 (`docs/history/wd-direct-leader/CONTEXT.md`). The
+Locked by wd-direct-leader D1–D12 (`docs/history/wd-direct-leader/CONTEXT.md`) and
+leader-idle-close D2 (`docs/history/leader-idle-close/CONTEXT.md`, decision `12506149`),
+which sends a `reply` or `redo` back to its own task's leader. The
 shared names and rules live in the slice-1 contract of
 `docs/history/wd-direct-leader/plan.md`, in `slice-2.md` and in `slice-3.md`. This path
 replaces the Paseo supervisor
@@ -30,7 +32,7 @@ at wd's main session: what wd writes on Telegram is wd's own turn.
 | Step | From → to | Carried by |
 |------|-----------|------------|
 | Hand-off | wd → daemon | `wd-bridge.py handoff --project <p> --task <t>`: `waggledance mcp` with `WAGGLEDANCE_CALLER=wd`, calling `waggledance_dispatch {project, task, leader: true, request_id: <corr>}` |
-| Delivery | daemon → leader | the daemon leader queue of [paseo-leader-dispatch](paseo-leader-dispatch.md), to a new leader labelled `waggledance.via=wd` |
+| Delivery | daemon → leader | the daemon leader queue of [paseo-leader-dispatch](paseo-leader-dispatch.md), to a new leader labelled `waggledance.via=wd`, or to the task's own leader for a `reply` or `redo` |
 | Mail | leader → inbox | `waggledance mail send --to wd --corr <corr> --kind <kind>`, body on stdin or from a file |
 | Wake | inbox → wd | one `openclaw agent --agent <agent_id> --message <frame> --deliver --channel telegram --json` turn in wd's main session per message |
 | Follow-up | wd → daemon | `wd-bridge.py reply`, `redo`, `accept`, `permit allow|deny`, over the `waggledance_task` MCP tool |
@@ -59,10 +61,17 @@ parts: `Done:`, `Proof:`, `Left:`, `Where:`. The advisor rule tells it to ask it
 project's bee advisor (`bee dispatch prepare --kind advisor`) before a `question`, and to
 mail only what the advisor cannot decide, quoting the advisor's answer (D7).
 
-Each wd run, `reply` and `redo` included, starts its own new leader and never waits on
-another caller's leader; runs of one project go out in parallel (leader-per-task D1). A
-wd run's leader is not archived when the run ends `done`: it stays until `accept`
-(leader-per-task D2).
+A wd hand-off starts its own new leader and never waits on another caller's leader; runs
+of one project go out in parallel (leader-per-task D1). A follow-up is the exception
+(leader-idle-close D2): a `reply` or `redo` run (`request_id` `<corr>:<n>`) goes to that
+task's recorded leader while the leader is not archived, and waits queued while it is
+`running` or `initializing`. When the leader is archived, a new leader starts and its
+prompt carries the original task text before the follow-up. A wd run's leader is not
+archived when the run ends `done`: it stays until `accept` (leader-per-task D2). An idle
+wd leader is still archived after 24 hours
+(leader-idle-close D1). Its task stays open: the heartbeat still lists it on the board, a
+`reply` or `redo` starts a new leader that carries the original task text, and `accept`
+closes it.
 
 ## The inbox
 
@@ -124,13 +133,13 @@ through `wd-bridge.py`.
 
 | Action | Effect |
 |--------|--------|
-| `reply`, `redo` | queues a leader run for the task's project with `request_id = <corr>:<n>`, caller `openclaw:wd`, and the task text behind the same `wd_task` prefix plus `Reply from the user:` or `Redo requested:` |
+| `reply`, `redo` | queues a leader run for the task's project with `request_id = <corr>:<n>`, caller `openclaw:wd`, and the task text behind the same `wd_task` prefix plus `Reply from the user:` or `Redo requested:`; delivery sends it to the task's recorded leader while that leader is not archived |
 | `accept` | closes the task, then archives its leader with `paseo archive <leader_id>` only when no queued or working run belongs to that leader and no other open task shares it; otherwise it leaves the leader and says why |
 | `allow`, `deny` | runs `paseo permit allow|deny <leader_id> <req_id>`; without `req_id`, it takes the task's newest unanswered request; marks the request answered |
 
 An unknown corr, a closed task, or a task with no leader yet returns a tool error that
-names the cause. `accept` on a closed task is idempotent. A leader is archived only
-after `accept` (D10).
+names the cause. `accept` on a closed task is idempotent. Apart from the 24-hour idle
+archive, a leader is archived only after `accept` (D10).
 
 ## The heartbeat
 
