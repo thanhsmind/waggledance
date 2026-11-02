@@ -1,18 +1,18 @@
 ---
 type: bee.pattern
-title: A request for a project reaches its one Paseo leader through waggledance_dispatch
-description: "Practice: with a working Paseo CLI found and a registered project whose .waggledance.toml does not say orchestration = false, waggledance_dispatch with leader: true queues the task for the project's labelled Paseo leader; the daemon delivers it once, in order, only while the leader is idle, marks it done when Paseo reports that turn completed, and tells the caller."
+title: Each request for a project starts its own Paseo leader through waggledance_dispatch
+description: "Practice: with a working Paseo CLI found and a registered project whose .waggledance.toml does not say orchestration = false, waggledance_dispatch with leader: true queues the task; the daemon starts a new labelled Paseo leader for that run, delivers it once, runs of one project in parallel, marks it done when Paseo reports that turn completed, archives a non-wd run's leader when the run ends done, and tells the caller."
 timestamp: 2026-10-16
 bee:
   id: paseo-leader-dispatch
   lifecycle: active
   areas: [orchestration]
-  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md, docs/history/paseo-leader-mode/CONTEXT.md, docs/history/paseo-leader-mode/plan.md, docs/history/paseo-dispatch-default-on/CONTEXT.md, docs/history/paseo-dispatch-default-on/plan.md]
+  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md, docs/history/paseo-leader-mode/CONTEXT.md, docs/history/paseo-leader-mode/plan.md, docs/history/paseo-dispatch-default-on/CONTEXT.md, docs/history/paseo-dispatch-default-on/plan.md, docs/history/leader-per-task/CONTEXT.md]
   polarity: practice
   signature: request for a project running in Paseo
 ---
 
-# A request for a project reaches its one Paseo leader through waggledance_dispatch
+# Each request for a project starts its own Paseo leader through waggledance_dispatch
 
 Locked by paseo-leader-dispatch D1/D2/D3/D4/D5/D6/D8/D9/D10
 (`docs/history/paseo-leader-dispatch/CONTEXT.md`),
@@ -21,10 +21,13 @@ paseo-auto-wiring D1/D2/D3/D4/D5/D6/D7 (`docs/history/paseo-auto-wiring/CONTEXT.
 paseo-leader-mode D2/D3/D4 (`docs/history/paseo-leader-mode/CONTEXT.md`), which narrows
 paseo-auto-wiring D8 for `mode` only, and paseo-dispatch-default-on D1/D2/D4/D5
 (`docs/history/paseo-dispatch-default-on/CONTEXT.md`, decision `fb1b49ab`), which
-supersedes paseo-auto-wiring D2 and D5: dispatch is on by default.
-Leader-delivery D3 supersedes paseo-leader-dispatch D7: a busy leader no longer refuses a
-request. Paseo-auto-wiring D3 removes paseo-leader-dispatch D8's two-workspace refusal,
-and paseo-auto-wiring D4 makes the global `[paseo]` block optional.
+supersedes paseo-auto-wiring D2 and D5: dispatch is on by default, and
+leader-per-task D1/D2 (`docs/history/leader-per-task/CONTEXT.md`, decisions `a29369df`
+and `0398ca94`): every run starts its own leader, and a non-wd run's leader is archived
+when the run ends `done`. Leader-per-task D1 supersedes leader-delivery D3, which had
+superseded paseo-leader-dispatch D7: no run waits for, or goes to, an existing leader.
+Paseo-auto-wiring D3 removes paseo-leader-dispatch D8's two-workspace refusal, and
+paseo-auto-wiring D4 makes the global `[paseo]` block optional.
 
 ## Turn it on
 
@@ -122,8 +125,8 @@ herdr.
 
 wd-direct-leader D1 lifts the freeze paseo-native-supervisor D8 put on this path. wd,
 the aicoworker agent on OpenClaw, hands its tasks through this door with caller
-`openclaw:wd`. Its runs go only to leaders labelled `waggledance.via=wd`, and every other
-caller's runs skip those leaders. A wd run sends no caller notice: its outcome reaches
+`openclaw:wd`. Each wd run starts its own leader, which also carries the label
+`waggledance.via=wd`, and that leader stays until wd's `accept` archives it. A wd run sends no caller notice: its outcome reaches
 wd through the waggledance inbox. See
 [wd hands a task straight to a project's leader](wd-direct-leader.md).
 
@@ -137,8 +140,8 @@ sent unchanged. `request_id` is optional; pass one on every call.
 3. The request is stored as a run with status `queued`, pane id `paseo:pending`, and the
    caller's `PASEO_AGENT_ID` when the dispatch came from a Paseo agent. No `paseo`
    command runs inside the call.
-4. The call returns `{run_id, status: "queued", duplicate: false, warnings}`. A busy
-   leader is not a refusal: the request waits its turn (D3).
+4. The call returns `{run_id, status: "queued", duplicate: false, warnings}`. The run
+   gets its own new leader, so nothing it waits on is busy (leader-per-task D1).
 
 When the daemon's delivery heartbeat (`<data dir>/paseo-delivery.heartbeat`) is missing
 or older than 30 seconds, `warnings` holds "paused — waggledance daemon not running
@@ -160,31 +163,27 @@ The same `request_id` in another project is a new request.
 ## Delivery
 
 The daemon runs the delivery loop when it finds Paseo available, and writes the
-heartbeat on every tick. For each project it delivers at most one request at a time,
-oldest first, holding the per-project lock file in `<data dir>/paseo-locks/` for the
-whole delivery so two deliveries cannot start two leaders (D3).
+heartbeat on every tick. It delivers queued requests oldest first, and the runs of one
+project are delivered in parallel, one leader each (leader-per-task D1). Delivery never
+looks up, reuses or waits on an existing leader.
 
-waggledance never sends to a Paseo agent whose status is `running` or `initializing`
-(D5). A project waits while its leader is running, including a turn a human started,
-and its next request goes out once the leader is idle.
-
-A delivery finds the leader by its labels (`waggledance.role=leader`,
-`waggledance.project=<project id>`), the first agent that is not archived:
-
-- **A leader exists.** The task goes to it through a blocking `paseo send <id>
-  --prompt-file <temp file> --json`, which returns when the leader's turn ends.
-- **No leader.** waggledance resolves the workspace and starts one with a blocking
-  `paseo run --json --workspace <id> --cwd <project root> --title "<project name>
-  leader" --label waggledance.role=leader --label waggledance.project=<project id> --
-  <task>`. The task is the leader's first turn; there is no bootstrap turn (D8).
+Each delivery resolves the workspace and starts a new leader with a blocking `paseo run
+--json --workspace <id> --cwd <project root> --title "<project name> leader" --label
+waggledance.role=leader --label waggledance.project=<project id> --label
+waggledance.run=<run id> -- <task>`. A wd run adds `--label waggledance.via=wd`. The
+task is the leader's first turn; there is no bootstrap turn (D8).
 
 The run's pane id becomes `paseo:<agent id>` as soon as the agent id is known.
+
+When a run that is not a wd run ends `done`, the daemon archives its leader with `paseo
+archive <id>`. A wd run's leader stays for `reply` and `redo` until `accept` archives it.
+The leader of a `lost` or `blocked` run is left alone (leader-per-task D2).
 
 ### Leader mode check
 
 A leader runs in the mode waggledance asked for, checked from the agent's runtime mode
-(paseo-leader-mode D3/D4). The check runs before a task is sent to an existing leader,
-and while a new leader's first turn runs, as soon as its agent id appears.
+(paseo-leader-mode D3/D4). The check runs while a new leader's first turn runs, as
+soon as its agent id appears.
 
 1. waggledance reads `runtimeInfo.modeId` from Paseo's agent record,
    `<PASEO_HOME>/agents/<cwd-slug>/<id>.json`, read only. It reads once a second for
@@ -231,14 +230,13 @@ that line, not by time.
   unreachable Paseo puts the run back to `queued` with backoff (10 s, 30 s, 1 min, 5 min).
   The fifth failure marks it `lost` with the error (D6).
 - **After the send.** A timeout marks the run `lost` "the leader may still be
-  finishing", and the project's queue holds until its leader is idle. Killing a blocking
+  finishing", and its leader is left alone. Killing a blocking
   send does not end the leader's turn, so the task is never sent again (D6). Only a
   failure to start the binary or to write the prompt file counts as "before the send";
   any other send error is treated as sent, so a request is never delivered twice.
 - **Daemon restart.** A run claimed but not yet sent (still `paseo:pending`) goes back to
   `queued`. A run already sent becomes `lost` with "daemon restarted — the leader may
-  still be finishing; check its chat", is never re-sent, and its project holds until the
-  leader is idle (D6).
+  still be finishing; check its chat", and is never re-sent (D6).
 
 ## Run status
 
@@ -313,8 +311,8 @@ says `orchestration = false` (paseo-dispatch-default-on D1).
 
 ## Workspace resolution
 
-A workspace is resolved only when a new leader starts; an existing leader is always
-reused first. The first rule that matches wins (paseo-auto-wiring D3/D7):
+A workspace is resolved each time a new leader starts, which is once per run. The first
+rule that matches wins (paseo-auto-wiring D3/D7):
 
 1. `[paseo] workspace` in the project's `.waggledance.toml` — reason `file`.
 2. A deprecated `[[paseo.leaders]]` entry whose `project` equals the project's id or

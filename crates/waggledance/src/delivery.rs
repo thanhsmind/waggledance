@@ -12,7 +12,7 @@ use waggledance_core::Engine;
 
 use crate::discovery::{self, Bounds};
 use crate::orchestrate::{self, PASEO_PANE_PREFIX};
-use crate::paseo::{self, Leader, LeaderLock, ModeCheck, Paseo, PaseoError, TurnEnd};
+use crate::paseo::{self, ModeCheck, Paseo, PaseoError, TurnEnd};
 
 pub const TICK: Duration = Duration::from_secs(2);
 const MAX_ATTEMPTS: i64 = 5;
@@ -42,8 +42,7 @@ struct State {
     recovered: bool,
     discovering: bool,
     headers: HashMap<String, String>,
-    busy: HashSet<String>,
-    held: HashSet<String>,
+    inflight: HashSet<String>,
     not_before: HashMap<String, Instant>,
     quiet_until: HashMap<String, Instant>,
 }
@@ -158,12 +157,6 @@ impl Delivery {
             self.recover();
         }
         self.flush_notices().await;
-        let held: Vec<String> = self.state.lock().unwrap().held.iter().cloned().collect();
-        for project_id in held {
-            if self.leader_idle(&project_id).await {
-                self.state.lock().unwrap().held.remove(&project_id);
-            }
-        }
         let projects = self
             .engine
             .list_projects_with_queued_paseo_runs()
@@ -172,21 +165,19 @@ impl Delivery {
                 Vec::new()
             });
         for project_id in projects {
-            let Some(run) = self.next_run(&project_id) else {
-                continue;
-            };
-            {
-                let mut s = self.state.lock().unwrap();
-                if s.busy.contains(&project_id) || s.held.contains(&project_id) {
-                    continue;
+            for run in self.deliverable(&project_id) {
+                {
+                    let mut s = self.state.lock().unwrap();
+                    if !s.inflight.insert(run.id.clone()) {
+                        continue;
+                    }
                 }
-                s.busy.insert(project_id.clone());
+                let this = self.clone();
+                deliveries.spawn(async move {
+                    this.deliver(&run).await;
+                    this.state.lock().unwrap().inflight.remove(&run.id);
+                });
             }
-            let this = self.clone();
-            deliveries.spawn(async move {
-                this.deliver(&run).await;
-                this.state.lock().unwrap().busy.remove(&run.project_id);
-            });
         }
     }
 
@@ -213,44 +204,25 @@ impl Delivery {
                 self.set_status(&run.id, "queued");
                 continue;
             }
-            self.state
-                .lock()
-                .unwrap()
-                .held
-                .insert(run.project_id.clone());
             self.end(&self.name_of(&run), &run, "lost", Some(RESTARTED), agent);
         }
     }
 
-    fn next_run(&self, project_id: &str) -> Option<Run> {
-        let run = self
+    fn deliverable(&self, project_id: &str) -> Vec<Run> {
+        let runs = self
             .engine
             .list_queued_paseo_runs(project_id)
             .map_err(|e| tracing::warn!("delivery could not list queued runs: {e}"))
-            .ok()?
-            .into_iter()
-            .next()?;
+            .unwrap_or_default();
         let s = self.state.lock().unwrap();
-        match s.not_before.get(&run.id) {
-            Some(at) if Instant::now() < *at => None,
-            _ => Some(run),
-        }
-    }
-
-    async fn leader_idle(&self, project_id: &str) -> bool {
-        let Ok(ids) = self.paseo.leaders(project_id).await else {
-            return false;
-        };
-        for id in ids {
-            match self.paseo.inspect(&id).await {
-                Ok(s) if s.archived => {}
-                Ok(s)
-                    if s.pending_permissions == 0
-                        && !matches!(s.status.as_str(), "running" | "initializing") => {}
-                _ => return false,
-            }
-        }
-        true
+        runs.into_iter()
+            .filter(|run| {
+                s.not_before
+                    .get(&run.id)
+                    .is_none_or(|at| Instant::now() >= *at)
+                    && !s.inflight.contains(&run.id)
+            })
+            .collect()
     }
 
     fn name_of(&self, run: &Run) -> String {
@@ -261,7 +233,6 @@ impl Delivery {
     }
 
     async fn deliver(&self, run: &Run) {
-        let lock = LeaderLock::acquire(&self.data_dir, &run.project_id).await;
         match self.engine.claim_queued_run(&run.id) {
             Ok(true) => {}
             Ok(false) => return,
@@ -271,10 +242,6 @@ impl Delivery {
             }
         }
         let name = self.name_of(run);
-        let _lock = match lock {
-            Ok(lock) => lock,
-            Err(e) => return self.presend_failed(&name, run, &e.to_string()),
-        };
         let project = match self.engine.get_project(&run.project_id) {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -291,68 +258,57 @@ impl Delivery {
             tracing::warn!("delivery for {name}: {warning}");
         }
         let wd = matches!(self.engine.run_caller(&run.id), Ok(Some(c)) if c == paseo::WD_CALLER);
-        let paseo = self.paseo.as_ref();
-        let leader = match paseo::resolve_leader(paseo, config, &settings.paseo, &project, wd).await
+        let start = match paseo::resolve_leader(
+            self.paseo.as_ref(),
+            config,
+            &settings.paseo,
+            &project,
+            &run.id,
+            wd,
+        )
+        .await
         {
-            Ok(leader) => leader,
+            Ok(start) => start,
             Err(e) => return self.presend_failed(&name, run, &e.to_string()),
         };
         let mode = paseo::leader_mode(config, &settings.paseo);
         let sent_at = now_rfc3339();
-        let (agent, outcome) = match leader {
-            Leader::Existing { busy: true, .. } => {
-                self.set_status(&run.id, "queued");
-                self.state.lock().unwrap().held.insert(project.id);
-                return;
+        tracing::info!(
+            run = %run.id,
+            workspace = %start.workspace,
+            reason = start.reason,
+            "delivery starts the {name} leader"
+        );
+        self.state.lock().unwrap().headers.insert(
+            run.id.clone(),
+            format!(
+                "[waggledance] leader started in Paseo workspace {} ({})",
+                start.workspace, start.reason
+            ),
+        );
+        let spec = start.spec(&run.task);
+        let started = self.paseo.run_and_wait(&spec, timeout);
+        let finder = async {
+            let id = self.new_leader(&project.id, &run.id).await;
+            self.check_mode(run, &id, &mode).await;
+        };
+        tokio::pin!(started, finder);
+        let mut checked = false;
+        let result = loop {
+            tokio::select! {
+                result = &mut started => break result,
+                () = &mut finder, if !checked => checked = true,
             }
-            Leader::Existing { id, .. } => {
-                self.check_mode(run, &id, &mode).await;
-                self.sent(run, &id, wd, &sent_at);
-                let outcome = self.paseo.send_and_wait(&id, &run.task, timeout).await;
-                (Some(id), outcome)
-            }
-            Leader::Start(start) => {
-                tracing::info!(
-                    run = %run.id,
-                    workspace = %start.workspace,
-                    reason = start.reason,
-                    "delivery starts the {name} leader"
-                );
-                self.state.lock().unwrap().headers.insert(
-                    run.id.clone(),
-                    format!(
-                        "[waggledance] leader started in Paseo workspace {} ({})",
-                        start.workspace, start.reason
-                    ),
-                );
-                let known = paseo::leader_ids(paseo, &project.id, wd)
-                    .await
-                    .unwrap_or_default();
-                let spec = start.spec(&run.task);
-                let started = paseo.run_and_wait(&spec, timeout);
-                let finder = async {
-                    let id = self.new_leader(&project.id, wd, &known).await;
+        };
+        let (agent, outcome) = match result {
+            Ok((id, end)) => {
+                if !checked {
                     self.check_mode(run, &id, &mode).await;
-                };
-                tokio::pin!(started, finder);
-                let mut checked = false;
-                let result = loop {
-                    tokio::select! {
-                        result = &mut started => break result,
-                        () = &mut finder, if !checked => checked = true,
-                    }
-                };
-                match result {
-                    Ok((id, end)) => {
-                        if !checked {
-                            self.check_mode(run, &id, &mode).await;
-                        }
-                        self.sent(run, &id, wd, &sent_at);
-                        (Some(id), Ok(end))
-                    }
-                    Err(e) => (None, Err(e)),
                 }
+                self.sent(run, &id, wd, &sent_at);
+                (Some(id), Ok(end))
             }
+            Err(e) => (None, Err(e)),
         };
         let run = Run {
             pane_id: pane(agent.as_deref()),
@@ -364,9 +320,12 @@ impl Delivery {
                 self.presend_failed(&name, &run, &e.to_string())
             }
             Err(e) => self.lose(&name, &run, agent, &e.to_string()),
-            Ok(TurnEnd::Completed) => self.done(&name, &run, agent).await,
+            Ok(TurnEnd::Completed) => self.done(&name, &run, agent, wd).await,
             Ok(TurnEnd::Permission) => match agent {
-                Some(agent) => self.blocked_then_done(&name, &run, agent, deadline).await,
+                Some(agent) => {
+                    self.blocked_then_done(&name, &run, agent, deadline, wd)
+                        .await
+                }
                 None => self.lose(&name, &run, None, "permission requested"),
             },
             Ok(TurnEnd::Other { status, message }) => self.lose(
@@ -378,10 +337,10 @@ impl Delivery {
         }
     }
 
-    async fn new_leader(&self, project_id: &str, wd: bool, known: &[String]) -> String {
+    async fn new_leader(&self, project_id: &str, run_id: &str) -> String {
         loop {
-            if let Ok(ids) = paseo::leader_ids(self.paseo.as_ref(), project_id, wd).await {
-                if let Some(id) = ids.into_iter().find(|id| !known.contains(id)) {
+            if let Ok(ids) = self.paseo.run_leaders(project_id, run_id).await {
+                if let Some(id) = ids.into_iter().next() {
                     return id;
                 }
             }
@@ -418,7 +377,14 @@ impl Delivery {
         }
     }
 
-    async fn blocked_then_done(&self, name: &str, run: &Run, agent: &str, deadline: Instant) {
+    async fn blocked_then_done(
+        &self,
+        name: &str,
+        run: &Run,
+        agent: &str,
+        deadline: Instant,
+        wd: bool,
+    ) {
         loop {
             self.end(name, run, "blocked", None, Some(agent));
             loop {
@@ -434,9 +400,9 @@ impl Delivery {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.paseo.wait(agent, remaining).await {
-                Ok(TurnEnd::Completed) => return self.done(name, run, Some(agent)).await,
+                Ok(TurnEnd::Completed) => return self.done(name, run, Some(agent), wd).await,
                 Ok(TurnEnd::Other { status, .. }) if status == "idle" => {
-                    return self.done(name, run, Some(agent)).await
+                    return self.done(name, run, Some(agent), wd).await
                 }
                 Ok(TurnEnd::Permission) => {}
                 Ok(TurnEnd::Other { status, message }) => {
@@ -459,7 +425,7 @@ impl Delivery {
         }
     }
 
-    async fn done(&self, name: &str, run: &Run, agent: Option<&str>) {
+    async fn done(&self, name: &str, run: &Run, agent: Option<&str>, wd: bool) {
         let logs = match agent {
             Some(agent) => self
                 .paseo
@@ -473,14 +439,18 @@ impl Delivery {
         };
         let reply = leader_reply(&logs, &run.task);
         self.end(name, run, "done", Some(&reply), agent);
+        if let (false, Some(agent)) = (wd, agent) {
+            self.archive(agent).await;
+        }
+    }
+
+    async fn archive(&self, agent: &str) {
+        if let Err(e) = self.paseo.archive(agent).await {
+            tracing::warn!("delivery could not archive leader {agent}: {e}");
+        }
     }
 
     fn lose(&self, name: &str, run: &Run, agent: Option<&str>, why: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .held
-            .insert(run.project_id.clone());
         let transcript = format!("{MAY_STILL_FINISH} ({why})");
         self.end(name, run, "lost", Some(&transcript), agent);
     }
@@ -744,12 +714,12 @@ mod tests {
             }
         }
 
-        fn sends_to(&self, id: &str) -> Vec<String> {
+        fn started_tasks(&self) -> Vec<String> {
             self.fake
                 .calls()
                 .into_iter()
                 .filter_map(|c| match c {
-                    Call::SendAndWait(to, text) if to == id => Some(text),
+                    Call::Run(spec) => Some(spec.task),
                     _ => None,
                 })
                 .collect()
@@ -781,74 +751,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_sends_one_run_per_project_per_tick_in_order_and_marks_done() {
+    async fn delivery_starts_one_leader_per_queued_run_in_the_same_tick() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
+        root_workspace(&r);
         r.queue_at("proj-1", "run-a", "first", None, "2026-10-14T14:00:01Z");
         r.queue_at("proj-1", "run-b", "second", None, "2026-10-14T14:00:02Z");
         r.queue_at("proj-1", "run-c", "third", None, "2026-10-14T14:00:03Z");
-        r.set_logs("lead", "[User] first\nreply one\n");
-
         r.tick().await;
-        assert_eq!(r.sends_to("lead"), vec!["first"]);
+        let mut tasks: Vec<String> = r
+            .fake
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Run(spec) => Some(spec.task),
+                _ => None,
+            })
+            .collect();
+        tasks.sort();
+        assert_eq!(tasks, vec!["first", "second", "third"]);
         assert_eq!(
             (r.status("run-a"), r.status("run-b"), r.status("run-c")),
-            ("done".into(), "queued".into(), "queued".into())
+            ("done".into(), "done".into(), "done".into())
         );
-        assert_eq!(r.transcript("run-a"), "reply one");
-        assert_eq!(
-            r.engine.get_run("run-a").unwrap().unwrap().pane_id,
-            "paseo:lead"
-        );
-        r.tick().await;
-        r.tick().await;
-        assert_eq!(r.sends_to("lead"), vec!["first", "second", "third"]);
-        assert_eq!(r.status("run-c"), "done");
         assert!(std::fs::metadata(paseo::delivery_heartbeat_path(&r.delivery.data_dir)).is_ok());
     }
 
     #[tokio::test]
     async fn delivery_serves_two_projects_in_the_same_tick() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead-1", "idle", false);
-        r.fake.add_leader("proj-2", "lead-2", "idle", false);
+        r.fake.add_workspace(
+            "wks-1",
+            "local",
+            &r.engine.get_project("proj-1").unwrap().unwrap().root_path,
+        );
+        r.fake.add_workspace(
+            "wks-2",
+            "local",
+            &r.engine.get_project("proj-2").unwrap().unwrap().root_path,
+        );
         r.queue("proj-1", "run-1", "one", None);
         r.queue("proj-2", "run-2", "two", None);
         r.tick().await;
-        assert_eq!(r.sends_to("lead-1"), vec!["one"]);
-        assert_eq!(r.sends_to("lead-2"), vec!["two"]);
+        assert_eq!(
+            (r.status("run-1"), r.status("run-2")),
+            ("done".into(), "done".into())
+        );
     }
 
     #[tokio::test]
-    async fn delivery_skips_a_project_with_a_delivery_in_flight() {
+    async fn delivery_never_sends_to_a_leader_that_existed_before_the_run() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
+        root_workspace(&r);
+        r.fake
+            .add_run_leader("proj-1", "run-0", "idle-lead", "idle");
+        r.queue("proj-1", "run-1", "one", None);
+        r.tick().await;
+        assert_eq!(r.status("run-1"), "done");
+        let run = r.engine.get_run("run-1").unwrap().unwrap();
+        assert_ne!(run.pane_id, "paseo:idle-lead");
+        assert!(r
+            .fake
+            .calls()
+            .iter()
+            .all(|c| !matches!(c, Call::Inspect(_))));
+        assert!(r.fake.archived(agent_of(&run)));
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_delivery_is_in_flight_is_not_delivered_twice() {
+        let r = rig();
+        root_workspace(&r);
         r.queue("proj-1", "run-1", "one", None);
         r.delivery
             .state
             .lock()
             .unwrap()
-            .busy
-            .insert("proj-1".into());
+            .inflight
+            .insert("run-1".into());
         r.tick().await;
-        assert!(r.sends_to("lead").is_empty());
+        assert!(r.fake.calls().iter().all(|c| !matches!(c, Call::Run(_))));
         assert_eq!(r.status("run-1"), "queued");
-    }
-
-    #[tokio::test]
-    async fn delivery_never_sends_to_a_running_leader_and_waits_for_idle() {
-        let r = rig();
-        r.fake.add_leader("proj-1", "lead", "running", false);
-        r.queue("proj-1", "run-1", "one", None);
-        r.tick().await;
-        r.tick().await;
-        assert!(r.sends_to("lead").is_empty());
-        assert_eq!(r.status("run-1"), "queued");
-        assert_eq!(r.engine.run_attempts("run-1").unwrap(), Some(0));
-        r.fake.set_status("lead", "idle");
-        r.tick().await;
-        assert_eq!(r.sends_to("lead"), vec!["one"]);
-        assert_eq!(r.status("run-1"), "done");
     }
 
     #[tokio::test]
@@ -896,6 +878,12 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn agent_of(run: &Run) -> &str {
+        run.pane_id
+            .strip_prefix(orchestrate::PASEO_PANE_PREFIX)
+            .unwrap_or_default()
     }
 
     fn at(r: &Rig, call: &Call) -> usize {
@@ -957,16 +945,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_existing_leader_is_set_to_the_asked_mode_before_the_task_is_sent() {
+    async fn the_mode_check_reads_the_leader_started_for_that_run() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
-        r.fake.script_modes("lead", &[Some("default")], false);
+        root_workspace(&r);
+        r.fake
+            .add_run_leader("proj-1", "run-0", "idle-lead", "idle");
         r.queue("proj-1", "run-1", "one", None);
         r.tick().await;
-        let set = Call::SetMode("lead".into(), "bypassPermissions".into());
-        assert_eq!(set_modes(&r).len(), 1);
-        assert!(at(&r, &set) < at(&r, &Call::SendAndWait("lead".into(), "one".into())));
+        let run = r.engine.get_run("run-1").unwrap().unwrap();
+        let agent = agent_of(&run).to_string();
+        assert_ne!(agent, "idle-lead");
+        let calls = r.fake.calls();
+        assert!(calls.contains(&Call::RunLeaders("proj-1".into(), "run-1".into())));
+        assert!(calls.contains(&Call::RuntimeMode(agent.clone())));
+        assert!(!calls.contains(&Call::RuntimeMode("idle-lead".into())));
+        assert!(set_modes(&r).is_empty());
         assert_eq!(r.status("run-1"), "done");
+        assert!(r.fake.archived(&agent));
     }
 
     #[tokio::test]
@@ -975,8 +970,13 @@ mod tests {
         config.paseo.mode = String::new();
         let r = rig_with(config);
         root_workspace(&r);
-        r.fake.add_leader("proj-2", "lead", "idle", false);
-        r.fake.script_modes("lead", &[Some("default")], true);
+        r.fake.add_workspace(
+            "wks-2",
+            "local",
+            &r.engine.get_project("proj-2").unwrap().unwrap().root_path,
+        );
+        r.fake.script_modes("agent-1", &[Some("default")], true);
+        r.fake.script_modes("agent-2", &[Some("default")], true);
         r.queue("proj-1", "run-1", "build it", None);
         r.queue("proj-2", "run-2", "two", None);
         r.tick().await;
@@ -1025,15 +1025,14 @@ mod tests {
     #[tokio::test]
     async fn delivery_marks_a_permission_blocked_then_done_once_idle() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
-        r.fake.add_leader("proj-9", "caller", "idle", false);
-        r.fake.set_permissions("lead", &["Write"]);
+        root_workspace(&r);
+        r.fake.add_leader("caller", "idle", false);
+        r.fake.set_permissions("agent-1", &["Write"]);
         r.fake.push_turn_end(TurnEnd::Permission);
         r.fake.push_turn_end(TurnEnd::Other {
             status: "idle".into(),
             message: "Agent is idle.".into(),
         });
-        r.set_logs("lead", "[User] one\nwrote it\n");
         r.queue("proj-1", "run-1", "one", Some("caller"));
 
         let mut set = JoinSet::new();
@@ -1045,13 +1044,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert_eq!(r.status("run-1"), "blocked");
-        r.fake.set_permissions("lead", &[]);
+        let run = r.engine.get_run("run-1").unwrap().unwrap();
+        let agent = agent_of(&run).to_string();
+        r.set_logs(&agent, "[User] one\nwrote it\n");
+        assert!(!r.fake.archived(&agent), "a blocked run keeps its leader");
+        r.fake.set_permissions(&agent, &[]);
         while let Some(res) = set.join_next().await {
             res.unwrap();
         }
         assert_eq!(r.status("run-1"), "done");
-        assert_eq!(r.transcript("run-1"), "wrote it");
-        assert!(r.fake.calls().contains(&Call::Wait("lead".into())));
+        assert!(
+            r.transcript("run-1").ends_with("wrote it"),
+            "{}",
+            r.transcript("run-1")
+        );
+        assert!(r.fake.calls().contains(&Call::Wait(agent.clone())));
+        assert!(r.fake.archived(&agent), "a done run archives its leader");
         r.tick().await;
         let notices = r.notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
@@ -1064,27 +1072,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_marks_an_unfinished_turn_lost_and_holds_the_project_until_idle() {
+    async fn delivery_marks_an_unfinished_turn_lost_and_keeps_its_leader() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
+        root_workspace(&r);
         r.fake.push_turn_end(TurnEnd::Other {
             status: "timeout".into(),
             message: "still running".into(),
         });
         r.queue_at("proj-1", "run-1", "one", None, "2026-10-14T14:00:01Z");
-        r.queue_at("proj-1", "run-2", "two", None, "2026-10-14T14:00:02Z");
-        r.fake.set_status("lead", "idle");
         r.tick().await;
         assert_eq!(r.status("run-1"), "lost");
         assert!(r.transcript("run-1").contains(MAY_STILL_FINISH));
-        assert!(r.delivery.state.lock().unwrap().held.contains("proj-1"));
-        r.fake.set_status("lead", "running");
+        let lost = agent_of(&r.engine.get_run("run-1").unwrap().unwrap()).to_string();
+        assert!(!r.fake.archived(&lost), "a lost run keeps its leader");
+
+        r.fake.push_turn_end(TurnEnd::Completed);
+        r.queue_at("proj-1", "run-2", "two", None, "2026-10-14T14:00:02Z");
         r.tick().await;
-        assert_eq!(r.sends_to("lead"), vec!["one"]);
-        r.fake.set_status("lead", "idle");
-        r.tick().await;
-        assert_eq!(r.sends_to("lead"), vec!["one", "two"]);
         assert_eq!(r.status("run-2"), "done");
+        let done = agent_of(&r.engine.get_run("run-2").unwrap().unwrap()).to_string();
+        assert_ne!(lost, done, "each run has its own leader");
+        assert!(r.fake.archived(&done), "a done run archives its leader");
     }
 
     #[tokio::test]
@@ -1092,7 +1100,7 @@ mod tests {
         let r = rig();
         r.fake.state.lock().unwrap().workspaces_fail = true;
         r.queue("proj-1", "run-1", "one", Some("caller"));
-        r.fake.add_leader("proj-9", "caller", "idle", false);
+        r.fake.add_leader("caller", "idle", false);
         for attempt in 1..5 {
             r.tick().await;
             assert_eq!(r.status("run-1"), "queued");
@@ -1101,11 +1109,7 @@ mod tests {
         r.tick().await;
         assert_eq!(r.status("run-1"), "lost");
         assert!(r.transcript("run-1").contains("`fake workspace` exited"));
-        assert!(r
-            .fake
-            .calls()
-            .iter()
-            .all(|c| !matches!(c, Call::Run(_) | Call::SendAndWait(..))));
+        assert!(r.fake.calls().iter().all(|c| !matches!(c, Call::Run(_))));
         r.tick().await;
         let notices = r.notices();
         assert_eq!(notices.len(), 1);
@@ -1138,8 +1142,9 @@ mod tests {
     #[tokio::test]
     async fn delivery_restart_requeues_unsent_runs_and_loses_sent_ones_without_resending() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "running", false);
-        r.fake.add_leader("proj-9", "caller", "idle", false);
+        root_workspace(&r);
+        r.fake.add_leader("running-lead", "running", false);
+        r.fake.add_leader("caller", "idle", false);
         r.queue_at("proj-1", "run-pending", "one", None, "2026-10-14T14:00:01Z");
         r.queue_at(
             "proj-1",
@@ -1150,16 +1155,19 @@ mod tests {
         );
         r.engine.claim_queued_run("run-pending").unwrap();
         r.engine.claim_queued_run("run-sent").unwrap();
-        r.engine.set_run_pane("run-sent", "paseo:lead").unwrap();
+        r.engine
+            .set_run_pane("run-sent", "paseo:running-lead")
+            .unwrap();
 
         r.tick().await;
-        assert_eq!(r.status("run-pending"), "queued");
+        assert_eq!(r.status("run-pending"), "done");
         assert_eq!(r.status("run-sent"), "lost");
         assert_eq!(r.transcript("run-sent"), RESTARTED);
-        assert!(r.sends_to("lead").is_empty());
-        r.fake.set_status("lead", "idle");
-        r.tick().await;
-        assert_eq!(r.sends_to("lead"), vec!["one"]);
+        assert!(r.fake.calls().iter().all(|c| !matches!(
+            c,
+            Call::RunDone(id) if id == "running-lead"
+        )));
+        assert!(!r.fake.archived("running-lead"));
         assert_eq!(r.notices().len(), 1);
         assert_eq!(r.notice_state("run-sent").as_deref(), Some("sent"));
     }
@@ -1167,8 +1175,8 @@ mod tests {
     #[tokio::test]
     async fn delivery_notifies_a_caller_once_and_only_while_idle() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
-        r.fake.add_leader("proj-9", "caller", "running", false);
+        root_workspace(&r);
+        r.fake.add_leader("caller", "running", false);
         r.queue("proj-1", "run-1", "one", Some("caller"));
         r.tick().await;
         r.tick().await;
@@ -1190,7 +1198,7 @@ mod tests {
     #[tokio::test]
     async fn delivery_never_notifies_the_leader_about_its_own_run() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
+        root_workspace(&r);
         r.queue("proj-1", "run-1", "one", Some("lead"));
         r.tick().await;
         r.tick().await;
@@ -1203,7 +1211,7 @@ mod tests {
         let r = rig();
         let store = Arc::new(NotifyStore::open_in_memory().unwrap());
         *r.delivery.notify.lock().unwrap() = Some(store.clone());
-        r.fake.add_leader("proj-1", "lead", "idle", false);
+        root_workspace(&r);
         r.queue("proj-1", "run-1", "one", None);
         r.tick().await;
         let kinds: Vec<String> = store
@@ -1218,8 +1226,8 @@ mod tests {
     #[tokio::test]
     async fn a_pending_notice_survives_a_restart_and_sends_on_the_first_idle_tick() {
         let mut r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
-        r.fake.add_leader("proj-9", "caller", "running", false);
+        root_workspace(&r);
+        r.fake.add_leader("caller", "running", false);
         r.queue("proj-1", "run-1", "one", Some("caller"));
         r.tick().await;
         assert_eq!(r.status("run-1"), "done");
@@ -1242,8 +1250,8 @@ mod tests {
     #[tokio::test]
     async fn an_expired_notice_is_dropped_and_never_sent() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
-        r.fake.add_leader("proj-9", "caller", "idle", false);
+        root_workspace(&r);
+        r.fake.add_leader("caller", "idle", false);
         r.queue("proj-1", "run-1", "one", Some("caller"));
         r.engine
             .finish_run(
@@ -1274,12 +1282,8 @@ mod tests {
     #[tokio::test]
     async fn a_wd_run_starts_a_via_wd_leader_and_never_uses_a_plain_one() {
         let r = rig();
-        r.fake.add_leader("proj-1", "plain", "idle", false);
-        r.fake.add_workspace(
-            "wks",
-            "local",
-            &r.engine.get_project("proj-1").unwrap().unwrap().root_path,
-        );
+        r.fake.add_leader("plain", "idle", false);
+        root_workspace(&r);
         let task = paseo::wd_task("corr-1", "build it");
         r.queue("proj-1", "run-1", &task, Some(paseo::WD_CALLER));
         r.tick().await;
@@ -1294,8 +1298,18 @@ mod tests {
             .collect();
         assert_eq!(labels.len(), 1, "{labels:?}");
         assert!(labels[0].iter().any(|l| l == paseo::WD_LABEL));
-        assert!(r.sends_to("plain").is_empty());
+        assert!(r
+            .fake
+            .calls()
+            .iter()
+            .all(|c| !matches!(c, Call::Inspect(_))));
+        assert!(r.fake.calls().iter().all(|c| !matches!(
+            c,
+            Call::RunDone(id) if id == "plain"
+        )));
         assert_eq!(r.status("run-1"), "done");
+        let agent = agent_of(&r.engine.get_run("run-1").unwrap().unwrap()).to_string();
+        assert!(!r.fake.archived(&agent), "a wd run keeps its leader");
         assert!(inbox(&r.engine).is_empty());
         r.tick().await;
         assert!(r.notices().is_empty());
@@ -1304,7 +1318,7 @@ mod tests {
     #[tokio::test]
     async fn delivering_a_wd_run_records_its_leader_and_clears_the_nudge_marks() {
         let r = rig();
-        r.fake.add_wd_leader("proj-1", "lead", "idle");
+        root_workspace(&r);
         r.engine
             .insert_task("corr-4", "proj-1", "2026-10-14T13:00:00Z")
             .unwrap();
@@ -1318,9 +1332,14 @@ mod tests {
         let task = paseo::wd_task("corr-4", "one");
         r.queue("proj-1", "run-1", &task, Some(paseo::WD_CALLER));
         r.tick().await;
-        assert_eq!(r.sends_to("lead"), vec![task]);
+        assert_eq!(r.started_tasks(), vec![task]);
+        let delivered_to = agent_of(&r.engine.get_run("run-1").unwrap().unwrap()).to_string();
         let t = r.engine.get_task("corr-4").unwrap().unwrap();
-        assert_eq!(t.leader_id.as_deref(), Some("lead"));
+        assert_eq!(t.leader_id.as_deref(), Some(delivered_to.as_str()));
+        assert!(
+            !r.fake.archived(&delivered_to),
+            "a wd run keeps its leader for reply and redo"
+        );
         let delivered = t.last_delivered_at.unwrap();
         assert!(delivered >= before, "{delivered} < {before}");
         assert_eq!(t.changed_at, delivered);
@@ -1330,7 +1349,7 @@ mod tests {
     #[tokio::test]
     async fn delivering_a_non_wd_run_touches_no_task() {
         let r = rig();
-        r.fake.add_leader("proj-1", "lead", "idle", false);
+        root_workspace(&r);
         r.engine
             .insert_task("corr-5", "proj-1", "2026-10-14T13:00:00Z")
             .unwrap();
@@ -1345,8 +1364,8 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_wd_run_mails_no_permission_and_sends_no_notice() {
         let r = rig();
-        r.fake.add_wd_leader("proj-1", "lead", "idle");
-        r.fake.set_permissions("lead", &["Write"]);
+        root_workspace(&r);
+        r.fake.set_permissions("agent-1", &["Write"]);
         r.fake.push_turn_end(TurnEnd::Permission);
         r.fake.push_turn_end(TurnEnd::Completed);
         let task = paseo::wd_task("corr-2", "one");
@@ -1360,11 +1379,12 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        r.fake.set_permissions("lead", &[]);
+        r.fake.set_permissions("agent-1", &[]);
         while let Some(res) = set.join_next().await {
             res.unwrap();
         }
         assert_eq!(r.status("run-1"), "done");
+        assert!(!r.fake.archived("agent-1"));
         let mail = inbox(&r.engine);
         assert!(
             mail.is_empty(),
@@ -1377,7 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn a_lost_wd_run_mails_one_error_and_sends_no_notice() {
         let r = rig();
-        r.fake.add_wd_leader("proj-1", "lead", "idle");
+        root_workspace(&r);
         r.fake.push_turn_end(TurnEnd::Other {
             status: "timeout".into(),
             message: "still running".into(),

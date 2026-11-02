@@ -160,8 +160,8 @@ below, and never search for the leader yourself — do not list Paseo agents, pa
 workspaces to find it. The mode gate still decides scope: a routing phrase with no
 completion verb is relay mode.
 
-The daemon finds the project's Paseo leader or creates it, queues per project, and
-delivers while the leader is idle. Hand the task to it:
+The daemon starts a new Paseo leader for each task and never reuses or waits on an
+existing one, so tasks for one project run in parallel. Hand the task to it:
 
 - From aicoworker, run `wd-bridge.py handoff --project <project> --task "<task>"`.
   Keep the `corr` it prints; `reply`, `redo` and `accept` carry it.
