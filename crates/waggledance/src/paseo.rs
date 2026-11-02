@@ -161,6 +161,7 @@ pub trait Paseo: Send + Sync {
     fn stored_workspaces(&self) -> Vec<StoredWorkspace>;
     async fn create_workspace(&self, path: &Path) -> Result<String>;
     async fn run_and_wait(&self, spec: &RunSpec, timeout: Duration) -> Result<(String, TurnEnd)>;
+    async fn send_and_wait(&self, id: &str, text: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn send(&self, id: &str, text: &str) -> Result<()>;
     async fn wait(&self, id: &str, timeout: Duration) -> Result<TurnEnd>;
     async fn logs_since(&self, id: &str, since: &str) -> Result<String>;
@@ -903,6 +904,18 @@ impl Paseo for PaseoCli {
         self.turn(&run_args(spec), timeout).await
     }
 
+    async fn send_and_wait(&self, id: &str, text: &str, timeout: Duration) -> Result<TurnEnd> {
+        let file = PromptFile::write(text)?;
+        let args = [
+            "send".into(),
+            id.into(),
+            "--prompt-file".into(),
+            file.0.to_string_lossy().into_owned(),
+            "--json".into(),
+        ];
+        Ok(self.turn(&args, timeout).await?.1)
+    }
+
     async fn send(&self, id: &str, text: &str) -> Result<()> {
         let file = PromptFile::write(text)?;
         self.exec(
@@ -1191,6 +1204,7 @@ pub mod fake {
         Providers,
         CreateWorkspace(PathBuf),
         Run(RunSpec),
+        SendAndWait(String, String),
         Send(String, String),
         Wait(String),
         LogsSince(String, String),
@@ -1466,6 +1480,11 @@ pub mod fake {
             tokio::time::sleep(run_after).await;
             self.record(Call::RunDone(id.clone()));
             Ok((id, self.next_turn_end()))
+        }
+
+        async fn send_and_wait(&self, id: &str, text: &str, _timeout: Duration) -> Result<TurnEnd> {
+            self.record(Call::SendAndWait(id.to_string(), text.to_string()));
+            Ok(self.next_turn_end())
         }
 
         async fn send(&self, id: &str, text: &str) -> Result<()> {

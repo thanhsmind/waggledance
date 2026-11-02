@@ -55,6 +55,11 @@ struct Notice {
     text: String,
 }
 
+struct Follow {
+    leader: String,
+    original: Run,
+}
+
 fn notice_until() -> String {
     let until =
         time::OffsetDateTime::now_utc() + time::Duration::seconds(NOTICE_WINDOW.as_secs() as i64);
@@ -337,6 +342,22 @@ impl Delivery {
             tracing::warn!("delivery for {name}: {warning}");
         }
         let wd = matches!(self.engine.run_caller(&run.id), Ok(Some(c)) if c == paseo::WD_CALLER);
+        let mode = paseo::leader_mode(config, &settings.paseo);
+        let prompt = match wd.then(|| self.follow_up(run)).flatten() {
+            Some(follow) => match self.paseo.inspect(&follow.leader).await {
+                Ok(state) if !state.archived && LEADER_RUNNING.contains(&state.status.as_str()) => {
+                    self.set_status(&run.id, "queued");
+                    return;
+                }
+                Ok(state) if !state.archived => {
+                    return self
+                        .follow_on(&name, run, &follow.leader, &mode, timeout)
+                        .await;
+                }
+                _ => format!("{}\n\n{}", follow.original.task, run.task),
+            },
+            None => run.task.clone(),
+        };
         let start = match paseo::resolve_leader(
             self.paseo.as_ref(),
             config,
@@ -350,7 +371,6 @@ impl Delivery {
             Ok(start) => start,
             Err(e) => return self.presend_failed(&name, run, &e.to_string()),
         };
-        let mode = paseo::leader_mode(config, &settings.paseo);
         let sent_at = now_rfc3339();
         tracing::info!(
             run = %run.id,
@@ -365,7 +385,7 @@ impl Delivery {
                 start.workspace, start.reason
             ),
         );
-        let spec = start.spec(&run.task);
+        let spec = start.spec(&prompt);
         let started = self.paseo.run_and_wait(&spec, timeout);
         let finder = async {
             let id = self.new_leader(&project.id, &run.id).await;
@@ -409,6 +429,48 @@ impl Delivery {
             },
             Ok(TurnEnd::Other { status, message }) => self.lose(
                 &name,
+                &run,
+                agent,
+                &format!("paseo reported {status}: {message}"),
+            ),
+        }
+    }
+
+    fn follow_up(&self, run: &Run) -> Option<Follow> {
+        let corr = paseo::wd_corr(&run.task)?;
+        let original = self
+            .engine
+            .run_by_request(&run.project_id, corr)
+            .ok()
+            .flatten()?;
+        if original.id == run.id {
+            return None;
+        }
+        let leader = self.engine.get_task(corr).ok().flatten()?.leader_id?;
+        Some(Follow { leader, original })
+    }
+
+    async fn follow_on(&self, name: &str, run: &Run, leader: &str, mode: &str, timeout: Duration) {
+        self.check_mode(run, leader, mode).await;
+        self.sent(run, leader, true, &now_rfc3339());
+        let run = Run {
+            pane_id: pane(Some(leader)),
+            ..run.clone()
+        };
+        let deadline = Instant::now() + timeout;
+        let agent = Some(leader);
+        match self.paseo.send_and_wait(leader, &run.task, timeout).await {
+            Err(e @ (PaseoError::Spawn { .. } | PaseoError::PromptFile(_))) => {
+                self.presend_failed(name, &run, &e.to_string())
+            }
+            Err(e) => self.lose(name, &run, agent, &e.to_string()),
+            Ok(TurnEnd::Completed) => self.done(name, &run, agent, true).await,
+            Ok(TurnEnd::Permission) => {
+                self.blocked_then_done(name, &run, leader, deadline, true)
+                    .await
+            }
+            Ok(TurnEnd::Other { status, message }) => self.lose(
+                name,
                 &run,
                 agent,
                 &format!("paseo reported {status}: {message}"),
@@ -1442,6 +1504,148 @@ mod tests {
         let t = r.engine.get_task("corr-5").unwrap().unwrap();
         assert_eq!((t.leader_id, t.last_delivered_at), (None, None));
         assert_eq!(t.changed_at, "2026-10-14T13:00:00Z");
+    }
+
+    fn hand_off(r: &Rig, id: &str, corr: &str, text: &str) -> String {
+        let task = paseo::wd_task(corr, text);
+        r.engine
+            .insert_task(corr, "proj-1", "2026-10-14T13:00:00Z")
+            .unwrap();
+        r.queue("proj-1", id, &task, Some(paseo::WD_CALLER));
+        r.engine.set_run_request(id, corr).unwrap();
+        id.to_string()
+    }
+
+    fn follow_up(r: &Rig, id: &str, corr: &str, n: usize, text: &str) {
+        let task = paseo::wd_task(corr, &format!("Reply from the user:\n{text}"));
+        r.queue("proj-1", id, &task, Some(paseo::WD_CALLER));
+        r.engine
+            .set_run_request(id, &format!("{corr}:{n}"))
+            .unwrap();
+    }
+
+    fn send_waits(r: &Rig) -> Vec<(String, String)> {
+        r.fake
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::SendAndWait(id, text) => Some((id, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reply_goes_to_the_tasks_idle_leader_and_starts_no_new_one() {
+        let r = rig();
+        root_workspace(&r);
+        hand_off(&r, "run-1", "corr-7", "build it");
+        r.tick().await;
+        let leader = agent_of(&r.engine.get_run("run-1").unwrap().unwrap()).to_string();
+        r.fake.set_status(&leader, "idle");
+        follow_up(&r, "run-2", "corr-7", 1, "add a test");
+        r.tick().await;
+        let started = r.started_tasks();
+        assert_eq!(started, vec![paseo::wd_task("corr-7", "build it")]);
+        let sent = send_waits(&r);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, leader);
+        assert!(sent[0].1.ends_with("Reply from the user:\nadd a test"));
+        assert_eq!(r.status("run-2"), "done");
+        assert_eq!(
+            r.engine.get_run("run-2").unwrap().unwrap().pane_id,
+            format!("paseo:{leader}")
+        );
+        assert!(
+            !r.fake.archived(&leader),
+            "a wd leader stays for the next reply"
+        );
+        assert_eq!(
+            r.engine
+                .get_task("corr-7")
+                .unwrap()
+                .unwrap()
+                .leader_id
+                .as_deref(),
+            Some(leader.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_running_leader_waits_queued_until_it_is_idle() {
+        let r = rig();
+        root_workspace(&r);
+        hand_off(&r, "run-1", "corr-8", "build it");
+        r.tick().await;
+        let leader = agent_of(&r.engine.get_run("run-1").unwrap().unwrap()).to_string();
+        r.fake.set_status(&leader, "running");
+        follow_up(&r, "run-2", "corr-8", 1, "add a test");
+        r.tick().await;
+        assert!(send_waits(&r).is_empty(), "no send mid-turn");
+        assert_eq!(r.status("run-2"), "queued");
+        assert_eq!(r.started_tasks().len(), 1, "no second leader");
+        r.fake.set_status(&leader, "idle");
+        r.tick().await;
+        let sent = send_waits(&r);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, leader);
+        assert_eq!(r.status("run-2"), "done");
+        assert_eq!(r.started_tasks().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reply_whose_leader_is_archived_starts_one_that_carries_the_original_task() {
+        let r = rig();
+        root_workspace(&r);
+        hand_off(&r, "run-1", "corr-9", "build it");
+        r.tick().await;
+        let old = agent_of(&r.engine.get_run("run-1").unwrap().unwrap()).to_string();
+        r.fake.archive(&old).await.unwrap();
+        follow_up(&r, "run-2", "corr-9", 1, "add a test");
+        r.tick().await;
+        let started = r.started_tasks();
+        assert_eq!(started.len(), 2, "{started:?}");
+        let prompt = &started[1];
+        let original = paseo::wd_task("corr-9", "build it");
+        assert!(prompt.starts_with(&original), "{prompt}");
+        assert!(
+            prompt.contains("\n\nReply from the user:\nadd a test"),
+            "{prompt}"
+        );
+        assert!(send_waits(&r).is_empty());
+        let fresh = agent_of(&r.engine.get_run("run-2").unwrap().unwrap()).to_string();
+        assert_ne!(fresh, old);
+        assert_eq!(
+            r.engine
+                .get_task("corr-9")
+                .unwrap()
+                .unwrap()
+                .leader_id
+                .as_deref(),
+            Some(fresh.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wd_run_that_is_not_a_follow_up_still_starts_its_own_leader() {
+        let r = rig();
+        root_workspace(&r);
+        r.fake.set_status("idle-lead", "idle");
+        hand_off(&r, "run-1", "corr-10", "build it");
+        r.engine
+            .mark_task_delivered("corr-10", "idle-lead", "2026-10-14T13:00:00Z")
+            .unwrap();
+        r.tick().await;
+        let started = r.started_tasks();
+        assert_eq!(started, vec![paseo::wd_task("corr-10", "build it")]);
+        assert!(send_waits(&r).is_empty());
+        let fresh = agent_of(&r.engine.get_run("run-1").unwrap().unwrap()).to_string();
+        assert_ne!(fresh, "idle-lead");
+        assert!(r
+            .fake
+            .calls()
+            .iter()
+            .all(|c| !matches!(c, Call::Inspect(_))));
     }
 
     #[tokio::test]
