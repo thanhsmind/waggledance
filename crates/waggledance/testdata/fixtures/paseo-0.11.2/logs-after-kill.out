@@ -1,0 +1,6 @@
+[User] Reply with exactly the word SHORT-DONE.
+SHORT-DONE
+[User] Run the shell command `sleep 20` and then reply with exactly KILL-SURVIVED.
+[Shell] sleep 20
+[Shell] until ! pgrep -x sleep >/dev/null; do sleep 2; done; echo finished
+[Task notification] Background command "Wait 20 seconds" completed (exit code 0)

@@ -1,7 +1,9 @@
 //! SQLite adapter: project registry + file index + FTS5 search.
 //! Behind a `Mutex<Connection>` so it is Send+Sync for the async daemon.
 
-use crate::domain::{IndexedFile, Project, Run, SearchResult};
+use crate::domain::{
+    InboxMessage, IndexedFile, PermissionRequest, Project, Run, SearchResult, WdTask,
+};
 use crate::error::Result;
 use crate::short_link;
 use rusqlite::{params, Connection};
@@ -93,13 +95,17 @@ impl SqliteStore {
         c.execute("DELETE FROM files_fts WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM links WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM runs WHERE project_id=?1", params![id])?;
+        c.execute("DELETE FROM inbox WHERE project_id=?1", params![id])?;
+        c.execute(
+            "DELETE FROM permission_requests
+             WHERE corr IN (SELECT corr FROM tasks WHERE project_id=?1)",
+            params![id],
+        )?;
+        c.execute("DELETE FROM tasks WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM projects WHERE id=?1", params![id])?;
         Ok(())
     }
 
-    /// D6: flip a project's opt-in flag. Effective only alongside the global
-    /// `terminal.enabled` — the caller (`Engine::orchestration_allowed`)
-    /// combines the two.
     pub fn set_orchestration_enabled(&self, project_id: &str, enabled: bool) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
@@ -121,10 +127,22 @@ impl SqliteStore {
     /// [`Run`] is constructed by literal in several places this cell may
     /// not touch; see `Run`'s own doc for the note.
     pub fn insert_run(&self, r: &Run, feature: Option<&str>) -> Result<()> {
+        self.insert_run_with_request(r, feature, None, None)
+            .map(|_| ())
+    }
+
+    pub fn insert_run_with_request(
+        &self,
+        r: &Run,
+        feature: Option<&str>,
+        request_id: Option<&str>,
+        caller: Option<&str>,
+    ) -> Result<String> {
         let c = self.conn.lock().unwrap();
-        c.execute(
-            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        let inserted = c.execute(
+            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature,request_id,caller)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(project_id,request_id) WHERE request_id IS NOT NULL DO NOTHING",
             params![
                 r.id,
                 r.project_id,
@@ -136,10 +154,138 @@ impl SqliteStore {
                 r.status,
                 r.created_at,
                 r.updated_at,
-                feature
+                feature,
+                request_id,
+                caller
             ],
         )?;
+        if inserted == 1 {
+            return Ok(r.id.clone());
+        }
+        Ok(c.query_row(
+            "SELECT id FROM runs WHERE project_id=?1 AND request_id=?2",
+            params![r.project_id, request_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn run_by_request(&self, project_id: &str, request_id: &str) -> Result<Option<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE project_id=?1 AND request_id=?2",
+        )?;
+        let mut rows = stmt.query(params![project_id, request_id])?;
+        Ok(rows.next()?.map(row_to_run))
+    }
+
+    pub fn project_for_corr(&self, corr: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT project_id FROM runs
+             WHERE request_id=?1 OR substr(request_id,1,length(?1)+1)=?1||':'
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![corr])?;
+        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+    }
+
+    pub fn run_caller(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT caller FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
+    }
+
+    pub fn run_attempts(&self, id: &str) -> Result<Option<i64>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT attempts FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows.next()?.and_then(|r| r.get::<_, i64>(0).ok()))
+    }
+
+    pub fn list_queued_paseo_runs(&self, project_id: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE project_id=?1 AND status='queued' AND pane_id LIKE 'paseo:%'
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn list_projects_with_queued_paseo_runs(&self) -> Result<Vec<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT DISTINCT project_id FROM runs
+             WHERE status='queued' AND pane_id LIKE 'paseo:%' ORDER BY project_id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn claim_queued_run(&self, id: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let changed = c.execute(
+            "UPDATE runs SET status='working' WHERE id=?1 AND status='queued'",
+            params![id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_run_request(&self, id: &str, request_id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET request_id=?2 WHERE id=?1",
+            params![id, request_id],
+        )?;
         Ok(())
+    }
+
+    pub fn set_run_pane(&self, id: &str, pane_id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET pane_id=?2 WHERE id=?1",
+            params![id, pane_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn requeue_run(&self, id: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let changed = c.execute(
+            "UPDATE runs SET status='queued', attempts=attempts+1 WHERE id=?1 AND status='working'",
+            params![id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn list_inflight_paseo_runs(&self) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE status IN ('working','blocked') AND pane_id LIKE 'paseo:%'
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn list_leader_waits(&self, lost_since: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs
+             WHERE pane_id LIKE 'paseo:%'
+               AND (status='blocked' OR (status='lost' AND updated_at >= ?1))
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![lost_since], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Update a run's status (and its `updated_at` stamp). `baseline`/`marker`
@@ -204,6 +350,50 @@ impl SqliteStore {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Every still-`working` run waggledance itself spawned, across all
+    /// projects — the reaper's sweep list (board-run-reaper D1,
+    /// `eecfefeb`). Newest first.
+    ///
+    /// Two filters, both load-bearing:
+    ///
+    /// - `status='working'`: a run that already reached any terminal status
+    ///   (`done`, `blocked`, `timeout`, `lost`) is finished business, and
+    ///   re-awaiting it would re-read a pane that may belong to someone
+    ///   else by now.
+    /// - `preset_label IS NOT NULL`: waggledance spawned this pane. A
+    ///   `DispatchTarget::Pane` run borrows a pane the user already owned
+    ///   and leaves the column NULL exactly there — the same guard
+    ///   `orchestrate::finish` reads before closing anything — so the
+    ///   reaper never so much as looks at a human's own pane.
+    ///
+    /// Deliberately project-blind, unlike
+    /// [`list_live_runs_for_feature`](Self::list_live_runs_for_feature):
+    /// the leak D1 names is who-calls-await, not which project or which
+    /// button dispatched, so the sweep covers board runs and abandoned MCP
+    /// dispatches alike. Age is not filtered here — the caller's grace
+    /// window is a policy the store has no business holding.
+    pub fn list_unattended_working_runs(&self) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE status='working' AND preset_label IS NOT NULL
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn list_working_paseo_runs(&self) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE status='working' AND pane_id LIKE 'paseo:%'
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// The `feature` column of one run row, for the round-trip proof and for
     /// any caller that holds a [`Run`] and needs the column the struct does
     /// not carry. `Ok(None)` for both an unknown id and a NULL column.
@@ -215,6 +405,344 @@ impl SqliteStore {
             .next()?
             .and_then(|r| r.get::<_, Option<String>>(0).ok())
             .flatten())
+    }
+
+    /// Record the transcript delta a run ended with.
+    ///
+    /// Written only once a run reaches a terminal status, so a non-NULL
+    /// column means "this run is over, and this is what it left on screen"
+    /// — which is what lets a second await answer from the ledger instead
+    /// of re-reading a pane that may already have been closed.
+    ///
+    /// Column-only, like `feature`, and for the same reason: see [`Run`]'s
+    /// own doc on why neither becomes a struct field.
+    pub fn set_run_final_transcript(&self, id: &str, transcript: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET final_transcript=?2 WHERE id=?1",
+            params![id, transcript],
+        )?;
+        Ok(())
+    }
+
+    /// The `final_transcript` column of one run row. `Ok(None)` for an
+    /// unknown id, for a run that has not finished, and for every row
+    /// written before the column existed — all three are honestly "no
+    /// stored transcript", and the caller treats them alike.
+    pub fn run_final_transcript(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT final_transcript FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
+    }
+
+    pub fn finish_run(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: &str,
+        transcript: Option<&str>,
+        notice: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET status=?2, updated_at=?3,
+               final_transcript=COALESCE(?4, final_transcript),
+               notice=COALESCE(?5, notice),
+               notice_state=CASE WHEN ?5 IS NULL THEN notice_state ELSE 'pending' END,
+               notice_until=COALESCE(?6, notice_until)
+             WHERE id=?1",
+            params![
+                id,
+                status,
+                updated_at,
+                transcript,
+                notice.map(|(text, _)| text),
+                notice.map(|(_, until)| until),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_notices(&self) -> Result<Vec<(String, String, String, String)>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id, caller, notice, notice_until FROM runs
+             WHERE notice_state='pending' AND caller IS NOT NULL AND notice IS NOT NULL
+             ORDER BY updated_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn set_notice_state(&self, run_id: &str, state: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET notice_state=?2 WHERE id=?1",
+            params![run_id, state],
+        )?;
+        Ok(())
+    }
+
+    pub fn run_notice_state(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT notice_state FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
+    }
+
+    pub fn insert_inbox_message(
+        &self,
+        recipient: &str,
+        corr: &str,
+        project_id: &str,
+        kind: &str,
+        body: &str,
+        created_at: &str,
+    ) -> Result<i64> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO inbox(recipient, corr, project_id, kind, body, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![recipient, corr, project_id, kind, body, created_at],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn next_inbox_message(&self, recipient: &str) -> Result<Option<InboxMessage>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT seq, recipient, corr, project_id, kind, body, created_at, acked_at,
+                    attempts, dead_at
+             FROM inbox
+             WHERE recipient=?1 AND acked_at IS NULL AND dead_at IS NULL
+             ORDER BY seq ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![recipient])?;
+        Ok(rows.next()?.map(|r| InboxMessage {
+            seq: r.get_unwrap(0),
+            recipient: r.get_unwrap(1),
+            corr: r.get_unwrap(2),
+            project_id: r.get_unwrap(3),
+            kind: r.get_unwrap(4),
+            body: r.get_unwrap(5),
+            created_at: r.get_unwrap(6),
+            acked_at: r.get_unwrap(7),
+            attempts: r.get_unwrap(8),
+            dead_at: r.get_unwrap(9),
+        }))
+    }
+
+    pub fn ack_inbox_message(&self, seq: i64, acked_at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE inbox SET acked_at=?2 WHERE seq=?1",
+            params![seq, acked_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_inbox_message(&self, seq: i64, dead_at_attempts: i64, now: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE inbox SET attempts=attempts+1,
+                    dead_at=CASE WHEN attempts+1 >= ?2 THEN ?3 ELSE dead_at END
+             WHERE seq=?1",
+            params![seq, dead_at_attempts, now],
+        )?;
+        Ok(c.query_row(
+            "SELECT dead_at IS NOT NULL FROM inbox WHERE seq=?1",
+            params![seq],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn prune_inbox(&self, acked_before: &str) -> Result<usize> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "DELETE FROM inbox WHERE acked_at IS NOT NULL AND acked_at < ?1",
+            params![acked_before],
+        )?)
+    }
+
+    pub fn insert_task(&self, corr: &str, project_id: &str, at: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "INSERT OR IGNORE INTO tasks(corr, project_id, state, created_at, changed_at)
+             VALUES(?1, ?2, 'open', ?3, ?3)",
+            params![corr, project_id, at],
+        )? == 1)
+    }
+
+    pub fn get_task(&self, corr: &str) -> Result<Option<WdTask>> {
+        Ok(self.select_tasks("WHERE corr=?1", params![corr])?.pop())
+    }
+
+    pub fn list_open_tasks(&self) -> Result<Vec<WdTask>> {
+        self.select_tasks(
+            "WHERE state='open' ORDER BY created_at ASC, corr ASC",
+            params![],
+        )
+    }
+
+    fn select_tasks(&self, filter: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<WdTask>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(&format!(
+            "SELECT corr, project_id, leader_id, state, created_at, last_delivered_at,
+                    last_mail_at, nudged_at, progress_sent_at, changed_at, board_sent_at
+             FROM tasks {filter}"
+        ))?;
+        let rows = stmt.query_map(args, |r| {
+            Ok(WdTask {
+                corr: r.get(0)?,
+                project_id: r.get(1)?,
+                leader_id: r.get(2)?,
+                state: r.get(3)?,
+                created_at: r.get(4)?,
+                last_delivered_at: r.get(5)?,
+                last_mail_at: r.get(6)?,
+                nudged_at: r.get(7)?,
+                progress_sent_at: r.get(8)?,
+                changed_at: r.get(9)?,
+                board_sent_at: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn update_task(&self, set: &str, corr: &str, args: &[&str]) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&corr];
+        values.extend(args.iter().map(|a| a as &dyn rusqlite::ToSql));
+        c.execute(
+            &format!("UPDATE tasks SET {set} WHERE corr=?1"),
+            values.as_slice(),
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_task_delivered(&self, corr: &str, leader_id: &str, at: &str) -> Result<()> {
+        self.update_task(
+            "leader_id=?2, last_delivered_at=?3, nudged_at=NULL, progress_sent_at=NULL,
+             changed_at=?3",
+            corr,
+            &[leader_id, at],
+        )
+    }
+
+    pub fn mark_task_mail(&self, corr: &str, at: &str) -> Result<()> {
+        self.update_task("last_mail_at=?2, changed_at=?2", corr, &[at])
+    }
+
+    pub fn close_task(&self, corr: &str, at: &str) -> Result<()> {
+        self.update_task("state='closed', changed_at=?2", corr, &[at])
+    }
+
+    pub fn set_task_nudged(&self, corr: &str, at: &str) -> Result<()> {
+        self.update_task("nudged_at=?2", corr, &[at])
+    }
+
+    pub fn set_task_progress_sent(&self, corr: &str, at: &str) -> Result<()> {
+        self.update_task("progress_sent_at=?2", corr, &[at])
+    }
+
+    pub fn stamp_board_sent(&self, at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("UPDATE tasks SET board_sent_at=?1", params![at])?;
+        Ok(())
+    }
+
+    pub fn insert_permission_request(&self, r: &PermissionRequest) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "INSERT OR IGNORE INTO permission_requests
+                 (req_id, corr, leader_id, tool, description, seen_at, answered_at, closed_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                r.req_id,
+                r.corr,
+                r.leader_id,
+                r.tool,
+                r.description,
+                r.seen_at,
+                r.answered_at,
+                r.closed_at
+            ],
+        )? == 1)
+    }
+
+    pub fn unanswered_permission_requests(&self, corr: &str) -> Result<Vec<PermissionRequest>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT req_id, corr, leader_id, tool, description, seen_at, answered_at, closed_at
+             FROM permission_requests
+             WHERE corr=?1 AND answered_at IS NULL AND closed_at IS NULL
+             ORDER BY seen_at DESC, rowid DESC",
+        )?;
+        let rows = stmt.query_map(params![corr], |r| {
+            Ok(PermissionRequest {
+                req_id: r.get(0)?,
+                corr: r.get(1)?,
+                leader_id: r.get(2)?,
+                tool: r.get(3)?,
+                description: r.get(4)?,
+                seen_at: r.get(5)?,
+                answered_at: r.get(6)?,
+                closed_at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn answer_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE permission_requests SET answered_at=?2 WHERE req_id=?1",
+            params![req_id, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn close_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE permission_requests SET closed_at=?2 WHERE req_id=?1",
+            params![req_id, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn permission_request_ids(&self, corr: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT req_id FROM permission_requests WHERE corr=?1")?;
+        let rows = stmt.query_map(params![corr], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn prune_tasks(&self, before: &str) -> Result<usize> {
+        let c = self.conn.lock().unwrap();
+        let tasks = c.execute(
+            "DELETE FROM tasks WHERE state='closed' AND changed_at < ?1",
+            params![before],
+        )?;
+        let requests = c.execute(
+            "DELETE FROM permission_requests WHERE closed_at < ?1 OR answered_at < ?1",
+            params![before],
+        )?;
+        Ok(tasks + requests)
     }
 
     // ---- files ----
@@ -477,10 +1005,15 @@ const MIGRATIONS: &[MigrationStep] = &[
     (1, migration_1_path_hash),
     (2, migration_2_orchestration_enabled),
     (3, migration_3_runs_feature),
+    (4, migration_4_runs_final_transcript),
+    (5, migration_5_runs_request),
+    (6, migration_6_runs_notice),
+    (7, migration_7_inbox),
+    (8, migration_8_tasks),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -545,6 +1078,102 @@ fn migration_3_runs_feature(conn: &Connection) -> Result<()> {
     if !has_column(conn, "runs", "feature")? {
         conn.execute("ALTER TABLE runs ADD COLUMN feature TEXT", [])?;
     }
+    Ok(())
+}
+
+/// v4 (dispatch-submit-and-reclaim P2-4) — the transcript a run finished
+/// with. Once a finished run's pane can be closed, the pane is no longer
+/// there to re-read, so the answer a repeat await gets has to be one the
+/// store already holds. Nullable with no default, for the same reason
+/// `feature` is: a run still working genuinely has no final transcript, and
+/// so does every row written before this column existed.
+fn migration_4_runs_final_transcript(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "runs", "final_transcript")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN final_transcript TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn migration_5_runs_request(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "runs", "request_id")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN request_id TEXT", [])?;
+    }
+    if !has_column(conn, "runs", "caller")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN caller TEXT", [])?;
+    }
+    if !has_column(conn, "runs", "attempts")? {
+        conn.execute(
+            "ALTER TABLE runs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_request ON runs(project_id, request_id)
+         WHERE request_id IS NOT NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migration_6_runs_notice(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "runs", "notice")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN notice TEXT", [])?;
+    }
+    if !has_column(conn, "runs", "notice_state")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN notice_state TEXT", [])?;
+    }
+    if !has_column(conn, "runs", "notice_until")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN notice_until TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn migration_7_inbox(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS inbox (
+             seq INTEGER PRIMARY KEY,
+             recipient TEXT NOT NULL,
+             corr TEXT NOT NULL,
+             project_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             body TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             acked_at TEXT,
+             attempts INTEGER NOT NULL DEFAULT 0,
+             dead_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(recipient, acked_at, dead_at, seq);",
+    )?;
+    Ok(())
+}
+
+fn migration_8_tasks(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tasks (
+             corr TEXT PRIMARY KEY,
+             project_id TEXT NOT NULL,
+             leader_id TEXT,
+             state TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             last_delivered_at TEXT,
+             last_mail_at TEXT,
+             nudged_at TEXT,
+             progress_sent_at TEXT,
+             changed_at TEXT NOT NULL,
+             board_sent_at TEXT
+         );
+         CREATE TABLE IF NOT EXISTS permission_requests (
+             req_id TEXT PRIMARY KEY,
+             corr TEXT NOT NULL,
+             leader_id TEXT NOT NULL,
+             tool TEXT NOT NULL,
+             description TEXT NOT NULL,
+             seen_at TEXT NOT NULL,
+             answered_at TEXT,
+             closed_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_permission_requests_corr ON permission_requests(corr);",
+    )?;
     Ok(())
 }
 
@@ -633,7 +1262,14 @@ CREATE TABLE IF NOT EXISTS runs (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    feature TEXT
+    feature TEXT,
+    final_transcript TEXT,
+    request_id TEXT,
+    caller TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    notice TEXT,
+    notice_state TEXT,
+    notice_until TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
 "#;
@@ -1124,6 +1760,145 @@ mod tests {
         );
     }
 
+    /// board-run-reaper D1: the reaper's sweep list is every `working` run
+    /// waggledance itself spawned, in every project. The four rows this test
+    /// keeps out are the whole contract — a finished run, a reaped (`lost`)
+    /// run, and a run in a pane the user already owned (NULL
+    /// `preset_label`, the same guard `finish` reads before closing
+    /// anything) must never reach a sweep, while a second project's working
+    /// run must.
+    #[test]
+    fn the_sweep_list_is_every_waggledance_spawned_working_run_in_every_project() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+
+        let mut working = sample_run();
+        working.id = "r-working".into();
+        working.status = "working".into();
+        working.created_at = "2026-08-16T00:00:00Z".into();
+        s.insert_run(&working, Some("board-run-reaper")).unwrap();
+
+        // Another project entirely, and newer — the sweep is project-blind
+        // and newest-first.
+        let mut other_project = sample_run();
+        other_project.id = "r-other-project".into();
+        other_project.project_id = "p2".into();
+        other_project.status = "working".into();
+        other_project.created_at = "2026-08-17T00:00:00Z".into();
+        s.insert_run(&other_project, None).unwrap();
+
+        let mut done = sample_run();
+        done.id = "r-done".into();
+        done.status = "done".into();
+        s.insert_run(&done, Some("board-run-reaper")).unwrap();
+
+        let mut lost = sample_run();
+        lost.id = "r-lost".into();
+        lost.status = "lost".into();
+        s.insert_run(&lost, Some("board-run-reaper")).unwrap();
+
+        // Dispatched into a pane the user already owned: no preset label,
+        // so nothing waggledance spawned, so not the reaper's business.
+        let mut borrowed = sample_run();
+        borrowed.id = "r-borrowed-pane".into();
+        borrowed.status = "working".into();
+        borrowed.preset_label = None;
+        s.insert_run(&borrowed, Some("board-run-reaper")).unwrap();
+
+        let sweep = s.list_unattended_working_runs().unwrap();
+        assert_eq!(
+            sweep.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-other-project", "r-working"],
+            "only preset-labeled working rows, newest first: {sweep:?}"
+        );
+
+        // And a run the reaper caps leaves the list on the next sweep.
+        s.update_run_status("r-working", "lost", "2026-08-18T00:00:00Z", None, None)
+            .unwrap();
+        let sweep = s.list_unattended_working_runs().unwrap();
+        assert_eq!(
+            sweep.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-other-project"],
+            "a reaped run is not swept twice: {sweep:?}"
+        );
+    }
+
+    #[test]
+    fn working_paseo_runs_are_listed_apart_from_the_herdr_sweep() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for (id, pane, status) in [
+            ("r-paseo", "paseo:agent-1", "working"),
+            ("r-paseo-done", "paseo:agent-2", "done"),
+            ("r-herdr", "w1:p1", "working"),
+        ] {
+            let mut run = sample_run();
+            run.id = id.into();
+            run.pane_id = pane.into();
+            run.status = status.into();
+            run.preset_label = None;
+            s.insert_run(&run, None).unwrap();
+        }
+        let paseo = s.list_working_paseo_runs().unwrap();
+        assert_eq!(
+            paseo.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-paseo"]
+        );
+        assert!(s.list_unattended_working_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn leader_waits_are_blocked_paseo_runs_and_only_recent_lost_ones() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for (id, pane, status, updated_at) in [
+            (
+                "r-blocked",
+                "paseo:agent-1",
+                "blocked",
+                "2026-10-16T09:00:00Z",
+            ),
+            (
+                "r-lost-inside",
+                "paseo:agent-2",
+                "lost",
+                "2026-10-16T10:30:00Z",
+            ),
+            (
+                "r-lost-outside",
+                "paseo:agent-3",
+                "lost",
+                "2026-10-16T08:00:00Z",
+            ),
+            (
+                "r-working",
+                "paseo:agent-4",
+                "working",
+                "2026-10-16T10:40:00Z",
+            ),
+            (
+                "r-herdr-blocked",
+                "w1:p1",
+                "blocked",
+                "2026-10-16T10:40:00Z",
+            ),
+        ] {
+            let mut run = sample_run();
+            run.id = id.into();
+            run.pane_id = pane.into();
+            run.status = status.into();
+            run.updated_at = updated_at.into();
+            s.insert_run(&run, None).unwrap();
+        }
+        let waits = s.list_leader_waits("2026-10-16T10:00:00Z").unwrap();
+        assert_eq!(
+            waits.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-lost-inside", "r-blocked"],
+            "blocked always counts, lost only inside the window, and neither a working nor a \
+             herdr-pane run is a leader wait: {waits:?}"
+        );
+    }
+
     /// A database whose `runs` table predates the `feature` column: SCHEMA's
     /// `CREATE TABLE IF NOT EXISTS` leaves it exactly as it was, so the
     /// migration step is the only thing that can add the column. The old row
@@ -1187,6 +1962,377 @@ mod tests {
         );
     }
 
+    /// dispatch-submit-and-reclaim P2-4: the transcript a run finished with
+    /// is stored on its own row, so the answer survives the pane. A run
+    /// still working has none — that is what makes a non-NULL column mean
+    /// "over".
+    #[test]
+    fn a_runs_final_transcript_round_trips_and_is_empty_until_it_finishes() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        s.insert_run(&sample_run(), None).unwrap();
+
+        assert_eq!(
+            s.run_final_transcript("r1").unwrap(),
+            None,
+            "a run that has not finished carries no final transcript"
+        );
+        assert_eq!(
+            s.run_final_transcript("r-unknown").unwrap(),
+            None,
+            "an unknown run reads back the same honest none"
+        );
+
+        s.set_run_final_transcript("r1", "the last delta\nHERDR_DONE_abc123")
+            .unwrap();
+        assert_eq!(
+            s.run_final_transcript("r1").unwrap().as_deref(),
+            Some("the last delta\nHERDR_DONE_abc123"),
+            "the transcript a run ended with must survive the round trip"
+        );
+        assert_eq!(
+            s.get_run("r1").unwrap().unwrap().status,
+            "pending",
+            "writing the transcript touches no other column"
+        );
+    }
+
+    /// A database whose `runs` table predates `final_transcript`: as with
+    /// `feature`, only the migration can add it, and running the migration
+    /// twice (a second open of the same file) must stay a no-op.
+    #[test]
+    fn migrate_adds_the_runs_final_transcript_column_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO runs VALUES('r-old','p1','pane-1',NULL,'t','','m','done','t','t');",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            assert!(
+                has_column(&c, "runs", "final_transcript").unwrap(),
+                "the migration must add the column an older build never had"
+            );
+            // A second open runs `migrate` again against the same database.
+            // `has_column` guards the ALTER, and `user_version` already
+            // stands at the target, so the step must not error or double-add.
+            super::migrate(&c).unwrap();
+            super::migration_4_runs_final_transcript(&c)
+                .expect("re-running the step against a migrated database is a no-op");
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+        }
+
+        assert_eq!(
+            s.run_final_transcript("r-old").unwrap(),
+            None,
+            "a row written before the column existed has no stored transcript"
+        );
+        s.set_run_final_transcript("r-old", "recovered").unwrap();
+        assert_eq!(
+            s.run_final_transcript("r-old").unwrap().as_deref(),
+            Some("recovered"),
+            "the migrated column is writable"
+        );
+    }
+
+    fn queued_leader_run(id: &str, project_id: &str, created_at: &str) -> Run {
+        let mut run = sample_run();
+        run.id = id.into();
+        run.project_id = project_id.into();
+        run.pane_id = "paseo:pending".into();
+        run.preset_label = None;
+        run.status = "queued".into();
+        run.created_at = created_at.into();
+        run
+    }
+
+    #[test]
+    fn migrate_adds_the_runs_request_columns_to_a_v4_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 feature TEXT,
+                 final_transcript TEXT
+             );
+             INSERT INTO runs VALUES('r-old','p1','paseo:a1',NULL,'t','','m','done','t','t',NULL,'fin');
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            for column in ["request_id", "caller", "attempts"] {
+                assert!(has_column(&c, "runs", column).unwrap(), "{column}");
+            }
+            super::migrate(&c).unwrap();
+            super::migration_5_runs_request(&c).unwrap();
+        }
+        assert_eq!(s.get_run("r-old").unwrap().unwrap().status, "done");
+        assert_eq!(
+            s.run_final_transcript("r-old").unwrap().as_deref(),
+            Some("fin")
+        );
+        assert_eq!(s.run_attempts("r-old").unwrap(), Some(0));
+        assert_eq!(s.run_caller("r-old").unwrap(), None);
+    }
+
+    #[test]
+    fn migrate_adds_the_runs_notice_columns_to_a_v5_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 feature TEXT,
+                 final_transcript TEXT,
+                 request_id TEXT,
+                 caller TEXT,
+                 attempts INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO runs VALUES('r-old','p1','paseo:a1',NULL,'t','','m','done','t','t',NULL,'fin','req-1','caller',0);
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            for column in ["notice", "notice_state", "notice_until"] {
+                assert!(has_column(&c, "runs", column).unwrap(), "{column}");
+            }
+            super::migrate(&c).unwrap();
+            super::migration_6_runs_notice(&c).unwrap();
+        }
+        assert_eq!(s.get_run("r-old").unwrap().unwrap().status, "done");
+        assert_eq!(s.run_caller("r-old").unwrap().as_deref(), Some("caller"));
+        assert!(
+            s.pending_notices().unwrap().is_empty(),
+            "a row written before the columns existed owes no notice"
+        );
+    }
+
+    #[test]
+    fn a_finished_run_keeps_its_caller_notice_until_it_is_sent_or_dropped() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        s.insert_run_with_request(&sample_run(), None, None, Some("caller"))
+            .unwrap();
+
+        assert!(s.pending_notices().unwrap().is_empty());
+        s.finish_run(
+            "r1",
+            "done",
+            "2026-10-16T11:00:00Z",
+            Some("the reply"),
+            Some(("notice one", "2026-10-16T12:00:00Z")),
+        )
+        .unwrap();
+
+        let run = s.get_run("r1").unwrap().unwrap();
+        assert_eq!(run.status, "done");
+        assert_eq!(run.updated_at, "2026-10-16T11:00:00Z");
+        assert_eq!(
+            s.run_final_transcript("r1").unwrap().as_deref(),
+            Some("the reply")
+        );
+        assert_eq!(
+            s.pending_notices().unwrap(),
+            vec![(
+                "r1".to_string(),
+                "caller".to_string(),
+                "notice one".to_string(),
+                "2026-10-16T12:00:00Z".to_string()
+            )]
+        );
+
+        s.set_notice_state("r1", "sent").unwrap();
+        assert!(s.pending_notices().unwrap().is_empty());
+
+        s.set_notice_state("r1", "pending").unwrap();
+        s.finish_run(
+            "r1",
+            "blocked",
+            "2026-10-16T11:05:00Z",
+            None,
+            Some(("notice two", "2026-10-16T12:00:00Z")),
+        )
+        .unwrap();
+        assert_eq!(
+            s.pending_notices()
+                .unwrap()
+                .iter()
+                .map(|n| n.2.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notice two"],
+            "a newer notice replaces the one still pending for the same run"
+        );
+        assert_eq!(
+            s.run_final_transcript("r1").unwrap().as_deref(),
+            Some("the reply"),
+            "a finish with no transcript leaves the stored one alone"
+        );
+    }
+
+    #[test]
+    fn runs_with_one_request_id_insert_once_per_project() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        let first = queued_leader_run("r-a", "p1", "2026-08-16T00:00:00Z");
+        assert_eq!(
+            s.insert_run_with_request(&first, None, Some("req-1"), Some("agent-x"))
+                .unwrap(),
+            "r-a"
+        );
+        let repeat = queued_leader_run("r-b", "p1", "2026-08-16T00:00:01Z");
+        assert_eq!(
+            s.insert_run_with_request(&repeat, None, Some("req-1"), None)
+                .unwrap(),
+            "r-a"
+        );
+        assert!(s.get_run("r-b").unwrap().is_none());
+        assert_eq!(s.run_by_request("p1", "req-1").unwrap().unwrap().id, "r-a");
+        assert_eq!(s.run_caller("r-a").unwrap().as_deref(), Some("agent-x"));
+
+        let other = queued_leader_run("r-c", "p2", "2026-08-16T00:00:02Z");
+        assert_eq!(
+            s.insert_run_with_request(&other, None, Some("req-1"), None)
+                .unwrap(),
+            "r-c"
+        );
+        assert!(s.run_by_request("p1", "req-missing").unwrap().is_none());
+
+        let mut plain = sample_run();
+        plain.id = "r-d".into();
+        s.insert_run(&plain, None).unwrap();
+        plain.id = "r-e".into();
+        s.insert_run(&plain, None).unwrap();
+        assert!(s.insert_run(&plain, None).is_err());
+        s.set_run_request("r-d", "req-2").unwrap();
+        assert_eq!(
+            s.run_by_request(&plain.project_id, "req-2")
+                .unwrap()
+                .unwrap()
+                .id,
+            "r-d"
+        );
+    }
+
+    #[test]
+    fn queued_paseo_runs_claim_once_and_requeue_with_an_attempt() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for run in [
+            queued_leader_run("r-late", "p1", "2026-08-16T00:00:02Z"),
+            queued_leader_run("r-early", "p1", "2026-08-16T00:00:01Z"),
+            queued_leader_run("r-p2", "p2", "2026-08-16T00:00:03Z"),
+        ] {
+            s.insert_run(&run, None).unwrap();
+        }
+        let mut herdr = queued_leader_run("r-herdr", "p1", "2026-08-16T00:00:00Z");
+        herdr.pane_id = "w1:p1".into();
+        s.insert_run(&herdr, None).unwrap();
+
+        assert_eq!(
+            s.list_queued_paseo_runs("p1")
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r-early", "r-late"]
+        );
+        assert_eq!(
+            s.list_projects_with_queued_paseo_runs().unwrap(),
+            vec!["p1".to_string(), "p2".to_string()]
+        );
+
+        assert!(s.claim_queued_run("r-early").unwrap());
+        assert!(!s.claim_queued_run("r-early").unwrap());
+        let claimed = s.get_run("r-early").unwrap().unwrap();
+        assert_eq!(claimed.status, "working");
+        assert_eq!(claimed.pane_id, "paseo:pending");
+
+        s.set_run_pane("r-early", "paseo:agent-1").unwrap();
+        s.update_run_status("r-late", "blocked", "t", None, None)
+            .unwrap();
+        assert_eq!(
+            s.list_inflight_paseo_runs()
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r-early", "r-late"]
+        );
+
+        assert!(s.requeue_run("r-early").unwrap());
+        assert!(!s.requeue_run("r-early").unwrap());
+        assert_eq!(s.run_attempts("r-early").unwrap(), Some(1));
+        assert_eq!(s.get_run("r-early").unwrap().unwrap().status, "queued");
+        assert_eq!(s.run_attempts("r-unknown").unwrap(), None);
+    }
+
+    #[test]
+    fn queued_runs_are_not_in_the_unattended_working_runs_sweep() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        let mut run = queued_leader_run("r-q", "p1", "2026-08-16T00:00:00Z");
+        run.preset_label = Some("claude".into());
+        s.insert_run(&run, None).unwrap();
+        assert!(s.list_unattended_working_runs().unwrap().is_empty());
+        assert!(s.list_working_paseo_runs().unwrap().is_empty());
+    }
+
     #[test]
     fn set_orchestration_enabled_flips_the_flag_on_get_project() {
         let s = SqliteStore::open_in_memory().unwrap();
@@ -1237,5 +2383,361 @@ mod tests {
             )
             .unwrap();
         assert!(!flag, "existing rows must default the new column to off");
+    }
+
+    fn mail(s: &SqliteStore, project_id: &str, body: &str) -> i64 {
+        s.insert_inbox_message(
+            "wd",
+            "corr-1",
+            project_id,
+            "result",
+            body,
+            "2026-10-22T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migrate_adds_the_inbox_table_to_a_v6_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL,
+                 pane_id TEXT NOT NULL,
+                 preset_label TEXT,
+                 task TEXT NOT NULL,
+                 baseline TEXT NOT NULL,
+                 marker TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 feature TEXT,
+                 final_transcript TEXT,
+                 request_id TEXT,
+                 caller TEXT,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 notice TEXT,
+                 notice_state TEXT,
+                 notice_until TEXT
+             );
+             INSERT INTO runs VALUES('r-a','p1','paseo:a1',NULL,'t','','m','done','t','t',NULL,'fin','req-1','caller',0,NULL,NULL,NULL);
+             INSERT INTO runs VALUES('r-b','p1','paseo:a2',NULL,'t','','m','working','t','t',NULL,NULL,'req-2',NULL,1,NULL,NULL,NULL);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            assert_eq!(
+                c.query_row::<i64, _, _>("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+                    .unwrap(),
+                2
+            );
+            super::migrate(&c).unwrap();
+            super::migration_7_inbox(&c).unwrap();
+        }
+        assert_eq!(s.get_run("r-b").unwrap().unwrap().status, "working");
+        let seq = mail(&s, "p1", "hello");
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, seq);
+    }
+
+    #[test]
+    fn next_pending_inbox_message_is_the_lowest_seq_and_ack_hides_it() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
+        let first = mail(&s, "p1", "one");
+        let second = mail(&s, "p1", "two");
+        s.insert_inbox_message("other", "c", "p1", "result", "x", "t")
+            .unwrap();
+        assert!(second > first);
+
+        let next = s.next_inbox_message("wd").unwrap().unwrap();
+        assert_eq!(next.seq, first);
+        assert_eq!(next.recipient, "wd");
+        assert_eq!(next.corr, "corr-1");
+        assert_eq!(next.project_id, "p1");
+        assert_eq!(next.kind, "result");
+        assert_eq!(next.body, "one");
+        assert_eq!(next.created_at, "2026-10-22T00:00:00Z");
+        assert_eq!(next.acked_at, None);
+        assert_eq!(next.attempts, 0);
+        assert_eq!(next.dead_at, None);
+
+        s.ack_inbox_message(first, "2026-10-22T00:01:00Z").unwrap();
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, second);
+        s.ack_inbox_message(second, "2026-10-22T00:02:00Z").unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
+    }
+
+    #[test]
+    fn five_failed_attempts_mark_an_inbox_message_dead_and_next_pending_skips_it() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let poison = mail(&s, "p1", "poison");
+        let after = mail(&s, "p1", "after");
+        for attempt in 1..5 {
+            assert!(!s
+                .fail_inbox_message(poison, 5, "2026-10-22T00:05:00Z")
+                .unwrap());
+            let next = s.next_inbox_message("wd").unwrap().unwrap();
+            assert_eq!((next.seq, next.attempts), (poison, attempt));
+        }
+        assert!(s
+            .fail_inbox_message(poison, 5, "2026-10-22T00:05:00Z")
+            .unwrap());
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().seq, after);
+    }
+
+    #[test]
+    fn prune_deletes_only_acked_inbox_rows_older_than_the_cutoff() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let old_acked = mail(&s, "p1", "old");
+        let new_acked = mail(&s, "p1", "new");
+        let pending = mail(&s, "p1", "pending");
+        s.ack_inbox_message(old_acked, "2026-09-01T00:00:00Z")
+            .unwrap();
+        s.ack_inbox_message(new_acked, "2026-10-21T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(s.prune_inbox("2026-09-22T00:00:00Z").unwrap(), 1);
+        let c = s.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT seq FROM inbox ORDER BY seq").unwrap();
+        let left: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec![new_acked, pending]);
+    }
+
+    #[test]
+    fn delete_project_removes_only_that_projects_inbox_rows() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        mail(&s, "p1", "gone");
+        let kept = mail(&s, "p2", "kept");
+        s.delete_project("p1").unwrap();
+        let next = s.next_inbox_message("wd").unwrap().unwrap();
+        assert_eq!((next.seq, next.project_id.as_str()), (kept, "p2"));
+        s.ack_inbox_message(kept, "t").unwrap();
+        assert!(s.next_inbox_message("wd").unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_adds_the_tasks_and_permission_tables_to_a_v7_database_keeping_its_inbox() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::migration_7_inbox(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO inbox(recipient, corr, project_id, kind, body, created_at)
+             VALUES('wd','c-1','p1','result','kept','t');
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+
+        let s = SqliteStore::from_conn(conn).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            assert_eq!(
+                c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap(),
+                8
+            );
+            super::migrate(&c).unwrap();
+            super::migration_8_tasks(&c).unwrap();
+        }
+        assert_eq!(s.next_inbox_message("wd").unwrap().unwrap().body, "kept");
+        assert!(s.insert_task("c-1", "p1", "t0").unwrap());
+        assert!(s
+            .insert_permission_request(&request("q-1", "c-1", "t0"))
+            .unwrap());
+    }
+
+    fn request(req_id: &str, corr: &str, seen_at: &str) -> PermissionRequest {
+        PermissionRequest {
+            req_id: req_id.into(),
+            corr: corr.into(),
+            leader_id: "lead".into(),
+            tool: "Bash".into(),
+            description: "rm -rf target".into(),
+            seen_at: seen_at.into(),
+            answered_at: None,
+            closed_at: None,
+        }
+    }
+
+    #[test]
+    fn an_inserted_task_is_open_with_only_its_creation_stamps_and_inserts_once() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.get_task("c-1").unwrap().is_none());
+        assert!(s.insert_task("c-1", "p1", "t1").unwrap());
+        assert!(!s.insert_task("c-1", "p2", "t2").unwrap());
+        assert_eq!(
+            s.get_task("c-1").unwrap().unwrap(),
+            WdTask {
+                corr: "c-1".into(),
+                project_id: "p1".into(),
+                leader_id: None,
+                state: "open".into(),
+                created_at: "t1".into(),
+                last_delivered_at: None,
+                last_mail_at: None,
+                nudged_at: None,
+                progress_sent_at: None,
+                changed_at: "t1".into(),
+                board_sent_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn delivery_records_the_leader_and_clears_the_nudge_marks() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_task("c-1", "p1", "t1").unwrap();
+        s.set_task_nudged("c-1", "t2").unwrap();
+        s.set_task_progress_sent("c-1", "t3").unwrap();
+        let t = s.get_task("c-1").unwrap().unwrap();
+        assert_eq!(
+            (t.nudged_at.as_deref(), t.progress_sent_at.as_deref()),
+            (Some("t2"), Some("t3"))
+        );
+        assert_eq!(t.changed_at, "t1");
+
+        s.mark_task_delivered("c-1", "lead", "t4").unwrap();
+        let t = s.get_task("c-1").unwrap().unwrap();
+        assert_eq!(t.leader_id.as_deref(), Some("lead"));
+        assert_eq!(t.last_delivered_at.as_deref(), Some("t4"));
+        assert_eq!((t.nudged_at, t.progress_sent_at), (None, None));
+        assert_eq!(t.changed_at, "t4");
+    }
+
+    #[test]
+    fn mail_and_close_stamp_changed_at_and_close_drops_the_task_from_the_open_list() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_task("c-1", "p1", "t1").unwrap();
+        s.insert_task("c-2", "p2", "t2").unwrap();
+        s.mark_task_mail("c-1", "t3").unwrap();
+        let t = s.get_task("c-1").unwrap().unwrap();
+        assert_eq!(
+            (t.last_mail_at.as_deref(), t.changed_at.as_str()),
+            (Some("t3"), "t3")
+        );
+        let open: Vec<String> = s
+            .list_open_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.corr)
+            .collect();
+        assert_eq!(open, vec!["c-1", "c-2"]);
+
+        s.close_task("c-1", "t4").unwrap();
+        let t = s.get_task("c-1").unwrap().unwrap();
+        assert_eq!((t.state.as_str(), t.changed_at.as_str()), ("closed", "t4"));
+        let open: Vec<String> = s
+            .list_open_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.corr)
+            .collect();
+        assert_eq!(open, vec!["c-2"]);
+    }
+
+    #[test]
+    fn stamping_the_board_marks_every_task() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_task("c-1", "p1", "t1").unwrap();
+        s.insert_task("c-2", "p2", "t2").unwrap();
+        s.close_task("c-2", "t3").unwrap();
+        s.stamp_board_sent("t5").unwrap();
+        for corr in ["c-1", "c-2"] {
+            let t = s.get_task(corr).unwrap().unwrap();
+            assert_eq!(t.board_sent_at.as_deref(), Some("t5"), "{corr}");
+        }
+        assert_eq!(s.get_task("c-1").unwrap().unwrap().changed_at, "t1");
+    }
+
+    #[test]
+    fn permission_requests_insert_once_and_answer_or_close_hides_them() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s
+            .insert_permission_request(&request("q-1", "c-1", "t1"))
+            .unwrap());
+        assert!(!s
+            .insert_permission_request(&request("q-1", "c-1", "t9"))
+            .unwrap());
+        s.insert_permission_request(&request("q-2", "c-1", "t2"))
+            .unwrap();
+        s.insert_permission_request(&request("q-3", "c-1", "t3"))
+            .unwrap();
+        s.insert_permission_request(&request("q-4", "c-2", "t4"))
+            .unwrap();
+
+        let open = s.unanswered_permission_requests("c-1").unwrap();
+        assert_eq!(open[0], request("q-3", "c-1", "t3"));
+        let ids: Vec<&str> = open.iter().map(|r| r.req_id.as_str()).collect();
+        assert_eq!(ids, vec!["q-3", "q-2", "q-1"]);
+
+        s.answer_permission_request("q-3", "t5").unwrap();
+        s.close_permission_request("q-1", "t6").unwrap();
+        let ids: Vec<String> = s
+            .unanswered_permission_requests("c-1")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.req_id)
+            .collect();
+        assert_eq!(ids, vec!["q-2"]);
+        let mut known = s.permission_request_ids("c-1").unwrap();
+        known.sort();
+        assert_eq!(known, vec!["q-1", "q-2", "q-3"]);
+    }
+
+    #[test]
+    fn prune_drops_old_closed_tasks_and_old_answered_or_closed_requests_only() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_task("old-closed", "p1", "2026-08-01").unwrap();
+        s.close_task("old-closed", "2026-08-02").unwrap();
+        s.insert_task("new-closed", "p1", "2026-08-01").unwrap();
+        s.close_task("new-closed", "2026-10-20").unwrap();
+        s.insert_task("old-open", "p1", "2026-08-01").unwrap();
+        for id in ["old-answered", "old-closed", "new-answered", "old-pending"] {
+            s.insert_permission_request(&request(id, "c-1", "2026-08-01"))
+                .unwrap();
+        }
+        s.answer_permission_request("old-answered", "2026-08-02")
+            .unwrap();
+        s.close_permission_request("old-closed", "2026-08-02")
+            .unwrap();
+        s.answer_permission_request("new-answered", "2026-10-20")
+            .unwrap();
+
+        assert_eq!(s.prune_tasks("2026-09-22").unwrap(), 3);
+        assert!(s.get_task("old-closed").unwrap().is_none());
+        assert!(s.get_task("new-closed").unwrap().is_some());
+        assert!(s.get_task("old-open").unwrap().is_some());
+        let mut known = s.permission_request_ids("c-1").unwrap();
+        known.sort();
+        assert_eq!(known, vec!["new-answered", "old-pending"]);
+    }
+
+    #[test]
+    fn delete_project_removes_only_that_projects_tasks_and_their_requests() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        s.insert_task("c-1", "p1", "t1").unwrap();
+        s.insert_task("c-2", "p2", "t1").unwrap();
+        s.insert_permission_request(&request("q-1", "c-1", "t1"))
+            .unwrap();
+        s.insert_permission_request(&request("q-2", "c-2", "t1"))
+            .unwrap();
+        s.delete_project("p1").unwrap();
+        assert!(s.get_task("c-1").unwrap().is_none());
+        assert!(s.get_task("c-2").unwrap().is_some());
+        assert!(s.permission_request_ids("c-1").unwrap().is_empty());
+        assert_eq!(s.permission_request_ids("c-2").unwrap(), vec!["q-2"]);
     }
 }

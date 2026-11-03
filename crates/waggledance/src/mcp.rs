@@ -9,14 +9,16 @@
 
 use crate::herdr::{socket::SocketHerdr, Herdr};
 use crate::orchestrate;
+use crate::paseo;
 use crate::runtime;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use waggledance_core::bee;
-use waggledance_core::config::registry_db_path;
+use waggledance_core::config::{registry_db_path, resolve_data_dir};
 use waggledance_core::domain::{Project, Run};
+use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::notify_store::NotifyStore;
 use waggledance_core::{Config, Engine, Error, SqliteStore};
 
@@ -136,10 +138,12 @@ pub fn run() -> Result<()> {
                         view_file_schema(),
                         search_schema(),
                         projects_schema(),
+                        bee_upgrade_schema(),
                         ask_state_schema(),
                         dispatch_schema(),
                         await_schema(),
-                        runs_schema()
+                        runs_schema(),
+                        task_schema()
                     ]
                 }),
             )),
@@ -208,6 +212,23 @@ fn projects_schema() -> Value {
     })
 }
 
+fn bee_upgrade_schema() -> Value {
+    json!({
+        "name": "waggledance_bee_upgrade",
+        "description": "Upgrade bee in the registered projects that already use bee. \
+    Previews by default. With `apply: true` it runs `bee onboard --apply` and \
+    commits only bee's files. `apply` requires a non-empty `projects` list the \
+    human has approved.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "apply": { "type": "boolean", "default": false, "description": "Run the upgrade and commit; false previews" },
+                "projects": { "type": "array", "items": { "type": "string" }, "description": "Project ids to narrow the run to; required with apply" }
+            }
+        }
+    })
+}
+
 fn ask_state_schema() -> Value {
     json!({
         "name": "waggledance_ask_state",
@@ -222,8 +243,15 @@ fn ask_state_schema() -> Value {
     which is how you find an idle pane to reuse instead of spawning a new one. `panes` \
     is ABSENT when the terminal surface is switched off, `null` beside a `panes_error` \
     reason when herdr cannot be read — the bee state is complete either way — and an \
-    array otherwise. Seeing a pane grants nothing: dispatching still requires the \
-    project's own orchestration opt-in.",
+    array otherwise. Seeing a pane grants nothing: dispatch is refused in a project \
+    whose .waggledance.toml says `orchestration = false`. `leaders` lists the Paseo agents labelled \
+    waggledance.role=leader whose cwd sits in the project's root or one of its worktrees, \
+    oldest first: {agent_id, status, cwd, created, via, labels, waiting_on, \
+    last_daemon_run}, where `via` is `wd` for a leader carrying \
+    waggledance.via=wd and `daemon` otherwise. `leaders` is ABSENT when \
+    `[paseo] enabled = false`, `null` beside a `leaders_error` reason when Paseo cannot \
+    be read, and an array (possibly empty) beside `leaders_skipped`, the count of \
+    leaders under no registered project, otherwise.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -236,19 +264,22 @@ fn ask_state_schema() -> Value {
 fn dispatch_schema() -> Value {
     json!({
         "name": "waggledance_dispatch",
-        "description": "Dispatch a task to an agent pane in a project that has opted into \
-    orchestrator dispatch (D6 — refused, naming the remedy, when the project or the terminal \
-    surface has not been switched on). Either spawn a fresh agent via an operator-configured \
-    preset label, or target an already-running pane by id — exactly one of `preset`/`pane_id`, \
-    never both, and never a raw command. Returns a `run_id` immediately; poll completion with \
-    `waggledance_await`.",
+        "description": "Dispatch a task to an agent pane in a managed project. Every \
+    project takes dispatch unless its .waggledance.toml says `orchestration = false`; pane \
+    dispatch also needs terminal.enabled, and a refusal names the remedy. Either spawn a fresh agent via an operator-configured \
+    preset label, target an already-running pane by id, or hand the task to the project's Paseo \
+    leader with `leader: true` (queued and delivered by the waggledance daemon once the leader is \
+    idle) — exactly one of `preset`/`pane_id`/`leader`, and never a raw command. Returns a \
+    `run_id` immediately; poll completion with `waggledance_await`.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": { "type": "string", "description": "Registered project id" },
                 "preset": { "type": "string", "description": "Operator-configured agent preset label to spawn a fresh pane — mutually exclusive with pane_id" },
                 "pane_id": { "type": "string", "description": "An already-running pane id to target — mutually exclusive with preset" },
-                "task": { "type": "string", "description": "The task text sent to the agent" }
+                "leader": { "type": "boolean", "description": "true sends the task to the project's Paseo leader — mutually exclusive with preset and pane_id" },
+                "task": { "type": "string", "description": "The task text sent to the agent" },
+                "request_id": { "type": "string", "description": "Caller-chosen id for this request — pass one on every call so a retry never sends twice" }
             },
             "required": ["project", "task"]
         }
@@ -288,6 +319,27 @@ fn runs_schema() -> Value {
     })
 }
 
+fn task_schema() -> Value {
+    json!({
+        "name": "waggledance_task",
+        "description": "Follow up on a task wd handed to a project's Paseo leader, by its corr. \
+    `reply` and `redo` queue the user's words for that leader; `accept` closes the task and \
+    archives its leader when nothing else uses it; `allow` and `deny` answer the leader's \
+    permission request `req_id` (the newest unanswered one when absent). Only ever pass the \
+    user's own allow or deny.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "corr": { "type": "string", "description": "The task's correlation id" },
+                "action": { "type": "string", "enum": ["reply", "redo", "accept", "allow", "deny"] },
+                "text": { "type": "string", "description": "The user's words — required for reply and redo" },
+                "req_id": { "type": "string", "description": "The permission request to answer — allow and deny only" }
+            },
+            "required": ["corr", "action"]
+        }
+    })
+}
+
 fn handle_tool_call(
     id: Option<Value>,
     engine: &Engine,
@@ -308,10 +360,14 @@ fn handle_tool_call(
         "waggledance_view_file" => handle_view_file(id, engine, &args),
         "waggledance_search" => handle_search(id, engine, &args),
         "waggledance_projects" => handle_projects(id, engine),
+        "waggledance_bee_upgrade" => handle_bee_upgrade(id, engine, &args),
         "waggledance_ask_state" => handle_ask_state(id, engine, orchestration, &args),
         "waggledance_dispatch" => handle_dispatch(id, engine, orchestration, &args),
-        "waggledance_await" => handle_await(id, engine, orchestration, &args),
+        "waggledance_await" => {
+            handle_await(id, engine, orchestration, &args, &resolve_data_dir(None))
+        }
         "waggledance_runs" => handle_runs(id, engine, &args),
+        "waggledance_task" => handle_task(id, engine, orchestration, &args),
         _ => err(id, -32602, "unknown tool"),
     }
 }
@@ -520,6 +576,64 @@ fn handle_projects(id: Option<Value>, engine: &Engine) -> Value {
     )
 }
 
+fn handle_bee_upgrade(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
+    let apply = match args.get("apply") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return tool_error(id, "apply must be a boolean"),
+    };
+    let only: Vec<String> = match args.get("projects") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => match items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(ids) => ids,
+            None => return tool_error(id, "projects must be an array of project id strings"),
+        },
+        Some(_) => return tool_error(id, "projects must be an array of project id strings"),
+    };
+    if apply && only.is_empty() {
+        return tool_error(
+            id,
+            "apply true needs a non-empty projects list the human has approved",
+        );
+    }
+    let projects = match engine.list_projects() {
+        Ok(p) => p,
+        Err(e) => return tool_error(id, &format!("could not list registered projects: {e}")),
+    };
+    let opts = waggledance_core::bee_upgrade::UpgradeOptions {
+        apply,
+        only,
+        ..Default::default()
+    };
+    let report = match waggledance_core::bee_upgrade::run(&projects, &opts) {
+        Ok(r) => r,
+        Err(e) => return tool_error(id, &e.to_string()),
+    };
+    let structured = serde_json::to_value(&report).unwrap_or(Value::Null);
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for row in structured["projects"].as_array().into_iter().flatten() {
+        let status = row["outcome"]["status"].as_str().unwrap_or("unknown");
+        *counts.entry(status.to_string()).or_default() += 1;
+    }
+    let per_status = counts
+        .iter()
+        .map(|(status, n)| format!("{status} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!("{} project(s): {per_status}", report.projects.len());
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": structured
+        }),
+    )
+}
+
 /// `waggledance_ask_state`: parsed bee state, so the caller never opens a
 /// `.bee/` file itself. With `project`: the full digest for that project
 /// (`bee::read_snapshot`), including a project with no `.bee/` at all —
@@ -550,8 +664,17 @@ fn handle_ask_state(
             let rollup = rollups.pop().expect("one root in, one rollup out");
             let snapshot = &rollup.snapshot;
             let fleet = read_fleet_panes(engine, orchestration);
+            let leaders = read_leaders(&engine.config.paseo);
+            let mut claims: Vec<LeaderClaim> = engine
+                .list_projects()
+                .unwrap_or_default()
+                .iter()
+                .map(|other| (canonical(&other.root_path), other.id.clone()))
+                .collect();
+            claims.extend(worktree_claims(&p, &rollup));
             let mut digest = ask_state_digest(&p.id, snapshot);
             attach_panes(&mut digest, &p, &rollup, &fleet);
+            attach_leaders(&mut digest, engine, &p, &rollup, &claims, &leaders);
             let text = if !snapshot.present {
                 format!("{}: no .bee/ directory (absent)", p.id)
             } else {
@@ -588,12 +711,24 @@ fn handle_ask_state(
             // D4: one fleet read for the whole rollup, filtered per project
             // below — never one herdr call per project.
             let fleet = read_fleet_panes(engine, orchestration);
+            let leaders = read_leaders(&engine.config.paseo);
+            let claims: Vec<LeaderClaim> = projects
+                .iter()
+                .map(|p| (canonical(&p.root_path), p.id.clone()))
+                .chain(
+                    projects
+                        .iter()
+                        .zip(rollups.iter())
+                        .flat_map(|(p, rollup)| worktree_claims(p, rollup)),
+                )
+                .collect();
             let digests: Vec<Value> = projects
                 .iter()
                 .zip(rollups.iter())
                 .map(|(p, rollup)| {
                     let mut digest = ask_state_digest(&p.id, &rollup.snapshot);
                     attach_panes(&mut digest, p, rollup, &fleet);
+                    attach_leaders(&mut digest, engine, p, rollup, &claims, &leaders);
                     digest
                 })
                 .collect();
@@ -795,6 +930,161 @@ fn attach_panes(
     }
 }
 
+enum LeadersRead {
+    Off,
+    Unreachable(String),
+    Listed {
+        all: Vec<paseo::ListedAgent>,
+        wd: std::collections::HashSet<String>,
+    },
+}
+
+type LeaderClaim = (std::path::PathBuf, String);
+
+fn read_leaders(config: &waggledance_core::config::PaseoConfig) -> LeadersRead {
+    if config.enabled == Some(false) {
+        return LeadersRead::Off;
+    }
+    if let Some(reason) = paseo::paseo_unavailable(config) {
+        return LeadersRead::Unreachable(reason);
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return LeadersRead::Unreachable(format!("failed to start the Paseo read runtime: {e}"))
+        }
+    };
+    let cli = paseo::PaseoCli::new(config);
+    runtime
+        .block_on(async {
+            let all = cli.list_labelled(&paseo::role_leaders_args()).await?;
+            let wd = paseo::labelled(paseo::role_leaders_args(), paseo::WD_LABEL);
+            let wd = cli.list_labelled(&wd).await?;
+            Ok::<_, paseo::PaseoError>(LeadersRead::Listed {
+                all,
+                wd: wd.into_iter().map(|a| a.id).collect(),
+            })
+        })
+        .unwrap_or_else(|e| LeadersRead::Unreachable(e.to_string()))
+}
+
+fn canonical(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn agent_cwd(cwd: &str) -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    match cwd.strip_prefix('~') {
+        Some(rest) => canonical(&home.join(rest.trim_start_matches('/'))),
+        None => canonical(Path::new(cwd)),
+    }
+}
+
+fn worktree_claims(
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+) -> Vec<LeaderClaim> {
+    let Some(parent) = project.root_path.parent() else {
+        return Vec::new();
+    };
+    rollup
+        .snapshot
+        .worktrees
+        .iter()
+        .map(|w| (canonical(&parent.join(&w.id)), project.id.clone()))
+        .collect()
+}
+
+fn leader_owner<'a>(cwd: &Path, claims: &'a [LeaderClaim]) -> Option<&'a str> {
+    claims
+        .iter()
+        .filter(|(root, _)| cwd.starts_with(root))
+        .max_by_key(|(root, _)| root.components().count())
+        .map(|(_, id)| id.as_str())
+}
+
+fn attach_leaders(
+    digest: &mut Value,
+    engine: &Engine,
+    project: &waggledance_core::domain::Project,
+    rollup: &waggledance_core::bee::BeeProjectRollup,
+    claims: &[LeaderClaim],
+    leaders: &LeadersRead,
+) {
+    let Some(object) = digest.as_object_mut() else {
+        return;
+    };
+    let (all, wd) = match leaders {
+        LeadersRead::Off => return,
+        LeadersRead::Unreachable(reason) => {
+            object.insert("leaders".to_string(), Value::Null);
+            object.insert("leaders_error".to_string(), json!(reason));
+            return;
+        }
+        LeadersRead::Listed { all, wd } => (all, wd),
+    };
+    let mut skipped = 0usize;
+    let mut mine: Vec<(&paseo::ListedAgent, std::path::PathBuf)> = Vec::new();
+    for agent in all {
+        let cwd = agent_cwd(&agent.cwd);
+        match leader_owner(&cwd, claims) {
+            None => skipped += 1,
+            Some(owner) if owner == project.id => mine.push((agent, cwd)),
+            Some(_) => {}
+        }
+    }
+    mine.sort_by_key(|(agent, _)| {
+        std::cmp::Reverse(agent.created.as_deref().and_then(paseo::created_age_secs))
+    });
+    let last_daemon_run = if mine.is_empty() {
+        Value::Null
+    } else {
+        engine
+            .list_runs(&project.id, 20)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|r| r.pane_id.starts_with("paseo:"))
+            .map_or(
+                Value::Null,
+                |r| json!({ "run_id": r.id, "status": r.status }),
+            )
+    };
+    let waiting_on = rollup
+        .snapshot
+        .state
+        .as_ref()
+        .and_then(|s| s.waiting_on.as_ref())
+        .map_or(
+            Value::Null,
+            |w| json!({ "kind": w.kind, "subject": w.subject }),
+        );
+    let entries: Vec<Value> = mine
+        .into_iter()
+        .map(|(agent, cwd)| {
+            let via = wd.contains(&agent.id).then_some("wd");
+            json!({
+                "agent_id": agent.id,
+                "status": agent.status,
+                "cwd": cwd.display().to_string(),
+                "created": agent.created,
+                "via": via.unwrap_or("daemon"),
+                "labels": {
+                    "waggledance.role": "leader",
+                    "waggledance.project": project.id,
+                    "waggledance.via": via
+                },
+                "waiting_on": waiting_on,
+                "last_daemon_run": last_daemon_run
+            })
+        })
+        .collect();
+    object.insert("leaders".to_string(), Value::Array(entries));
+    object.insert("leaders_skipped".to_string(), json!(skipped));
+}
+
 /// The human-readable half of the tool result.
 ///
 /// Pure on purpose: the caller resolves the daemon's base URLs (which starts a
@@ -819,11 +1109,24 @@ fn attach_panes(
 /// (`orchestrator-dispatch` D3, unweakened). Nor does this widen who may
 /// dispatch: `terminal.enabled` and the per-project `orchestration.enabled`
 /// are checked by the caller and remain the only gate (D5).
-fn resolve_preset(
+///
+/// `pub(crate)` rather than private since observer-tick-trigger: the trigger
+/// (`crates/waggledance/src/trigger.rs`) dispatches its own ticks and needs a
+/// resolved entry to spawn one at all, so it calls this — the one resolver,
+/// with its global-then-project order intact — rather than growing a second
+/// copy that could disagree with it. Visibility only; no caller's answer
+/// changes.
+pub(crate) fn resolve_preset(
     engine: &Engine,
     project: &waggledance_core::domain::Project,
     label: &str,
-) -> std::result::Result<waggledance_core::config::AgentPreset, String> {
+) -> std::result::Result<
+    (
+        waggledance_core::config::AgentPreset,
+        waggledance_core::bee::BeeHerdingEntry,
+    ),
+    String,
+> {
     if let Some(global) = engine
         .config
         .terminal
@@ -831,13 +1134,23 @@ fn resolve_preset(
         .iter()
         .find(|p| p.label == label)
     {
-        return Ok(global.clone());
+        // An operator's preset is a command and nothing else: the conditions
+        // are a project's declaration, and a global list declares none.
+        let entry = waggledance_core::bee::BeeHerdingEntry {
+            argv: global.argv.clone(),
+            env: Vec::new(),
+            workspace_trust: None,
+        };
+        return Ok((global.clone(), entry));
     }
-    if let Some(argv) = waggledance_core::bee::herding_argv_for_label(&project.root_path, label) {
-        return Ok(waggledance_core::config::AgentPreset {
-            label: label.to_string(),
-            argv,
-        });
+    if let Some(entry) = waggledance_core::bee::herding_entry_for_label(&project.root_path, label) {
+        return Ok((
+            waggledance_core::config::AgentPreset {
+                label: label.to_string(),
+                argv: entry.argv.clone(),
+            },
+            entry,
+        ));
     }
     // D4: a label the project DECLARES but this reader cannot start is not
     // "unknown" — calling it that sends a caller hunting a typo that does not
@@ -895,15 +1208,29 @@ fn handle_dispatch(
         .get("pane_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    match (preset_label, pane_id_arg) {
-        (Some(_), Some(_)) => {
+    let leader = args.get("leader").and_then(Value::as_bool).unwrap_or(false);
+    let request_id = args
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    match [preset_label.is_some(), pane_id_arg.is_some(), leader]
+        .iter()
+        .filter(|t| **t)
+        .count()
+    {
+        0 => {
             return tool_error(
                 id,
-                "specify exactly one of \"preset\" or \"pane_id\", not both",
+                "specify one of \"preset\", \"pane_id\" or \"leader\": true",
             )
         }
-        (None, None) => return tool_error(id, "specify one of \"preset\" or \"pane_id\""),
-        _ => {}
+        1 => {}
+        _ => {
+            return tool_error(
+                id,
+                "specify exactly one of \"preset\", \"pane_id\" or \"leader\": true, not both",
+            )
+        }
     }
 
     let project = match engine.get_project(project_id) {
@@ -911,6 +1238,28 @@ fn handle_dispatch(
         Ok(None) => return tool_error(id, &format!("project not found: {project_id}")),
         Err(e) => return tool_error(id, &format!("project lookup failed: {e}")),
     };
+    if let Some(request_id) = request_id {
+        match engine.run_by_request(&project.id, request_id) {
+            Ok(Some(run)) => return duplicate(id, &run),
+            Ok(None) => {}
+            Err(e) => return tool_error(id, &format!("request lookup failed: {e}")),
+        }
+    }
+    if leader {
+        let caller = dispatch_caller(
+            std::env::var("PASEO_AGENT_ID").ok(),
+            std::env::var("WAGGLEDANCE_CALLER").ok(),
+        );
+        return dispatch_to_leader(
+            id,
+            engine,
+            &project,
+            task,
+            request_id,
+            caller.as_deref(),
+            &resolve_data_dir(None),
+        );
+    }
     if !engine.config.terminal.enabled {
         return tool_error(
             id,
@@ -919,20 +1268,14 @@ fn handle_dispatch(
         );
     }
     if !engine.orchestration_allowed(&project) {
-        return tool_error(
-            id,
-            &format!(
-                "project {project_id} has not opted into orchestrator dispatch — enable it \
-                 from the project's settings page"
-            ),
-        );
+        return tool_error(id, &dispatch_off(engine, &project));
     }
 
     // Resolved before any herdr call so an unresolvable label never touches
     // the socket at all.
     let preset = match preset_label {
         Some(label) => match resolve_preset(engine, &project, label) {
-            Ok(p) => Some(p),
+            Ok(resolved) => Some(resolved),
             Err(refusal) => return tool_error(id, &refusal),
         },
         None => None,
@@ -951,15 +1294,375 @@ fn handle_dispatch(
         task,
     ));
     match outcome {
-        Ok(run_id) => ok(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": format!("dispatched run {run_id}") }],
-                "structuredContent": { "run_id": run_id }
-            }),
-        ),
+        // D9: a fail-open step that went wrong is named HERE, in the answer
+        // that says the agent started — not left in the daemon's log, where a
+        // warning is indistinguishable from no warning at the moment the
+        // operator is looking at a pane that will not move.
+        Ok((run_id, mut warnings)) => {
+            if let Some(request_id) = request_id {
+                if let Err(e) = engine.set_run_request(&run_id, request_id) {
+                    warnings.push(format!("request_id not recorded: {e}"));
+                }
+            }
+            let text = if warnings.is_empty() {
+                format!("dispatched run {run_id}")
+            } else {
+                format!("dispatched run {run_id}; {}", warnings.join("; "))
+            };
+            ok(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": { "run_id": run_id, "duplicate": false, "warnings": warnings }
+                }),
+            )
+        }
         Err(msg) => tool_error(id, &msg),
     }
+}
+
+fn dispatch_off(engine: &Engine, project: &Project) -> String {
+    let file = waggledance_core::project_settings::settings_path(&project.root_path);
+    match engine.project_settings(project).0.unreadable {
+        Some(warning) => format!(
+            "project {} has a .waggledance.toml at {} that could not be read, so dispatch is \
+             off: {warning}",
+            project.id,
+            file.display()
+        ),
+        None => format!(
+            "project {} has turned off orchestrator dispatch with `orchestration = false` in {} \
+             — remove that line to allow it",
+            project.id,
+            file.display()
+        ),
+    }
+}
+
+const DELIVERY_PAUSED: &str =
+    "paused — waggledance daemon not running (start it with `waggledance serve`)";
+
+fn delivery_paused(data_dir: &Path) -> bool {
+    match std::fs::metadata(paseo::delivery_heartbeat_path(data_dir)).and_then(|m| m.modified()) {
+        Ok(beat) => beat
+            .elapsed()
+            .is_ok_and(|age| age > std::time::Duration::from_secs(30)),
+        Err(_) => true,
+    }
+}
+
+fn duplicate(id: Option<Value>, run: &Run) -> Value {
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": format!(
+                "request already accepted as run {} ({}) — nothing sent again",
+                run.id, run.status
+            ) }],
+            "structuredContent": { "run_id": run.id, "status": run.status, "duplicate": true }
+        }),
+    )
+}
+
+fn dispatch_caller(paseo_agent: Option<String>, waggledance: Option<String>) -> Option<String> {
+    paseo_agent
+        .filter(|s| !s.is_empty())
+        .or_else(|| (waggledance.as_deref() == Some("wd")).then(|| paseo::WD_CALLER.to_string()))
+}
+
+fn dispatch_to_leader(
+    id: Option<Value>,
+    engine: &Engine,
+    project: &Project,
+    task: &str,
+    request_id: Option<&str>,
+    caller: Option<&str>,
+    data_dir: &Path,
+) -> Value {
+    if !engine.orchestration_allowed(project) {
+        return tool_error(id, &dispatch_off(engine, project));
+    }
+    if let Some(why) = paseo::paseo_unavailable(&engine.config.paseo) {
+        return tool_error(id, &why);
+    }
+    let now = now_rfc3339();
+    let run_id = format!("run-{:016x}", rand::random::<u64>());
+    let task = match caller == Some(paseo::WD_CALLER) {
+        true => {
+            let corr = request_id.unwrap_or(&run_id);
+            paseo::wd_task(corr.split_once(':').map_or(corr, |(c, _)| c), task)
+        }
+        false => task.to_string(),
+    };
+    let run = Run {
+        id: run_id,
+        project_id: project.id.clone(),
+        pane_id: format!("{}pending", orchestrate::PASEO_PANE_PREFIX),
+        preset_label: None,
+        task,
+        baseline: now.clone(),
+        marker: String::new(),
+        status: "queued".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let stored = match engine.insert_run_with_request(&run, None, request_id, caller) {
+        Ok(stored) => stored,
+        Err(e) => return tool_error(id, &format!("run persistence failed: {e}")),
+    };
+    if stored != run.id {
+        return match engine.get_run(&stored) {
+            Ok(Some(existing)) => duplicate(id, &existing),
+            Ok(None) => tool_error(id, &format!("run {stored} vanished")),
+            Err(e) => tool_error(id, &format!("run lookup failed: {e}")),
+        };
+    }
+    let mut warnings: Vec<String> = if delivery_paused(data_dir) {
+        vec![DELIVERY_PAUSED.to_string()]
+    } else {
+        Vec::new()
+    };
+    let hand_off = request_id.filter(|r| caller == Some(paseo::WD_CALLER) && !r.contains(':'));
+    if let Some(corr) = hand_off {
+        if let Err(e) = engine.insert_task(corr, &project.id, &run.created_at) {
+            warnings.push(format!("task {corr} was not recorded: {e}"));
+        }
+    }
+    let mut text = format!(
+        "queued run {} for project {}'s Paseo leader",
+        run.id, project.id
+    );
+    for warning in &warnings {
+        text.push_str("; ");
+        text.push_str(warning);
+    }
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": {
+                "run_id": run.id,
+                "status": "queued",
+                "duplicate": false,
+                "warnings": warnings
+            }
+        }),
+    )
+}
+
+fn handle_task(
+    id: Option<Value>,
+    engine: &Engine,
+    orchestration: &mut Option<Orchestration>,
+    args: &Value,
+) -> Value {
+    let orch = match orchestration_handle(orchestration, &engine.config.terminal) {
+        Ok(o) => o,
+        Err(e) => return tool_error(id, &e),
+    };
+    let cli = paseo::PaseoCli::new(&engine.config.paseo);
+    orch.runtime
+        .block_on(task_action(id, engine, &cli, args, &resolve_data_dir(None)))
+}
+
+async fn task_action(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    args: &Value,
+    data_dir: &Path,
+) -> Value {
+    let arg = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let Some(corr) = arg("corr") else {
+        return tool_error(id, "\"corr\" is required");
+    };
+    let action = arg("action").unwrap_or_default();
+    let prefix = match action {
+        "reply" => "Reply from the user:",
+        "redo" => "Redo requested:",
+        "accept" | "allow" | "deny" => "",
+        _ => {
+            return tool_error(
+                id,
+                &format!("unknown action {action}: use reply, redo, accept, allow or deny"),
+            )
+        }
+    };
+    let text = arg("text");
+    if !prefix.is_empty() && text.is_none() {
+        return tool_error(id, &format!("\"text\" is required for {action}"));
+    }
+    let task = match engine.get_task(corr) {
+        Ok(Some(task)) => task,
+        Ok(None) => return tool_error(id, &format!("unknown task {corr}")),
+        Err(e) => return tool_error(id, &format!("task lookup failed: {e}")),
+    };
+    if task.state == "closed" {
+        return match action {
+            "accept" => ok(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": format!("task {corr} was already closed") }],
+                    "structuredContent": { "corr": corr, "closed": true, "archived": false }
+                }),
+            ),
+            _ => tool_error(id, &format!("task {corr} is closed")),
+        };
+    }
+    let Some(leader) = task.leader_id.as_deref() else {
+        return tool_error(
+            id,
+            &format!("task {corr} has no leader yet — it is still queued for delivery"),
+        );
+    };
+    let project = match engine.get_project(&task.project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return tool_error(id, &format!("project not found: {}", task.project_id)),
+        Err(e) => return tool_error(id, &format!("project lookup failed: {e}")),
+    };
+    if !prefix.is_empty() {
+        let body = format!("{prefix}\n{}", text.unwrap_or_default());
+        for n in 1.. {
+            let resp = dispatch_to_leader(
+                id.clone(),
+                engine,
+                &project,
+                &body,
+                Some(&format!("{corr}:{n}")),
+                Some(paseo::WD_CALLER),
+                data_dir,
+            );
+            if resp["result"]["structuredContent"]["duplicate"] != true {
+                return resp;
+            }
+        }
+    }
+    if let Some(why) = paseo::paseo_unavailable(&engine.config.paseo) {
+        return tool_error(id, &why);
+    }
+    match action {
+        "accept" => accept_task(id, engine, paseo, corr, leader, &project.id).await,
+        _ => {
+            permit_task(
+                id,
+                engine,
+                paseo,
+                corr,
+                leader,
+                action == "allow",
+                arg("req_id"),
+            )
+            .await
+        }
+    }
+}
+
+async fn accept_task(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    corr: &str,
+    leader: &str,
+    project_id: &str,
+) -> Value {
+    if let Err(e) = engine.close_task(corr, &now_rfc3339()) {
+        return tool_error(id, &format!("task {corr} was not closed: {e}"));
+    }
+    let pane = format!("{}{leader}", orchestrate::PASEO_PANE_PREFIX);
+    let pending = format!("{}pending", orchestrate::PASEO_PANE_PREFIX);
+    let queued = engine
+        .list_queued_paseo_runs(project_id)
+        .unwrap_or_default();
+    let inflight = engine.list_inflight_paseo_runs().unwrap_or_default();
+    let live = queued
+        .iter()
+        .filter(|r| {
+            r.pane_id == pane || (r.pane_id == pending && paseo::wd_corr(&r.task).is_some())
+        })
+        .chain(inflight.iter().filter(|r| r.pane_id == pane))
+        .next();
+    let sharing = engine
+        .list_open_tasks()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|t| t.leader_id.as_deref() == Some(leader));
+    let kept = match (live, sharing) {
+        (Some(run), _) => Some(format!("run {} is still queued or working on it", run.id)),
+        (None, Some(other)) => Some(format!("open task {} shares it", other.corr)),
+        (None, None) => None,
+    };
+    let text = match &kept {
+        Some(why) => format!("task {corr} closed; leader {leader} left running: {why}"),
+        None => match paseo.archive(leader).await {
+            Ok(()) => format!("task {corr} closed; leader {leader} archived"),
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("task {corr} closed, but archiving leader {leader} failed: {e}"),
+                )
+            }
+        },
+    };
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "corr": corr, "closed": true, "archived": kept.is_none() }
+        }),
+    )
+}
+
+async fn permit_task(
+    id: Option<Value>,
+    engine: &Engine,
+    paseo: &dyn paseo::Paseo,
+    corr: &str,
+    leader: &str,
+    allow: bool,
+    req_id: Option<&str>,
+) -> Value {
+    let req_id = match req_id {
+        Some(r) => r.to_string(),
+        None => match engine.unanswered_permission_requests(corr) {
+            Ok(requests) => match requests.into_iter().next() {
+                Some(r) => r.req_id,
+                None => {
+                    return tool_error(
+                        id,
+                        &format!("task {corr} has no unanswered permission request"),
+                    )
+                }
+            },
+            Err(e) => return tool_error(id, &format!("permission lookup failed: {e}")),
+        },
+    };
+    let verb = if allow { "allow" } else { "deny" };
+    if let Err(e) = paseo.permit(leader, &req_id, allow).await {
+        return tool_error(
+            id,
+            &format!("paseo permit {verb} {leader} {req_id} failed: {e}"),
+        );
+    }
+    let mut warnings = Vec::new();
+    if let Err(e) = engine.answer_permission_request(&req_id, &now_rfc3339()) {
+        warnings.push(format!("request {req_id} not marked answered: {e}"));
+    }
+    let mut text = format!("{verb} sent for request {req_id} of leader {leader} (task {corr})");
+    for warning in &warnings {
+        text.push_str("; ");
+        text.push_str(warning);
+    }
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "corr": corr, "req_id": req_id, "answer": verb, "warnings": warnings }
+        }),
+    )
 }
 
 /// The dispatch protocol sequence itself (D1/D3/D5): resolve the target pane
@@ -971,21 +1674,21 @@ async fn run_dispatch(
     herdr: &dyn Herdr,
     engine: &Engine,
     project: &Project,
-    preset: Option<waggledance_core::config::AgentPreset>,
+    preset: Option<(
+        waggledance_core::config::AgentPreset,
+        waggledance_core::bee::BeeHerdingEntry,
+    )>,
     pane_id_arg: Option<String>,
     task: &str,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<(String, Vec<String>), String> {
     // This tool's own half: which destination the two argument shapes mean,
     // and how a run started here is labelled. Everything after it -- the
     // preflight, baseline, marker, send and the persisted run -- is the one
     // shared dispatch path (`orchestrate::dispatch_run`), the same one the
     // board's run actions use.
     let (target, preset_label) = match (preset, pane_id_arg) {
-        (Some(preset), None) => (
-            orchestrate::DispatchTarget::Spawn {
-                argv: preset.argv,
-                cwd: None,
-            },
+        (Some((preset, entry)), None) => (
+            orchestrate::DispatchTarget::Spawn { entry, cwd: None },
             Some(preset.label),
         ),
         (None, Some(pane_id)) => {
@@ -1016,10 +1719,11 @@ async fn run_dispatch(
 
     // No feature: a run started from this tool belongs to whoever called it,
     // not to a board card, and must never hold a card's per-feature lock.
-    let run = orchestrate::dispatch_run(herdr, engine, project, target, task, None, preset_label)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(run.id)
+    let dispatched =
+        orchestrate::dispatch_run(herdr, engine, project, target, task, None, preset_label)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok((dispatched.run.id, dispatched.warnings))
 }
 
 /// `waggledance_await`: bounded poll for a run's completion (D4/D5).
@@ -1030,6 +1734,7 @@ fn handle_await(
     engine: &Engine,
     orchestration: &mut Option<Orchestration>,
     args: &Value,
+    data_dir: &Path,
 ) -> Value {
     let Some(run_id) = args
         .get("run_id")
@@ -1060,17 +1765,46 @@ fn handle_await(
         timeout,
         orch.notify_store.as_ref(),
     )) {
-        Ok(outcome) => ok(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": format!("run {run_id}: {}", outcome.status.as_str()) }],
-                "structuredContent": {
-                    "run_id": run_id,
-                    "status": outcome.status.as_str(),
-                    "delta": outcome.delta
-                }
-            }),
-        ),
+        Ok(mut outcome) => {
+            let mut text = format!("run {run_id}: {}", outcome.status.as_str());
+            let mut report = json!({
+                "run_id": run_id,
+                "status": outcome.status.as_str(),
+                "delta": outcome.delta,
+            });
+            if outcome.status == orchestrate::RunStatus::Queued {
+                let age = time::OffsetDateTime::parse(
+                    &run.created_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map(|at| {
+                    (time::OffsetDateTime::now_utc() - at)
+                        .whole_seconds()
+                        .max(0)
+                })
+                .unwrap_or(0);
+                text.push_str(&format!(" for {age}s"));
+                report["age_secs"] = json!(age);
+            }
+            if run.pane_id.starts_with(orchestrate::PASEO_PANE_PREFIX)
+                && !outcome.status.is_terminal()
+                && delivery_paused(data_dir)
+            {
+                outcome.warnings.push(DELIVERY_PAUSED.to_string());
+            }
+            for warning in &outcome.warnings {
+                text.push_str("; ");
+                text.push_str(warning);
+            }
+            report["warnings"] = json!(outcome.warnings);
+            ok(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": report
+                }),
+            )
+        }
         Err(e) => tool_error(id, &format!("await failed: {e}")),
     }
 }
@@ -1250,13 +1984,14 @@ mod tests {
             "# Project B\nA grapefruit smoothie recipe for summer.",
         );
 
-        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let mut config = Config::default();
+        config.paseo.enabled = Some(false);
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
         let pa = engine.register(&dir_a, None).unwrap();
         let pb = engine.register(&dir_b, None).unwrap();
         (engine, pa, pb)
     }
 
-    #[test]
     /// A published field nobody can discover is not published: an agent
     /// learns what `ask_state` answers with from this description and
     /// nowhere else. Pinned so a later trim cannot quietly drop the two
@@ -1282,15 +2017,17 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_seven_schemas() {
+    fn tools_list_has_nine_schemas() {
         let tools = [
             view_file_schema(),
             search_schema(),
             projects_schema(),
+            bee_upgrade_schema(),
             ask_state_schema(),
             dispatch_schema(),
             await_schema(),
             runs_schema(),
+            task_schema(),
         ];
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
@@ -1299,12 +2036,53 @@ mod tests {
                 "waggledance_view_file",
                 "waggledance_search",
                 "waggledance_projects",
+                "waggledance_bee_upgrade",
                 "waggledance_ask_state",
                 "waggledance_dispatch",
                 "waggledance_await",
-                "waggledance_runs"
+                "waggledance_runs",
+                "waggledance_task"
             ]
         );
+    }
+
+    fn empty_engine() -> Engine {
+        let mut config = Config::default();
+        config.paseo.enabled = Some(false);
+        Engine::new(SqliteStore::open_in_memory().unwrap(), config)
+    }
+
+    #[test]
+    fn bee_upgrade_apply_without_projects_is_refused() {
+        let engine = empty_engine();
+        for args in [json!({ "apply": true }), json!({ "apply": true, "projects": [] })] {
+            let resp = call_tool(&engine, "waggledance_bee_upgrade", args);
+            assert_eq!(resp["result"]["isError"], true, "{resp}");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("projects"), "{text}");
+        }
+    }
+
+    #[test]
+    fn bee_upgrade_non_boolean_apply_is_refused() {
+        let engine = empty_engine();
+        let resp = call_tool(
+            &engine,
+            "waggledance_bee_upgrade",
+            json!({ "apply": "yes", "projects": ["x"] }),
+        );
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("apply"), "{text}");
+    }
+
+    #[test]
+    fn bee_upgrade_empty_registry_reports_no_source() {
+        let engine = empty_engine();
+        let resp = call_tool(&engine, "waggledance_bee_upgrade", json!({}));
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no registered project holds"), "{text}");
     }
 
     #[test]
@@ -1533,7 +2311,8 @@ mod tests {
                     "agent_command": "claude-sonnet",
                     "agents": {
                         "claude-sonnet": ["claude", "--model", "sonnet"],
-                        "agy-flash": {"argv": ["agy", "--dangerously-skip-permissions"]}
+                        "agy-flash": {"argv": ["agy", "--dangerously-skip-permissions"]},
+                        "broken": {"env": {"K": "v"}}
                     }
                 }
             }"#,
@@ -1546,11 +2325,18 @@ mod tests {
         );
         let herding = &filtered["result"]["structuredContent"]["project"]["herding"];
         assert_eq!(herding["default"], "claude-sonnet", "{filtered}");
-        assert_eq!(herding["agents"], json!(["claude-sonnet", "agy-flash"]));
+        assert_eq!(
+            herding["agents"],
+            json!(["claude-sonnet", "agy-flash", "broken"])
+        );
+        // herding-entry-conditions D1: the object form is a bee shape, so
+        // `agy-flash` resolves. What still cannot start is an entry yielding no
+        // command at all — and it is listed, because a label a consumer cannot
+        // see is a label it cannot ask about.
         assert_eq!(
             herding["resolvable"],
-            json!(["claude-sonnet"]),
-            "bee's object form is listed but does not claim to resolve"
+            json!(["claude-sonnet", "agy-flash"]),
+            "an object entry with a usable argv resolves; one without does not"
         );
 
         let rollup = call_tool(&engine, "waggledance_ask_state", json!({}));
@@ -1770,6 +2556,238 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn listed(id: &str, cwd: &str, created: &str) -> paseo::ListedAgent {
+        paseo::ListedAgent {
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+            status: "idle".to_string(),
+            created: Some(created.to_string()),
+        }
+    }
+
+    fn leaders_project(tag: &str) -> (Engine, Project, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("wd-leaders-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("widgets");
+        let worktree = base.join("widgets--wt--polish");
+        write(&root, "docs/a.md", "# Project");
+        write(&worktree, "src/lib.rs", "");
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&root, None).unwrap();
+        (engine, project, base)
+    }
+
+    fn with_worktree(
+        mut rollup: waggledance_core::bee::BeeProjectRollup,
+        id: &str,
+    ) -> waggledance_core::bee::BeeProjectRollup {
+        rollup.snapshot.worktrees.push(
+            serde_json::from_value(json!({
+                "id": id, "resolved": false, "unresolved_reason": null, "feature": null,
+                "phase": null, "mode": null, "branch": null, "created_at": null,
+                "live": false, "heartbeat_age_minutes": null, "merged_pending": false
+            }))
+            .unwrap(),
+        );
+        rollup
+    }
+
+    #[test]
+    fn leaders_map_root_and_worktree_cwds_oldest_first_and_count_the_homeless() {
+        let (engine, project, base) = leaders_project("map");
+        write(
+            &project.root_path,
+            ".bee/state.json",
+            r#"{"feature": "widget-polish", "waiting_on": {"kind": "gate", "subject": "approve plan"}}"#,
+        );
+        let mut daemon_run = seeded_run(&project.id, "run-paseo");
+        daemon_run.pane_id = "paseo:abc".to_string();
+        daemon_run.status = "done".to_string();
+        engine.insert_run(&daemon_run, None).unwrap();
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = with_worktree(rollups.pop().unwrap(), "widgets--wt--polish");
+        let mut claims = vec![(canonical(&project.root_path), project.id.clone())];
+        claims.extend(worktree_claims(&project, &rollup));
+        let root = project.root_path.display().to_string();
+        let worktree = base.join("widgets--wt--polish/src").display().to_string();
+        let read = LeadersRead::Listed {
+            all: vec![
+                listed("young", &root, "2 hours ago"),
+                listed("old", &worktree, "3 days ago"),
+                listed(
+                    "homeless",
+                    "/nonexistent/wd-leaders/elsewhere",
+                    "1 days ago",
+                ),
+            ],
+            wd: Default::default(),
+        };
+        let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
+        attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
+
+        let leaders = digest["leaders"]
+            .as_array()
+            .expect("a list when Paseo answered");
+        let ids: Vec<&str> = leaders
+            .iter()
+            .map(|l| l["agent_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["old", "young"], "{digest}");
+        assert_eq!(digest["leaders_skipped"], 1, "{digest}");
+        assert_eq!(leaders[0]["via"], "daemon");
+        assert!(leaders[0]["labels"]["waggledance.via"].is_null());
+        assert_eq!(leaders[1]["via"], "daemon");
+        assert!(leaders[1]["labels"]["waggledance.via"].is_null());
+        assert_eq!(leaders[1]["labels"]["waggledance.role"], "leader");
+        assert_eq!(
+            leaders[1]["labels"]["waggledance.project"],
+            json!(project.id)
+        );
+        assert_eq!(
+            leaders[1]["cwd"],
+            json!(canonical(&project.root_path).display().to_string())
+        );
+        assert_eq!(
+            leaders[1]["waiting_on"],
+            json!({ "kind": "gate", "subject": "approve plan" })
+        );
+        assert_eq!(
+            leaders[0]["last_daemon_run"],
+            json!({ "run_id": "run-paseo", "status": "done" })
+        );
+        assert_eq!(leaders[0]["created"], "3 days ago");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn leaders_go_to_the_deeper_root_and_tilde_cwds_expand_to_home() {
+        let claims = vec![
+            (std::path::PathBuf::from("/srv/outer"), "outer".to_string()),
+            (
+                std::path::PathBuf::from("/srv/outer/inner"),
+                "inner".to_string(),
+            ),
+        ];
+        assert_eq!(
+            leader_owner(Path::new("/srv/outer/inner/src"), &claims),
+            Some("inner")
+        );
+        assert_eq!(
+            leader_owner(Path::new("/srv/outer/docs"), &claims),
+            Some("outer")
+        );
+        assert_eq!(leader_owner(Path::new("/srv/outerwear"), &claims), None);
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            agent_cwd("~/wd-leaders-no-such-dir"),
+            home.join("wd-leaders-no-such-dir")
+        );
+    }
+
+    #[test]
+    fn leaders_of_another_project_are_neither_listed_nor_skipped() {
+        let (engine, project, base) = leaders_project("other");
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = rollups.pop().unwrap();
+        let claims = vec![
+            (canonical(&project.root_path), project.id.clone()),
+            (
+                std::path::PathBuf::from("/srv/elsewhere"),
+                "elsewhere".to_string(),
+            ),
+        ];
+        let read = LeadersRead::Listed {
+            all: vec![listed("theirs", "/srv/elsewhere", "1 hours ago")],
+            wd: Default::default(),
+        };
+        let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
+        attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
+        assert_eq!(digest["leaders"], json!([]), "{digest}");
+        assert_eq!(digest["leaders_skipped"], 0, "{digest}");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn unreachable_paseo_nulls_leaders_with_a_reason_and_keeps_every_key() {
+        let (engine, project, base) = leaders_project("down");
+        let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
+        let rollup = rollups.pop().unwrap();
+        let before = ask_state_digest(&project.id, &rollup.snapshot);
+        let mut digest = before.clone();
+        attach_leaders(
+            &mut digest,
+            &engine,
+            &project,
+            &rollup,
+            &[],
+            &LeadersRead::Unreachable("`paseo ls` timed out after 15s".to_string()),
+        );
+        assert!(digest["leaders"].is_null(), "{digest}");
+        assert_eq!(digest["leaders_error"], "`paseo ls` timed out after 15s");
+        for (key, value) in before.as_object().unwrap() {
+            assert_eq!(&digest[key], value, "{key} changed");
+        }
+        assert!(digest.get("leaders_skipped").is_none(), "{digest}");
+
+        let mut off = before.clone();
+        attach_leaders(&mut off, &engine, &project, &rollup, &[], &LeadersRead::Off);
+        assert_eq!(off, before);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn paseo_switched_off_leaves_no_leaders_key_in_either_form() {
+        let (engine, pa, pb) = two_project_engine("ask-state-leaders-off");
+        assert_eq!(engine.config.paseo.enabled, Some(false));
+        assert!(matches!(
+            read_leaders(&engine.config.paseo),
+            LeadersRead::Off
+        ));
+        let one = call_tool(
+            &engine,
+            "waggledance_ask_state",
+            json!({ "project": pa.id }),
+        );
+        let digest = &one["result"]["structuredContent"]["project"];
+        assert!(digest.get("leaders").is_none(), "{digest}");
+        assert!(digest.get("leaders_error").is_none(), "{digest}");
+        let all = call_tool(&engine, "waggledance_ask_state", json!({}));
+        for entry in all["result"]["structuredContent"]["projects"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(entry.get("leaders").is_none(), "{entry}");
+        }
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+        std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    #[test]
+    fn ask_state_description_names_leaders_via_and_the_three_absence_states() {
+        let description = ask_state_schema()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for promised in [
+            "leaders",
+            "via",
+            "leaders_error",
+            "leaders_skipped",
+            "enabled = false",
+            "`null`",
+            "possibly empty",
+        ] {
+            assert!(
+                description.contains(promised),
+                "{promised:?}: {description}"
+            );
+        }
+    }
+
     #[test]
     fn ask_state_unfiltered_rolls_up_every_project_including_one_with_no_bee_dir() {
         let (engine, pa, pb) = two_project_engine("ask-state-rollup");
@@ -1932,21 +2950,74 @@ mod tests {
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 
-    /// D6: terminal family on, but this project never opted in — the
-    /// refusal must name the remedy (the project's own settings page).
     #[test]
-    fn dispatch_refuses_a_project_that_has_not_opted_in() {
-        let (engine, pa) = dispatch_engine("dispatch-not-opted-in");
+    fn dispatch_accepts_a_project_with_no_settings_file() {
+        let (engine, pa) = dispatch_engine("dispatch-no-file");
+        assert!(!pa.root_path.join(".waggledance.toml").exists());
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "preset": "nope" }),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("dispatch is off"), "{text}");
+        assert!(!text.contains("turned off"), "{text}");
+        assert!(text.contains("unknown agent preset: nope"), "{text}");
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_refuses_a_project_that_turned_it_off_naming_the_file_and_line() {
+        let (engine, pa) = dispatch_engine("dispatch-turned-off");
+        engine.set_orchestration_enabled(&pa.id, true).unwrap();
+        write(
+            &pa.root_path,
+            ".waggledance.toml",
+            "orchestration = false\n",
+        );
         let resp = call_tool(
             &engine,
             "waggledance_dispatch",
             json!({ "project": pa.id, "task": "go", "pane_id": "w1:p1" }),
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let file = pa.root_path.join(".waggledance.toml");
+        assert!(file.is_absolute());
+        assert_eq!(
+            text,
+            format!(
+                "project {} has turned off orchestrator dispatch with `orchestration = false` \
+                 in {} — remove that line to allow it",
+                pa.id,
+                file.display()
+            )
+        );
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_refuses_a_project_whose_settings_file_fails_to_parse() {
+        let (engine, pa) = dispatch_engine("dispatch-bad-settings-file");
+        write(&pa.root_path, ".waggledance.toml", "orchestration = tru\n");
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "pane_id": "w1:p1" }),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let file = pa.root_path.join(".waggledance.toml");
         assert!(
-            text.contains("has not opted into orchestrator dispatch"),
+            text.starts_with(&format!(
+                "project {} has a .waggledance.toml at {} that could not be read, so dispatch \
+                 is off: ",
+                pa.id,
+                file.display()
+            )),
             "{text}"
         );
+        assert!(text.contains("failed to parse"), "{text}");
 
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
@@ -2036,7 +3107,7 @@ mod tests {
 
         let resolved = resolve_preset(&engine, &pa, "shared").expect("both sources hold it");
         assert_eq!(
-            resolved.argv,
+            resolved.0.argv,
             vec!["from-global".to_string()],
             "the global list is searched first, so an existing label never re-aims"
         );
@@ -2045,7 +3116,7 @@ mod tests {
         // project — the fallback only ever fills a gap.
         engine.config.terminal.agent_presets.clear();
         let resolved = resolve_preset(&engine, &pa, "shared").expect("the project holds it");
-        assert_eq!(resolved.argv, vec!["from-project".to_string()]);
+        assert_eq!(resolved.0.argv, vec!["from-project".to_string()]);
 
         std::fs::remove_dir_all(&pa.root_path).ok();
     }
@@ -2054,6 +3125,12 @@ mod tests {
     /// refused in those terms, never as unknown — and the line it is refused
     /// on is exactly the line `ask_state` publishes as `resolvable`, so the
     /// tool cannot advertise a label and then reject it.
+    ///
+    /// *Updated by herding-entry-conditions D1:* the example moved. `agy-flash`
+    /// used to be the declared-but-unstartable case purely because this reader
+    /// did not understand its shape; it starts now. The rule is unchanged and
+    /// still needs a case, so the example is an entry that genuinely yields no
+    /// command — declared, and still unable to run.
     #[test]
     fn a_declared_but_unstartable_label_refuses_in_its_own_terms_and_matches_ask_state() {
         let (engine, pa) = dispatch_engine("dispatch-object-form");
@@ -2067,16 +3144,24 @@ mod tests {
                         "claude-sonnet": ["claude", "--model", "sonnet"],
                         "agy-flash": {
                             "argv": ["agy", "--dangerously-skip-permissions"],
-                            "workspace_trust": {"file": "~/.gemini/settings.json"}
-                        }
+                            "workspace_trust": {
+                                "file": "~/.gemini/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        },
+                        "no-command": {"env": {"K": "v"}}
                     }
                 }
             }"#,
         );
 
-        let refusal = resolve_preset(&engine, &pa, "agy-flash")
-            .expect_err("bee's object form does not resolve today");
-        assert!(refusal.contains("agy-flash"), "{refusal}");
+        // The object form now starts, which is this feature's whole point.
+        resolve_preset(&engine, &pa, "agy-flash")
+            .expect("an object entry with a usable argv resolves");
+
+        let refusal = resolve_preset(&engine, &pa, "no-command")
+            .expect_err("an entry that yields no command cannot start");
+        assert!(refusal.contains("no-command"), "{refusal}");
         assert!(
             !refusal.contains("unknown"),
             "the label exists — calling it unknown sends a caller hunting a typo: {refusal}"
@@ -2361,5 +3446,680 @@ mod tests {
 
         std::fs::remove_dir_all(&pa.root_path).ok();
         std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    fn leader_engine(
+        tag: &str,
+        terminal: bool,
+        paseo_on: bool,
+        opted_in: bool,
+    ) -> (Engine, Project, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "waggledance-mcp-leader-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# Project\n");
+        let mut config = Config::default();
+        config.terminal.enabled = terminal;
+        config.paseo.enabled = Some(paseo_on);
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), config);
+        if !opted_in {
+            write(&dir, ".waggledance.toml", "orchestration = false\n");
+        }
+        let project = engine.register(&dir, None).unwrap();
+        let data_dir = dir.join(".data");
+        (engine, project, data_dir)
+    }
+
+    fn leader_call(
+        engine: &Engine,
+        project: &Project,
+        data_dir: &Path,
+        task: &str,
+        request_id: Option<&str>,
+    ) -> Value {
+        dispatch_to_leader(
+            Some(json!(1)),
+            engine,
+            project,
+            task,
+            request_id,
+            Some("agent-caller"),
+            data_dir,
+        )
+    }
+
+    fn text_of(resp: &Value) -> String {
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn beat(data_dir: &Path, age_secs: u64) {
+        std::fs::create_dir_all(data_dir).unwrap();
+        let path = crate::paseo::delivery_heartbeat_path(data_dir);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn dispatch_refuses_leader_beside_another_target() {
+        let (engine, pa) = dispatch_engine("dispatch-leader-xor");
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "preset": "p", "leader": true }),
+        );
+        let text = text_of(&resp);
+        assert!(text.contains("exactly one of"), "{text}");
+        assert!(text.contains("leader"), "{text}");
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_schema_offers_a_request_id_for_every_target() {
+        let schema = dispatch_schema();
+        let desc = schema["inputSchema"]["properties"]["request_id"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("retry never sends twice"), "{desc}");
+    }
+
+    #[test]
+    fn leader_dispatch_with_orchestration_off_is_refused_and_stores_nothing() {
+        let (engine, project, data_dir) = leader_engine("orch-off", true, true, false);
+        let resp = leader_call(&engine, &project, &data_dir, "go", None);
+        assert_eq!(resp["result"]["isError"], true);
+        let text = text_of(&resp);
+        assert!(
+            text.contains(&project.id) && text.contains("`orchestration = false` in"),
+            "{text}"
+        );
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn leader_dispatch_with_paseo_off_is_refused_naming_the_config_line() {
+        let (engine, project, data_dir) = leader_engine("paseo-off", true, false, true);
+        let text = text_of(&leader_call(&engine, &project, &data_dir, "go", None));
+        assert!(text.contains("~/.waggledance/config.toml"), "{text}");
+        assert!(
+            text.contains("`[paseo]`") && text.contains("`enabled = false`"),
+            "{text}"
+        );
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+
+        let through_the_tool = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": project.id, "task": "go", "leader": true }),
+        );
+        assert!(text_of(&through_the_tool).contains("enabled = false"));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn leader_dispatch_is_not_gated_by_the_terminal_surface() {
+        let (engine, project, _) = leader_engine("terminal-off", false, false, true);
+        let through_the_tool = text_of(&call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": project.id, "task": "go", "leader": true }),
+        ));
+        assert!(
+            !through_the_tool.contains("terminal.enabled") && through_the_tool.contains("[paseo]"),
+            "{through_the_tool}"
+        );
+        std::fs::remove_dir_all(&project.root_path).ok();
+
+        let (engine, project, data_dir) = leader_engine("terminal-off-on", false, true, true);
+        let resp = leader_call(&engine, &project, &data_dir, "go", None);
+        assert_ne!(resp["result"]["isError"], true, "{resp}");
+        let run_id = resp["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap();
+        assert!(engine.get_run(run_id).unwrap().is_some());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_leader_dispatch_stores_a_queued_run_and_sends_nothing() {
+        let (engine, project, data_dir) = leader_engine("queued", true, true, true);
+        beat(&data_dir, 0);
+        let task = "--help me\n  ship the thing  ";
+        let resp = leader_call(&engine, &project, &data_dir, task, Some("req-1"));
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["status"], "queued", "{resp}");
+        assert_eq!(sc["duplicate"], false);
+        assert_eq!(sc["warnings"], json!([]));
+        let run = engine
+            .get_run(sc["run_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.pane_id, "paseo:pending");
+        assert_eq!(run.preset_label, None);
+        assert_eq!(run.task, task);
+        assert_eq!(run.marker, "");
+        assert_eq!(run.status, "queued");
+        assert_eq!(
+            engine.run_caller(&run.id).unwrap().as_deref(),
+            Some("agent-caller")
+        );
+        assert_eq!(
+            engine
+                .run_by_request(&project.id, "req-1")
+                .unwrap()
+                .unwrap()
+                .id,
+            run.id
+        );
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_wd_caller_comes_from_waggledance_caller_only_without_a_paseo_agent() {
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(
+            dispatch_caller(None, some("wd")).as_deref(),
+            Some("openclaw:wd")
+        );
+        assert_eq!(
+            dispatch_caller(some(""), some("wd")).as_deref(),
+            Some("openclaw:wd")
+        );
+        assert_eq!(
+            dispatch_caller(some("agent"), some("wd")).as_deref(),
+            Some("agent")
+        );
+        assert_eq!(dispatch_caller(None, some("other")), None);
+        assert_eq!(dispatch_caller(None, None), None);
+        let schema = dispatch_schema();
+        assert!(schema["inputSchema"]["properties"].get("caller").is_none());
+        assert!(schema["inputSchema"]["properties"].get("via").is_none());
+    }
+
+    #[test]
+    fn a_wd_leader_dispatch_stores_the_task_behind_the_wd_prefix() {
+        let (engine, project, data_dir) = leader_engine("wd-prefix", true, true, true);
+        beat(&data_dir, 0);
+        let resp = dispatch_to_leader(
+            Some(json!(1)),
+            &engine,
+            &project,
+            "ship it",
+            Some("corr-9"),
+            Some(paseo::WD_CALLER),
+            &data_dir,
+        );
+        let run_id = resp["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap();
+        let run = engine.get_run(run_id).unwrap().unwrap();
+        assert_eq!(run.task, paseo::wd_task("corr-9", "ship it"));
+        assert_eq!(paseo::wd_corr(&run.task), Some("corr-9"));
+        assert_eq!(
+            engine.run_caller(run_id).unwrap().as_deref(),
+            Some("openclaw:wd")
+        );
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_wd_hand_off_opens_one_task_and_follow_ups_and_other_callers_open_none() {
+        let (engine, project, data_dir) = leader_engine("wd-task", true, true, true);
+        beat(&data_dir, 0);
+        let send = |task: &str, request_id: &str, caller: Option<&str>| {
+            dispatch_to_leader(
+                Some(json!(1)),
+                &engine,
+                &project,
+                task,
+                Some(request_id),
+                caller,
+                &data_dir,
+            )
+        };
+        send("ship it", "t-abc123", Some(paseo::WD_CALLER));
+        let task = engine.get_task("t-abc123").unwrap().unwrap();
+        assert_eq!(
+            (task.project_id.as_str(), task.state.as_str()),
+            (project.id.as_str(), "open")
+        );
+        assert_eq!(task.changed_at, task.created_at);
+        assert_eq!(task.leader_id, None);
+
+        let dup = send("ship it", "t-abc123", Some(paseo::WD_CALLER));
+        assert_eq!(dup["result"]["structuredContent"]["duplicate"], true);
+        send("more", "t-abc123:1", Some(paseo::WD_CALLER));
+        send("plain", "t-def456", Some("agent-caller"));
+        send("plain", "t-fed654", None);
+        let open: Vec<String> = engine
+            .list_open_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.corr)
+            .collect();
+        assert_eq!(open, vec!["t-abc123"]);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_via_wd_leader_shows_via_wd_in_ask_state() {
+        let (engine, project, base) = leaders_project("wd-via");
+        let rollup = bee::read_rollup(std::slice::from_ref(&project.root_path))
+            .pop()
+            .unwrap();
+        let claims = vec![(canonical(&project.root_path), project.id.clone())];
+        let root = project.root_path.display().to_string();
+        let read = LeadersRead::Listed {
+            all: vec![listed("wd-lead", &root, "2 hours ago")],
+            wd: ["wd-lead".to_string()].into_iter().collect(),
+        };
+        let mut digest = ask_state_digest(&project.id, &rollup.snapshot);
+        attach_leaders(&mut digest, &engine, &project, &rollup, &claims, &read);
+        assert_eq!(digest["leaders"][0]["via"], "wd", "{digest}");
+        assert_eq!(digest["leaders"][0]["labels"]["waggledance.via"], "wd");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_leader_dispatch_is_accepted_while_an_earlier_one_is_still_held() {
+        let (engine, project, data_dir) = leader_engine("busy", true, true, true);
+        beat(&data_dir, 0);
+        let first = leader_call(&engine, &project, &data_dir, "one", None);
+        let second = leader_call(&engine, &project, &data_dir, "two", None);
+        assert_ne!(second["result"]["isError"], true, "{second}");
+        assert_eq!(second["result"]["structuredContent"]["status"], "queued");
+        assert_ne!(
+            first["result"]["structuredContent"]["run_id"],
+            second["result"]["structuredContent"]["run_id"]
+        );
+        let queued = engine.list_queued_paseo_runs(&project.id).unwrap();
+        let tasks: Vec<&str> = queued.iter().map(|r| r.task.as_str()).collect();
+        assert_eq!(tasks, ["one", "two"]);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_warns_delivery_is_paused_on_a_missing_or_stale_heartbeat() {
+        let (engine, project, data_dir) = leader_engine("heartbeat", true, true, true);
+        let missing = leader_call(&engine, &project, &data_dir, "a", None);
+        assert_eq!(
+            missing["result"]["structuredContent"]["warnings"],
+            json!([DELIVERY_PAUSED])
+        );
+        assert!(text_of(&missing).contains("paused — waggledance daemon not running"));
+
+        beat(&data_dir, 60);
+        let stale = leader_call(&engine, &project, &data_dir, "b", None);
+        assert_eq!(
+            stale["result"]["structuredContent"]["warnings"],
+            json!([DELIVERY_PAUSED])
+        );
+
+        beat(&data_dir, 5);
+        let fresh = leader_call(&engine, &project, &data_dir, "c", None);
+        assert_eq!(fresh["result"]["structuredContent"]["warnings"], json!([]));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn await_on_a_queued_leader_run_reports_its_age_and_a_paused_daemon() {
+        let (engine, project, data_dir) = leader_engine("await-queued", false, true, true);
+        let sent = leader_call(&engine, &project, &data_dir, "go", None);
+        let run_id = sent["result"]["structuredContent"]["run_id"].clone();
+        let args = json!({ "run_id": run_id, "timeout_seconds": 0 });
+        let mut orchestration = None;
+
+        let paused = handle_await(
+            Some(json!(2)),
+            &engine,
+            &mut orchestration,
+            &args,
+            &data_dir,
+        );
+        let report = &paused["result"]["structuredContent"];
+        assert_eq!(report["status"], "queued");
+        assert!(
+            report["age_secs"].as_i64().is_some_and(|a| a >= 0),
+            "{report}"
+        );
+        assert_eq!(report["warnings"], json!([DELIVERY_PAUSED]));
+        assert!(text_of(&paused).contains("queued for"));
+
+        beat(&data_dir, 0);
+        let live = handle_await(
+            Some(json!(3)),
+            &engine,
+            &mut orchestration,
+            &args,
+            &data_dir,
+        );
+        assert_eq!(live["result"]["structuredContent"]["warnings"], json!([]));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_with_a_repeated_leader_request_id_returns_the_first_run() {
+        let (engine, project, data_dir) = leader_engine("repeat", true, true, true);
+        let first = leader_call(&engine, &project, &data_dir, "go", Some("req-7"));
+        let again = leader_call(&engine, &project, &data_dir, "go", Some("req-7"));
+        assert_eq!(
+            again["result"]["structuredContent"]["run_id"],
+            first["result"]["structuredContent"]["run_id"]
+        );
+        assert_eq!(again["result"]["structuredContent"]["duplicate"], true);
+        assert_eq!(engine.list_runs(&project.id, 10).unwrap().len(), 1);
+
+        let through_the_tool = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": project.id, "task": "go", "leader": true, "request_id": "req-7" }),
+        );
+        let sc = &through_the_tool["result"]["structuredContent"];
+        assert_eq!(sc["run_id"], first["result"]["structuredContent"]["run_id"]);
+        assert_eq!(sc["status"], "queued");
+        assert_eq!(sc["duplicate"], true);
+        assert_eq!(engine.list_runs(&project.id, 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_with_a_repeated_herdr_request_id_returns_the_stored_run_without_herdr() {
+        let (engine, pa) = dispatch_engine("dispatch-herdr-repeat");
+        engine.set_orchestration_enabled(&pa.id, true).unwrap();
+        let stored = engine
+            .insert_run_with_request(&seeded_run(&pa.id, "run-h"), None, Some("req-h"), None)
+            .unwrap();
+        let mut orchestration: Option<Orchestration> = None;
+        let resp = call_tool_with_orchestration(
+            &engine,
+            &mut orchestration,
+            "waggledance_dispatch",
+            json!({ "project": pa.id, "task": "go", "pane_id": "w9:p9", "request_id": "req-h" }),
+        );
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["run_id"], stored, "{resp}");
+        assert_eq!(sc["status"], "working");
+        assert_eq!(sc["duplicate"], true);
+        assert!(orchestration.is_none());
+        std::fs::remove_dir_all(&pa.root_path).ok();
+    }
+
+    fn task_rig(tag: &str) -> (Engine, Project, std::path::PathBuf, paseo::fake::FakePaseo) {
+        let (engine, project, data_dir) = leader_engine(tag, true, true, true);
+        beat(&data_dir, 0);
+        engine
+            .insert_task("t-1", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-1", "lead-1", "2026-10-22T10:01:00Z")
+            .unwrap();
+        (engine, project, data_dir, paseo::fake::FakePaseo::default())
+    }
+
+    async fn task_call(
+        engine: &Engine,
+        fake: &paseo::fake::FakePaseo,
+        data_dir: &Path,
+        args: Value,
+    ) -> Value {
+        task_action(Some(json!(1)), engine, fake, &args, data_dir).await
+    }
+
+    fn permission(req_id: &str, seen_at: &str) -> waggledance_core::domain::PermissionRequest {
+        waggledance_core::domain::PermissionRequest {
+            req_id: req_id.into(),
+            corr: "t-1".into(),
+            leader_id: "lead-1".into(),
+            tool: "Bash".into(),
+            description: "rm -rf build".into(),
+            seen_at: seen_at.into(),
+            answered_at: None,
+            closed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_and_redo_queue_numbered_wd_runs_that_resolve_to_the_corr() {
+        let (engine, project, data_dir, fake) = task_rig("task-reply");
+        let reply = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "reply", "text": "use dd/mm" }),
+        )
+        .await;
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+        let first = engine
+            .run_by_request(&project.id, "t-1:1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["result"]["structuredContent"]["run_id"], first.id);
+        assert_eq!(
+            first.task,
+            paseo::wd_task("t-1", "Reply from the user:\nuse dd/mm")
+        );
+        assert_eq!(paseo::wd_corr(&first.task), Some("t-1"));
+        assert_eq!(first.status, "queued");
+        assert_eq!(
+            engine.run_caller(&first.id).unwrap().as_deref(),
+            Some(paseo::WD_CALLER)
+        );
+
+        let redo = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "redo", "text": "button on the right" }),
+        )
+        .await;
+        assert_eq!(
+            redo["result"]["structuredContent"]["duplicate"], false,
+            "{redo}"
+        );
+        let second = engine
+            .run_by_request(&project.id, "t-1:2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.task,
+            paseo::wd_task("t-1", "Redo requested:\nbutton on the right")
+        );
+        assert!(fake.calls().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn accept_closes_the_task_archives_an_unused_leader_and_repeats_quietly() {
+        let (engine, project, data_dir, fake) = task_rig("task-accept");
+        let args = json!({ "corr": "t-1", "action": "accept" });
+        let resp = task_call(&engine, &fake, &data_dir, args.clone()).await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], true,
+            "{resp}"
+        );
+        assert_eq!(engine.get_task("t-1").unwrap().unwrap().state, "closed");
+        assert_eq!(
+            fake.calls(),
+            vec![paseo::fake::Call::Archive("lead-1".into())]
+        );
+
+        let again = task_call(&engine, &fake, &data_dir, args).await;
+        assert_ne!(again["result"]["isError"], true, "{again}");
+        assert_eq!(again["result"]["structuredContent"]["archived"], false);
+        assert_eq!(fake.calls().len(), 1);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn accept_leaves_a_leader_another_task_or_a_live_run_still_uses() {
+        let (engine, project, data_dir, fake) = task_rig("task-accept-shared");
+        engine
+            .insert_task("t-2", &project.id, "2026-10-22T10:02:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-2", "lead-1", "2026-10-22T10:03:00Z")
+            .unwrap();
+        let resp = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "accept" }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], false,
+            "{resp}"
+        );
+        assert!(text_of(&resp).contains("t-2"), "{resp}");
+        assert_eq!(engine.get_task("t-1").unwrap().unwrap().state, "closed");
+
+        task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-2", "action": "reply", "text": "one more" }),
+        )
+        .await;
+        let resp = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-2", "action": "accept" }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["archived"], false,
+            "{resp}"
+        );
+        assert!(text_of(&resp).contains("queued or working"), "{resp}");
+        assert!(fake.calls().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn allow_and_deny_permit_the_leader_and_mark_the_request_answered() {
+        let (engine, project, data_dir, fake) = task_rig("task-permit");
+        engine
+            .insert_permission_request(&permission("req-old", "2026-10-22T10:05:00Z"))
+            .unwrap();
+        engine
+            .insert_permission_request(&permission("req-new", "2026-10-22T10:06:00Z"))
+            .unwrap();
+        let allow = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "allow" }),
+        )
+        .await;
+        assert_ne!(allow["result"]["isError"], true, "{allow}");
+        let deny = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "deny", "req_id": "req-old" }),
+        )
+        .await;
+        assert_ne!(deny["result"]["isError"], true, "{deny}");
+        assert_eq!(
+            fake.calls(),
+            vec![
+                paseo::fake::Call::Permit("lead-1".into(), "req-new".into(), true),
+                paseo::fake::Call::Permit("lead-1".into(), "req-old".into(), false),
+            ]
+        );
+        assert!(engine
+            .unanswered_permission_requests("t-1")
+            .unwrap()
+            .is_empty());
+
+        let none_left = task_call(
+            &engine,
+            &fake,
+            &data_dir,
+            json!({ "corr": "t-1", "action": "allow" }),
+        )
+        .await;
+        assert_eq!(none_left["result"]["isError"], true);
+        assert!(text_of(&none_left).contains("no unanswered permission request"));
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[tokio::test]
+    async fn task_refusals_name_their_cause_and_touch_nothing() {
+        let (engine, project, data_dir, fake) = task_rig("task-refuse");
+        engine
+            .insert_task("t-new", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .insert_task("t-done", &project.id, "2026-10-22T10:00:00Z")
+            .unwrap();
+        engine
+            .mark_task_delivered("t-done", "lead-9", "2026-10-22T10:01:00Z")
+            .unwrap();
+        engine.close_task("t-done", "2026-10-22T10:02:00Z").unwrap();
+        let cases = [
+            (
+                json!({ "action": "reply", "text": "x" }),
+                "\"corr\" is required",
+            ),
+            (
+                json!({ "corr": "t-1", "action": "merge" }),
+                "unknown action merge",
+            ),
+            (
+                json!({ "corr": "t-1", "action": "reply" }),
+                "\"text\" is required",
+            ),
+            (
+                json!({ "corr": "t-zz", "action": "reply", "text": "x" }),
+                "unknown task t-zz",
+            ),
+            (
+                json!({ "corr": "t-done", "action": "reply", "text": "x" }),
+                "task t-done is closed",
+            ),
+            (
+                json!({ "corr": "t-done", "action": "allow" }),
+                "task t-done is closed",
+            ),
+            (
+                json!({ "corr": "t-new", "action": "redo", "text": "x" }),
+                "task t-new has no leader yet",
+            ),
+            (
+                json!({ "corr": "t-new", "action": "deny" }),
+                "task t-new has no leader yet",
+            ),
+        ];
+        for (args, cause) in cases {
+            let resp = task_call(&engine, &fake, &data_dir, args.clone()).await;
+            assert_eq!(resp["result"]["isError"], true, "{args} {resp}");
+            assert!(text_of(&resp).contains(cause), "{args} {resp}");
+        }
+        assert!(fake.calls().is_empty());
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn the_task_tool_is_listed_and_routed() {
+        let schema = task_schema();
+        assert_eq!(schema["name"], "waggledance_task");
+        assert_eq!(schema["inputSchema"]["required"], json!(["corr", "action"]));
+        let (engine, pa) = dispatch_engine("task-routed");
+        let resp = call_tool(
+            &engine,
+            "waggledance_task",
+            json!({ "corr": "t-x", "action": "reply", "text": "x" }),
+        );
+        assert!(text_of(&resp).contains("unknown task t-x"), "{resp}");
+        std::fs::remove_dir_all(&pa.root_path).ok();
     }
 }

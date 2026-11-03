@@ -1,7 +1,7 @@
 ---
 area: daemon
 updated: 2026-08-12
-sources: [daemon-auto-spawn-detach, hostname-port-truth, windows-daemon-fixes]
+sources: [daemon-auto-spawn-detach, hostname-port-truth, windows-daemon-fixes, review-p1-fixes, daemon-lock-stale]
 decisions: [625c69fa, 1c8473f4, 08b4c8c3, d1429530]
 coverage: partial
 ---
@@ -154,6 +154,12 @@ serves (see the web-interface and agent-integration areas for that).
   the desktop shell all detach it the same way.
 - **R2.** At most one daemon owns the registry at a time; launchers reuse a live
   daemon and never start a second concurrent one.
+- **R3.** The daemon answers only requests that address it as the local machine.
+  A request naming any host but a loopback address — or carrying no host at all —
+  is refused as a misdirected request before any page runs, so a browser lured to
+  a foreign name that resolves to this machine cannot reach the interface. The
+  guard is router-wide rather than per-page, and is independent of which host the
+  daemon binds.
 
 ## Edge Cases Settled
 

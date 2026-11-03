@@ -16,6 +16,79 @@ pub struct Config {
     pub renderer: RendererConfig,
     pub search: SearchConfig,
     pub terminal: TerminalConfig,
+    pub paseo: PaseoConfig,
+    pub openclaw: OpenClawConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PaseoConfig {
+    pub enabled: Option<bool>,
+    pub binary: String,
+    pub provider: String,
+    pub mode: String,
+    pub thinking: String,
+    pub turn_timeout_secs: u64,
+    pub leaders: Vec<PaseoLeader>,
+}
+
+impl Default for PaseoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            binary: String::new(),
+            provider: String::new(),
+            mode: "bypassPermissions".into(),
+            thinking: String::new(),
+            turn_timeout_secs: 3600,
+            leaders: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PaseoLeader {
+    pub project: String,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OpenClawConfig {
+    pub home: String,
+    pub hook_url: String,
+    pub cli: String,
+    pub agent_id: String,
+    pub telegram_to: String,
+    pub hook_model: String,
+    pub hook_thinking: String,
+    pub heartbeat_secs: u64,
+}
+
+impl Default for OpenClawConfig {
+    fn default() -> Self {
+        Self {
+            home: "~/aicoworker/openclaw".into(),
+            hook_url: "http://127.0.0.1:18789/hooks/agent".into(),
+            cli: String::new(),
+            agent_id: String::new(),
+            telegram_to: String::new(),
+            hook_model: String::new(),
+            hook_thinking: "low".into(),
+            heartbeat_secs: 600,
+        }
+    }
+}
+
+impl PaseoConfig {
+    pub fn workspace_for(&self, project_id: &str, project_name: &str) -> Option<&str> {
+        self.leaders
+            .iter()
+            .find(|l| l.project == project_id || l.project == project_name)
+            .map(|l| l.workspace.as_str())
+            .filter(|w| !w.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,10 +134,11 @@ pub struct SearchConfig {
 }
 
 /// The D7 opt-in switches for the agent terminal surface, all off until the
-/// user turns them on from the settings page. `#[derive(Default)]` gives
-/// every switch `false`, matching a config that has never seen this
-/// section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// user turns them on from the settings page — matching a config that has
+/// never seen this section. [`TerminalConfig::default`] is hand-written
+/// rather than derived for exactly one reason: `reaper_enabled` is the one
+/// switch here that defaults **on**, and its own doc says why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
     /// The terminal surface itself (D2/D3) — panes and screens are reachable
@@ -76,6 +150,53 @@ pub struct TerminalConfig {
     /// D7: Telegram notification on agent status change. waggledance makes no
     /// outbound call while this is off.
     pub notify_enabled: bool,
+    /// board-run-reaper: the in-daemon reaper that awaits every
+    /// waggledance-spawned `working` run nobody else is awaiting, so a run
+    /// that printed its own completion marker gets capped and its pane
+    /// closed with no human in the loop, and a run whose pane has vanished
+    /// stops reading `working` forever (D1 `eecfefeb`, D2 `4047ca75`).
+    ///
+    /// The one switch in this section that defaults **on**, and
+    /// deliberately: unlike the supervisor (which spawns a process) and
+    /// notifications (which make an outbound call), the reaper only tidies
+    /// up runs waggledance itself dispatched — it touches nothing the user
+    /// owns, `preset_label IS NOT NULL` being the same guard `finish`
+    /// reads. It is still mastered by [`enabled`](Self::enabled) above like
+    /// every other background task, so a terminal family switched off runs
+    /// no reaper at all; this switch is the narrow off-ramp for someone who
+    /// wants the terminal without the sweep. Because the default is `true`,
+    /// this struct's `Default` is written out by hand — a derived one would
+    /// silently ship it off.
+    pub reaper_enabled: bool,
+    /// observer-tick-trigger (D6): the in-daemon trigger that wakes exactly
+    /// one cold `bee supervisor` observation tick in a project whose fleet
+    /// just made a transition waggledance itself detected — a run capped, a
+    /// run blocked, a run overrun, a new escalation row — and stays silent
+    /// otherwise (`crates/waggledance/src/trigger.rs`).
+    ///
+    /// Defaults **off**, for exactly the reason
+    /// [`reaper_enabled`](Self::reaper_enabled) above defaults on, read the
+    /// other way round. The reaper only tidies up runs waggledance itself
+    /// dispatched, so it touches nothing the user owns; this task *spawns an
+    /// LLM agent* into a project's own repository with no human in the loop,
+    /// which is the largest external side effect anything in this section
+    /// has. So it joins `supervisor_enabled`/`notify_enabled`'s off-by-default
+    /// class — nothing here fires until the owner made a deliberate act — and
+    /// is mastered by [`enabled`](Self::enabled) on top of its own switch,
+    /// like the reaper.
+    pub trigger_enabled: bool,
+    /// observer-tick-trigger (D10): measure before arming. With this on,
+    /// every trigger detector runs exactly as it would in production and
+    /// logs the transition it saw and the tick it would have dispatched —
+    /// and `dispatch_run` is never called. Independent of
+    /// [`trigger_enabled`](Self::trigger_enabled) above in meaning (it
+    /// changes what an armed trigger *does*, not whether it runs), so an
+    /// operator can watch real fleet transition volume for a week before
+    /// ever letting a tick actually spawn.
+    ///
+    /// A log line, never a store: D5 forbids waggledance keeping any copy of
+    /// what it observed, and this mode does not create one.
+    pub trigger_dry_run: bool,
     /// toa-4 (D9): the Unassigned group — panes that live outside every
     /// registered project's root. This group has no containment check of
     /// its own; before terminal-open-access removed the terminal's session,
@@ -84,10 +205,10 @@ pub struct TerminalConfig {
     /// this switch is a second, deliberate gate on top of `enabled` above —
     /// both must be on for the group's routes to answer, so turning off
     /// `enabled` alone still closes this group, and turning this switch on
-    /// while `enabled` is off opens nothing. `#[derive(Default)]` on this
-    /// struct gives it `false`, matching a config that has never mentioned
-    /// it — the same "off unless the owner made a deliberate act" rule
-    /// every other switch in this section follows.
+    /// while `enabled` is off opens nothing. This struct's `Default` gives
+    /// it `false`, matching a config that has never mentioned it — the same
+    /// "off unless the owner made a deliberate act" rule every other
+    /// user-facing switch in this section follows.
     pub unassigned_enabled: bool,
     /// D8/P4: operator-authored agent-create presets, keyed by label — the
     /// terminal page's creation controls
@@ -125,6 +246,27 @@ pub struct AgentPreset {
     pub argv: Vec<String>,
 }
 
+/// Hand-written so `reaper_enabled` can ship **on** while every
+/// user-facing switch in the section stays off (see the field's own doc).
+/// The container-level `#[serde(default)]` routes every absent key in a
+/// `[terminal]` section through here, so an existing install's config.toml
+/// — written before the reaper existed — loads with the reaper on and its
+/// other switches exactly as the owner left them.
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            supervisor_enabled: false,
+            notify_enabled: false,
+            reaper_enabled: true,
+            trigger_enabled: false,
+            trigger_dry_run: false,
+            unassigned_enabled: false,
+            agent_presets: Vec::new(),
+            notify_chat_id: None,
+        }
+    }
+}
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -333,6 +475,33 @@ pub fn notify_store_path_override(override_dir: Option<&Path>) -> PathBuf {
 /// (now-unused) `terminal.token` — saving one never disturbs the other.
 const NOTIFY_CREDENTIAL_FILE_NAME: &str = "telegram.token";
 
+const HOOK_CREDENTIAL_FILE_NAME: &str = "hook.token";
+
+pub fn hook_token_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(HOOK_CREDENTIAL_FILE_NAME)
+}
+
+pub fn read_hook_token(data_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(hook_token_path(data_dir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn ensure_hook_token(data_dir: &Path) -> Result<bool> {
+    let path = hook_token_path(data_dir);
+    if path.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(data_dir)?;
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    write_owner_only(&path, format!("{token}\n").as_bytes())?;
+    Ok(true)
+}
+
 /// `<data_dir>/telegram.token`, or `override_dir/telegram.token` when given
 /// — mirrors `config_path_override` so a route-level test never touches the
 /// real `~/.waggledance`.
@@ -398,7 +567,7 @@ fn random_temp_suffix() -> String {
 }
 
 #[cfg(unix)]
-fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -411,7 +580,7 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 #[cfg(not(unix))]
-fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -694,7 +863,9 @@ mod tests {
     fn terminal_switches_default_off_and_carry_no_token_field() {
         // A config that has never seen the terminal section — the shape a
         // pre-existing install's config.toml has today — must still resolve
-        // every switch to off, never on by an absent-field accident.
+        // every user-facing switch to off, never on by an absent-field
+        // accident. `reaper_enabled` is the deliberate exception and has its
+        // own test (`reaper_switch_defaults_on_and_survives_an_explicit_off`).
         let c = Config::default();
         assert!(!c.terminal.enabled);
         assert!(!c.terminal.supervisor_enabled);
@@ -714,6 +885,45 @@ mod tests {
         assert!(!loaded.terminal.supervisor_enabled);
         assert!(!loaded.terminal.notify_enabled);
         assert!(!loaded.terminal.unassigned_enabled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// board-run-reaper: the one switch in `[terminal]` that ships on. Both
+    /// halves matter — a fresh `Config` has it on, and an *existing*
+    /// install's config.toml, written by a build that never heard of the
+    /// key, still loads with it on rather than falling to `bool`'s `false`.
+    /// The explicit `false` round-trip is the other half of the same
+    /// contract: default-on must not mean unturnoffable.
+    #[test]
+    fn reaper_switch_defaults_on_and_survives_an_explicit_off() {
+        assert!(
+            Config::default().terminal.reaper_enabled,
+            "the reaper ships on — it only tidies runs waggledance dispatched"
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-cfg-reaper-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+
+        // A config file that predates the switch entirely.
+        std::fs::write(&p, "[terminal]\nenabled = true\n").unwrap();
+        let loaded = Config::load_from(&p);
+        assert!(loaded.terminal.enabled);
+        assert!(
+            loaded.terminal.reaper_enabled,
+            "an absent key must read as the shipped default, not as false"
+        );
+
+        // And the owner's explicit off is honored, through the file.
+        std::fs::write(&p, "[terminal]\nenabled = true\nreaper_enabled = false\n").unwrap();
+        let loaded = Config::load_from(&p);
+        assert!(!loaded.terminal.reaper_enabled);
+
+        let mut c = Config::default();
+        c.terminal.reaper_enabled = false;
+        c.save_to(&p).unwrap();
+        assert!(!Config::load_from(&p).terminal.reaper_enabled);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -743,6 +953,41 @@ mod tests {
         assert!(loaded.terminal.supervisor_enabled);
         assert!(!loaded.terminal.unassigned_enabled);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paseo_config_defaults_to_auto_and_empty_and_matches_leaders_by_id_or_name() {
+        let c = Config::load_from(Path::new("/nonexistent/waggledance/config.toml"));
+        assert_eq!(c.paseo, PaseoConfig::default());
+        assert_eq!(c.paseo.enabled, None);
+        assert!(c.paseo.binary.is_empty());
+        assert_eq!(c.paseo.turn_timeout_secs, 3600);
+        assert!(c.paseo.provider.is_empty() && c.paseo.thinking.is_empty());
+        assert_eq!(c.paseo.mode, "bypassPermissions");
+
+        let parsed: Config = toml::from_str(
+            "[paseo]\nenabled = true\nbinary = \"/opt/paseo\"\n\n[[paseo.leaders]]\nproject = \"waggledance\"\nworkspace = \"wks_a\"\n\n[[paseo.leaders]]\nproject = \"p-2\"\nworkspace = \"wks_b\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.paseo.enabled, Some(true));
+        assert_eq!(parsed.paseo.binary, "/opt/paseo");
+        let off: Config = toml::from_str("[paseo]\nenabled = false\n").unwrap();
+        assert_eq!(off.paseo.enabled, Some(false));
+        let saved = toml::to_string(&c).unwrap();
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.paseo.enabled, None);
+        assert_eq!(parsed.paseo.turn_timeout_secs, 3600);
+        let tuned: Config = toml::from_str("[paseo]\nturn_timeout_secs = 90\n").unwrap();
+        assert_eq!(tuned.paseo.turn_timeout_secs, 90);
+        assert_eq!(
+            parsed.paseo.workspace_for("p-1", "waggledance"),
+            Some("wks_a")
+        );
+        assert_eq!(parsed.paseo.workspace_for("p-2", "other"), Some("wks_b"));
+        assert_eq!(parsed.paseo.workspace_for("p-3", "other"), None);
+        assert_eq!(parsed.paseo.mode, "bypassPermissions");
+        let unset: Config = toml::from_str("[paseo]\nmode = \"\"\n").unwrap();
+        assert!(unset.paseo.mode.is_empty());
     }
 
     #[test]
@@ -871,9 +1116,14 @@ mod tests {
             !config_text.contains(secret),
             "config.toml must never carry the Telegram credential: {config_text}"
         );
+        let lower = config_text.to_lowercase();
         assert!(
-            !config_text.to_lowercase().contains("telegram"),
-            "config.toml must carry no telegram-shaped field at all: {config_text}"
+            !lower.contains("token") && !lower.contains("credential"),
+            "config.toml must carry no credential-shaped field at all: {config_text}"
+        );
+        assert!(
+            !config_text.contains(&cred_path.display().to_string()),
+            "config.toml must never name the credential file: {config_text}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -991,6 +1241,99 @@ mod tests {
             None,
             "a failed save must never leave a partial credential readable"
         );
+    }
+
+    #[test]
+    fn openclaw_defaults_are_the_shipped_values() {
+        let c = Config::default();
+        assert_eq!(c.openclaw.home, "~/aicoworker/openclaw");
+        assert_eq!(c.openclaw.hook_url, "http://127.0.0.1:18789/hooks/agent");
+        assert_eq!(c.openclaw.cli, "");
+        assert_eq!(c.openclaw.agent_id, "");
+        assert_eq!(c.openclaw.telegram_to, "");
+        assert_eq!(c.openclaw.hook_model, "");
+        assert_eq!(c.openclaw.hook_thinking, "low");
+        assert_eq!(c.openclaw.heartbeat_secs, 600);
+    }
+
+    #[test]
+    fn a_retired_supervisor_table_should_still_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "waggledance-cfg-retired-supervisor-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(
+            &p,
+            "[server]\nport = 7711\n\n[supervisor]\nprovider = \"claude/x\"\ntitle = \"old\"\n",
+        )
+        .unwrap();
+        assert_eq!(Config::load_from(&p).server.port, 7711);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn openclaw_should_read_as_the_defaults_from_a_file_without_the_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "waggledance-cfg-seat-defaults-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[server]\nport = 7711\n").unwrap();
+        let loaded = Config::load_from(&p);
+        assert_eq!(
+            loaded.openclaw.hook_url,
+            "http://127.0.0.1:18789/hooks/agent"
+        );
+        assert_eq!(loaded.openclaw.cli, "");
+        assert_eq!(loaded.openclaw.hook_thinking, "low");
+        assert_eq!(loaded.openclaw.agent_id, "");
+        assert_eq!(loaded.openclaw.heartbeat_secs, 600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_token_path_is_beside_the_config() {
+        let dir = Path::new("/tmp/wd-data");
+        assert_eq!(hook_token_path(dir), dir.join("hook.token"));
+    }
+
+    #[test]
+    fn read_hook_token_is_none_when_absent_empty_or_blank() {
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-cfg-hooktok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_hook_token(&dir), None);
+
+        std::fs::write(hook_token_path(&dir), "").unwrap();
+        assert_eq!(read_hook_token(&dir), None);
+
+        std::fs::write(hook_token_path(&dir), "   \n\t ").unwrap();
+        assert_eq!(read_hook_token(&dir), None);
+
+        std::fs::write(hook_token_path(&dir), "  abc123  \n").unwrap();
+        assert_eq!(read_hook_token(&dir).as_deref(), Some("abc123"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_token_never_becomes_a_config_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "waggledance-cfg-hooktok-leak-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = "hook-bearer-secret-abc123";
+        std::fs::write(hook_token_path(&dir), secret).unwrap();
+        let path = config_path_override(Some(&dir));
+        Config::default().save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(secret), "{text}");
+        assert!(!text.to_lowercase().contains("token"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Defect (4): originally added because the identical mechanism next

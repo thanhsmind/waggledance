@@ -9,6 +9,7 @@ bee:
   areas: [web-interface, bee-cockpit]
   sources: [.bee/cells/archive/board-live-morph/blm-1.json, .bee/cells/archive/board-live-morph/blm-2.json, docs/knowledge/work/board-live-morph/delivery.md]
   polarity: pitfall
+  critical: true
   signature: literal-substring match
 ---
 
@@ -58,3 +59,55 @@ you edit it.
   why it is not where it belongs — the reason is the artifact, not the position.
 - When writing a new assertion, assert the presence of what the behaviour promises,
   never the neighbours it happens to sit between.
+
+## Recurrence
+
+Mined from every promote proposal in `docs/history/` at compound on 2026-08-25:
+**21 recorded deviations across 6 features**, none of them about behaviour.
+
+| Feature | Deviations |
+|---|---|
+| waggledance-rename | 10 |
+| console-rail-orchestrator | 4 |
+| board-live-morph | 3 |
+| console-phone-layout | 2 |
+| bee-agent-activity | 1 |
+| board-new-task | 1 |
+
+It is by a wide margin the most repeated non-behavioural cost in this codebase's
+history — the whole remaining corpus of 78 proposals holds 110 deviations in total,
+so roughly one line in five is this one trap. The shapes repeat exactly: a rename
+retargeting literals across test files, a wrapper's opening tag pinned whole, an
+assertion counting something document-wide that a second landmark now also matches,
+a selector picking the *n*-th occurrence of a class name.
+
+Two things this recurrence changed:
+
+- Promoted to `bee.critical` and given a `bee.signature`, so
+  `bee knowledge report` counts future hits instead of leaving the tally to a
+  once-a-month mining pass.
+- The escalation to a durable owner — a check that flags an assertion selecting
+  rendered markup by whole-string equality or *n*-th occurrence — is proposed rather
+  than built, because the discriminator between "pins ordering" and "pins behaviour"
+  is not mechanical enough yet to fail a build on. Prose plus a measured signature
+  stands until a recurrence count justifies the false-positive budget.
+
+## The trap reaches prose, not just code (2026-08-31)
+
+`term-keys-nav-tint` cost two red runs to a shape the entries above do not
+cover: **a comment is page content**.
+
+The first red came from a CSS rule selecting the arrow keys by per-key
+attribute literals. That put those literals into the stylesheet *ahead of* the
+markup they describe, and the grid-order test — which locates a key by its bare
+attribute and compares positions — found the CSS occurrence first. Rewriting
+the rule to select by class fixed it.
+
+The second red came from the explanatory **comment** written to record that
+fix, because the comment quoted the selector it was explaining. The literal was
+back in the block, ahead of the markup, and the same test went red again.
+
+The rule this adds: in a file that ships its stylesheet inside the page it
+asserts on, anything a test greps for must not be spelled out anywhere in that
+block — prose included. A position-based assertion cannot tell a rule from a
+comment, and neither can it tell either from the markup.

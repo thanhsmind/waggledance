@@ -45,3 +45,22 @@ None: the work item declares no bee.areas, so there is no area to sync (D19).
 None: no capped cell trace carries a deviation or a failure signature.
 
 knowledge promote: 1 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 0 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, nothing was proposed
+
+Reviewed in a sweep of the unapplied-proposal backlog.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/board-pane-lane-pin/delivery.md`
+  already exists as a curated record, so the generated draft would replace a
+  written record with a list of cell ids.
+- **(b) Area updates** — nothing proposed: the work item declares no `bee.areas`, so the generator had nothing to route (D19).
+- **(c) Pattern candidates** — none. No capped cell of this feature carries a
+  deviation or a failure signature, which is what the generator mines.
+
+Nothing here was skipped for later: the file proposes no change to make.
+
+<!-- /bee:not-a-deferral -->

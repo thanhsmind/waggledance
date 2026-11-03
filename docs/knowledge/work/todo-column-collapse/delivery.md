@@ -8,7 +8,7 @@ bee:
   lifecycle: active
   areas: [bee-cockpit, web-interface]
   required_context: [docs/specs/bee-cockpit.md, docs/specs/web-interface.md, .bee/lanes/todo-column-collapse.json]
-  sources: [.bee/lanes/todo-column-collapse.json, .bee/cells/tcc-1.json]
+  sources: [.bee/lanes/todo-column-collapse.json, .bee/cells/archive/todo-column-collapse/tcc-1.json]
 ---
 
 # todo-column-collapse — Delivery
@@ -51,8 +51,17 @@ the pairing that carries the whole point of the feature: Todo ships closed while
 still stating its true count. The four unfolded columns are asserted to keep
 their previous shape.
 
-Not yet confirmed against a running daemon — the recorded next step is a daemon
-restart to see the folded column on the live board.
+Accepted by the owner at the uat gate on 2026-08-25. That acceptance is the
+owner's own.
+
+Confirmed against the running daemon on 2026-08-25, after a restart onto a build
+of main. Both boards serve Todo as `<details class="bee-hub__group--fold"
+id="hub-todo">` with no `open` attribute, so the column arrives closed; its
+`<summary>` carries the dot, the label, the true count (19 on the cross-project
+board, 4 on `/p/waggledance/_bee`) and the chevron. The four columns beside it
+are plain `<div>`s and cannot fold. The only script-free rotation is the CSS
+rule `.bee-hub__group--fold[open] .bee-hub__chev { transform: rotate(90deg) }`,
+matching the archive bar and the cards.
 
 ## Deviations
 

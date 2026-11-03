@@ -116,3 +116,22 @@ Folded TERMINAL_CREATE_SCRIPT and UNASSIGNED_TERMINAL_SCRIPT out of views.rs int
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 5 capped cell(s) mined, 1 delivery draft, 3 area bullet(s), 2 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed against the spec
+
+Reviewed in a sweep of the unapplied-proposal backlog, checking each candidate
+bullet against what the spec already states rather than pasting it in.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/backlog-groom-2/delivery.md`
+  already exists as a curated record.
+- **(b) Area updates** — the generated bullets are each cell's outcome in
+  implementation vocabulary (function and type names), which a spec never carries
+  outside its Pointers section, so none was applied as written. What the reader
+  actually gained: already stated in `docs/specs/bee-cockpit.md` — the reader-visible halves are already stated — "A store that cannot be fully read says so" covers the warning strip, and the tab strip's survival of an empty surface is now stated with the home page's tabs; the rest of the cells are refactors with no behaviour to describe.
+- **(c) Pattern candidates** — none proposed for this feature.
+
+<!-- /bee:not-a-deferral -->

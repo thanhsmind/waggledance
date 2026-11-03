@@ -1,0 +1,75 @@
+promote proposal for work item "trigger-settings-toggle" (.bee/lanes/trigger-settings-toggle.json) — 1 capped cell(s): tst-1
+anchor: ledger — .bee/lanes/trigger-settings-toggle.json
+PROPOSAL ONLY — nothing was written. Applying any section below is a human or agent decision.
+
+(a) DELIVERY DRAFT — save as docs/knowledge/work/trigger-settings-toggle/delivery.md
+
+---
+type: bee.delivery
+title: trigger-settings-toggle — delivery
+description: "Delivery record proposed by bee knowledge promote for work item trigger-settings-toggle: 1 capped cell(s), 2 recorded deviation(s)."
+timestamp: 2026-08-31
+bee:
+  id: trigger-settings-toggle-delivery
+  lifecycle: active
+  required_context: [.bee/lanes/trigger-settings-toggle.json]
+  sources: [.bee/lanes/trigger-settings-toggle.json, .bee/cells/tst-1.json]
+---
+
+# trigger-settings-toggle — Delivery
+
+## What shipped
+
+- **tst-1** — Two Settings checkboxes wired end-to-end for terminal.trigger_enabled/trigger_dry_run (3 file(s) changed)
+
+## Verify
+
+Each cell below was capped only against a recorded passing verify result — bee refuses a cap without one.
+
+- **tst-1** — `cargo build --profile fast -p waggledance && cargo test -p waggledance-core -p waggledance --no-fail-fast`
+
+## Deviations
+
+- **tst-1** — Edited views.rs and only formally claimed/finished this cell after a live cross-worktree reservation on it (from unrelated feature home-terminal-new-shell, cell htns-1) cleared — a live reservation from another worktree blocked bee cells claim on the exact file this cell needed even though the two edits were disjoint by line range — hit an unforeseen obstacle
+- **tst-1** — bee cells claim initially refused with RESERVATION_CONFLICT on views.rs: an unrelated live worktree home-terminal-new-shell cell htns-1 held a cross-worktree reservation on that file. Its declared edit lines are disjoint from this cells edit, and the write-guard hook flagged the hold as advisory-only. Made the views.rs edit under that advisory path rather than blocking the whole cell, then formally claimed and finished once the hold cleared naturally a few minutes later.
+
+## Provenance
+
+Proposed by `bee knowledge promote --work trigger-settings-toggle` from 1 capped cell trace(s) in `.bee/cells/` and the anchor `.bee/lanes/trigger-settings-toggle.json`. Every line above is copied from a trace or from the work item; nothing here is curated truth until a human or agent accepts it.
+
+(b) AREA UPDATES — candidate spec-sync bullets, each citing its cell
+
+None: the work item declares no bee.areas, so there is no area to sync (D19).
+
+(c) PATTERN CANDIDATES — candidate bee.pattern concepts, bee.polarity pitfall
+
+from cell tst-1 — save as docs/knowledge/patterns/trigger-settings-toggle-tst-1-pitfall.md
+
+---
+type: bee.pattern
+title: trigger-settings-toggle cell tst-1 — pitfall candidate
+description: "Pitfall candidate mined from cell tst-1's capped trace: Edited views.rs and only formally claimed/finished this cell after a live cross-worktree reservation on it (from unrelated feature home-terminal-new-shell, cel…"
+timestamp: 2026-08-31
+bee:
+  id: trigger-settings-toggle-tst-1-pitfall
+  lifecycle: draft
+  sources: [.bee/cells/tst-1.json]
+  polarity: pitfall
+---
+
+# trigger-settings-toggle cell tst-1 — pitfall candidate
+
+## What the cell did
+
+Two Settings checkboxes wired end-to-end for terminal.trigger_enabled/trigger_dry_run
+
+## Recorded evidence (verbatim from .bee/cells/tst-1.json)
+
+- **deviation** — Edited views.rs and only formally claimed/finished this cell after a live cross-worktree reservation on it (from unrelated feature home-terminal-new-shell, cell htns-1) cleared — a live reservation from another worktree blocked bee cells claim on the exact file this cell needed even though the two edits were disjoint by line range — hit an unforeseen obstacle
+- **deviation** — bee cells claim initially refused with RESERVATION_CONFLICT on views.rs: an unrelated live worktree home-terminal-new-shell cell htns-1 held a cross-worktree reservation on that file. Its declared edit lines are disjoint from this cells edit, and the write-guard hook flagged the hold as advisory-only. Made the views.rs edit under that advisory path rather than blocking the whole cell, then formally claimed and finished once the hold cleared naturally a few minutes later.
+
+## Status
+
+Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
+
+knowledge promote: 1 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 1 pattern candidate(s), 0 file(s) written.

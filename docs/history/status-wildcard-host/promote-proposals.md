@@ -79,3 +79,20 @@ Health probe sends the dialed loopback as Host so a wildcard-bound daemon reads 
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 1 capped cell(s) mined, 1 delivery draft, 2 area bullet(s), 1 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed against the spec
+
+Reviewed in the sweep of the unapplied-proposal backlog. The generated bullets
+are each cell's outcome in implementation vocabulary, which a spec never carries
+outside its Pointers, so each was checked as behaviour rather than pasted in.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/status-wildcard-host/delivery.md`
+  already exists as a curated record.
+- **(b) Area updates** — already stated in `docs/specs/daemon.md` under the all-interfaces liveness check — the probe dials loopback and names the address it dialed as its host, so a daemon that checks the host it is asked for recognises its own probe.
+- **(c) Pattern candidates** — none promoted from here.
+
+<!-- /bee:not-a-deferral -->

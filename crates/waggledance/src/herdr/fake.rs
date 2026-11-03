@@ -37,6 +37,23 @@ struct Inner {
     /// test assert exactly when (and whether) a scroller escalated, without
     /// inferring it from timing.
     sent_text: Mutex<Vec<(String, String)>>,
+    /// Every `close_pane` call, in order -- a test asserting "nothing was
+    /// closed" needs to see zero entries, and one asserting "exactly this
+    /// pane" needs the id. Recorded even for a pane this fake does not
+    /// know, so a close aimed at the wrong pane shows up as a recorded
+    /// call rather than vanishing into an error.
+    closed_panes: Mutex<Vec<String>>,
+    /// When set, `close_pane` refuses with this remote error instead of
+    /// closing -- the seam for "a close that errors still reports the run
+    /// as Done".
+    close_error: Mutex<Option<String>>,
+    /// Every `read_pane` call, in order, as `(pane_id, source)`. Same
+    /// reason `closed_panes` exists: the assertion that matters is often
+    /// the EMPTY one -- board-run-reaper D2 says a run whose pane vanished
+    /// is capped from the ledger alone, with no pane read attempted, and
+    /// only a recorded call log can tell "did not read" from "read and
+    /// got an error".
+    read_panes: Mutex<Vec<(String, ReadSource)>>,
 }
 
 /// One pane's fake screen state -- history-aware so a test can construct all
@@ -263,6 +280,9 @@ impl FakeHerdr {
                 available: std::sync::atomic::AtomicBool::new(true),
                 next_created_id: std::sync::atomic::AtomicU64::new(1),
                 sent_text: Mutex::new(Vec::new()),
+                closed_panes: Mutex::new(Vec::new()),
+                close_error: Mutex::new(None),
+                read_panes: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -364,6 +384,28 @@ impl FakeHerdr {
             .collect()
     }
 
+    /// Every pane id `close_pane` was called with, in call order. The
+    /// empty vec is the assertion that matters most here: a pane closed on
+    /// an inferred completion is a killed working agent.
+    pub async fn closed_panes(&self) -> Vec<String> {
+        self.inner.closed_panes.lock().await.clone()
+    }
+
+    /// Every `read_pane` call, in order, as `(pane_id, source)` -- recorded
+    /// even for a pane this fake does not know, so a read aimed at a
+    /// vanished pane shows up as a recorded call rather than disappearing
+    /// into its own error.
+    pub async fn read_pane_log(&self) -> Vec<(String, ReadSource)> {
+        self.inner.read_panes.lock().await.clone()
+    }
+
+    /// Test-only: make every subsequent `close_pane` refuse with `message`.
+    /// The call is still recorded -- the close was attempted, it just did
+    /// not take.
+    pub async fn fail_close_pane(&self, message: &str) {
+        *self.inner.close_error.lock().await = Some(message.to_string());
+    }
+
     /// Drive an agent's status (as a live change would).
     pub async fn set_status(&self, pane_id: &str, status: AgentStatus) -> Result<()> {
         let mut snap = self.inner.snapshot.lock().await;
@@ -417,11 +459,15 @@ impl FakeHerdr {
     /// against the snapshot's own state, not fake-only side-state: a name
     /// collision and an unknown workspace are both read from `snap` itself,
     /// the same thing `snapshot()` returns.
+    /// Protocol 20's `agent.start`: it attaches an agent to a pane that
+    /// ALREADY EXISTS. It creates nothing, so there is no workspace to
+    /// resolve and no cwd to fall back on — the two hazards this method's
+    /// older shape had to model are simply gone, because the directory was
+    /// settled when the pane was made.
     async fn agent_start_named(
         &self,
         name: &str,
-        workspace_id: &str,
-        cwd: Option<&str>,
+        pane_id: &str,
         argv: &[String],
     ) -> Result<AgentStarted> {
         self.ensure_up()?;
@@ -431,40 +477,20 @@ impl FakeHerdr {
             ));
         }
 
-        // herdr's agent.start does NOT resolve the workspace anchor when cwd
-        // is omitted (unlike tab.create) -- it falls back to its own process
-        // directory, an arbitrary folder unrelated to the workspace. Modeled
-        // faithfully so a test against the fake sees the same asymmetry the
-        // trait documents, not a kinder anchor-resolved path that would hide
-        // the wrong-repo hazard.
-        let resolved_cwd = match cwd {
-            Some(c) => c.to_string(),
-            None => std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "/".to_string()),
-        };
-
         let mut snap = self.inner.snapshot.lock().await;
-        // Real herdr splits into the workspace's own active tab (upstream's
-        // default placement is accepted as-is) rather than creating a new
-        // one -- unlike tab_create, no new Tab/PaneLayout row is needed, the
-        // created pane just joins the existing tab.
-        //
-        // An unknown workspace is agent_placement_not_found, NOT
-        // workspace_not_found: that is the exact code the live server
-        // returns for a missing workspace on agent.start. tab.create keeps
-        // workspace_not_found; only agent.start differs, so the fake must
-        // too rather than being kinder/different from production.
-        let active_tab_id = snap
-            .workspaces
-            .iter()
-            .find(|w| w.workspace_id == workspace_id)
-            .ok_or_else(|| HerdrError::Remote {
+
+        // An unknown pane is where the real server refuses now. Kept as the
+        // same `agent_placement_not_found` code the old shape reported for an
+        // unplaceable agent: the target moved from a workspace to a pane, the
+        // failure did not change meaning.
+        let Some(pane) = snap.panes.iter().find(|p| p.pane_id == pane_id) else {
+            return Err(HerdrError::Remote {
                 code: "agent_placement_not_found".into(),
-                message: format!("agent placement target {workspace_id} not found"),
-            })?
-            .active_tab_id
-            .clone();
+                message: format!("agent placement target {pane_id} not found"),
+            });
+        };
+        let workspace_id = pane.workspace_id.clone();
+        let tab_id = pane.tab_id.clone();
 
         if snap.agents.iter().any(|a| a.name == name) {
             return Err(HerdrError::AgentNameTaken {
@@ -473,32 +499,15 @@ impl FakeHerdr {
             });
         }
 
-        // No active tab means genuinely nowhere to place the agent -- do
-        // not invent a tab_id, that would leave a pane pointing at a tab
-        // absent from snap.tabs, a shape real herdr cannot produce. This is
-        // exactly what herdr itself reports as agent_placement_not_found;
-        // the variant set is closed, so it rides as Remote with that code
-        // rather than a new typed variant.
-        let Some(tab_id) = active_tab_id else {
-            return Err(HerdrError::Remote {
-                code: "agent_placement_not_found".into(),
-                message: format!("workspace {workspace_id} has no active tab to place an agent in"),
-            });
-        };
-
-        let n = self
-            .inner
-            .next_created_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let pane_id = format!("{workspace_id}:created-agent-pane-{n}");
-
         snap.agents.push(Agent {
-            pane_id: pane_id.clone(),
-            workspace_id: workspace_id.to_string(),
+            pane_id: pane_id.to_string(),
+            workspace_id,
             tab_id: tab_id.clone(),
+            // The same split the real params builder makes: argv[0] is the
+            // kind herdr is told to launch.
             kind: argv[0].clone(),
             name: name.to_string(),
-            // Idle, not Unknown: a just-spawned agent genuinely has no work
+            // Idle, not Unknown: a just-started agent genuinely has no work
             // in progress yet -- Unknown means "a value this app doesn't
             // recognize", which is not true here -- this is not yet a claim
             // that it finished starting.
@@ -506,27 +515,25 @@ impl FakeHerdr {
             title: String::new(),
             session_id: None,
         });
-        snap.panes.push(Pane {
-            pane_id: pane_id.clone(),
-            workspace_id: workspace_id.to_string(),
-            tab_id: tab_id.clone(),
-            cwd: Some(resolved_cwd.clone()),
-            foreground_cwd: Some(resolved_cwd),
-        });
+        // No new Pane row: the agent joins a pane that already exists, which
+        // is the whole shape change. Pushing one would model a server that
+        // creates panes on agent.start -- the protocol 16 behaviour this port
+        // exists to stop pretending is still true.
         drop(snap);
 
-        // Without this, read_pane on the just-created pane returns
-        // NoSuchPane -- the same seeding tab_create and FakeHerdr::new do
-        // for every pane they start with.
+        // The pane already existed (tab_create seeded its screen), so this is
+        // a no-op refresh rather than the creation seeding it used to be --
+        // kept so a pane created by some other path still reads.
         self.inner
             .screens
             .lock()
             .await
-            .insert(pane_id.clone(), PaneScreen::new("❯ ".to_string()));
+            .entry(pane_id.to_string())
+            .or_insert_with(|| PaneScreen::new("❯ ".to_string()));
 
         Ok(AgentStarted {
             tab_id,
-            pane_id,
+            pane_id: pane_id.to_string(),
             name: name.to_string(),
         })
     }
@@ -577,6 +584,11 @@ impl Herdr for FakeHerdr {
         source: ReadSource,
         lines: usize,
     ) -> Result<ScreenRead> {
+        self.inner
+            .read_panes
+            .lock()
+            .await
+            .push((pane_id.to_string(), source));
         self.ensure_up()?;
         let mut screens = self.inner.screens.lock().await;
         match screens.get_mut(pane_id) {
@@ -632,6 +644,109 @@ impl Herdr for FakeHerdr {
             entry.recent.push('\n');
         }
         entry.revision += 1; // revision bumps so a poller re-renders
+        Ok(())
+    }
+
+    /// Mirrors the real daemon's decision points (see `Herdr::agent_prompt`'s
+    /// doc) with no timing model: `FakeHerdr` has no clock to simulate the
+    /// daemon's own "observed a state change within 5000ms" wait, so it
+    /// answers synchronously from whatever status the agent already carries
+    /// at call time -- a test scripts the outcome it wants with `set_status`
+    /// BEFORE calling `agent_prompt`, exactly the same seam `set_status`
+    /// already serves for every other status-driven test in this module.
+    /// `Blocked` refuses before the text is sent, same as production; a
+    /// status already inside `until` (or an empty `until`) accepts and
+    /// delivers the text via `send_input`'s own submit path; anything else
+    /// is a stall. `timeout_ms` has no effect here -- there is nothing to
+    /// time out against without a clock, so this fake never returns
+    /// `HerdrError::Timeout`; only the real socket path can prove that arm.
+    async fn agent_prompt(
+        &self,
+        pane_id: &str,
+        text: &str,
+        until: &[AgentStatus],
+        _timeout_ms: u64,
+    ) -> Result<AgentStatus> {
+        self.ensure_up()?;
+        let status = {
+            let snap = self.inner.snapshot.lock().await;
+            let agent = snap
+                .agents
+                .iter()
+                .find(|a| a.pane_id == pane_id)
+                .ok_or_else(|| HerdrError::NoSuchPane(pane_id.to_string()))?;
+            if agent.status == AgentStatus::Blocked {
+                return Err(HerdrError::AgentBlocked(format!(
+                    "agent on {pane_id} is blocked"
+                )));
+            }
+            agent.status
+        };
+
+        self.send_input(pane_id, text, true).await?;
+
+        if until.is_empty() || until.contains(&status) {
+            Ok(status)
+        } else {
+            Err(HerdrError::AgentPromptStalled(format!(
+                "agent on {pane_id} did not reach {until:?} (observed {status:?})"
+            )))
+        }
+    }
+
+    /// The readiness hop, with the same no-clock honesty as `agent_prompt`:
+    /// `FakeHerdr` cannot simulate the daemon spending 3.41s watching an
+    /// agent come up, so it answers from the status the agent already
+    /// carries. `agent_start_named` registers a new agent as `Idle`, which
+    /// is inside every caller's `until`, so a spawn through this fake sails
+    /// through exactly as a real ready agent would. A pane with no
+    /// registered agent refuses `NoSuchPane` -- the fake's spelling of
+    /// herdr's own `agent_not_found` -- and a status outside `until` is the
+    /// budget running out, since with no clock there is nothing else a
+    /// non-matching state could become.
+    async fn agent_wait(
+        &self,
+        pane_id: &str,
+        until: &[AgentStatus],
+        _timeout_ms: u64,
+    ) -> Result<AgentStatus> {
+        self.ensure_up()?;
+        let snap = self.inner.snapshot.lock().await;
+        let agent = snap
+            .agents
+            .iter()
+            .find(|a| a.pane_id == pane_id)
+            .ok_or_else(|| HerdrError::NoSuchPane(pane_id.to_string()))?;
+        if until.is_empty() || until.contains(&agent.status) {
+            Ok(agent.status)
+        } else {
+            Err(HerdrError::Timeout(format!(
+                "agent on {pane_id} did not reach {until:?} (observed {:?})",
+                agent.status
+            )))
+        }
+    }
+
+    async fn close_pane(&self, pane_id: &str) -> Result<()> {
+        self.ensure_up()?;
+        // Logged before the refusal check and before the pane is looked up:
+        // the record is "a close was attempted on this pane", which is the
+        // fact every test here asserts on.
+        self.inner
+            .closed_panes
+            .lock()
+            .await
+            .push(pane_id.to_string());
+        if let Some(message) = self.inner.close_error.lock().await.clone() {
+            return Err(HerdrError::Remote {
+                code: "pane_close_failed".into(),
+                message,
+            });
+        }
+        self.inner.screens.lock().await.remove(pane_id);
+        let mut snap = self.inner.snapshot.lock().await;
+        snap.agents.retain(|a| a.pane_id != pane_id);
+        snap.panes.retain(|p| p.pane_id != pane_id);
         Ok(())
     }
 
@@ -769,17 +884,12 @@ impl Herdr for FakeHerdr {
             .await
             .insert(pane_id.clone(), PaneScreen::new("❯ ".to_string()));
 
-        Ok(TabCreated { tab_id, pane_id })
+        Ok(TabCreated { tab_id })
     }
 
-    async fn agent_start(
-        &self,
-        workspace_id: &str,
-        cwd: Option<&str>,
-        argv: &[String],
-    ) -> Result<AgentStarted> {
+    async fn agent_start(&self, pane_id: &str, argv: &[String]) -> Result<AgentStarted> {
         retry_on_name_collision(generate_agent_name, |name| async move {
-            self.agent_start_named(&name, workspace_id, cwd, argv).await
+            self.agent_start_named(&name, pane_id, argv).await
         })
         .await
     }
@@ -881,6 +991,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agentprompt_fake_accepted_delivers_text_and_returns_status() {
+        let f = FakeHerdr::new();
+        // w1:p1 seeds Working, which is inside `until` -- an accepted send.
+        let status = f
+            .agent_prompt("w1:p1", "go", &[AgentStatus::Working], 8000)
+            .await
+            .unwrap();
+        assert_eq!(status, AgentStatus::Working);
+        let after = f.read_pane("w1:p1", ReadSource::Visible, 0).await.unwrap();
+        assert!(after.text.contains("go"), "text must still be delivered");
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_blocked_refuses_before_send() {
+        let f = FakeHerdr::new();
+        let before = f.read_pane("w1:p2", ReadSource::Visible, 0).await.unwrap();
+        // w1:p2 seeds Blocked -- refused before any input reaches the pane.
+        let result = f
+            .agent_prompt("w1:p2", "go", &[AgentStatus::Working], 8000)
+            .await;
+        assert!(matches!(result, Err(HerdrError::AgentBlocked(_))));
+        let after = f.read_pane("w1:p2", ReadSource::Visible, 0).await.unwrap();
+        assert_eq!(after.text, before.text, "blocked must send nothing");
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_stalled_when_status_not_in_until() {
+        let f = FakeHerdr::new();
+        // w2:p4 seeds Idle, which is not in `until` -- a stall, distinct
+        // from both AgentBlocked and Timeout.
+        let result = f
+            .agent_prompt("w2:p4", "go", &[AgentStatus::Working], 8000)
+            .await;
+        assert!(matches!(result, Err(HerdrError::AgentPromptStalled(_))));
+        assert!(!matches!(result, Err(HerdrError::AgentBlocked(_))));
+    }
+
+    #[tokio::test]
+    async fn agentprompt_fake_unknown_pane_errors() {
+        let f = FakeHerdr::new();
+        assert!(matches!(
+            f.agent_prompt("nope", "go", &[AgentStatus::Working], 8000)
+                .await,
+            Err(HerdrError::NoSuchPane(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn unknown_pane_errors() {
         let f = FakeHerdr::new();
         assert!(matches!(
@@ -916,10 +1074,12 @@ mod tests {
 
         assert!(after.tabs.iter().any(|t| t.tab_id == created.tab_id));
 
+        // Protocol 20 hands back no pane, so the pane is found the way
+        // production finds it: by the tab it belongs to.
         let pane = after
             .panes
             .iter()
-            .find(|p| p.pane_id == created.pane_id)
+            .find(|p| p.tab_id == created.tab_id)
             .expect("created pane must be in panes[]");
         assert_eq!(pane.workspace_id, "w1");
         assert_eq!(pane.tab_id, created.tab_id);
@@ -933,7 +1093,7 @@ mod tests {
             .expect("created tab must have a PaneLayout row");
         assert_eq!(
             layout.focused_pane_id.as_deref(),
-            Some(created.pane_id.as_str())
+            Some(pane.pane_id.as_str())
         );
 
         // focus: false -- the workspace's own active tab does not move.
@@ -946,7 +1106,7 @@ mod tests {
 
         // The screens entry is what makes the created pane readable at all.
         assert!(f
-            .read_pane(&created.pane_id, ReadSource::Visible, 0)
+            .read_pane(&pane.pane_id, ReadSource::Visible, 0)
             .await
             .is_ok());
     }
@@ -970,8 +1130,12 @@ mod tests {
             .await
             .unwrap();
 
+        let pane_id = crate::herdr::pane_of_tab(&f, &created.tab_id)
+            .await
+            .unwrap()
+            .expect("the created tab brings a pane");
         let screen = f
-            .read_pane(&created.pane_id, ReadSource::Visible, 0)
+            .read_pane(&pane_id, ReadSource::Visible, 0)
             .await
             .expect("newly created pane must be readable, not NoSuchPane");
         assert_eq!(screen.text, "❯ ");
@@ -980,21 +1144,32 @@ mod tests {
     #[tokio::test]
     async fn agentstart_fake_appends_named_agent_and_readable_pane() {
         let f = FakeHerdr::new();
+
+        // Protocol 20 starts an agent INTO an existing pane, so make the
+        // pane first — the same two steps production takes.
+        let created = f
+            .tab_create("w1", Some("/home/dev/new-agent"))
+            .await
+            .unwrap();
+        let target = crate::herdr::pane_of_tab(&f, &created.tab_id)
+            .await
+            .unwrap()
+            .expect("the created tab brings a pane");
         let before = f.snapshot().await.unwrap();
 
         let started = f
-            .agent_start_named(
-                "mobile-agent-1",
-                "w1",
-                Some("/home/dev/new-agent"),
-                &["claude".to_string()],
-            )
+            .agent_start_named("mobile-agent-1", &target, &["claude".to_string()])
             .await
             .unwrap();
 
         let after = f.snapshot().await.unwrap();
         assert_eq!(after.agents.len(), before.agents.len() + 1);
-        assert_eq!(after.panes.len(), before.panes.len() + 1);
+        assert_eq!(
+            after.panes.len(),
+            before.panes.len(),
+            "agent.start attaches to a pane that already exists; it must create none"
+        );
+        assert_eq!(started.pane_id, target);
 
         let agent = after
             .agents
@@ -1022,12 +1197,12 @@ mod tests {
     #[tokio::test]
     async fn agentstart_duplicate_name_errors() {
         let f = FakeHerdr::new();
-        f.agent_start_named("dup-name", "w1", Some("/home/dev"), &["claude".to_string()])
+        f.agent_start_named("dup-name", "w1:p1", &["claude".to_string()])
             .await
             .unwrap();
 
         match f
-            .agent_start_named("dup-name", "w2", Some("/home/dev"), &["codex".to_string()])
+            .agent_start_named("dup-name", "w2:p5", &["codex".to_string()])
             .await
         {
             Err(HerdrError::AgentNameTaken { name, .. }) => assert_eq!(name, "dup-name"),
@@ -1041,7 +1216,7 @@ mod tests {
         let before = f.snapshot().await.unwrap();
 
         let err = f
-            .agent_start_named("mobile-agent-1", "w1", Some("/home/dev"), &[])
+            .agent_start_named("mobile-agent-1", "w1:p1", &[])
             .await
             .unwrap_err();
         assert!(matches!(err, HerdrError::InvalidAgentArgv(_)));
@@ -1052,20 +1227,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn createcwd_agentstart_unknown_workspace_is_placement_not_found() {
-        // agent.start on an unknown workspace returns the SAME code the live
-        // server does -- agent_placement_not_found (Remote), NOT
-        // WorkspaceNotFound. The old fake returned WorkspaceNotFound, a
-        // variant kinder and different from production. tab.create keeps
-        // WorkspaceNotFound; only agent.start differs.
+    async fn createcwd_agentstart_unknown_pane_is_placement_not_found() {
+        // agent.start's target is a PANE under protocol 20, so an unknown
+        // pane is what it now refuses -- with the same
+        // agent_placement_not_found (Remote) code, NOT WorkspaceNotFound.
+        // tab.create keeps WorkspaceNotFound; only agent.start differs.
         let f = FakeHerdr::new();
         match f
-            .agent_start_named(
-                "mobile-agent-1",
-                "no-such-workspace",
-                Some("/home/dev"),
-                &["claude".to_string()],
-            )
+            .agent_start_named("mobile-agent-1", "no-such-pane", &["claude".to_string()])
             .await
         {
             Err(HerdrError::Remote { code, .. }) => {
@@ -1075,47 +1244,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn agentstart_no_active_tab_errors_without_inventing_one() {
-        // A workspace with no active tab has genuinely nowhere to place the
-        // agent -- must not invent a tab_id (that would leave a pane
-        // pointing at a tab absent from tabs[], a shape real herdr cannot
-        // produce). herdr itself reports this as agent_placement_not_found.
-        let f = FakeHerdr::new();
-        {
-            let mut snap = f.inner.snapshot.lock().await;
-            snap.workspaces.push(Workspace {
-                workspace_id: "w-no-tab".into(),
-                label: "no-active-tab".into(),
-                agent_status: AgentStatus::Unknown,
-                active_tab_id: None,
-            });
-        }
-
-        let before = f.snapshot().await.unwrap();
-        let screens_before = f.inner.screens.lock().await.len();
-        match f
-            .agent_start_named(
-                "mobile-agent-1",
-                "w-no-tab",
-                Some("/home/dev"),
-                &["claude".to_string()],
-            )
-            .await
-        {
-            Err(HerdrError::Remote { code, .. }) => {
-                assert_eq!(code, "agent_placement_not_found");
-            }
-            other => panic!("expected Remote(agent_placement_not_found), got {other:?}"),
-        }
-
-        // Nothing was mutated -- a placement failure creates nothing: no
-        // agent, no pane, no screens entry.
-        let after = f.snapshot().await.unwrap();
-        assert_eq!(after.agents.len(), before.agents.len());
-        assert_eq!(after.panes.len(), before.panes.len());
-        assert_eq!(f.inner.screens.lock().await.len(), screens_before);
-    }
+    // REMOVED with the protocol 20 port: `agentstart_no_active_tab_errors_
+    // without_inventing_one` pinned that agent.start refused a workspace with
+    // no active tab rather than inventing a tab_id. agent.start no longer
+    // places anything — it attaches to a pane the caller already made — so
+    // that refusal has no code path left to guard. The concern it protected
+    // (never invent a placement) now lives in
+    // `HerdrError::TabPaneUnresolved`, which refuses when a created tab
+    // yields no pane instead of reaching for another one.
 
     #[tokio::test]
     async fn agentstart_port_retries_transparently_on_collision() {
@@ -1127,10 +1263,14 @@ mod tests {
         // generate_agent_name() produces, so this call should simply
         // succeed on the first attempt -- proving the public entry point
         // works end to end, not just the exact-name helper.
-        let started = f
-            .agent_start("w1", Some("/home/dev/new-agent"), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            &f,
+            "w1",
+            Some("/home/dev/new-agent"),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         assert!(!started.name.is_empty());
 
         let snap = f.snapshot().await.unwrap();
@@ -1197,7 +1337,7 @@ mod tests {
         let pane = after
             .panes
             .iter()
-            .find(|p| p.pane_id == created.pane_id)
+            .find(|p| p.tab_id == created.tab_id)
             .unwrap();
         assert_eq!(
             pane.cwd.as_deref(),
@@ -1207,12 +1347,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn createcwd_fake_agent_start_omitted_cwd_uses_process_dir_not_anchor() {
-        // The asymmetry the trait documents: agent.start does NOT resolve the
-        // workspace anchor when cwd is omitted -- it falls back to the process
-        // directory, an arbitrary folder that is NOT the workspace's anchor.
-        // This is exactly why a caller that cannot resolve a real path must
-        // refuse rather than omit cwd here.
+    async fn agentstart_lands_in_the_pane_it_was_given_not_a_directory_of_its_own() {
+        // Replaces `createcwd_fake_agent_start_omitted_cwd_uses_process_dir_
+        // not_anchor`, which pinned an asymmetry protocol 20 deleted: back
+        // then agent.start took a cwd and, when it was omitted, silently
+        // started in herdr's own process directory — the wrong-repo hazard a
+        // caller had to refuse rather than risk. agent.start has no cwd now.
+        // The directory is decided once, when the pane is created, and the
+        // agent lands wherever that pane already is. That is the property
+        // worth pinning, and it is strictly safer than the one it replaces.
         let f = FakeHerdr::new();
         let anchor = f
             .snapshot()
@@ -1221,8 +1364,13 @@ mod tests {
             .anchor_cwd_for_workspace("w3")
             .unwrap();
 
+        let created = f.tab_create("w3", None).await.unwrap();
+        let target = crate::herdr::pane_of_tab(&f, &created.tab_id)
+            .await
+            .unwrap()
+            .expect("the created tab brings a pane");
         let started = f
-            .agent_start_named("mobile-agent-omit", "w3", None, &["claude".to_string()])
+            .agent_start_named("mobile-agent-omit", &target, &["claude".to_string()])
             .await
             .unwrap();
 
@@ -1232,14 +1380,11 @@ mod tests {
             .iter()
             .find(|p| p.pane_id == started.pane_id)
             .unwrap();
-        assert!(
-            pane.cwd.is_some(),
-            "still lands in some real dir (process cwd)"
-        );
-        assert_ne!(
+        assert_eq!(
             pane.cwd.as_deref(),
             Some(anchor.as_str()),
-            "agent.start must NOT resolve the workspace anchor -- unlike tab.create"
+            "the agent lands in its pane's own directory — there is no second, \
+             arbitrary directory for it to fall back to any more"
         );
     }
 }

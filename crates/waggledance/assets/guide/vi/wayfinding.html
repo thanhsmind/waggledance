@@ -1,0 +1,190 @@
+<p>Có những yêu cầu bạn không thể chốt thành một câu "xong là gì". Ví dụ: <em>"Mình thấy cái flow onboarding có gì đó sai sai."</em> Không sai chỗ nào cụ thể, không biết muốn nó thành cái gì — chỉ là một cảm giác mù mờ.</p>
+
+<p><a href="/guide/vong-doi">Chặng shaping</a> không nhận được câu đó: nó cần viết ra một dòng nghiệm thu, và bạn chưa có gì để viết. Đây là lúc bee đi cửa thứ hai.</p>
+
+<figure class="guide-fig">
+  <svg viewBox="0 0 820 260" role="img" aria-labelledby="fig-hai-cua-title">
+    <title id="fig-hai-cua-title">Một ý tưởng còn mù mờ đi vào cửa Discovery; một ý tưởng đã có đích đi thẳng vào cửa Main. Discovery khép lại bằng cách nạp quyết định đã khoá ngược vào Main.</title>
+
+    <rect class="fig-box" x="330" y="16" width="160" height="50" rx="8"/>
+    <text class="fig-t" x="410" y="38" text-anchor="middle">Một ý tưởng</text>
+    <text class="fig-t fig-t--sm" x="410" y="56" text-anchor="middle">chưa biết muốn gì</text>
+
+    <g class="fig-line" stroke-width="1.5" fill="none">
+      <path d="M372 68 C 300 95, 240 110, 195 136"/>
+      <path d="M203 128 l-10 9 -3 -13"/>
+      <path d="M448 68 C 520 95, 580 110, 625 136"/>
+      <path d="M617 128 l10 9 3 -13"/>
+    </g>
+    <text class="fig-t fig-t--sm" x="255" y="96" text-anchor="middle">còn mù mờ, chưa đặt được đích</text>
+    <text class="fig-t fig-t--sm" x="565" y="96" text-anchor="middle">đã biết muốn gì</text>
+
+    <rect class="fig-box fig-fill-agent" x="60" y="140" width="260" height="66" rx="10"/>
+    <text class="fig-t" x="190" y="164" text-anchor="middle">bee-wayfinding</text>
+    <text class="fig-t fig-t--sm" x="190" y="184" text-anchor="middle">docs/discovery/&lt;effort&gt;/MAP.md</text>
+
+    <a href="/guide/vong-doi">
+      <rect class="fig-box fig-fill-ok" x="500" y="140" width="260" height="66" rx="10"/>
+      <text class="fig-t" x="630" y="164" text-anchor="middle">bee-shaping</text>
+      <text class="fig-t fig-t--sm" x="630" y="184" text-anchor="middle">chốt thành CONTEXT.md</text>
+    </a>
+
+    <g class="fig-line" stroke-width="1.5" stroke-dasharray="4 4" fill="none">
+      <path d="M190 206 L190 230 L630 230 L630 208"/>
+      <path d="M622 216 l8 -8 8 8"/>
+    </g>
+    <text class="fig-t fig-t--sm" x="410" y="222" text-anchor="middle">hết mù mờ: Lock đọc thẳng D-ID vào CONTEXT.md</text>
+  </svg>
+  <p class="guide-fig__cap">Hai cửa, không phải hai sản phẩm khác nhau: Discovery chỉ tồn tại để dắt một ý tưởng còn mù mờ tới đúng chỗ Main flow có thể bắt đầu.</p>
+</figure>
+
+<h2>Đi cửa nào?</h2>
+
+<p>Agent tự chọn cửa — bạn không bao giờ phải gọi tên "flow". Quy tắc rất ngắn: <strong>đặt tên được đích</strong> thì đi <a href="/guide/vong-doi">Main flow</a>; <strong>còn mù mờ</strong>, hoặc việc quá lớn để đặt tên trong một buổi, thì đi <code>bee-wayfinding</code>. Một câu người dùng nói thẳng ra — "wayfinding", "brainstorm", "bàn thử", "khám phá", ở bất kỳ ngôn ngữ nào — đi thẳng vào Discovery, bỏ qua luôn bước phân loại.</p>
+
+<p>Một map đang mở với vé còn ở biên cũng kéo agent quay lại đây trước khi chạm tới shaping — mục dưới nói kỹ "biên" là gì.</p>
+
+<h2>Bản đồ khám phá — MAP.md</h2>
+
+<p>Bằng chứng sống của Discovery là một file markdown thường, nằm ngoài kho <code>.bee/</code>: <code>docs/discovery/&lt;effort&gt;/MAP.md</code>. Nó là nội dung git theo dõi bình thường — đọc giống nhau ở mọi phiên, mọi worktree.</p>
+
+<p>Map ra đời theo hai cách: skill <code>bee-wayfinding</code> viết tay trong một buổi "chart", hoặc chính bee tự tạo khung khi một mục backlog bị gác lại vì quá mù mờ lúc shaping lọc việc:</p>
+
+<pre class="guide-code">bee discovery stub --effort onboarding-flow --from "parked from route Qualify: too vague"
+<span class="c"># Created discovery stub for "onboarding-flow" at docs/discovery/onboarding-flow/MAP.md.</span></pre>
+
+<p>Khung mới có đúng năm mục: <strong>Destination</strong>, <strong>Notes</strong>, <strong>Decisions so far</strong>, <strong>Not yet specified</strong>, <strong>Out of scope</strong>. Destination mang nguyên văn <code>(unknown — charting session needed)</code> cho tới khi một buổi chart đặt tên đích thật. Không có gì khác được tạo — không vé, không bản ghi trong kho, không commit git.</p>
+
+<div class="guide-note">
+  <span class="guide-note__title">Đích chỉ là một dòng</span>
+  <p><code>bee discovery list</code> đọc Destination là <strong>dòng đầu tiên</strong> dưới heading đó, không phải cả đoạn. Viết đích thành một câu xuống dòng giữa chừng thì phần đọc lại sẽ dừng đúng ở chỗ xuống dòng — một câu bị cắt cụt không phải lỗi hiển thị, mà là quy tắc đọc.</p>
+</div>
+
+<h2>Vé câu hỏi và biên (frontier)</h2>
+
+<p>Mỗi câu hỏi còn treo trong map là một file riêng dưới <code>tickets/</code>, do skill viết tay — <code>bee discovery stub</code> không tạo thư mục này. Mỗi vé mang vài dòng quy ước: <code>status:</code> (mặc định <code>open</code> nếu thiếu hẳn dòng này), <code>claimed-by:</code>, <code>blocked-by:</code>.</p>
+
+<p><code>bee discovery list</code> đếm đúng hai con số cho mỗi effort:</p>
+
+<div class="guide-table-wrap">
+<table class="guide-table">
+  <thead>
+    <tr><th>Con số</th><th>Nghĩa là gì</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>open</strong></td>
+      <td>Mọi vé còn <code>status: open</code>, bị chặn hay không cũng tính.</td>
+    </tr>
+    <tr>
+      <td><strong>frontier</strong> — "biên"</td>
+      <td>Tập con của open: chưa ai nhận (<code>claimed-by:</code> trống), và mọi vé chặn nó (<code>blocked-by:</code>) đã <code>closed</code>. Đây đúng là "việc một phiên có thể nhận ngay bây giờ".</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>Một <code>blocked-by:</code> trỏ tới id không tồn tại thì <strong>đóng theo hướng an toàn</strong>: vé đó nằm ngoài biên mãi mãi thay vì tự mở nhầm vì một lỗi gõ id.</p>
+
+<pre class="guide-code">bee discovery list
+<span class="c"># - onboarding-flow: A locked spec for the new onboarding. (open 3, frontier 2)</span></pre>
+
+<figure class="guide-fig">
+  <svg viewBox="0 0 820 200" role="img" aria-labelledby="fig-vong-ve-title">
+    <title id="fig-vong-ve-title">Bốn bước của một vòng bee-wayfinding: tạo khung, đặt đích và viết vé, chọn vé ở biên, trả lời rồi lặp lại tới khi hết vé.</title>
+
+    <rect class="fig-box" x="20" y="40" width="170" height="56" rx="8"/>
+    <text class="fig-t" x="105" y="64" text-anchor="middle">tạo khung</text>
+    <text class="fig-t fig-t--sm" x="105" y="82" text-anchor="middle">discovery stub</text>
+
+    <rect class="fig-box" x="220" y="40" width="170" height="56" rx="8"/>
+    <text class="fig-t" x="305" y="64" text-anchor="middle">chart</text>
+    <text class="fig-t fig-t--sm" x="305" y="82" text-anchor="middle">đặt đích, viết vé</text>
+
+    <rect class="fig-box fig-box--on" x="420" y="40" width="170" height="56" rx="8"/>
+    <text class="fig-t" x="505" y="64" text-anchor="middle">biên (frontier)</text>
+    <text class="fig-t fig-t--sm" x="505" y="82" text-anchor="middle">chọn một vé nhận</text>
+
+    <rect class="fig-box fig-fill-ok" x="620" y="40" width="170" height="56" rx="8"/>
+    <text class="fig-t" x="705" y="64" text-anchor="middle">trả lời</text>
+    <text class="fig-t fig-t--sm" x="705" y="82" text-anchor="middle">vé đóng, log quyết định</text>
+
+    <g class="fig-line" stroke-width="1.5" fill="none">
+      <path d="M190 68 L216 68"/>
+      <path d="M390 68 L416 68"/>
+      <path d="M590 68 L616 68"/>
+    </g>
+    <g class="fig-line" stroke-width="1.5">
+      <path d="M208 62 l8 6 -8 6"/>
+      <path d="M408 62 l8 6 -8 6"/>
+      <path d="M608 62 l8 6 -8 6"/>
+    </g>
+
+    <g class="fig-line" stroke-width="1.5" stroke-dasharray="4 4" fill="none">
+      <path d="M705 96 C 705 140, 505 140, 505 98"/>
+    </g>
+    <text class="fig-t fig-t--sm" x="605" y="152" text-anchor="middle">còn vé khác ở biên → lặp lại</text>
+  </svg>
+  <p class="guide-fig__cap">Vòng lặp quay tới khi biên trống — không còn vé nào vừa mở, vừa rảnh, vừa hết bị chặn.</p>
+</figure>
+
+<h2>Con số này lộ diện ở đâu</h2>
+
+<p>Một lần quét, ba chỗ hiện — không phiên nào bỏ sót một map đang chờ:</p>
+
+<div class="guide-table-wrap">
+<table class="guide-table">
+  <thead>
+    <tr><th>Chỗ hiện</th><th>Hiện cái gì</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>bee status</code></td>
+      <td>Một dòng <code>### Open discovery map(s): &lt;tên&gt; — &lt;N&gt; frontier ticket(s)</code> cho mỗi effort còn mở.</td>
+    </tr>
+    <tr>
+      <td>Preamble đầu phiên</td>
+      <td>Đúng những dòng đó, quét ngay trong phiên — không cần gõ lệnh.</td>
+    </tr>
+    <tr>
+      <td><code>bee orient</code></td>
+      <td>Khi guồng máy đang rảnh hẳn (không handoff chờ, không cell nào mở hay claim) và có map với biên khác không, orient <strong>đổi luôn</strong> gợi ý kế tiếp: "resume discovery map … — switch to bee-wayfinding."</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>Khi một feature khác đang chạy sống, map cũ không giành sân: nó chỉ còn một dòng chặn-để-báo, gợi ý chặng kế tiếp vẫn giữ nguyên — feature đang sống không bao giờ bị một map cũ ngắt ngang.</p>
+
+<h2>Quyết định bị hoãn không được chìm — trigger</h2>
+
+<p>Có những câu trả lời hợp lý là "để sau" — <em>"revisit khi thư viện upstream ra bản mới"</em>. Nói suông thì câu đó chìm vào một đoạn prose không ai đọc lại. Bee đóng nó thành một bản ghi riêng:</p>
+
+<pre class="guide-code">bee triggers add --decision c2a7bd4f --condition "revisit when upstream anomalyco/opencode#29638 lands"
+<span class="c"># Registered manual trigger revisit-when-upstream-anomalyco-opencode-29__c2a7bd4f for decision c2a7bd4f.</span></pre>
+
+<p>Một <code>trigger</code> có hai tầng: có <code>--predicate</code> (dạng <code>path-exists:&lt;path&gt;</code> hay <code>path-missing:&lt;path&gt;</code>) thì nó tự dò mỗi lần bị đọc, lật từ <code>waiting</code> sang <code>due</code> ngay khi điều kiện đúng; không có predicate thì nó chỉ nằm chờ, hiện thành "đang chờ người xác nhận" cho tới khi bạn tự chốt bằng <code>bee triggers resolve --id &lt;id&gt; --outcome "&lt;kết quả&gt;"</code>.</p>
+
+<div class="guide-note guide-note--warn">
+  <span class="guide-note__title">Chỗ người mới hay vấp</span>
+  <p><code>bee decisions log</code> <strong>từ chối thẳng</strong> mọi câu chữ nghe như hoãn lại — "để sau", "revisit khi", "hoãn" — nếu không kèm một <code>--trigger</code> đã đăng ký sẵn. Vì vậy thứ tự luôn ngược đời một chút: đăng ký trigger <em>trước</em>, rồi mới log quyết định trỏ vào nó — chưa từng có chuyện một quyết định hoãn tồn tại ngoài sổ trigger.</p>
+</div>
+
+<h2>Hỏng giữa chừng thì sao</h2>
+
+<p>Mỗi ghi đều nguyên tử: file trọn vẹn hoặc không tồn tại, không bao giờ có một <code>MAP.md</code> viết dở. Tiến trình bị giết giữa chừng thì chỉ cần chạy lại — <code>discovery list</code> hay <code>triggers list</code> luôn nói đúng sự thật hiện có trên đĩa.</p>
+
+<p>Cái mù mờ chưa kịp ghi thành khung thì mất theo phiên chat — đúng thứ <code>discovery stub</code> sinh ra để chặn. Còn khung đã ghi rồi thì sống ngoài phiên: preamble phiên sau tự nhắc lại nó. Một handoff đang chờ luôn thắng — nó chặn luôn cả gợi ý quay lại map cho tới khi bạn lên tiếng.</p>
+
+<h2>Lối ra — Lock của shaping nạp thẳng D-ID</h2>
+
+<p>Không có lệnh nào "nộp" một map đã xong sang shaping. Khi map hết vé và hết mù mờ, bước <strong>Lock</strong> của <a href="/guide/vong-doi">shaping</a> đọc thẳng mục "Decisions so far" cùng id quyết định của nó vào <code>docs/history/&lt;feature&gt;/CONTEXT.md</code> — trích dẫn lại, không hỏi lần hai. Đó là một kỷ luật đọc, không phải một lệnh CLI.</p>
+
+<p>Discovery không tự mở cổng nào của riêng nó. Chốt chặn con người của nó chính là buổi trò chuyện đặt tên đích lúc chart; các quyết định đã chốt gặp lại bạn một lần nữa ở <a href="/guide/cong-gate">Cổng 1</a> của shaping.</p>
+
+<h2>Đọc tiếp</h2>
+<ul>
+  <li><a href="/guide/vong-doi">Chương 8 — Vòng đời một feature</a>: Discovery kết thúc đúng ở cửa vào của chặng shaping, chỗ Lock đọc lại D-ID.</li>
+  <li><a href="/guide/cong-gate">Chương 3 — Năm cái cổng</a>: Cổng 1 là nơi các quyết định Discovery gặp lại bạn để chốt lần cuối.</li>
+  <li><a href="/guide/bo-nho">Chương 12 — Bee nhớ những gì</a>: quyết định và trigger đều là những bản ghi sống mãi, cùng họ với capture và decision log.</li>
+</ul>

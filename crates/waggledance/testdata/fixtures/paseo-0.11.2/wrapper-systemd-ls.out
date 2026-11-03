@@ -1,0 +1,54 @@
+22:47:26.299 › [desktop] app startup { version: '0.11.2', platform: 'linux', arch: 'x64', isPackaged: true }
+22:47:26.305 › [linux-sandbox] { enabled: false, reason: 'requested by --no-sandbox' }
+[
+  {
+    "id": "35eca12c-e112-4690-bf48-af0222f659e1",
+    "shortId": "35eca12",
+    "name": "Tôi đang chạy waggledance trong paseo tôi muốn thêm config v",
+    "provider": "claude/claude-opus-5-5",
+    "thinking": "medium",
+    "status": "running",
+    "cwd": "~/Projects/goglbe/waggledance",
+    "created": "1 hours ago"
+  },
+  {
+    "id": "68b5798b-707f-4b25-a613-d75b4d3aeccd",
+    "shortId": "68b5798",
+    "name": "Cài đặt bản mới nhất cho waggledance",
+    "provider": "claude/claude-opus-5-5",
+    "thinking": "medium",
+    "status": "idle",
+    "cwd": "~/Projects/goglbe/beehive",
+    "created": "1 hours ago"
+  },
+  {
+    "id": "f736d15a-aca1-4e7e-a544-87e26ace7ef5",
+    "shortId": "f736d15",
+    "name": "Tôi muốn dùng threejs để xây dựng lại game happyfarm của fac",
+    "provider": "claude/claude-opus-5",
+    "thinking": "high",
+    "status": "idle",
+    "cwd": "~/Projects/goglbe/happyfarm",
+    "created": "6 hours ago"
+  },
+  {
+    "id": "294036d4-f55e-45f1-93a4-2e99581bcd19",
+    "shortId": "294036d",
+    "name": "[Handoff] Goglbe Video Studio web",
+    "provider": "claude/claude-opus-5-5",
+    "thinking": "auto",
+    "status": "idle",
+    "cwd": "~/Projects/goglbe/goglbe-tools",
+    "created": "6 hours ago"
+  },
+  {
+    "id": "acfeb295-76a6-4777-82b6-7055dfcaa363",
+    "shortId": "acfeb29",
+    "name": "Thêm 2 nút copy 1 copy thường chỉ copy nội dung comment 1 co",
+    "provider": "claude/claude-opus-5",
+    "thinking": "high",
+    "status": "idle",
+    "cwd": "~/Projects/anphabe/anphabe-goglbe",
+    "created": "7 hours ago"
+  }
+]

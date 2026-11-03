@@ -4,14 +4,20 @@
 
 use crate::code_source::{self, DirListing, SourceContent};
 use crate::config::Config;
-use crate::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
+use crate::domain::{
+    InboxMessage, IndexedFile, PermissionRequest, Project, RenderedPage, Run, SearchResult, WdTask,
+};
 use crate::error::{Error, Result};
 use crate::fuzzy::{self, FuzzyHit};
+use crate::git_diff::{self, ActiveBase, CommitEntry, DiffBase, GitDiffError, WorkingTreeDiff};
 use crate::indexer::{self, IndexService};
+use crate::project_settings::{self, ProjectSettings};
 use crate::render::{self, HighlightedSource, RenderService};
 use crate::repository::SqliteStore;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -19,7 +25,10 @@ pub struct Engine {
     pub store: SqliteStore,
     pub config: Config,
     render: RenderService,
+    settings_cache: Mutex<HashMap<PathBuf, CachedSettings>>,
 }
+
+type CachedSettings = (Option<SystemTime>, ProjectSettings, Vec<String>);
 
 #[derive(Debug, Clone)]
 pub struct ViewFile {
@@ -36,6 +45,7 @@ impl Engine {
             store,
             config,
             render: RenderService::new(),
+            settings_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -57,7 +67,7 @@ impl Engine {
         if let Some(mut p) = self.store.find_project_by_root(&root)? {
             p.last_seen_at = indexer::now_rfc3339();
             self.store.upsert_project(&p)?;
-            return Ok(p);
+            return Ok(self.with_consent(p));
         }
         let id = self.unique_id(&indexer::slug_from_root(&root))?;
         let name = name.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -83,7 +93,7 @@ impl Engine {
             self.max_bytes(),
         )?;
         self.reindex_links(&project)?;
-        Ok(project)
+        Ok(self.with_consent(project))
     }
 
     fn unique_id(&self, base: &str) -> Result<String> {
@@ -361,25 +371,47 @@ impl Engine {
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        self.store.list_projects()
+        Ok(self
+            .store
+            .list_projects()?
+            .into_iter()
+            .map(|p| self.with_consent(p))
+            .collect())
     }
 
     pub fn get_project(&self, id: &str) -> Result<Option<Project>> {
-        self.store.get_project(id)
+        Ok(self.store.get_project(id)?.map(|p| self.with_consent(p)))
     }
 
-    /// D6: flip a project's orchestrator-dispatch opt-in flag.
+    fn with_consent(&self, mut project: Project) -> Project {
+        project.orchestration_enabled = self.orchestration_allowed(&project);
+        project
+    }
+
     pub fn set_orchestration_enabled(&self, project_id: &str, enabled: bool) -> Result<()> {
         self.store.set_orchestration_enabled(project_id, enabled)
     }
 
-    /// D6 gating predicate: true only when this project has opted into
-    /// orchestrator dispatch. This is the per-project half of the check —
-    /// the caller combines it with the global `terminal.enabled` switch
-    /// (`self.config.terminal.enabled`) before allowing a dispatch, since a
-    /// project can be opted in while the terminal family itself is off.
     pub fn orchestration_allowed(&self, project: &Project) -> bool {
-        project.orchestration_enabled
+        let settings = self.project_settings(project).0;
+        settings.unreadable.is_none() && settings.orchestration != Some(false)
+    }
+
+    pub fn project_settings(&self, project: &Project) -> (ProjectSettings, Vec<String>) {
+        let path = project_settings::settings_path(&project.root_path);
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mut cache = self
+            .settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, settings, warnings)) = cache.get(&path) {
+            if *cached == mtime {
+                return (settings.clone(), warnings.clone());
+            }
+        }
+        let (settings, warnings) = project_settings::load(&project.root_path);
+        cache.insert(path, (mtime, settings.clone(), warnings.clone()));
+        (settings, warnings)
     }
 
     // ---- runs (D7) ----
@@ -421,6 +453,191 @@ impl Engine {
     /// The feature a run was started for, read back off its own row.
     pub fn run_feature(&self, id: &str) -> Result<Option<String>> {
         self.store.run_feature(id)
+    }
+
+    /// Record the transcript a run ended with, on its own row. Called once
+    /// a run reaches a terminal status, so the answer outlives the pane it
+    /// was read from.
+    pub fn set_run_final_transcript(&self, id: &str, transcript: &str) -> Result<()> {
+        self.store.set_run_final_transcript(id, transcript)
+    }
+
+    pub fn finish_run(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: &str,
+        transcript: Option<&str>,
+        notice: Option<(&str, &str)>,
+    ) -> Result<()> {
+        self.store
+            .finish_run(id, status, updated_at, transcript, notice)
+    }
+
+    pub fn pending_notices(&self) -> Result<Vec<(String, String, String, String)>> {
+        self.store.pending_notices()
+    }
+
+    pub fn set_notice_state(&self, run_id: &str, state: &str) -> Result<()> {
+        self.store.set_notice_state(run_id, state)
+    }
+
+    pub fn run_notice_state(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_notice_state(id)
+    }
+
+    pub fn insert_inbox_message(
+        &self,
+        recipient: &str,
+        corr: &str,
+        project_id: &str,
+        kind: &str,
+        body: &str,
+        created_at: &str,
+    ) -> Result<i64> {
+        self.store
+            .insert_inbox_message(recipient, corr, project_id, kind, body, created_at)
+    }
+
+    pub fn next_inbox_message(&self, recipient: &str) -> Result<Option<InboxMessage>> {
+        self.store.next_inbox_message(recipient)
+    }
+
+    pub fn ack_inbox_message(&self, seq: i64, acked_at: &str) -> Result<()> {
+        self.store.ack_inbox_message(seq, acked_at)
+    }
+
+    pub fn fail_inbox_message(&self, seq: i64, dead_at_attempts: i64, now: &str) -> Result<bool> {
+        self.store.fail_inbox_message(seq, dead_at_attempts, now)
+    }
+
+    pub fn prune_inbox(&self, acked_before: &str) -> Result<usize> {
+        self.store.prune_inbox(acked_before)
+    }
+
+    pub fn insert_task(&self, corr: &str, project_id: &str, at: &str) -> Result<bool> {
+        self.store.insert_task(corr, project_id, at)
+    }
+
+    pub fn get_task(&self, corr: &str) -> Result<Option<WdTask>> {
+        self.store.get_task(corr)
+    }
+
+    pub fn list_open_tasks(&self) -> Result<Vec<WdTask>> {
+        self.store.list_open_tasks()
+    }
+
+    pub fn mark_task_delivered(&self, corr: &str, leader_id: &str, at: &str) -> Result<()> {
+        self.store.mark_task_delivered(corr, leader_id, at)
+    }
+
+    pub fn mark_task_mail(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.mark_task_mail(corr, at)
+    }
+
+    pub fn close_task(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.close_task(corr, at)
+    }
+
+    pub fn set_task_nudged(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.set_task_nudged(corr, at)
+    }
+
+    pub fn set_task_progress_sent(&self, corr: &str, at: &str) -> Result<()> {
+        self.store.set_task_progress_sent(corr, at)
+    }
+
+    pub fn stamp_board_sent(&self, at: &str) -> Result<()> {
+        self.store.stamp_board_sent(at)
+    }
+
+    pub fn insert_permission_request(&self, request: &PermissionRequest) -> Result<bool> {
+        self.store.insert_permission_request(request)
+    }
+
+    pub fn unanswered_permission_requests(&self, corr: &str) -> Result<Vec<PermissionRequest>> {
+        self.store.unanswered_permission_requests(corr)
+    }
+
+    pub fn answer_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        self.store.answer_permission_request(req_id, at)
+    }
+
+    pub fn close_permission_request(&self, req_id: &str, at: &str) -> Result<()> {
+        self.store.close_permission_request(req_id, at)
+    }
+
+    pub fn permission_request_ids(&self, corr: &str) -> Result<Vec<String>> {
+        self.store.permission_request_ids(corr)
+    }
+
+    pub fn prune_tasks(&self, before: &str) -> Result<usize> {
+        self.store.prune_tasks(before)
+    }
+
+    /// The transcript a finished run ended with — `None` while it is still
+    /// working, and for rows written before the column existed.
+    pub fn run_final_transcript(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_final_transcript(id)
+    }
+
+    pub fn insert_run_with_request(
+        &self,
+        run: &Run,
+        feature: Option<&str>,
+        request_id: Option<&str>,
+        caller: Option<&str>,
+    ) -> Result<String> {
+        self.store
+            .insert_run_with_request(run, feature, request_id, caller)
+    }
+
+    pub fn run_by_request(&self, project_id: &str, request_id: &str) -> Result<Option<Run>> {
+        self.store.run_by_request(project_id, request_id)
+    }
+
+    pub fn project_for_corr(&self, corr: &str) -> Result<Option<String>> {
+        self.store.project_for_corr(corr)
+    }
+
+    pub fn run_caller(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_caller(id)
+    }
+
+    pub fn run_attempts(&self, id: &str) -> Result<Option<i64>> {
+        self.store.run_attempts(id)
+    }
+
+    pub fn list_queued_paseo_runs(&self, project_id: &str) -> Result<Vec<Run>> {
+        self.store.list_queued_paseo_runs(project_id)
+    }
+
+    pub fn list_projects_with_queued_paseo_runs(&self) -> Result<Vec<String>> {
+        self.store.list_projects_with_queued_paseo_runs()
+    }
+
+    pub fn claim_queued_run(&self, id: &str) -> Result<bool> {
+        self.store.claim_queued_run(id)
+    }
+
+    pub fn set_run_request(&self, id: &str, request_id: &str) -> Result<()> {
+        self.store.set_run_request(id, request_id)
+    }
+
+    pub fn set_run_pane(&self, id: &str, pane_id: &str) -> Result<()> {
+        self.store.set_run_pane(id, pane_id)
+    }
+
+    pub fn requeue_run(&self, id: &str) -> Result<bool> {
+        self.store.requeue_run(id)
+    }
+
+    pub fn list_inflight_paseo_runs(&self) -> Result<Vec<Run>> {
+        self.store.list_inflight_paseo_runs()
+    }
+
+    pub fn list_leader_waits(&self, lost_since: &str) -> Result<Vec<Run>> {
+        self.store.list_leader_waits(lost_since)
     }
 
     pub fn list_files(&self, project_id: &str) -> Result<Vec<IndexedFile>> {
@@ -517,6 +734,69 @@ impl Engine {
             }
         }
     }
+
+    /// The project's diff for the Changes screen — the working tree against
+    /// HEAD (D2: staged + unstaged + untracked) or one commit against its
+    /// parent (D6), whichever `base` asks for. Mirrors `code_path` above:
+    /// the HTTP layer never touches `git_diff` itself, and the project's own
+    /// exclude patterns travel with the call so D5's filter runs inside the
+    /// git layer rather than after it.
+    ///
+    /// `base` carries the caller's raw request, not a checked one: D7's gate
+    /// lives in `git_diff`, so a value that names no commit comes back as
+    /// the working-tree view with `ChangesView::base` saying so — never an
+    /// error, and never quoted back at the reader.
+    ///
+    /// Git being missing, the project not being a repository, and a call
+    /// that had to be killed are all `Ok` with a
+    /// `ChangesContent::Unavailable` inside, not `Err`: they are states the
+    /// screen explains (D3), not failures of the request. Only an unknown
+    /// project id is an `Err`.
+    pub fn changes(&self, project_id: &str, base: &DiffBase) -> Result<ChangesView> {
+        let project = self
+            .store
+            .get_project(project_id)?
+            .ok_or_else(|| Error::ProjectNotFound(project_id.to_string()))?;
+        let exclude = &self.config.indexing.exclude_patterns;
+        let content = match git_diff::diff(&project.root_path, exclude, base) {
+            Ok(diff) => ChangesContent::Diff(diff),
+            Err(reason) => ChangesContent::Unavailable(reason),
+        };
+        // The picker's list costs one more git call, so it is only paid for
+        // when there is a repository to list: an unavailable diff has no
+        // commits to offer either.
+        let (commits, active) = match &content {
+            ChangesContent::Diff(diff) => (
+                git_diff::log_entries(&project.root_path, git_diff::LOG_LIMIT),
+                diff.base.clone(),
+            ),
+            ChangesContent::Unavailable(_) => (Vec::new(), ActiveBase::WorkingTree),
+        };
+        Ok(ChangesView {
+            content,
+            commits,
+            base: active,
+        })
+    }
+}
+
+/// What the Changes screen renders — see `Engine::changes`.
+pub struct ChangesView {
+    /// The comparison, or why there is none (D3).
+    pub content: ChangesContent,
+    /// Recent commits for the base picker (D6), newest first. Empty when
+    /// there is no repository to list.
+    pub commits: Vec<CommitEntry>,
+    /// Which base the page is actually showing — a mirror of the diff's own
+    /// `base`, defined even when there is no diff so a caller can label the
+    /// screen without matching on the content first.
+    pub base: ActiveBase,
+}
+
+/// The Changes screen's content: a comparison, or the explained empty state.
+pub enum ChangesContent {
+    Diff(WorkingTreeDiff),
+    Unavailable(GitDiffError),
 }
 
 /// Result of resolving a Code-section path — see `Engine::code_path`.
@@ -990,22 +1270,130 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "r1");
 
+        assert_eq!(engine.run_final_transcript("r1").unwrap(), None);
+        engine
+            .set_run_final_transcript("r1", "final delta")
+            .unwrap();
+        assert_eq!(
+            engine.run_final_transcript("r1").unwrap().as_deref(),
+            Some("final delta")
+        );
+
+        engine
+            .finish_run(
+                "r1",
+                "done",
+                "2026-08-16T00:06:00Z",
+                Some("final delta"),
+                Some(("notice text", "2026-08-16T01:00:00Z")),
+            )
+            .unwrap();
+        assert_eq!(engine.get_run("r1").unwrap().unwrap().status, "done");
+        assert_eq!(
+            engine.get_run("r1").unwrap().unwrap().updated_at,
+            "2026-08-16T00:06:00Z"
+        );
+        assert!(
+            engine.pending_notices().unwrap().is_empty(),
+            "a run with no caller owes nobody a notice"
+        );
+        engine.set_notice_state("r1", "dropped").unwrap();
+        assert_eq!(
+            engine.run_notice_state("r1").unwrap().as_deref(),
+            Some("dropped")
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn write_bumped(file: &Path, text: &str, secs: u64) {
+        std::fs::write(file, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
     #[test]
-    fn orchestration_allowed_is_gated_by_the_per_project_flag() {
+    fn orchestration_is_on_without_a_project_file_whatever_the_stored_flag() {
         let dir = std::env::temp_dir().join(format!("waggledance-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
         let project = engine.register(&dir, None).unwrap();
-        assert!(!engine.orchestration_allowed(&project));
+        assert!(engine.orchestration_allowed(&project));
+        assert!(project.orchestration_enabled);
 
-        engine.set_orchestration_enabled(&project.id, true).unwrap();
+        engine
+            .set_orchestration_enabled(&project.id, false)
+            .unwrap();
         let reloaded = engine.get_project(&project.id).unwrap().unwrap();
+        assert!(reloaded.orchestration_enabled);
         assert!(engine.orchestration_allowed(&reloaded));
+        assert!(engine.list_projects().unwrap()[0].orchestration_enabled);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn orchestration_is_off_only_when_the_project_file_says_false_or_is_broken() {
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-gate-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(project_settings::FILE_NAME);
+
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&dir, None).unwrap();
+        engine.set_orchestration_enabled(&project.id, true).unwrap();
+
+        write_bumped(&file, "orchestration = false\n", 5);
+        assert!(!engine.orchestration_allowed(&project));
+        assert!(
+            !engine
+                .get_project(&project.id)
+                .unwrap()
+                .unwrap()
+                .orchestration_enabled
+        );
+        assert!(!engine.list_projects().unwrap()[0].orchestration_enabled);
+        assert!(
+            !engine
+                .ensure_project(&dir, None)
+                .unwrap()
+                .orchestration_enabled
+        );
+        assert!(!engine.register(&dir, None).unwrap().orchestration_enabled);
+
+        write_bumped(&file, "orchestration = true\n", 10);
+        assert!(engine.orchestration_allowed(&project));
+        assert!(
+            engine
+                .get_project(&project.id)
+                .unwrap()
+                .unwrap()
+                .orchestration_enabled
+        );
+
+        write_bumped(&file, "[paseo]\nprovider = \"claude\"\n", 15);
+        assert!(engine.orchestration_allowed(&project));
+
+        write_bumped(&file, "orchestration = tru\n", 20);
+        assert!(!engine.orchestration_allowed(&project));
+        assert!(
+            !engine
+                .get_project(&project.id)
+                .unwrap()
+                .unwrap()
+                .orchestration_enabled
+        );
+        let (settings, warnings) = engine.project_settings(&project);
+        let unreadable = settings.unreadable.expect("a broken file is named");
+        assert!(unreadable.contains("failed to parse"), "{unreadable}");
+        assert_eq!(warnings, vec![unreadable]);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -219,3 +219,34 @@ A published pane now carries bee's own state and feature, which is the half that
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 5 capped cell(s) mined, 1 delivery draft, 0 area bullet(s), 5 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, reviewed
+
+Reviewed in a sweep of the unapplied-proposal backlog.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/ask-state-fleet-read/delivery.md`
+  already exists as a curated record; the generated draft would replace it with a
+  list of cell ids and raw deviations.
+- **(b) Area updates** — nothing proposed by the generator.
+- **(c) Pattern candidates** — none promoted, from five candidates:
+  - *Checked and rejected on evidence.* One deviation says the declared verify
+    `cargo test -p waggledance mcp::` could not work because the package has no lib
+    target. Re-run on 2026-08-25: that command passes 42 tests. The claim does not
+    hold today, so nothing generalizable was promoted from it.
+  - *Already active.* The fix-first cell that found asfr-2 delivered nothing in
+    practice — visible only by running the built binary, because the unit tests
+    supply the orchestration slot themselves — is exactly
+    `docs/knowledge/patterns/the-test-builds-the-collaborator-production-does-not.md`,
+    and it also demonstrates `prove-the-whole-path`. Recorded here as a recurrence
+    of both rather than promoted again.
+  - *Not a pitfall.* "Ran inline rather than through a dispatched execution worker",
+    on four cells, is a standing user instruction being honoured.
+  - *Not a pitfall.* Making the pane projection a pure function, and widening four
+    items to `pub(crate)` so the MCP path reuses the board's join instead of copying
+    it, are design choices the delivery record already carries.
+
+<!-- /bee:not-a-deferral -->

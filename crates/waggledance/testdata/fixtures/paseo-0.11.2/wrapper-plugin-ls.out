@@ -1,0 +1,17 @@
+23:51:21.452 › [desktop] app startup { version: '0.11.2', platform: 'linux', arch: 'x64', isPackaged: true }
+23:51:21.457 › [linux-sandbox] { enabled: false, reason: 'requested by --no-sandbox' }
+[
+  {
+    "id": "waggledance",
+    "path": "/home/thanhsmind/.waggledance/paseo",
+    "enabled": true,
+    "status": "disabled",
+    "description": "Waggle Dance in Paseo: what waits on you, what is in progress, and the live agents (read-only)",
+    "installation": {
+      "identity": {
+        "kind": "directory",
+        "path": "/home/thanhsmind/.waggledance/paseo"
+      }
+    }
+  }
+]

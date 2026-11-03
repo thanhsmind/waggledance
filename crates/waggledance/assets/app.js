@@ -43,6 +43,354 @@
     return base != null || projectId != null;
   }
 
+  // pane-kick-refresh D1 (`ac627264`) / D2 (`5f697a7c`): a key or reply that
+  // lands is invisible until the next fixed 1500 ms screen tick, so a tap
+  // that herdr answers in ~14 ms (and that is visible in `/screen` at ~28 ms)
+  // still reads as 0–1500 ms of dead air — 750 ms on average, plus a tunnel's
+  // ~365 ms per leg. Nothing here polls harder: `POLL_MS` is untouched
+  // everywhere. The sender simply says "this pane just changed" and the
+  // screen pollers refetch that one pane at once instead of waiting out the
+  // rest of the tick.
+  //
+  // The senders and the screen pollers are separate IIFEs by design, and a
+  // window event is already this file's way of talking across that boundary
+  // (`window.dispatchEvent(new Event("resize"))` further down) — so the
+  // bridge is a window CustomEvent carrying the pane id, and each poller
+  // ignores a pane id it does not own (the project page and the Unassigned
+  // page must never poll each other's panes).
+  //
+  // The two follow-ups exist because the first kick can be swallowed: that
+  // pane's poll may already be in flight (`inFlightScreen` skips it, by
+  // design — never stack a second fetch on a held pane lock), or herdr may
+  // not have repainted the frame yet. Both are bounded one-shot timers; no
+  // new interval is introduced.
+  var PANE_DIRTY_FOLLOW_UP_MS = [250, 700];
+
+  function markPaneDirty(paneId) {
+    if (!paneId) return;
+    // Same try/catch the `resize` dispatches below carry: a browser without
+    // the `CustomEvent` constructor loses the kick (and falls back to the
+    // ordinary tick), never the send that triggered it.
+    try {
+      window.dispatchEvent(new CustomEvent("waggledance:pane-dirty", { detail: { paneId: paneId } }));
+    } catch (e) {}
+  }
+
+  // The listening half of that bridge, shared by both screen pollers so the
+  // ownership check and the follow-up schedule live in one place. `ownedEl`
+  // answers "is this pane mine?" for the calling poller — returning `null`
+  // for a pane belonging to the other page — and `poll` is that poller's own
+  // `pollOne`, whose existing refusals (`viewingHistory`, `inFlightScreen`)
+  // are deliberately left to do their job on every one of these calls.
+  function onPaneDirty(ownedEl, poll) {
+    window.addEventListener("waggledance:pane-dirty", function (ev) {
+      var paneId = ev && ev.detail ? ev.detail.paneId : null;
+      if (!paneId) return;
+      var el = ownedEl(paneId);
+      if (!el) return;
+      poll(el);
+      PANE_DIRTY_FOLLOW_UP_MS.forEach(function (ms) {
+        setTimeout(function () {
+          poll(el);
+        }, ms);
+      });
+    });
+  }
+
+  // tkg-1 (D1/D2): the 2×6 key grid's modifier buttons latch one at a
+  // time — aria-pressed marks which one, if any, is lit — and the next
+  // data-key tap combines with it as "<mod>+<key>" before the latch clears,
+  // exactly once. A second modifier tap replaces the first rather than
+  // stacking; tapping the SAME modifier again just clears it. With no
+  // latch, a bare key sends unchanged. Shared by the project-page wiring
+  // and the Unassigned page's own copy below so the combine/clear rule
+  // lives in exactly one place.
+  function wireTermKeysGrid(group, sendKeys) {
+    var modButtons = Array.prototype.slice.call(group.querySelectorAll("button[data-mod]"));
+    function clearLatch() {
+      modButtons.forEach(function (b) { b.setAttribute("aria-pressed", "false"); });
+    }
+    modButtons.forEach(function (modBtn) {
+      modBtn.addEventListener("click", function () {
+        var wasLatched = modBtn.getAttribute("aria-pressed") === "true";
+        clearLatch();
+        if (!wasLatched) modBtn.setAttribute("aria-pressed", "true");
+      });
+    });
+    Array.prototype.slice.call(group.querySelectorAll("button[data-key]")).forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var key = btn.getAttribute("data-key");
+        if (!key) return;
+        var latched = modButtons.filter(function (b) {
+          return b.getAttribute("aria-pressed") === "true";
+        })[0];
+        var mod = latched ? latched.getAttribute("data-mod") : null;
+        if (mod) clearLatch();
+        // ctrl-c-no-double: the Ctrl+C button's own key already IS "ctrl+c"
+        // — latching Ctrl first and tapping it would double the prefix into
+        // a wire name herdr refuses, so a key that already opens with the
+        // latched modifier's own prefix rides unchanged.
+        var wire = mod && key.indexOf(mod + "+") !== 0 ? mod + "+" + key : key;
+        sendKeys(wire);
+      });
+    });
+  }
+
+  // tkg-1 (D3): Paste reads the clipboard and inserts at the cursor of the
+  // nearest `.term-reply__text` — the SAME pane's own reply box, found via
+  // the shared `.fg-card.term-pane` ancestor both `views.rs::pane_controls`
+  // and `views.rs::screen_frame` wrap every pane's controls in — never
+  // posted straight into the pane (D3: review before send). Renders
+  // disabled the moment the clipboard read API turns out unavailable,
+  // matching the dimmed reference state — feature detection can only run
+  // in the browser, so the button always ships enabled from the server.
+  function wireTermKeysPaste(group) {
+    var pasteBtn = group.querySelector(".term-keys__paste");
+    if (!pasteBtn) return;
+    if (!navigator.clipboard || typeof navigator.clipboard.readText !== "function") {
+      pasteBtn.disabled = true;
+      return;
+    }
+    pasteBtn.addEventListener("click", function () {
+      var card = pasteBtn.closest(".term-pane");
+      var textarea = card ? card.querySelector(".term-reply__text") : null;
+      if (!textarea) return;
+      navigator.clipboard
+        .readText()
+        .then(function (text) {
+          if (!text) return;
+          var start = textarea.selectionStart;
+          var end = textarea.selectionEnd;
+          var hasSelection = typeof start === "number" && typeof end === "number";
+          var from = hasSelection ? start : textarea.value.length;
+          var to = hasSelection ? end : textarea.value.length;
+          textarea.value = textarea.value.slice(0, from) + text + textarea.value.slice(to);
+          var caret = from + text.length;
+          textarea.focus();
+          textarea.setSelectionRange(caret, caret);
+        })
+        .catch(function () {});
+    });
+  }
+
+  // csl-2 (D1 `a4d73a4f`, D2 `ae531e75`, D3 `4da60387`): slash-command and
+  // skill suggestions for a reply composer. Shared by all three composer
+  // wiring sites below (project panes and the Unassigned page) so the
+  // trigger rule and the key handling live in exactly one place, the way
+  // `wireTermKeysGrid` above holds the latch rule.
+  //
+  // The menu opens ONLY while `/` is the FIRST character of the box (D3):
+  // a mid-text slash is a path or a date, never a command, and popping a
+  // menu over one would fight the typist. The token between that `/` and
+  // the caret filters `name` by case-insensitive prefix; no match closes
+  // the menu rather than showing an empty box.
+  //
+  // Entries come from `fetchUrl` (D2's `{name, kind, description}` list),
+  // fetched at most once per page and cached — a failed fetch caches the
+  // empty list rather than retrying on every keystroke.
+  //
+  // Enter/Tab insert `/name ` and close. The keydown is bound in the
+  // CAPTURE phase so it runs before each site's own bubble-phase Ctrl+Enter
+  // send handler; a bare Enter with the menu open is swallowed
+  // (`preventDefault`, so no newline and no submit), while any keystroke
+  // carrying Ctrl/Cmd/Alt is left entirely to that send handler — Ctrl+Enter
+  // still sends, menu open or closed.
+  //
+  // Rows are built with `textContent` only: names and descriptions come
+  // from files on disk (`.claude/commands/*.md`, `SKILL.md` frontmatter),
+  // which are content, never markup.
+  function wireSlashSuggest(input, fetchUrl) {
+    if (!input || !fetchUrl) return;
+
+    var menu = null;
+    var entries = null; // null until the one fetch resolves; then an array
+    var fetching = false;
+    var shown = [];
+    var sel = 0;
+
+    function ensureMenu() {
+      if (menu) return menu;
+      menu = document.createElement("div");
+      menu.className = "slash-menu";
+      menu.setAttribute("role", "listbox");
+      menu.setAttribute("hidden", "");
+      // Anchored to the composer form (or the textarea's own parent when a
+      // site has no form), which the CSS positions the menu above. A static
+      // host gets `position: relative` so the absolute menu hangs off it and
+      // not off some far-away ancestor.
+      var host = (input.closest && input.closest("form")) || input.parentNode;
+      if (!host) return null;
+      try {
+        if (window.getComputedStyle(host).position === "static") host.style.position = "relative";
+      } catch (e) {}
+      host.appendChild(menu);
+      return menu;
+    }
+
+    function isOpen() {
+      return !!menu && !menu.hasAttribute("hidden");
+    }
+
+    function close() {
+      if (menu) menu.setAttribute("hidden", "");
+      shown = [];
+      sel = 0;
+    }
+
+    // The leading `/token` the caret sits inside, or null when the box is not
+    // in slash-suggest shape at all. `end` is where the token stops — the
+    // first whitespace, or the end of the text — so an insert replaces the
+    // whole token even when the caret was moved back into its middle.
+    function leadingToken() {
+      var value = input.value || "";
+      if (value.charAt(0) !== "/") return null;
+      var caret = typeof input.selectionStart === "number" ? input.selectionStart : value.length;
+      if (caret < 1) return null;
+      var match = /\s/.exec(value);
+      var end = match ? match.index : value.length;
+      if (caret > end) return null; // caret has left the leading token
+      return { query: value.slice(1, caret), end: end };
+    }
+
+    function load() {
+      if (entries !== null || fetching) return;
+      fetching = true;
+      fetch(fetchUrl, { credentials: "same-origin" })
+        .then(function (res) {
+          return res.ok ? res.json() : [];
+        })
+        .then(function (data) {
+          entries = Array.isArray(data) ? data : [];
+          fetching = false;
+          refresh();
+        })
+        .catch(function () {
+          entries = [];
+          fetching = false;
+        });
+    }
+
+    function refresh() {
+      var token = leadingToken();
+      if (!token) {
+        close();
+        return;
+      }
+      if (entries === null) {
+        load();
+        return;
+      }
+      var q = token.query.toLowerCase();
+      shown = entries.filter(function (e) {
+        return e && typeof e.name === "string" && e.name.toLowerCase().indexOf(q) === 0;
+      });
+      if (!shown.length) {
+        close();
+        return;
+      }
+      if (sel >= shown.length) sel = 0;
+      render();
+    }
+
+    function render() {
+      var el = ensureMenu();
+      if (!el) return;
+      el.textContent = "";
+      shown.forEach(function (entry, i) {
+        var row = document.createElement("div");
+        row.className = "slash-item" + (i === sel ? " active" : "");
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", i === sel ? "true" : "false");
+
+        var name = document.createElement("span");
+        name.className = "slash-item__name";
+        name.textContent = "/" + entry.name;
+        row.appendChild(name);
+
+        if (entry.kind) {
+          var kind = document.createElement("span");
+          kind.className = "slash-item__kind";
+          kind.textContent = entry.kind;
+          row.appendChild(kind);
+        }
+
+        if (entry.description) {
+          var desc = document.createElement("span");
+          desc.className = "slash-item__desc";
+          desc.textContent = entry.description;
+          row.appendChild(desc);
+        }
+
+        // mousedown, not click, and defaulted away: the same trick the jump
+        // palette uses — the textarea never loses focus, so the blur that
+        // would otherwise close the menu out from under the click never fires.
+        row.addEventListener("mousedown", function (ev) {
+          ev.preventDefault();
+          choose(i);
+        });
+        el.appendChild(row);
+      });
+      el.removeAttribute("hidden");
+      var active = el.children[sel];
+      if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest" });
+    }
+
+    function move(delta) {
+      if (!shown.length) return;
+      sel = (sel + delta + shown.length) % shown.length;
+      render();
+    }
+
+    function choose(i) {
+      var entry = shown[i];
+      var token = leadingToken();
+      if (!entry || !token) {
+        close();
+        return;
+      }
+      var insert = "/" + entry.name + " ";
+      input.value = insert + (input.value || "").slice(token.end);
+      var caret = insert.length;
+      input.focus();
+      if (input.setSelectionRange) input.setSelectionRange(caret, caret);
+      close();
+    }
+
+    input.addEventListener(
+      "keydown",
+      function (ev) {
+        if (!isOpen()) return;
+        // Ctrl+Enter (Cmd+Enter) is the send chord and stays untouched, as
+        // does anything else a modifier claims.
+        if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+        if (ev.key === "ArrowDown") {
+          ev.preventDefault();
+          move(1);
+        } else if (ev.key === "ArrowUp") {
+          ev.preventDefault();
+          move(-1);
+        } else if (ev.key === "Enter" || ev.key === "Tab") {
+          ev.preventDefault();
+          choose(sel);
+        } else if (ev.key === "Escape") {
+          ev.preventDefault();
+          close();
+        }
+      },
+      true
+    );
+
+    input.addEventListener("input", refresh);
+    input.addEventListener("click", refresh);
+    // Arrow/Home/End move the caret without firing `input`, and the caret is
+    // half of what decides whether the menu belongs open at all.
+    input.addEventListener("keyup", function (ev) {
+      if (ev.key && ev.key.indexOf("Arrow") === 0) refresh();
+      else if (ev.key === "Home" || ev.key === "End") refresh();
+    });
+    input.addEventListener("blur", close);
+  }
+
   // One-shot storage-key migration (D5 of the waggledance rename): the old
   // "mdview-theme" / "mdview-folders-open" key is read exactly once, copied
   // to its new "waggledance-*" key, then deleted — so neither the user's
@@ -1170,6 +1518,8 @@
         supervisor_enabled: form.supervisor_enabled.checked,
         notify_enabled: form.notify_enabled.checked,
         unassigned_enabled: form.unassigned_enabled.checked,
+        trigger_enabled: form.trigger_enabled.checked,
+        trigger_dry_run: form.trigger_dry_run.checked,
         notify_chat_id: form.notify_chat_id.value,
         notify_telegram_token: form.notify_telegram_token.value,
       };
@@ -1540,6 +1890,531 @@
     );
     headings.forEach(function (h) { observer.observe(h); });
   })();
+
+  // Changes-screen scrollspy: mark the sidebar row for the file section
+  // currently in view. Same idiom as the TOC spy above (the sidebar rows are
+  // ordinary "#f<n>" links, so the scroll itself is the browser's — this only
+  // adds the highlight), with the sections standing in for headings and the
+  // `.chap-file.active` state standing in for the TOC's own.
+  (function () {
+    var nav = document.querySelector(".changes-nav");
+    if (!nav) return;
+
+    var links = Array.prototype.slice.call(nav.querySelectorAll("a[href^='#']"));
+    if (!links.length) return;
+
+    var linkByHash = {};
+    links.forEach(function (a) { linkByHash[a.getAttribute("href")] = a; });
+
+    var sections = links
+      .map(function (a) { return document.getElementById(a.getAttribute("href").slice(1)); })
+      .filter(Boolean);
+    if (!sections.length) return;
+
+    var current = null;
+    function setActive(hash) {
+      if (hash === current) return;
+      if (current && linkByHash[current]) linkByHash[current].classList.remove("active");
+      current = hash;
+      if (current && linkByHash[current]) linkByHash[current].classList.add("active");
+    }
+
+    // A click marks its own row at once: a jump to a section already in view
+    // fires no new intersection, and the row would otherwise stay unmarked.
+    links.forEach(function (a) {
+      a.addEventListener("click", function () { setActive(a.getAttribute("href")); });
+    });
+
+    var observer = new IntersectionObserver(
+      function (entries) {
+        var visible = entries.filter(function (e) { return e.isIntersecting; });
+        if (!visible.length) return;
+        // Highest-on-page visible section wins.
+        visible.sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
+        setActive("#" + visible[0].target.id);
+      },
+      // The top inset is the topbar's own rendered height, so a section
+      // counts as "current" from the moment it clears the bar. Under D9's
+      // `embed=1` there IS no bar (`.layout--embed`), and keeping the inset
+      // would hand the highlight to the next section 53px early.
+      {
+        rootMargin:
+          (document.querySelector(".layout--embed") ? "0px" : "-53px") +
+          " 0px -70% 0px",
+        threshold: 0,
+      }
+    );
+    sections.forEach(function (s) { observer.observe(s); });
+  })();
+
+  // Changes-screen base picker (changes-diff-screen, D6): the header's
+  // `<select>` lists the working tree and the repository's recent commits,
+  // and choosing one is a NAVIGATION, not a form post — so the address bar
+  // keeps holding the shareable thing it already held: `?commit=<sha>` for a
+  // commit, the plain screen URL for the working tree.
+  //
+  // Values come from the server's own commit list and are shas or the empty
+  // string, never anything a reader typed. The hex test below is belt and
+  // braces on that; the server checks the same value again (D7) before git
+  // ever sees it.
+  //
+  // The surrounding `<form>` is what works with scripting off, so the submit
+  // button only earns its place there — here it is hidden, because the
+  // change handler has already done the navigating.
+  //
+  // D9: on an embedded page (`data-embed="1"`, the same flag the form's own
+  // hidden field carries for the scripting-off path) the navigation keeps
+  // `embed=1` on it — picking a base inside an iframe must not replace the
+  // frame with a full-chrome page.
+  //
+  // home-terminal-panel (UAT): `data-panel="1"` rides along the same way, and
+  // for the same reason one step in — inside the homepage panel the page is
+  // rendered without its own changed-file sidebar (the one beside the frame
+  // is it), and picking a base must not grow that duplicate column back.
+  (function () {
+    var sel = document.querySelector(".changes__base-select[data-base-url]");
+    if (!sel) return;
+    var url = sel.getAttribute("data-base-url");
+    if (!url) return;
+    var embed = sel.getAttribute("data-embed") === "1";
+    var panel = sel.getAttribute("data-panel") === "1";
+    var go = sel.form && sel.form.querySelector(".changes__base-go");
+    if (go) go.hidden = true;
+    sel.addEventListener("change", function () {
+      var v = sel.value || "";
+      if (v && !/^[0-9a-f]{4,40}$/.test(v)) return;
+      var q = [];
+      if (v) q.push("commit=" + encodeURIComponent(v));
+      if (embed) q.push("embed=1");
+      if (panel) q.push("panel=1");
+      window.location.href = q.length ? url + "?" + q.join("&") : url;
+    });
+  })();
+
+  // Changes-screen reviewed marks (changes-diff-screen, D4): which files the
+  // reader has already been through is the READER's business, so it lives in
+  // this browser and nowhere else — `localStorage["waggledance-reviewed:<project-id>"]`,
+  // no server state, no cookie, no request. Closing the tab is the only thing
+  // that has ever known about it.
+  //
+  // The stored value is a map of file path -> the section's `data-key`, the
+  // short content hash `views.rs` emits for exactly this purpose: a mark is a
+  // statement about CONTENT, not about a name. Edit a file after marking it
+  // and its key moves, the stored mark no longer matches, and it is dropped
+  // on load — "reviewed" can never end up hiding a change nobody has read.
+  //
+  // ONE source of truth: the checkbox in each sticky section header. The
+  // sidebar tick, the section's dimmed/collapsed state and the N/M counter
+  // are all painted FROM those checkboxes and never read back, so there is no
+  // second copy of the answer to keep in step.
+  (function () {
+    var root = document.querySelector(".changes[data-project-id]");
+    if (!root) return;
+    var sections = Array.prototype.slice.call(root.querySelectorAll(".changeset[data-key]"));
+    if (!sections.length) return;
+
+    // D6: a mark says "I have read this file IN THIS COMPARISON", so the key
+    // carries the base. The working tree keeps the key it has always had —
+    // marks made before the picker existed are still the same reader's marks
+    // on the same screen — and each commit view gets a key of its own, so
+    // reading a commit never ticks off the work you have not looked at yet.
+    var base = root.getAttribute("data-base") || "";
+    var KEY =
+      "waggledance-reviewed:" +
+      root.getAttribute("data-project-id") +
+      (base ? ":" + base : "");
+    var counter = root.querySelector(".changes__reviewed");
+    var foldAll = root.querySelector(".changes__fold-all");
+    var nav = document.querySelector(".changes-nav");
+    var total = sections.length;
+
+    // Storage is a hostile input like any other (same idiom as the rail and
+    // tab-bar collapses above): a disabled or quota-blocked `localStorage`
+    // throws on read, and anything that is not a flat object of strings reads
+    // as "nothing marked" rather than taking the screen down with it.
+    function load() {
+      var raw = null;
+      try { raw = localStorage.getItem(KEY); } catch (e) { return {}; }
+      if (!raw) return {};
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (e) { return {}; }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      var out = {};
+      Object.keys(parsed).forEach(function (k) {
+        if (typeof parsed[k] === "string") out[k] = parsed[k];
+      });
+      return out;
+    }
+
+    // Written from the checkboxes, so it carries only files this page still
+    // lists with the key it renders today. That is the pruning: a file that
+    // has since been committed, or whose content moved under a mark, simply
+    // is not in what gets written back.
+    function save() {
+      var next = {};
+      var marked = 0;
+      state.forEach(function (s) {
+        if (s.box && s.box.checked && s.path && s.key) {
+          next[s.path] = s.key;
+          marked += 1;
+        }
+      });
+      try {
+        if (!marked) localStorage.removeItem(KEY);
+        else localStorage.setItem(KEY, JSON.stringify(next));
+      } catch (e) {}
+    }
+
+    var state = sections.map(function (section) {
+      var label = section.querySelector(".changeset__review");
+      return {
+        section: section,
+        head: section.querySelector(".changeset__head"),
+        path: section.getAttribute("data-path") || "",
+        key: section.getAttribute("data-key") || "",
+        label: label,
+        box: label && label.querySelector(".changeset__review-box"),
+        // diff-file-collapse D1: the section's own fold button. Folding is
+        // view state and nothing else (D4) - this handle never reads or
+        // writes a mark, and nothing writes it down (D5): a reload derives
+        // the fold from the reviewed marks alone, exactly as before.
+        fold: section.querySelector(".changeset__fold"),
+        row: nav && nav.querySelector("a[href='#" + section.id + "']"),
+      };
+    });
+
+    function paintCounter() {
+      if (!counter) return;
+      var n = 0;
+      state.forEach(function (s) { if (s.box && s.box.checked) n += 1; });
+      var done = n === total;
+      // The complete state is a checkmark and the accent the rest of the site
+      // already uses for "green" — CSS carries the colour, this only says so.
+      counter.textContent = (done ? "✓ " : "") + n + "/" + total + " reviewed";
+      counter.classList.toggle("changes__reviewed--done", done);
+    }
+
+    function paintOne(s) {
+      var on = !!(s.box && s.box.checked);
+      s.section.classList.toggle("changeset--reviewed", on);
+      if (s.row) s.row.classList.toggle("chg-row--reviewed", on);
+      if (s.label) {
+        var what = s.path || "this file";
+        s.label.title = on ? "Mark " + what + " unreviewed" : "Mark " + what + " reviewed";
+      }
+    }
+
+    // The fold half of the screen (diff-file-collapse). `changeset--collapsed`
+    // is the one class that says "folded" - the reviewed tick has always
+    // toggled it and still does; these only give the reader a way to say it
+    // directly, in both directions.
+    function isOpen(s) {
+      return !s.section.classList.contains("changeset--collapsed");
+    }
+
+    function paintFold(s) {
+      if (!s.fold) return;
+      var open = isOpen(s);
+      var what = s.path || "this file";
+      s.fold.setAttribute("aria-expanded", open ? "true" : "false");
+      // The label flips with the state rather than naming a fixed direction:
+      // read aloud, the button says what pressing it will do.
+      s.fold.setAttribute("aria-label", (open ? "Fold " : "Unfold ") + what);
+      s.fold.title = (open ? "Fold " : "Unfold ") + what;
+    }
+
+    // D3: one control, its label the ANSWER to "what would pressing this
+    // do?" - Collapse all while anything is still open, Expand all once
+    // every section is folded.
+    function anySectionOpen() {
+      var open = false;
+      state.forEach(function (s) { if (isOpen(s)) open = true; });
+      return open;
+    }
+
+    function paintFoldAll() {
+      if (!foldAll) return;
+      var anyOpen = anySectionOpen();
+      foldAll.textContent = anyOpen ? "Collapse all" : "Expand all";
+      foldAll.setAttribute("aria-expanded", anyOpen ? "true" : "false");
+    }
+
+    function setFolded(s, folded) {
+      s.section.classList.toggle("changeset--collapsed", folded);
+      paintFold(s);
+    }
+
+    var marks = load();
+    state.forEach(function (s) {
+      if (!s.box) return;
+      // The key check is the whole "an edit clears the mark" rule: a stored
+      // key that is not the one this page just rendered is a mark on content
+      // the reader has not seen, and it does not come back.
+      s.box.checked = !!(s.path && s.key && marks[s.path] === s.key);
+      // A marked file folds away — reviewing is subtractive, and the point of
+      // marking one is to stop looking at it.
+      s.section.classList.toggle("changeset--collapsed", s.box.checked);
+      paintOne(s);
+      if (s.label) s.label.hidden = false;
+
+      paintFold(s);
+      if (s.fold) s.fold.hidden = false;
+
+      s.box.addEventListener("change", function () {
+        // D4 the other way round: ticking still folds, as it always has.
+        setFolded(s, s.box.checked);
+        paintOne(s);
+        paintCounter();
+        paintFoldAll();
+        save();
+      });
+
+      // The explicit gesture: this one button folds AND unfolds its own
+      // section, and touches no mark either way (D4).
+      if (s.fold) {
+        s.fold.addEventListener("click", function (e) {
+          // The header's own handler is expand-only (below). A click that
+          // reached it from here would undo the fold in the same gesture.
+          e.stopPropagation();
+          setFolded(s, isOpen(s));
+          paintFoldAll();
+        });
+      }
+
+      // Clicking the sticky header brings a folded section back. One way on
+      // purpose: a stray click on a header must never hide content the reader
+      // was reading. The mark itself is untouched — folding is a view of the
+      // review, not the review. Clicks inside the label belong to the
+      // checkbox and are left alone.
+      if (s.head) {
+        s.head.addEventListener("click", function (e) {
+          if (s.label && s.label.contains(e.target)) return;
+          if (s.fold && s.fold.contains(e.target)) return;
+          setFolded(s, false);
+          paintFoldAll();
+        });
+      }
+    });
+
+    paintCounter();
+    if (counter) counter.hidden = false;
+    paintFoldAll();
+    if (foldAll) {
+      foldAll.hidden = false;
+      foldAll.addEventListener("click", function () {
+        // Read the state once, then move every section to the same place -
+        // deciding per section would flip the answer halfway through.
+        var folded = anySectionOpen();
+        state.forEach(function (s) { setFolded(s, folded); });
+        paintFoldAll();
+      });
+    }
+    // Write once on load so the marks dropped just above (edited files, files
+    // no longer in the diff) leave storage instead of growing there forever.
+    save();
+  })();
+
+
+  // Terminal Files | Diff workspace (home-terminal-panel, D1/D2/D3): ONE
+  // panel + sidebar serving BOTH the project terminal page and the homepage
+  // Terminals tab. `views.rs::term_workspace` renders the same frame for both
+  // pages, so there is one block here rather than a variant each. It is split
+  // in two: the SIDEBAR carries the two nav frames (a file tree, a
+  // changed-file list), and the PANEL above the terminal carries whatever a
+  // row in one of them opens.
+  //
+  // What makes it one feature rather than two is the thing this module does
+  // NOT do: it never routes a click from the sidebar to the panel. The panel
+  // frame is named (`views.rs::PANEL_FRAME_NAME`) and the nav pages inside
+  // the sidebar carry `<base target>` with that same name, so the browser
+  // does the routing itself — with this script disabled, a file row still
+  // loads the panel, it just arrives in a panel nobody opened. That is why
+  // the split opens on the frame's own `load` event: it follows navigations
+  // this module never saw.
+  //
+  // Every URL here is the SERVER's (`views.rs::term_work_sidebar`): each tab
+  // button carries its own `data-nav-src`, the sidebar carries the panel's
+  // `data-panel-src`, and this module only ever copies one of those
+  // attributes onto a frame. No project id is assembled here, on the restore
+  // path included — a stored value only ever NAMES a tab this page rendered.
+  (function () {
+    var root = document.querySelector(".term-work");
+    if (!root) return;
+    var side = root.querySelector(".term-work__side");
+    var panel = root.querySelector(".term-work__panel");
+    var panelFrame = root.querySelector(".term-work__frame");
+    var tabs = Array.prototype.slice.call(
+      root.querySelectorAll(".term-work__tab[data-nav-tab]")
+    );
+    var navs = Array.prototype.slice.call(
+      root.querySelectorAll(".term-work__nav[data-nav-for]")
+    );
+    // A pane outside every registered project renders the sidebar's
+    // explanation and no frames at all — nothing to wire, and nothing about
+    // the terminal below changes.
+    if (!side || !panel || !panelFrame || !tabs.length || !navs.length) return;
+    // The split is a property of the whole content area: `<main>` is what
+    // stops scrolling as one column and starts dividing a fixed height
+    // between the panel and the terminal. The homepage tab's `<main>` carries
+    // no `data-project-id` (homepage-terminal-full D5) and the project page's
+    // does, so `<main>` is matched by position instead — one selector that
+    // finds the right element on either page.
+    var main = root.closest ? root.closest("main.fg-page") : null;
+    // ONE key for both pages: the Files/Diff choice follows the PROJECT, not
+    // the page the choice was made on, so opening Diff here and then arriving
+    // from the other page shows Diff again. Adopting this one name retires
+    // the homepage's old key, which resets every viewer's remembered tab
+    // exactly once — acceptable because it is a per-viewer `sessionStorage`
+    // convenience, not state anyone can lose work from, and what it falls
+    // back to is the closed default this page already renders.
+    var KEY =
+      "waggledance-term-panel:" + (root.getAttribute("data-panel-project") || "");
+    var openTab = "";
+    var split = false;
+
+    function paintTabs() {
+      tabs.forEach(function (btn) {
+        var on = btn.getAttribute("data-nav-tab") === openTab;
+        btn.setAttribute("aria-pressed", on ? "true" : "false");
+        btn.classList.toggle("term-work__tab--on", on);
+      });
+      navs.forEach(function (frame) {
+        frame.hidden = frame.getAttribute("data-nav-for") !== openTab;
+      });
+      side.classList.toggle("term-work__side--open", !!openTab);
+    }
+
+    function paintSplit() {
+      panel.hidden = !split;
+      root.classList.toggle("term-work--split", split);
+      if (main) main.classList.toggle("term-split", split);
+      // The terminal keeps its full WIDTH either way — the panel is above
+      // it, never beside it — but the bottom half becomes its own scroll
+      // container, and that scrollbar can take a few pixels off the screen's
+      // available width. The screen poller already refits on `resize` and
+      // already skips a pane whose available width did not move, so this
+      // reuses that path instead of reaching into the poller: nothing about
+      // polling, input or scrollback changes here.
+      try { window.dispatchEvent(new Event("resize")); } catch (e) {}
+    }
+
+    function navFrame(name) {
+      var found = null;
+      navs.forEach(function (frame) {
+        if (frame.getAttribute("data-nav-for") === name) found = frame;
+      });
+      return found;
+    }
+
+    function tabButton(name) {
+      var found = null;
+      tabs.forEach(function (btn) {
+        if (btn.getAttribute("data-nav-tab") === name) found = btn;
+      });
+      return found;
+    }
+
+    // Opening a nav tab is a SIDEBAR move only: it never touches the panel,
+    // which is what keeps the restore path below from reopening a split the
+    // reader closed. `src` is set once and left — a tab reopened shows a
+    // frame already loaded.
+    function showTab(name) {
+      var btn = tabButton(name);
+      var frame = navFrame(name);
+      if (!btn || !frame) return;
+      var src = btn.getAttribute("data-nav-src") || "";
+      if (!src) return;
+      openTab = name;
+      if (!frame.getAttribute("src")) frame.setAttribute("src", src);
+      paintTabs();
+    }
+
+    function closeTab() {
+      openTab = "";
+      paintTabs();
+    }
+
+    function openPanel() {
+      if (split) return;
+      split = true;
+      paintSplit();
+    }
+
+    // D1: choosing Diff shows the changed-file list in the sidebar AND the
+    // diff itself above the terminal, in one move — reading a diff is the
+    // one case where the list alone is never the answer.
+    function fillPanelWithDiff() {
+      var src = side.getAttribute("data-panel-src") || "";
+      if (!src) return;
+      if (panelFrame.getAttribute("src") !== src) {
+        panelFrame.setAttribute("src", src);
+      }
+      openPanel();
+    }
+
+    // Storage is a hostile input like everywhere else (the rail and tab-bar
+    // collapses above take the same shape): a disabled or quota-blocked
+    // `sessionStorage` throws on read or write, and every failure degrades to
+    // what this page already rendered — no tab open.
+    function persist() {
+      try {
+        if (openTab) sessionStorage.setItem(KEY, openTab);
+        else sessionStorage.removeItem(KEY);
+      } catch (e) {}
+    }
+
+    tabs.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var name = btn.getAttribute("data-nav-tab") || "";
+        if (!name) return;
+        if (name === openTab) {
+          closeTab();
+        } else {
+          showTab(name);
+          if (name === "diff") fillPanelWithDiff();
+        }
+        persist();
+      });
+    });
+
+    var closer = root.querySelector("[data-panel-close]");
+    if (closer) {
+      closer.addEventListener("click", function () {
+        // The frame keeps its `src`: closing gives the terminal its full
+        // height back, it does not throw away a page already fetched.
+        split = false;
+        paintSplit();
+      });
+    }
+
+    // The panel opens itself the first time it actually holds something —
+    // which is how a file clicked in the FILES nav splits the view without
+    // this module knowing that click happened (the `<base target>` above).
+    // A frame with no `src` may fire one `load` for its initial
+    // `about:blank`; that is not a page, so it is filtered out here rather
+    // than by guessing at timing.
+    panelFrame.addEventListener("load", function () {
+      var here = "";
+      try {
+        here =
+          (panelFrame.contentWindow && panelFrame.contentWindow.location.href) ||
+          "";
+      } catch (e) {
+        here = panelFrame.getAttribute("src") || "";
+      }
+      if (!here || here === "about:blank") return;
+      openPanel();
+    });
+
+    var storedTab = null;
+    try { storedTab = sessionStorage.getItem(KEY); } catch (e) { storedTab = null; }
+    // Restores the SIDEBAR tab only. The split is never restored: it is the
+    // terminal's own height, and taking half of it back on every reload
+    // (the homepage reloads itself on any watched change) is not a thing a
+    // reader asked for once and meant forever.
+    if (storedTab) showTab(storedTab);
+  })();
+
 
   // Live reload, targeted (PRD FR-19): the watcher broadcasts
   // {"changed":["<project_id>/<rel_path>", ...]}. A file page reloads only
@@ -2322,6 +3197,20 @@
     pollAll();
     setInterval(pollAll, POLL_MS);
 
+    // pane-kick-refresh D1/D2: a send into one of THIS poller's panes just
+    // landed — repaint it now rather than on the next `POLL_MS` tick. Panes
+    // this poller does not own resolve to `null` here and are ignored; on the
+    // Unassigned page (whose panes match this selector but have no resolvable
+    // target) `pollOne`'s own `hasTarget` bail is the second gate, so the two
+    // pages still never poll each other's panes.
+    onPaneDirty(function (paneId) {
+      var found = null;
+      screens.forEach(function (el) {
+        if (el.getAttribute("data-pane-id") === paneId) found = el;
+      });
+      return found;
+    }, pollOne);
+
     // Scroll-history buttons (terminal-scroll-2, `herdr/pane_scroller.rs`;
     // made stateful by scroll-keep-position): "Load older" raises this
     // pane's own running depth by one and sends that ABSOLUTE depth — the
@@ -2725,7 +3614,11 @@
       if (!text) return;
       postJson(inputUrl(paneId, base), { text: text, submit: submit })
         .then(function (res) {
-          if (res.ok && input) input.value = "";
+          // pane-kick-refresh D1: only a send that actually landed kicks a
+          // repaint — a rejected post leaves the pane alone.
+          if (!res.ok) return;
+          if (input) input.value = "";
+          markPaneDirty(paneId);
         })
         .catch(function () {});
     }
@@ -2892,6 +3785,7 @@
           if (res.ok) {
             if (input) input.value = "";
             clearChips(paneId, chipList);
+            markPaneDirty(paneId); // pane-kick-refresh D1
           }
         })
         .catch(function () {});
@@ -2908,8 +3802,37 @@
       // alongside it.
       if (!hasTarget(base, projectId)) return;
       var input = form.querySelector(".term-reply__text");
-      var stageBtn = form.querySelector(".term-reply__stage");
-      var approveBtn = form.querySelector(".term-reply__approve");
+      // trc-2: Approve/Stage now render in the key grid, not inside this
+      // form — found via the shared `.term-pane` card ancestor both
+      // `views.rs::pane_controls` and `views.rs::screen_frame` wrap every
+      // pane's controls in (same lookup `wireTermKeysPaste` above already
+      // uses to find the reply textarea from the key grid's own side).
+      var card = form.closest(".term-pane");
+      var stageBtn = card && card.querySelector(".term-reply__stage");
+      var approveBtn = card && card.querySelector(".term-reply__approve");
+      // csl-2 (D1): every reply composer gets slash suggestions. Wired
+      // BEFORE the send keydown below so its capture-phase handler is also
+      // first in registration order. csl-3: the form's own `data-term-base`
+      // (`/p/<id>/_terminal/<pane>`, shape pinned by `validTermBase`) names
+      // the pane's project even where the page-level `data-project-id` is
+      // absent — the home page's Terminals tab (see this IIFE's own doc
+      // above) — so the project id is read from `base` first and the
+      // page-level id is only the fallback; with neither, the user-level
+      // endpoint, never a `/p/null/...` URL.
+      // sbc-1 (D2): `?pane=` names the pane whose agent the daemon joins in
+      // the herdr snapshot, so the menu can offer that agent's own built-in
+      // commands (`/model`, `/usage`). A pane with no agent behind it — a
+      // plain shell — is simply absent from `agents[]` there and is offered
+      // none of them, which is why the id is sent rather than guessed at.
+      if (input) {
+        var slashUrl = base
+          ? "/p/" + base.split("/")[2] + "/_slash"
+          : projectId
+            ? "/p/" + encodeURIComponent(projectId) + "/_slash"
+            : "/_slash";
+        if (paneId) slashUrl += "?pane=" + encodeURIComponent(paneId);
+        wireSlashSuggest(input, slashUrl);
+      }
       var attachBox = form.querySelector(".term-attach[data-pane-id]");
       var fileInput = attachBox && attachBox.querySelector(".term-attach__input");
       var attachBtn = attachBox && attachBox.querySelector(".term-attach__btn");
@@ -2965,7 +3888,11 @@
           // guard is here so a stale card, a keyboard path or a script click
           // can never one-tap "Approve" into a pane that never asked.
           if (approveBtn.disabled) return;
-          postJson(inputUrl(paneId, base), { text: "Approve", submit: true }).catch(function () {});
+          postJson(inputUrl(paneId, base), { text: "Approve", submit: true })
+            .then(function (res) {
+              if (res.ok) markPaneDirty(paneId); // pane-kick-refresh D1
+            })
+            .catch(function () {});
         });
       }
 
@@ -2999,15 +3926,18 @@
     Array.prototype.slice.call(keyGroups).forEach(function (group) {
       var paneId = group.getAttribute("data-pane-id");
       var base = validTermBase(group.getAttribute("data-term-base"));
+      // Paste is a local clipboard→textarea action, never a `/keys` post,
+      // so it wires up whether or not this group has a posting target.
+      wireTermKeysPaste(group);
       // unassigned-poller-guard D1: same bail-out as the reply form above —
       // no target, no key posts wired for this group.
       if (!hasTarget(base, projectId)) return;
-      Array.prototype.slice.call(group.querySelectorAll("button[data-key]")).forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          var key = btn.getAttribute("data-key");
-          if (!key) return;
-          postJson(keysUrl(paneId, base), { keys: [key] }).catch(function () {});
-        });
+      wireTermKeysGrid(group, function (wire) {
+        postJson(keysUrl(paneId, base), { keys: [wire] })
+          .then(function (res) {
+            if (res.ok) markPaneDirty(paneId); // pane-kick-refresh D1
+          })
+          .catch(function () {});
       });
     });
   })();
@@ -3091,13 +4021,28 @@
         });
     }
 
+    function ownPanes() {
+      return Array.prototype.slice.call(
+        document.querySelectorAll(".unassigned-panes .term-screen[data-pane-id]"),
+      );
+    }
+
     function pollAll() {
-      Array.prototype.slice
-        .call(document.querySelectorAll(".unassigned-panes .term-screen[data-pane-id]"))
-        .forEach(pollOne);
+      ownPanes().forEach(pollOne);
     }
     pollAll();
     setInterval(pollAll, POLL_MS);
+
+    // pane-kick-refresh D1/D2: same immediate repaint as the shared poller
+    // above, scoped to `.unassigned-panes` — the same scope `pollAll` uses —
+    // so a project page's pane id finds nothing here and is ignored.
+    onPaneDirty(function (paneId) {
+      var found = null;
+      ownPanes().forEach(function (el) {
+        if (el.getAttribute("data-pane-id") === paneId) found = el;
+      });
+      return found;
+    }, pollOne);
 
     function postJson(url, body) {
       return fetch(url, {
@@ -3111,7 +4056,13 @@
     function sendReply(paneId, text, submit, input) {
       if (!text) return;
       postJson(inputUrl(paneId), { text: text, submit: submit })
-        .then(function (res) { if (res.ok && input) input.value = ""; })
+        .then(function (res) {
+          // pane-kick-refresh D1, same rule as the shared sender above: a
+          // send that did not land kicks nothing.
+          if (!res.ok) return;
+          if (input) input.value = "";
+          markPaneDirty(paneId);
+        })
         .catch(function () {});
     }
 
@@ -3120,8 +4071,22 @@
       .forEach(function (form) {
         var paneId = form.getAttribute("data-pane-id");
         var input = form.querySelector(".term-reply__text");
-        var stageBtn = form.querySelector(".term-reply__stage");
-        var approveBtn = form.querySelector(".term-reply__approve");
+        // trc-2: same move as the shared wiring above — Approve/Stage now
+        // render in the key grid, a sibling of this form under the same
+        // `.term-pane` card, not a descendant of the form itself.
+        var card = form.closest(".term-pane");
+        var stageBtn = card && card.querySelector(".term-reply__stage");
+        var approveBtn = card && card.querySelector(".term-reply__approve");
+        // csl-2 (D1): this page has no project of its own, so the
+        // suggestions are the user-level scan only. sbc-1 (D2): the pane id
+        // still rides along, so an agent pane here is offered its own
+        // built-in commands beside that scan.
+        if (input) {
+          wireSlashSuggest(
+            input,
+            paneId ? "/_slash?pane=" + encodeURIComponent(paneId) : "/_slash",
+          );
+        }
         form.addEventListener("submit", function (ev) {
           ev.preventDefault();
           sendReply(paneId, input.value, true, input);
@@ -3144,7 +4109,11 @@
             // A4, same guard as the shared wiring above: a disabled Approve
             // never posts, whatever produced the click.
             if (approveBtn.disabled) return;
-            postJson(inputUrl(paneId), { text: "Approve", submit: true }).catch(function () {});
+            postJson(inputUrl(paneId), { text: "Approve", submit: true })
+              .then(function (res) {
+                if (res.ok) markPaneDirty(paneId); // pane-kick-refresh D1
+              })
+              .catch(function () {});
           });
         }
       });
@@ -3153,12 +4122,13 @@
       .call(document.querySelectorAll(".unassigned-panes .term-keys[data-pane-id]"))
       .forEach(function (group) {
         var paneId = group.getAttribute("data-pane-id");
-        Array.prototype.slice.call(group.querySelectorAll("button[data-key]")).forEach(function (btn) {
-          btn.addEventListener("click", function () {
-            var key = btn.getAttribute("data-key");
-            if (!key) return;
-            postJson(keysUrl(paneId), { keys: [key] }).catch(function () {});
-          });
+        wireTermKeysPaste(group);
+        wireTermKeysGrid(group, function (wire) {
+          postJson(keysUrl(paneId), { keys: [wire] })
+            .then(function (res) {
+              if (res.ok) markPaneDirty(paneId); // pane-kick-refresh D1
+            })
+            .catch(function () {});
         });
       });
   })();
@@ -3369,12 +4339,17 @@
     }
 
     function agentRow(agent) {
-      var item = document.createElement("a");
+      // A herdr row always carries a non-empty `url` (`AgentPaneRow::url`,
+      // server.rs); a row without one carries no link/open affordance at all.
+      var hasLink = !!agent.url;
+      var item = document.createElement(hasLink ? "a" : "div");
       item.className = "fg-menu__item agent-drawer__item";
-      // home-terminal-parity-2: the homepage instance links to its own tab
-      // rather than the agent's own project page — `agent.url` still wins
-      // outright on the project page (`homepage: false`, unchanged).
-      item.href = homepage ? "/?tab=terminals&pane=" + encodeURIComponent(agent.pane_id) : agent.url;
+      if (hasLink) {
+        // home-terminal-parity-2: the homepage instance links to its own tab
+        // rather than the agent's own project page — `agent.url` still wins
+        // outright on the project page (`homepage: false`, unchanged).
+        item.href = homepage ? "/?tab=terminals&pane=" + encodeURIComponent(agent.pane_id) : agent.url;
+      }
 
       // Line one: the status pill, then what the agent is doing — its
       // terminal title (`AgentPaneRow.title`), falling back to the pane

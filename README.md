@@ -48,7 +48,7 @@ type code here.**
 | 🗂️ **Every agent, one drawer** | A slide-in list of every agent across every project, grouped by status. Switch panes without switching windows. |
 | 📖 **Read the docs** | Whole-project markdown: cross-folder links that never 404, full-text search (SQLite FTS5), Mermaid you can pan and zoom, live reload on save. |
 | 💻 **Read the code** | A second reading surface: the project's source as it sits on disk, syntax-coloured, line-numbered. For pointing at a line, not for changing it. |
-| 🤖 **Agent-native** | Seven MCP tools: `waggledance_view_file` hands a clickable URL the moment an agent writes a doc; `waggledance_search`, `waggledance_projects`, and `waggledance_ask_state` let it query docs and bee state cross-project instead of re-reading files; `waggledance_dispatch` / `waggledance_await` / `waggledance_runs` let it hand work to an agent pane in a project that has opted in. |
+| 🤖 **Agent-native** | Seven MCP tools: `waggledance_view_file` hands a clickable URL the moment an agent writes a doc; `waggledance_search`, `waggledance_projects`, and `waggledance_ask_state` let it query docs and bee state cross-project instead of re-reading files; `waggledance_dispatch` / `waggledance_await` / `waggledance_runs` let it hand work to an agent pane in any managed project that has not turned dispatch off. |
 | 📱 **Conduct from a phone** | Responsive layout, sidebar drawer, light & dark. Over the LAN or an SSH tunnel. |
 | 🦀 **One binary** | Rust. No runtime, no Node, no Docker. |
 
@@ -204,11 +204,12 @@ on your machine — it never writes config for a tool you don't have — exposin
   feature joined in — so an orchestrator can reuse an idle pane instead of only ever
   spawning. `panes` is absent when the terminal feature is off, and null-with-a-reason
   when the session host can't be reached.
-- **`waggledance_dispatch(project, task, preset? | pane_id?)`** → send a task to an agent
-  pane in a project that has **opted into orchestration**. Either spawn a fresh pane by
+- **`waggledance_dispatch(project, task, preset? | pane_id? | leader?)`** → send a task to an agent
+  pane in a managed project. Every project takes dispatched work unless its
+  `.waggledance.toml` says `orchestration = false`. Either spawn a fresh pane by
   `preset` (any agent label the *target project* declares — the same source the Start
-  button spawns from) or target an already-running `pane_id`; the two are mutually
-  exclusive. Returns a `run_id`.
+  button spawns from), target an already-running `pane_id`, or pass `leader: true` to hand
+  it to the project's Paseo leader; the three are mutually exclusive. Returns a `run_id`.
 - **`waggledance_await(run_id, timeout_seconds?)`** → block until that run completes,
   blocks on a human, or the timeout elapses (clamped to 60s server-side).
 - **`waggledance_runs(project?)`** → list dispatched runs and their current status,
@@ -218,6 +219,50 @@ Drop the snippet from [`docs/waggledance-agents-template.md`](docs/waggledance-a
 into your project's `AGENTS.md` / `CLAUDE.md` and your agents will hand you a viewable URL
 the moment they finish writing, and can query docs and bee state cross-project instead of
 re-reading files.
+
+### Paseo leaders
+
+When waggledance runs beside Paseo, each project can have one
+long-lived leader agent in its Paseo workspace. waggledance finds the Paseo CLI and
+registers every Paseo workspace as a project on its own.
+`waggledance_dispatch` with `leader: true` queues the task; the running daemon
+(`waggledance serve`) delivers it when that leader is idle, or starts one, and tells the
+caller when the leader's turn ends. Pass a `request_id` so a retry never sends twice.
+The request box in the Waggle Dance Paseo plugin uses this path. The detection order,
+the workspace rules, and the run statuses are in
+[A request for a project reaches its one Paseo leader](docs/knowledge/patterns/paseo-leader-dispatch.md).
+
+wd, the aicoworker agent on OpenClaw, uses the same door: `wd-bridge.py handoff` sends
+the task to the project's leader, and the leader answers with `waggledance mail send`.
+The daemon keeps those answers in an inbox and wakes wd's main session once per message.
+It also nudges a silent leader, sends wd a board of open tasks, and relays each
+permission request for wd to allow or deny. `waggledance setup openclaw` installs wd's
+side, and also installs the bee skill set from the bee-onboarded repo it runs in into
+OpenClaw's global skills dir (`~/.openclaw/skills`), so every OpenClaw agent can run the
+bee workflow; `waggledance_ask_state` lists each project's `leaders`. The inbox, the wake,
+the follow-up commands and the known gaps are in
+[wd hands a task straight to a project's leader](docs/knowledge/patterns/wd-direct-leader.md).
+
+### Per-project settings: .waggledance.toml
+
+Every managed project takes dispatched work with no file at all. A `.waggledance.toml`
+committed at the repo root tunes it:
+
+```toml
+orchestration = false
+
+[paseo]
+workspace = "wks_0123456789ab"
+```
+
+`orchestration = false` is the only per-project off switch; an absent key or `true`
+leaves dispatch on. A file that exists but cannot be read or parsed also turns dispatch
+off until it is fixed. The Orchestration section of the settings page shows each
+project's state and why. `terminal.enabled` still gates pane dispatch.
+`[paseo]` optionally names the workspace a new leader starts in, and takes `provider`,
+`mode`, and `thinking` for it. `mode` defaults to `bypassPermissions`. Every key is
+described in
+[.waggledance.toml](docs/knowledge/patterns/paseo-leader-dispatch.md#waggledancetoml).
 
 ---
 

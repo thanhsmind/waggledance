@@ -1,0 +1,1168 @@
+[
+ {
+  "id": "board-run-reaper",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Board-dispatched runs are never awaited: pane stays open after HERDR_DONE",
+  "sources": []
+ },
+ {
+  "id": "p-0f60abae",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": "paseo-native-supervisor",
+  "title": "Several leaders per project when a task is marked independent",
+  "sources": []
+ },
+ {
+  "id": "p-179a0d12",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "observer-tick-trigger: D4b can silently lose a transition when an MCP-awaited run reaches blocked first",
+  "sources": [
+   "docs/history/observer-tick-trigger/CONTEXT.md"
+  ]
+ },
+ {
+  "id": "p-19c4995c",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "observer-tick-trigger: D9 can't close the loop through the D4d escalation mailbox",
+  "sources": [
+   "docs/history/observer-tick-trigger/CONTEXT.md"
+  ]
+ },
+ {
+  "id": "p-1f6d0ebf",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "await reports a run done from screen stability, not from the agent saying so",
+  "sources": []
+ },
+ {
+  "id": "p-2f69f60c",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "CLAUDE.md still names target/fast/waggledance, a path that is stale on this host",
+  "sources": [
+   "docs/knowledge/patterns/the-binary-you-ran-is-not-the-one-you-built.md"
+  ]
+ },
+ {
+  "id": "p-30ca3505",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "wd-supervisor: the cockpit repository",
+  "sources": []
+ },
+ {
+  "id": "p-31d113c2",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Dispatched panes are never reclaimed — every run leaves a live agent behind",
+  "sources": []
+ },
+ {
+  "id": "p-498dd298",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "doctor reorders every key in the user's ~/.claude.json",
+  "sources": []
+ },
+ {
+  "id": "p-6be4d51f",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Attach images to a request sent to a Paseo leader",
+  "sources": []
+ },
+ {
+  "id": "p-6cd25610",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "dispatch_run reports a healthy run when the task was pasted but never submitted",
+  "sources": []
+ },
+ {
+  "id": "p-6fab30aa",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": "lint-gates-green",
+  "title": "A contributor running the repo's own lint gates on a clean main sees them pass, so a red gate means their change broke something",
+  "sources": []
+ },
+ {
+  "id": "p-7329a3c8",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Dispatch fails with 'database is locked' right after the daemon starts",
+  "sources": []
+ },
+ {
+  "id": "p-75c7b411",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Stop or archive a project's Paseo leader from waggledance",
+  "sources": []
+ },
+ {
+  "id": "p-87c083c8",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "A blocked notice reached the caller hours late, after its run was already done",
+  "sources": []
+ },
+ {
+  "id": "p-9212cae8",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Read the whole herding.agents entry shape bee declares, and honour its spawn conditions",
+  "sources": []
+ },
+ {
+  "id": "p-950905ce",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "CI's clippy and rustfmt gates are both red on main",
+  "sources": []
+ },
+ {
+  "id": "p-a541ffc2",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Optional swarm manifest declaring which registered projects form one coordinated group",
+  "sources": [
+   "docs/history/research/swarmforge-platoon-layer.md"
+  ]
+ },
+ {
+  "id": "p-c67e8eb5",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "commands.test in waggledance's .bee/config.json points at beehive's manifest",
+  "sources": []
+ },
+ {
+  "id": "p-cd0eadfc",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "bee backlog add refuses every argument shape",
+  "sources": []
+ },
+ {
+  "id": "p-da42b8f5",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "wd-supervisor: widen the ask_state digest for the supervisor seat",
+  "sources": []
+ },
+ {
+  "id": "p-e19137ac",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "wd-supervisor: weekly reports across registered projects",
+  "sources": []
+ },
+ {
+  "id": "p-e5b770fe",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Parse install.ps1 in CI — no pwsh on the dev machine",
+  "sources": []
+ },
+ {
+  "id": "p-e62c967c",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "Prove the desktop crate builds — it never has",
+  "sources": []
+ },
+ {
+  "id": "p-ebd4ce69",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": "lint-gates-green",
+  "title": "A contributor running the repo's own lint gates on a clean main sees them pass, so a red gate means their change broke something",
+  "sources": []
+ },
+ {
+  "id": "p-f1b14b9b",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "observer-tick-trigger: a genuinely independent trigger_dry_run (preview without arming trigger_enabled)",
+  "sources": [
+   "docs/history/observer-tick-trigger/CONTEXT.md"
+  ]
+ },
+ {
+  "id": "p-f738af40",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "A leader run is marked done at the end of the leader's first turn, while a long bee chain keeps working across later turns",
+  "sources": []
+ },
+ {
+  "id": "p-fee218b5",
+  "kind": "pbi",
+  "status": "proposed",
+  "feature": null,
+  "title": "The work record drifts: one session's 48 turns all sat under the first request's stub",
+  "sources": []
+ },
+ {
+  "id": "sup-20260830-9c4e",
+  "kind": "pbi",
+  "status": "in-flight",
+  "feature": "mailbox-inbox",
+  "title": "As the human, I want digests and unfinished-run status surfaced in the same mailbox inbox section as letters, so I don't miss run summaries or silently-failed runs",
+  "sources": [
+   "docs/discovery/human-mailbox-inbox/sup-20260830-9c4e-request.md",
+   "docs/knowledge/areas/human-mailbox/overview.md"
+  ]
+ },
+ {
+  "id": "usage-paseo-projects",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-23",
+  "merged": true,
+  "cells": {},
+  "history_files": [],
+  "next_action": "bee close finished \"usage-paseo-projects\" — feature is closed."
+ },
+ {
+  "id": "push-and-prune-1023",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-23",
+  "merged": false,
+  "cells": {},
+  "history_files": [],
+  "next_action": "Continue bee-planning for \"push-and-prune-1023\" (lane)."
+ },
+ {
+  "id": "paseo-dispatch-default-on",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-23",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "hat-wave-synthesis.md",
+   "plan.md"
+  ],
+  "next_action": "bee close finished \"paseo-dispatch-default-on\" — feature is closed."
+ },
+ {
+  "id": "usage-dashboard",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-23",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md"
+  ],
+  "next_action": "bee close finished \"usage-dashboard\" — feature is closed."
+ },
+ {
+  "id": "paseo-leader-mode",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-10-23",
+  "merged": true,
+  "cells": {
+   "capped": 2
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "reports",
+   "slice-1-cells.json"
+  ],
+  "next_action": "Merge wt/paseo-leader-mode into main, then hand the owner main to test (bee close holds uat)"
+ },
+ {
+  "id": "wd-direct-leader",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-10-22",
+  "merged": true,
+  "cells": {
+   "capped": 11
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "reports",
+   "slice-2-cells.json",
+   "slice-2.md",
+   "slice-3-cells.json",
+   "slice-3.md"
+  ],
+  "next_action": "Merge wd-direct-leader, install from main, retire the live supervisor agent, hand the user uat."
+ },
+ {
+  "id": "supervisor-active-loop",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-18",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "plan.md"
+  ],
+  "next_action": "bee close finished \"supervisor-active-loop\" — feature is closed."
+ },
+ {
+  "id": "leader-mail-envelope",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-18",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "plan.md"
+  ],
+  "next_action": "bee close finished \"leader-mail-envelope\" — feature is closed."
+ },
+ {
+  "id": "openclaw-agent-target",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-17",
+  "merged": true,
+  "cells": {},
+  "history_files": [],
+  "next_action": "bee close finished \"openclaw-agent-target\" — feature is closed."
+ },
+ {
+  "id": "paseo-native-supervisor",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-10-17",
+  "merged": true,
+  "cells": {
+   "capped": 6
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "reports"
+  ],
+  "next_action": "Close paseo-native-supervisor"
+ },
+ {
+  "id": "piggery-lessons",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-16",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"piggery-lessons\" — feature is closed."
+ },
+ {
+  "id": "paseo-auto-wiring",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-14",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md",
+   "reports"
+  ],
+  "next_action": "bee close finished \"paseo-auto-wiring\" — feature is closed."
+ },
+ {
+  "id": "leader-delivery",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-14",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md",
+   "reports"
+  ],
+  "next_action": "bee close finished \"leader-delivery\" — feature is closed."
+ },
+ {
+  "id": "paseo-leader-dispatch",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-14",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md",
+   "reports"
+  ],
+  "next_action": "bee close finished \"paseo-leader-dispatch\" — feature is closed."
+ },
+ {
+  "id": "pi-paseo-plugin",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-10-06",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"pi-paseo-plugin\" — feature is closed."
+ },
+ {
+  "id": "sheets-task-sync",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-09-24",
+  "merged": true,
+  "cells": {
+   "capped": 4
+  },
+  "history_files": [],
+  "next_action": "uat: user tests Sync Sheets with a real service account, then bee gate --name uat"
+ },
+ {
+  "id": "cargo-build-slim",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-09-23",
+  "merged": true,
+  "cells": {},
+  "history_files": [],
+  "next_action": "bee close finished \"cargo-build-slim\" — feature is closed."
+ },
+ {
+  "id": "ipad-dashboard-mobile",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-09-11",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"ipad-dashboard-mobile\" — feature is closed."
+ },
+ {
+  "id": "dispatched-pane-agent-visibility",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-31",
+  "merged": false,
+  "cells": {},
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"dispatched-pane-agent-visibility\" (lane)."
+ },
+ {
+  "id": "waggledance-supervisor-mode-gate",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"waggledance-supervisor-mode-gate\" — feature is closed."
+ },
+ {
+  "id": "diff-file-collapse",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"diff-file-collapse\" — feature is closed."
+ },
+ {
+  "id": "term-workspace-unify",
+  "kind": "feature",
+  "phase": "planning",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {
+   "capped": 4
+  },
+  "history_files": [
+   "plan.md"
+  ],
+  "next_action": "Continue bee-planning for \"term-workspace-unify\" (lane)."
+ },
+ {
+  "id": "trigger-settings-toggle",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"trigger-settings-toggle\" — feature is closed."
+ },
+ {
+  "id": "home-terminal-new-shell",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "plan.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"home-terminal-new-shell\" — feature is closed."
+ },
+ {
+  "id": "observer-tick-trigger",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md",
+   "reports"
+  ],
+  "next_action": "bee close finished \"observer-tick-trigger\" — feature is closed."
+ },
+ {
+  "id": "lint-gates-green",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"lint-gates-green\" (lane)."
+ },
+ {
+  "id": "paseo-removal",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md"
+  ],
+  "next_action": "Continue bee-exploring for \"paseo-removal\" (lane)."
+ },
+ {
+  "id": "term-keys-nav-tint",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {
+   "capped": 2
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"term-keys-nav-tint\" (lane)."
+ },
+ {
+  "id": "pane-kick-refresh",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"pane-kick-refresh\" (lane)."
+ },
+ {
+  "id": "slash-builtin-commands",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md"
+  ],
+  "next_action": "Continue bee-exploring for \"slash-builtin-commands\" (lane)."
+ },
+ {
+  "id": "term-keys-shift-tab",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"term-keys-shift-tab\" (lane)."
+ },
+ {
+  "id": "composer-slash-suggest",
+  "kind": "feature",
+  "phase": "swarming",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {
+   "capped": 3
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md"
+  ],
+  "next_action": "Dispatch csl-1 and csl-2 execution workers in the feature worktree."
+ },
+ {
+  "id": "board-run-reaper",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-31",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"board-run-reaper\" — feature is closed."
+ },
+ {
+  "id": "mailbox-inbox",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-30",
+  "merged": true,
+  "cells": {
+   "capped": 2
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "spec-drop-sup-20260830-9c4e.md"
+  ],
+  "next_action": "UAT: user tests /inbox with digests + unfinished badge on main; bee close after their word"
+ },
+ {
+  "id": "commit-label-condense",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-30",
+  "merged": false,
+  "cells": {},
+  "history_files": [
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"commit-label-condense\" — feature is closed."
+ },
+ {
+  "id": "push-main-sync",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-30",
+  "merged": false,
+  "cells": {},
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"push-main-sync\" (lane)."
+ },
+ {
+  "id": "home-terminal-panel",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-30",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"home-terminal-panel\" — feature is closed."
+ },
+ {
+  "id": "changes-diff-screen",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-30",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md",
+   "reports"
+  ],
+  "next_action": "bee close finished \"changes-diff-screen\" — feature is closed."
+ },
+ {
+  "id": "board-visibility",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-30",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "plan-slice-2.md",
+   "plan.md",
+   "promote-proposals.md",
+   "proof-slice-2.md",
+   "proof.md"
+  ],
+  "next_action": "bee close finished \"board-visibility\" — feature is closed."
+ },
+ {
+  "id": "dispatch-submit-and-reclaim",
+  "kind": "feature",
+  "phase": "swarming",
+  "created": "2026-08-30",
+  "merged": true,
+  "cells": {
+   "capped": 7
+  },
+  "history_files": [
+   "plan.md",
+   "proof.md"
+  ],
+  "next_action": "Invoke bee-swarming for slice 1 (dsr-1..dsr-5)."
+ },
+ {
+  "id": "wd-supervisor-seat",
+  "kind": "feature",
+  "phase": "swarming",
+  "created": "2026-08-30",
+  "merged": true,
+  "cells": {
+   "capped": 3
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "proof-run.md"
+  ],
+  "next_action": "Invoke bee-swarming."
+ },
+ {
+  "id": "paseo-control",
+  "kind": "feature",
+  "phase": "swarming",
+  "created": "2026-08-29",
+  "merged": true,
+  "cells": {
+   "capped": 6
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md"
+  ],
+  "next_action": "Run pc-1 through pc-5 for paseo-control."
+ },
+ {
+  "id": "term-reply-composer",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-29",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "Feature closed and pushed."
+ },
+ {
+  "id": "term-keys-grid",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-28",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"term-keys-grid\" — feature is closed."
+ },
+ {
+  "id": "paseo-support",
+  "kind": "feature",
+  "phase": "swarming",
+  "created": "2026-08-27",
+  "merged": true,
+  "cells": {
+   "capped": 3,
+   "dropped": 1
+  },
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md"
+  ],
+  "next_action": "Invoke bee-swarming for paseo-support (ps-1 then ps-2)."
+ },
+ {
+  "id": "guide-wayfinding",
+  "kind": "feature",
+  "phase": "swarming",
+  "created": "2026-08-26",
+  "merged": true,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Invoke bee-swarming."
+ },
+ {
+  "id": "guide-vi",
+  "kind": "feature",
+  "phase": "swarming",
+  "created": "2026-08-26",
+  "merged": true,
+  "cells": {
+   "capped": 6
+  },
+  "history_files": [
+   "CONTEXT.md"
+  ],
+  "next_action": "Merged into main at c51af17; reload the product and test \"guide-vi\", then either approve uat (\"bee gate --name uat --approved true --lane guide-vi\") or fix it in the worktree and merge again."
+ },
+ {
+  "id": "board-entry-conditions",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-25",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"board-entry-conditions\" — feature is closed."
+ },
+ {
+  "id": "herding-entry-conditions",
+  "kind": "feature",
+  "phase": "idle",
+  "created": "2026-08-25",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "bee close finished \"herding-entry-conditions\" — feature is closed."
+ },
+ {
+  "id": "board-action-dupes",
+  "kind": "feature",
+  "phase": "scribing",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "User accepts board-action-dupes on the live board, then bee worktree merge --id waggledance--wt--board-action-dupes"
+ },
+ {
+  "id": "herdr-protocol-20",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "Nothing owed; the port's behaviour deltas are in the Agent terminal spec."
+ },
+ {
+  "id": "spawn-destination-fallback",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "Prune the merged worktree"
+ },
+ {
+  "id": "board-live-morph",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "Prune the merged worktree"
+ },
+ {
+  "id": "dispatch-project-presets",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "plan.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "Prune the merged worktree"
+ },
+ {
+  "id": "session-work-line",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": true,
+  "cells": {
+   "capped": 2
+  },
+  "history_files": [
+   "CONTEXT.md"
+  ],
+  "next_action": "Prune the merged worktree"
+ },
+ {
+  "id": "card-glyph-is-status",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Nothing owed; the settled rule lives in the Appearance spec (R8/R9)."
+ },
+ {
+  "id": "ask-state-fleet-read",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": true,
+  "cells": {},
+  "history_files": [
+   "CONTEXT.md",
+   "promote-proposals.md"
+  ],
+  "next_action": "Prune the merged worktree"
+ },
+ {
+  "id": "dots-off-marks-on",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Nothing owed; the settled rule lives in the Appearance spec (R8/R9)."
+ },
+ {
+  "id": "rail-row-one-line",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Nothing owed; the settled rule lives in the Appearance spec (R8/R9)."
+ },
+ {
+  "id": "badge-mark-is-status",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Nothing owed; the settled rule lives in the Appearance spec (R8/R9)."
+ },
+ {
+  "id": "mark-state-tone",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Nothing owed; the settled rule lives in the Appearance spec (R8/R9)."
+ },
+ {
+  "id": "drawer-row-stack",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"drawer-row-stack\" (lane)."
+ },
+ {
+  "id": "drawer-mark-sprite",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"drawer-mark-sprite\" (lane)."
+ },
+ {
+  "id": "drawer-agent-mark",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"drawer-agent-mark\" (lane)."
+ },
+ {
+  "id": "mark-before-status",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"mark-before-status\" (lane)."
+ },
+ {
+  "id": "terminal-mark-only",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"terminal-mark-only\" (lane)."
+ },
+ {
+  "id": "claude-code-mark",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"claude-code-mark\" (lane)."
+ },
+ {
+  "id": "agent-marks-everywhere",
+  "kind": "feature",
+  "phase": "exploring",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Continue bee-exploring for \"agent-marks-everywhere\" (lane)."
+ },
+ {
+  "id": "agent-logo-marks",
+  "kind": "feature",
+  "phase": "scribing",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {
+   "capped": 1
+  },
+  "history_files": [],
+  "next_action": "Restart the daemon to see the real agent marks."
+ },
+ {
+  "id": "todo-column-collapse",
+  "kind": "feature",
+  "phase": "compounding",
+  "created": "2026-08-25",
+  "merged": false,
+  "cells": {},
+  "history_files": [
+   "promote-proposals.md"
+  ],
+  "next_action": "Compound complete: all 84 promote proposals reviewed and stamped."
+ }
+]

@@ -1,0 +1,51 @@
+{
+  "Id": "9950faad-b964-46a9-ac31-121939d43222",
+  "Name": "wd probe2 (delete me)",
+  "Provider": "claude",
+  "Model": "claude-sonnet-5-5",
+  "Thinking": "auto",
+  "Status": "running",
+  "Archived": false,
+  "ArchivedAt": null,
+  "Mode": "plan",
+  "Cwd": "/home/thanhsmind/Projects/goglbe/waggledance",
+  "CreatedAt": "2026-10-14T15:45:46.537Z",
+  "UpdatedAt": "2026-10-14T15:45:55.885Z",
+  "LastUsage": {
+    "InputTokens": 0,
+    "OutputTokens": 0,
+    "CachedTokens": 0,
+    "CostUsd": 0
+  },
+  "Capabilities": {
+    "Streaming": true,
+    "Persistence": true,
+    "DynamicModes": true,
+    "McpServers": true
+  },
+  "AvailableModes": [
+    {
+      "id": "plan",
+      "label": "Plan Mode"
+    },
+    {
+      "id": "default",
+      "label": "Always Ask"
+    },
+    {
+      "id": "acceptEdits",
+      "label": "Accept File Edits"
+    },
+    {
+      "id": "auto",
+      "label": "Auto mode"
+    },
+    {
+      "id": "bypassPermissions",
+      "label": "Bypass"
+    }
+  ],
+  "PendingPermissions": [],
+  "Worktree": null,
+  "ParentAgentId": "35eca12c-e112-4690-bf48-af0222f659e1"
+}

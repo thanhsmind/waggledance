@@ -10,7 +10,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, Form, Path, Query, State,
     },
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -19,11 +19,12 @@ use axum::{
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
+use waggledance_core::git_diff::DiffBase;
 use waggledance_core::indexer::now_rfc3339;
-use waggledance_core::render::theme_css;
+use waggledance_core::render::{theme_css, RenderService};
 use waggledance_core::Engine;
 
 #[derive(Clone)]
@@ -88,6 +89,8 @@ pub struct AppState {
     /// `terminal_background`/`scroll_tracker` already use for their own
     /// interior state.
     pub bee_cache: BeeSnapshotCache,
+    pub agent_logs: Arc<waggledance_core::agent_usage::AgentLogCache>,
+    pub agent_homes: Arc<waggledance_core::agent_usage::AgentHomes>,
 }
 
 /// scroll-keep-position: one pane's remembered position in the
@@ -272,7 +275,16 @@ pub async fn serve() -> Result<()> {
         notify_store,
         scroll_tracker: Arc::new(PaneScrollTracker::new()),
         bee_cache: BeeSnapshotCache::default(),
+        agent_logs: Arc::default(),
+        agent_homes: Arc::default(),
     };
+    {
+        let (logs, homes) = (state.agent_logs.clone(), state.agent_homes.clone());
+        tokio::task::spawn_blocking(move || {
+            let since = now_ms() - 30 * 86_400_000;
+            logs.runs(&homes, since);
+        });
+    }
 
     // D7: reconcile the live background against whatever the config already
     // says, once at startup — a config that already had a switch on before
@@ -425,12 +437,38 @@ fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/status", get(status))
         .route("/api/projects", get(api_projects))
+        .route("/api/board", get(api_board))
+        .route("/api/usage", get(api_usage))
         // agent-switch-drawer: the cross-project pane switcher's own feed —
         // every agent-backed pane on the host, from every registered
         // project plus the Unassigned group, gated the same as the rest of
         // the terminal family (`api_agents`'s own doc comment).
         .route("/api/agents", get(api_agents))
         .route("/settings", get(settings_page_handler))
+        // guide-vi: the built-in guide, reached from the top bar menu on
+        // every page. It reads nothing — no store, no project, no disk — so
+        // it answers on a host with nothing registered, and stays outside
+        // every containment boundary the project routes below live inside.
+        .route("/guide", get(guide_index_handler))
+        .route("/guide/:slug", get(guide_chapter_handler))
+        // board-visibility bi-2: the human mailbox. Cross-project like `/`
+        // and unlike every `/p/:id/…` route below — one list gathering the
+        // letters bee filed in EVERY registered project — so it is mounted
+        // here beside the guide rather than under a project. Reached from the
+        // same top bar menu the guide is (`views::inbox_page`'s doc comment
+        // names why it is not on the handset tab bar). The `:letter` segment
+        // is a letter's file name, which human-mailbox D11 makes its only id;
+        // `inbox_letter_handler` resolves it by matching an entry the mailbox
+        // reader already listed, never by joining the URL onto a path.
+        .route("/inbox", get(inbox_page_handler))
+        .route("/inbox/:project/:letter", get(inbox_letter_handler))
+        // board-visibility bi-3: the inbox's ONE write path, and it writes
+        // nothing itself — human-mailbox D6 keeps read/unread inside the
+        // letter file and makes `bee mailbox mark` the only thing allowed to
+        // move it, so this route relays into the project's own bee exactly
+        // the way `bee_action`'s gate half does. Mounted with `post` alone
+        // (toa-1): a GET here is axum's ordinary 405, never a flip.
+        .route("/inbox/:project/:letter/mark", post(inbox_mark_handler))
         .route("/api/config", get(api_config).post(update_config))
         // toa-1 (D5/D11): the method-mismatch-oracle this family used to
         // close with an extra method-checking extractor existed only to
@@ -445,6 +483,7 @@ fn router(state: AppState) -> Router {
         // stale-index-refresh-2: the 404 page's own "Refresh index" button
         // target — see `refresh_project`'s doc comment.
         .route("/api/projects/:id/refresh", post(refresh_project))
+        .route("/api/bee/upgrade", post(bee_upgrade_apply))
         // D7/D8: the add-project form's target. Mounted with its one true
         // method (toa-1), so an unauthenticated GET here answers axum's
         // ordinary 405 rather than reaching the handler.
@@ -455,9 +494,17 @@ fn router(state: AppState) -> Router {
         .route("/highlight.css", get(highlight_asset))
         .route("/ws", get(ws_handler))
         .route("/s/:code", get(short_link_redirect))
+        // composer-slash-suggest (D2): the projectless half of `_slash` — the
+        // user-level list, for composers on a page that has no project.
+        .route("/_slash", get(slash_suggest_user))
         .route("/p/:id/", get(project_home))
         .route("/p/:id/_search", get(search_page))
         .route("/p/:id/_jump", get(jump_search))
+        // composer-slash-suggest (D2): what the composer's `/` popup may
+        // offer — the project's own slash commands and skills merged over the
+        // user-level ones. `/_slash` below is the same list for a page with
+        // no project. Read-only, like `_jump` beside it.
+        .route("/p/:id/_slash", get(slash_suggest))
         .route("/p/:id/_bee", get(bee_board))
         // board-approve-actions (D1/D3/D4): the board's one write path —
         // a card's Approve/Reject relayed into the project's own bee CLI
@@ -471,11 +518,6 @@ fn router(state: AppState) -> Router {
         .route("/p/:id/_bee/pbi/:pbi_id", get(bee_pbi_detail))
         // D8: the read-only Runs view — no mutating route in this family.
         .route("/p/:id/_runs", get(runs_page_handler))
-        // D6: the settings-page Orchestration section's per-project toggle.
-        .route(
-            "/api/projects/:id/orchestration",
-            post(update_project_orchestration),
-        )
         // board-new-task (N2): the home board's "+ New task" dialog files
         // its task into this project's own backlog — see
         // `create_project_pbi` for why the project's own `.bee/bin/bee` is
@@ -555,6 +597,10 @@ fn router(state: AppState) -> Router {
         )
         .route("/p/:id/_code/", get(code_root))
         .route("/p/:id/_code/*path", get(code_dir_or_file))
+        // The Changes screen. Beside the Code routes and, like them, above
+        // the `/p/:id/*path` catch-all -- registered after it, the catch-all
+        // would swallow `_changes` as a document path.
+        .route("/p/:id/_changes", get(changes_screen))
         .route("/p/:id/*path", get(project_path))
         // review-p1-fixes D1: one layer wrapping every route above, closing
         // three findings at once (DNS-rebinding control of the daemon, CSRF
@@ -578,12 +624,21 @@ fn router(state: AppState) -> Router {
 /// `Host` header is rejected the same way: a real browser always sends one
 /// on HTTP/1.1, so its absence is never a legitimate local client, only a
 /// crafted request trying to dodge the check.
+///
+/// S8: also carries the Fetch-Metadata assertion
+/// (`sec_fetch_is_allowed`), refused with this same status and body so
+/// callers see one consistent behaviour rather than two dialects. `Host`
+/// alone stops DNS rebinding, not a cross-site request aimed at this
+/// daemon's own configured hostname (fact 6 / D10) -- the `Sec-Fetch-*`
+/// check closes that gap for every route the router serves, in one place.
 async fn require_loopback_host(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if !host_is_allowed(req.headers(), &state.engine.config.server.hostname) {
+    if !host_is_allowed(req.headers(), &state.engine.config.server.hostname)
+        || !sec_fetch_is_allowed(req.method(), req.headers())
+    {
         return (
             StatusCode::MISDIRECTED_REQUEST,
             "misdirected request: unrecognized Host header\n",
@@ -631,6 +686,78 @@ fn strip_host_port(host: &str) -> &str {
     }
 }
 
+/// S8: the Fetch-Metadata allowlist, split out from
+/// `require_loopback_host` the same way `host_is_allowed` is, so a unit test
+/// can drive it directly against a bare method and `HeaderMap`. An ABSENT
+/// `Sec-Fetch-Site` header is ALLOWED -- deliberately, not an oversight:
+/// every browser capable of mounting a cross-site attack against this
+/// router always sends `Sec-Fetch-Site` on fetches and navigations, while a
+/// non-browser client (curl, a scripted CLI, this crate's own tests) never
+/// sends it at all. Refusing an absent header would break every non-browser
+/// caller for zero security gain against the one actor the header exists to
+/// constrain. When the header IS present, `same-origin` and `none` (a
+/// typed-URL or bookmark navigation, not a cross-site fetch) are allowed
+/// outright.
+///
+/// changes-diff-screen cds-4: a `cross-site` or `same-site` value is allowed
+/// ONLY as a top-level navigation -- a GET or HEAD carrying
+/// `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`. This is the
+/// standard Fetch-Metadata resource-isolation shape, and it is what makes
+/// the daemon reachable behind an identity proxy at all: Cloudflare Access
+/// bounces the operator through its own login origin and redirects back to
+/// the configured hostname, and that return trip is by definition a
+/// cross-site top-level navigation. Refusing it 421'd the site immediately
+/// after every successful login.
+///
+/// Allowing it is safe because CSRF lives on state-changing requests, and
+/// every mutating route this router serves is a POST (`/api/config`,
+/// `/api/projects/...`, every `/_terminal/...` mutation) -- a cross-site
+/// POST is still refused here, whatever its
+/// `Sec-Fetch-Mode`. The `Dest: document` half keeps the allowance to real
+/// navigations: a cross-site `iframe`/`frame`/`image`/`script` load, or a
+/// `cors`/`no-cors` fetch, never satisfies it, so cross-origin embedding
+/// and cross-origin reads stay refused exactly as before.
+///
+/// Do not "tighten" the absent case into a refusal; that would lock out
+/// every non-browser client this daemon serves.
+fn sec_fetch_is_allowed(method: &Method, headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get("sec-fetch-site") else {
+        return true;
+    };
+    match value.to_str() {
+        Ok("same-origin") | Ok("none") => true,
+        // `cross-site` and `same-site` -- and any value a future browser
+        // spells that this build does not know -- get exactly one door: the
+        // top-level navigation.
+        Ok(_) => is_top_level_navigation(method, headers),
+        // A non-UTF-8 `Sec-Fetch-Site` is not something any browser sends;
+        // refuse it rather than guess, same as before this allowance.
+        Err(_) => false,
+    }
+}
+
+/// The top-level-navigation half of `sec_fetch_is_allowed`: true only for a
+/// safe method (GET/HEAD -- never a mutating one) whose `Sec-Fetch-Mode` is
+/// exactly `navigate` and whose `Sec-Fetch-Dest` is exactly `document`.
+/// Both headers must be PRESENT: a request that omits them is not a browser
+/// navigation, and this door is only ever opened for one.
+fn is_top_level_navigation(method: &Method, headers: &HeaderMap) -> bool {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    header_equals(headers, "sec-fetch-mode", "navigate")
+        && header_equals(headers, "sec-fetch-dest", "document")
+}
+
+/// `headers[name] == expected`, with an absent or non-UTF-8 value reading
+/// as "no" rather than as a match.
+fn header_equals(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected)
+}
+
 /// D1/D6: the bound on `index_page`'s one herdr snapshot. `SocketHerdr::call`
 /// (`herdr/socket.rs:198-217`) carries no timeout of its own on connect,
 /// write, or read, and the router has no `TimeoutLayer` — the moment `/`
@@ -676,6 +803,8 @@ struct RegisterFlag {
     /// terminal is gone" case, resolved once `index_page` has the actual
     /// pane inventory to check it against, not at parse time.
     pane: Option<String>,
+    days: u32,
+    project: Option<String>,
 }
 
 // `#[derive(Deserialize)]`'s generated struct visitor refuses a repeated
@@ -712,6 +841,8 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                 let mut register_error = None;
                 let mut tab = views::HomeTab::default();
                 let mut pane = None;
+                let mut days = 7;
+                let mut project = None;
                 while let Some((key, value)) = map.next_entry::<String, String>()? {
                     match key.as_str() {
                         "register_error" => register_error = Some(value),
@@ -734,6 +865,8 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                             tab = match value.as_str() {
                                 "kanban" | "projects" => views::HomeTab::Kanban,
                                 "terminals" => views::HomeTab::Terminals,
+                                "usage" => views::HomeTab::Usage,
+                                "bee" => views::HomeTab::Bee,
                                 _ => views::HomeTab::default(),
                             }
                         }
@@ -745,6 +878,14 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                         // this can only ever resolve to D7's not-found case,
                         // never accidentally to the D4 default.
                         "pane" => pane = Some(value),
+                        "days" => {
+                            days = value
+                                .parse()
+                                .ok()
+                                .filter(|d| views::USAGE_WINDOWS.contains(d))
+                                .unwrap_or(7)
+                        }
+                        "project" => project = Some(value).filter(|v| !v.is_empty()),
                         _ => {}
                     }
                 }
@@ -752,6 +893,8 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
                     register_error,
                     tab,
                     pane,
+                    days,
+                    project,
                 })
             }
         }
@@ -761,6 +904,10 @@ impl<'de> serde::Deserialize<'de> for RegisterFlag {
 }
 
 async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>) -> Response {
+    render_home(st, flag, None).await
+}
+
+async fn render_home(st: AppState, flag: RegisterFlag, bee_html: Option<String>) -> Response {
     match st.engine.list_projects() {
         Ok(projects) => {
             // D1/D1a/D2/D5/D6: badges are gated on the same single switch as
@@ -786,12 +933,15 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
             // this one surface) — deliberately not also on
             // `unassigned_group_enabled`, which every other reader of
             // `unassigned_panes`'s complement checks. With the switch off,
-            // `snapshot` is `None` and this is `Vec::new()` with no herdr
-            // call and no filesystem path in reach of the page at all.
-            let suggestions: Vec<views::ProjectSuggestion> = snapshot
-                .as_ref()
-                .map(|snap| suggested_projects(snap, &projects))
-                .unwrap_or_default();
+            // `snapshot` is `None` (computed under the `badges_enabled` gate
+            // above), so this still resolves to `Vec::new()` with no herdr
+            // call and no filesystem path in reach of the page at all —
+            // `suggested_projects` takes the snapshot as
+            // `Option<&herdr::Snapshot>` and treats a `None` snapshot as an
+            // EMPTY pane set. The pane half's own fail-closed semantics
+            // (`unassigned_panes`, called only when `Some`) are untouched.
+            let suggestions: Vec<views::ProjectSuggestion> =
+                suggested_projects(snapshot.as_ref(), &projects);
             let mut with_counts: Vec<_> = projects
                 .into_iter()
                 .map(|p| {
@@ -947,10 +1097,33 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                     &live_runs,
                 )
             };
+            // board-visibility bv-4: the rail's own view of the SAME roll-up
+            // the Kanban section above was built from — no extra read, no
+            // extra `spawn_blocking`, no store access this page did not
+            // already make. `rollups` is empty exactly when D9 skipped the
+            // read, and then every rail row renders as it did before.
+            let bee_by_project: std::collections::HashMap<
+                String,
+                &waggledance_core::bee::BeeProjectRollup,
+            > = rollups.iter().map(|(p, r)| (p.id.clone(), r)).collect();
+            let leader_waits = leader_waits_by_project(
+                &st.engine,
+                with_counts.iter().map(|(p, _, _)| p.id.as_str()),
+            );
             // home-terminal-parity-2: the same configured D8 preset labels
             // `terminal_page_inner` already threads into `terminal_page`, so
             // the Terminals tab's own create controls offer the same set.
             let terminals_presets = configured_preset_labels(&st);
+            let tab_html = match (flag.tab, bee_html) {
+                (views::HomeTab::Usage, _) => {
+                    let (summary, names) =
+                        usage_summary(&st, flag.days, flag.project.as_deref()).await;
+                    views::usage_tab(&summary, flag.days, flag.project.as_deref(), &names)
+                }
+                (views::HomeTab::Bee, Some(html)) => html,
+                (views::HomeTab::Bee, None) => bee_upgrade_html(all_projects, None).await,
+                _ => String::new(),
+            };
             Html(views::home_page(
                 &with_counts,
                 unassigned_visible,
@@ -962,11 +1135,97 @@ async fn index_page(State(st): State<AppState>, Query(flag): Query<RegisterFlag>
                 flag.pane.as_deref(),
                 terminals_herdr_ok,
                 &terminals_presets,
+                &bee_by_project,
+                &leader_waits,
+                &tab_html,
             ))
             .into_response()
         }
         Err(e) => internal_error(&e.to_string()),
     }
+}
+
+async fn bee_upgrade_html(
+    projects: Vec<waggledance_core::domain::Project>,
+    apply: Option<Option<String>>,
+) -> String {
+    use waggledance_core::bee_upgrade::{run, Outcome, UpgradeOptions};
+    let outcome = tokio::task::spawn_blocking(move || {
+        let dry = UpgradeOptions::default();
+        let only = match apply {
+            None => return run(&projects, &dry),
+            Some(Some(id)) => vec![id],
+            Some(None) => {
+                let report = run(&projects, &dry)?;
+                let pending: Vec<String> = report
+                    .projects
+                    .iter()
+                    .filter(|p| matches!(p.outcome, Outcome::Pending { .. }))
+                    .map(|p| p.id.clone())
+                    .collect();
+                if pending.is_empty() {
+                    return Ok(report);
+                }
+                pending
+            }
+        };
+        run(
+            &projects,
+            &UpgradeOptions {
+                apply: true,
+                only,
+                ..dry
+            },
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok(report)) => views::bee_tab(Some(&report), None),
+        Ok(Err(e)) => views::bee_tab(None, Some(&e.to_string())),
+        Err(e) => views::bee_tab(None, Some(&e.to_string())),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BeeUpgradeForm {
+    project: Option<String>,
+    all: Option<String>,
+}
+
+async fn bee_upgrade_apply(
+    State(st): State<AppState>,
+    Form(form): Form<BeeUpgradeForm>,
+) -> Response {
+    let target = match (
+        form.project.filter(|p| !p.is_empty()),
+        form.all.filter(|a| !a.is_empty()),
+    ) {
+        (Some(id), _) => Some(id),
+        (None, Some(_)) => None,
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(views::bee_tab(
+                    None,
+                    Some("name a project or all; nothing was upgraded"),
+                )),
+            )
+                .into_response()
+        }
+    };
+    let projects = match st.engine.list_projects() {
+        Ok(p) => p,
+        Err(e) => return internal_error(&e.to_string()),
+    };
+    let html = bee_upgrade_html(projects, Some(target)).await;
+    let flag = RegisterFlag {
+        register_error: None,
+        tab: views::HomeTab::Bee,
+        pane: None,
+        days: 7,
+        project: None,
+    };
+    render_home(st, flag, Some(html)).await
 }
 
 /// home-board-perf D1: a cheap stat-only measure of a project's `.bee/`
@@ -1168,6 +1427,162 @@ async fn api_projects(State(st): State<AppState>) -> impl IntoResponse {
     Json(json!({ "projects": arr }))
 }
 
+fn now_ms() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}
+
+async fn usage_summary(
+    st: &AppState,
+    days: u32,
+    project: Option<&str>,
+) -> (waggledance_core::usage::UsageSummary, Vec<(String, String)>) {
+    use waggledance_core::{agent_usage, usage};
+    let projects = st.engine.list_projects().unwrap_or_default();
+    let now_ms = now_ms();
+    let since = now_ms - (i64::from(days) + 1) * 86_400_000;
+    let (logs, homes) = (st.agent_logs.clone(), st.agent_homes.clone());
+    let (inputs, runs) = tokio::task::spawn_blocking(move || {
+        let projects: Vec<_> = match agent_usage::paseo_project_roots(&homes.paseo) {
+            Some(managed) => projects
+                .into_iter()
+                .filter(|p| {
+                    let root =
+                        std::fs::canonicalize(&p.root_path).unwrap_or_else(|_| p.root_path.clone());
+                    managed.contains(&root)
+                })
+                .collect(),
+            None => projects,
+        };
+        let roots: Vec<_> = projects
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone(), p.root_path.clone()))
+            .collect();
+        let runs: Vec<_> = logs
+            .runs(&homes, since)
+            .into_iter()
+            .map(|r| {
+                let id = agent_usage::project_for(std::path::Path::new(&r.cwd), &roots)
+                    .map(String::from);
+                (id, r)
+            })
+            .collect();
+        let inputs: Vec<_> = projects
+            .into_iter()
+            .map(|p| usage::ProjectUsageInput {
+                features: usage::read_usage(&p.root_path).0,
+                id: p.id,
+                name: p.name,
+            })
+            .collect();
+        (inputs, runs)
+    })
+    .await
+    .unwrap_or_default();
+    let offset = usage::local_offset_secs();
+    let all = usage::summarize_runs(&inputs, &runs, now_ms, days, offset);
+    let mut names: Vec<_> = all
+        .projects
+        .iter()
+        .filter(|p| !p.id.is_empty() && p.spend.all.total() > 0)
+        .map(|p| (p.id.clone(), p.name.clone()))
+        .collect();
+    names.push(("other".into(), "Other".into()));
+    let Some(id) = project else {
+        return (all, names);
+    };
+    let wanted = (id != "other").then_some(id);
+    let inputs: Vec<_> = inputs
+        .into_iter()
+        .filter(|p| Some(p.id.as_str()) == wanted)
+        .collect();
+    let runs: Vec<_> = runs
+        .into_iter()
+        .filter(|(p, _)| p.as_deref() == wanted)
+        .collect();
+    (
+        usage::summarize_runs(&inputs, &runs, now_ms, days, offset),
+        names,
+    )
+}
+
+async fn api_usage(
+    State(st): State<AppState>,
+    Query(flag): Query<RegisterFlag>,
+) -> impl IntoResponse {
+    Json(
+        usage_summary(&st, flag.days, flag.project.as_deref())
+            .await
+            .0,
+    )
+}
+
+async fn api_board(State(st): State<AppState>) -> impl IntoResponse {
+    let projects: Vec<waggledance_core::domain::Project> =
+        st.engine.list_projects().unwrap_or_default();
+    let bee_projects: Vec<waggledance_core::domain::Project> = projects
+        .iter()
+        .filter(|p| is_bee_project(p))
+        .cloned()
+        .collect();
+    let rollups = cross_project_rollup(st.bee_cache.clone(), bee_projects).await;
+    let refs: Vec<_> = rollups.iter().map(|(p, r)| (p, r)).collect();
+    let mut value = views::bee_board_json(&refs);
+    let by_id: std::collections::HashMap<&str, &waggledance_core::domain::Project> =
+        projects.iter().map(|p| (p.id.as_str(), p)).collect();
+    value["leader_waiting"] = leader_waiting_json(&leader_wait_runs(&st.engine), &by_id);
+    Json(value)
+}
+
+fn leader_waiting_json(
+    runs: &[waggledance_core::domain::Run],
+    projects: &std::collections::HashMap<&str, &waggledance_core::domain::Project>,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        runs.iter()
+            .filter_map(|run| {
+                let project = projects.get(run.project_id.as_str())?;
+                Some(json!({
+                    "project_id": project.id,
+                    "project_name": project.name,
+                    "run_id": run.id,
+                    "status": run.status,
+                    "since": run.updated_at,
+                    "url": format!("/p/{}/", project.id),
+                }))
+            })
+            .collect(),
+    )
+}
+
+const LEADER_LOST_WINDOW: time::Duration = time::Duration::hours(1);
+
+fn leader_wait_runs(engine: &waggledance_core::Engine) -> Vec<waggledance_core::domain::Run> {
+    let lost_since = (time::OffsetDateTime::now_utc() - LEADER_LOST_WINDOW)
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    engine.list_leader_waits(&lost_since).unwrap_or_default()
+}
+
+fn leader_waits_by_project<'a>(
+    engine: &waggledance_core::Engine,
+    project_ids: impl Iterator<Item = &'a str>,
+) -> views::LeaderWaitsByProject {
+    let registered: std::collections::HashSet<&str> = project_ids.collect();
+    let mut by_project: views::LeaderWaitsByProject = std::collections::HashMap::new();
+    for run in leader_wait_runs(engine) {
+        if registered.contains(run.project_id.as_str()) {
+            by_project
+                .entry(run.project_id.clone())
+                .or_default()
+                .push(views::LeaderWait {
+                    status: run.status.clone(),
+                    since: run.updated_at.clone(),
+                });
+        }
+    }
+    by_project
+}
+
 /// One project's public API summary. Deliberately omits the absolute
 /// `root_path`: this route carries no authentication (it is outside the
 /// agent terminal family, D4), so exposing each project's filesystem layout
@@ -1235,7 +1650,14 @@ async fn api_agents(State(st): State<AppState>) -> Response {
             .map(|(p, r)| (p.id.clone(), project_bee_activity(p, r, &herdr_sessions)))
             .collect()
     };
-    Json(json!(agent_pane_rows(&snapshot, &projects, &bee))).into_response()
+    let live_waggledance_panes = live_waggledance_dispatched_panes(&st.engine);
+    Json(json!(agent_pane_rows(
+        &snapshot,
+        &projects,
+        &bee,
+        &live_waggledance_panes
+    )))
+    .into_response()
 }
 
 async fn api_config(State(st): State<AppState>) -> impl IntoResponse {
@@ -1261,6 +1683,412 @@ struct SavedFlag {
     notify_error: Option<String>,
 }
 
+/// guide-vi: the guide's landing page. Takes no state and touches no
+/// filesystem — the chapters are compiled into the binary — so it is the one
+/// page in this router that cannot fail for a reason outside itself.
+async fn guide_index_handler() -> Response {
+    Html(views::guide_index_page()).into_response()
+}
+
+/// One chapter. An unknown slug answers 404 rather than redirecting to the
+/// index: a stale or mistyped link should say so, not silently land the
+/// reader somewhere plausible and let them believe they arrived.
+async fn guide_chapter_handler(Path(slug): Path<String>) -> Response {
+    match crate::guide::find(&slug) {
+        Some(chapter) => Html(views::guide_chapter_page(chapter)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Html(views::error_page(
+                404,
+                "Không có chương hướng dẫn nào tên như vậy.",
+            )),
+        )
+            .into_response(),
+    }
+}
+
+/// board-visibility bi-2: the roll-up read both inbox routes make — every
+/// registered project whose root holds a `.bee/` (`is_bee_project`, the same
+/// D3 rule the boards apply), read through the SAME fingerprinted cache and
+/// the same `spawn_blocking` fan-out the home page uses
+/// (`cross_project_rollup`), so opening the inbox costs no `.bee/` walk the
+/// board has not already paid for. A host with nothing registered, or nothing
+/// bee-shaped, yields an empty vector — and `views::inbox_page` renders its
+/// explaining empty state from that, which is the state of this machine today.
+async fn inbox_rollups(
+    st: &AppState,
+) -> Vec<(
+    waggledance_core::domain::Project,
+    waggledance_core::bee::BeeProjectRollup,
+)> {
+    let projects: Vec<waggledance_core::domain::Project> = st
+        .engine
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_bee_project)
+        .collect();
+    if projects.is_empty() {
+        return Vec::new();
+    }
+    cross_project_rollup(st.bee_cache.clone(), projects).await
+}
+
+/// Every project's letters as one list, newest first.
+///
+/// The sort key is the letter's FILE NAME, descending, not its `filed_at`:
+/// human-mailbox D11 names each letter `<UTC-timestamp>-<run-slug>.md`
+/// precisely so that "a directory listing is the index", so the name sorts
+/// chronologically by construction, needs no timestamp parsing, and gives an
+/// `Unreadable` entry — which has no parsed `filed_at` at all — its correct
+/// place in the sequence instead of banishing it to one end. Ties break on the
+/// project id so two letters filed in the same second render in a stable
+/// order rather than one that follows registration order.
+fn inbox_rows(
+    rollups: &[(
+        waggledance_core::domain::Project,
+        waggledance_core::bee::BeeProjectRollup,
+    )],
+) -> Vec<views::InboxRow> {
+    let mut entries: Vec<(
+        &waggledance_core::domain::Project,
+        &waggledance_core::bee::BeeMailboxEntry,
+    )> = rollups
+        .iter()
+        .flat_map(|(project, rollup)| {
+            rollup
+                .snapshot
+                .mailbox
+                .iter()
+                .map(move |entry| (project, entry))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.1.file().cmp(a.1.file()).then_with(|| a.0.id.cmp(&b.0.id)));
+    entries
+        .into_iter()
+        .map(|(project, entry)| inbox_row(project, entry))
+        .collect()
+}
+
+/// One mailbox entry, flattened for the view. An `Unreadable` entry keeps its
+/// file name and its reason and gets no link: there is no parsed letter to
+/// open, and hiding it would turn a broken store into a quiet night — bee's
+/// own words at the reader this reads from.
+fn inbox_row(
+    project: &waggledance_core::domain::Project,
+    entry: &waggledance_core::bee::BeeMailboxEntry,
+) -> views::InboxRow {
+    match entry {
+        waggledance_core::bee::BeeMailboxEntry::Letter(letter) => views::InboxRow {
+            href: Some(format!("/inbox/{}/{}", project.id, letter.id)),
+            subject: letter.subject.clone(),
+            // The letter's own `project` line, not the checkout's registered
+            // name: bee wrote it, and it is what the letter is about.
+            project: letter.project.clone(),
+            filed_at: letter.filed_at.clone(),
+            file: letter.id.clone(),
+            unread: entry.is_unread(),
+            // mailbox-inbox D2: bee's own subject mark, read where bee put it.
+            // Nothing here derives a status — `is_unfinished` is a look at the
+            // subject prefix, and the subject still reaches the view whole.
+            kind: views::InboxRowKind::Letter {
+                unfinished: letter.is_unfinished(),
+            },
+        },
+        // A digest rides the SAME list as the letters (mailbox-inbox D1) and is
+        // never one: `unread` is false because a digest holds no read state at
+        // all, and its `project` line is the checkout's — a fold spans every
+        // project of its period, so no single one can be named off the file.
+        // The href is the SAME `/inbox/:project/:file` route a letter takes
+        // (D3): one route, one renderer, read-only on the other side.
+        waggledance_core::bee::BeeMailboxEntry::Digest(digest) => views::InboxRow {
+            href: Some(format!("/inbox/{}/{}", project.id, digest.id)),
+            subject: digest.subject.clone(),
+            project: project.name.clone(),
+            filed_at: digest.filed_at.clone(),
+            file: digest.id.clone(),
+            unread: false,
+            // bee's own period word, carried through unenumerated — see
+            // `BeeDigest::period`.
+            kind: views::InboxRowKind::Digest {
+                period: digest.period.clone(),
+            },
+        },
+        waggledance_core::bee::BeeMailboxEntry::Unreadable { file, reason } => views::InboxRow {
+            href: None,
+            subject: String::new(),
+            // Nothing parsed, so the letter's own `project` line is not
+            // available — the checkout the file was found in is the only thing
+            // that can be named honestly here.
+            project: project.name.clone(),
+            filed_at: String::new(),
+            file: file.clone(),
+            unread: false,
+            kind: views::InboxRowKind::Unreadable {
+                reason: reason.clone(),
+            },
+        },
+    }
+}
+
+/// `GET /inbox`.
+async fn inbox_page_handler(State(st): State<AppState>) -> Response {
+    let rollups = inbox_rollups(&st).await;
+    Html(views::inbox_page(&inbox_rows(&rollups))).into_response()
+}
+
+/// The markdown pipeline a letter's body goes through: `waggledance-core`'s
+/// ordinary `RenderService` — the very one every indexed document on this
+/// host is rendered by, ammonia sanitize included.
+///
+/// Built once and kept, because `RenderService::default` loads syntect's whole
+/// default syntax set; a per-request construction would put that on the
+/// request thread. `Engine` owns one of these privately and only renders
+/// files it has INDEXED, and a letter is never indexed — `.bee/human-mailbox/`
+/// is git-ignored runtime state outside the docs tree — so the inbox reaches
+/// the pipeline directly rather than making a second one of its own.
+fn letter_render_service() -> &'static waggledance_core::render::RenderService {
+    static SERVICE: std::sync::OnceLock<waggledance_core::render::RenderService> =
+        std::sync::OnceLock::new();
+    SERVICE.get_or_init(waggledance_core::render::RenderService::new)
+}
+
+/// `GET /inbox/:project/:letter` — one letter, opened. mailbox-inbox D3: a
+/// DIGEST opens through this same route, the same file lookup and the same
+/// sanitized markdown pipeline, read-only — one route and one renderer for
+/// both, because a digest is prose bee composed in exactly the same way and a
+/// second path would be a second thing to keep sanitized.
+///
+/// The `:letter` segment is never joined onto a path as it arrives. It is
+/// matched against the file names the mailbox reader already listed for that
+/// project, and the path is built from the entry that matched — so a segment
+/// carrying `..`, an absolute path, or an encoded separator resolves to no
+/// entry and answers 404 like any other unknown letter, rather than reaching
+/// the filesystem at all.
+///
+/// An entry that exists but could not be parsed answers 404 too, and says so
+/// by name: the list never links one, so arriving here means a stale link, and
+/// a page pretending to render it would be the silence bee's own rule forbids.
+async fn inbox_letter_handler(
+    State(st): State<AppState>,
+    Path((project_id, letter_id)): Path<(String, String)>,
+) -> Response {
+    let rollups = inbox_rollups(&st).await;
+    let Some((project, rollup)) = rollups.iter().find(|(p, _)| p.id == project_id) else {
+        return not_found_letter();
+    };
+    let Some(entry) = rollup
+        .snapshot
+        .mailbox
+        .iter()
+        .find(|entry| entry.file() == letter_id)
+    else {
+        return not_found_letter();
+    };
+    // Only an entry that parsed as NEITHER a letter nor a digest answers 404:
+    // there is no prose behind one, the list never links one, and a page
+    // pretending to render it would be the silence bee's own rule forbids.
+    if matches!(
+        entry,
+        waggledance_core::bee::BeeMailboxEntry::Unreadable { .. }
+    ) {
+        return not_found_letter();
+    }
+    let row = inbox_row(project, entry);
+    // The name the reader itself listed, never the URL segment — the same
+    // property the letter path already had, now taken off the matched entry so
+    // a digest reaches its file the same way.
+    let path = waggledance_core::bee::mailbox_dir(&project.root_path).join(entry.file());
+    let project_id = project.id.clone();
+    let root = project.root_path.clone();
+    // Reading the file and rendering it are both synchronous, CPU-and-disk
+    // work, so they go off the request thread together — the same
+    // `spawn_blocking` rule every other filesystem read in this file follows.
+    let rendered = tokio::task::spawn_blocking(move || {
+        let source = std::fs::read_to_string(&path).ok()?;
+        // An empty index: a letter is not part of any project's indexed file
+        // set, so no internal link in one resolves to an indexed page. The
+        // pipeline marks those links rather than rewriting them, which is the
+        // honest answer for a file that lives outside the docs tree.
+        let index: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        Some(letter_render_service().render(&source, &path, &project_id, &root, &index))
+    })
+    .await;
+    let Ok(Some(page)) = rendered else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(views::error_page(
+                500,
+                "Không đọc được nội dung lá thư này trên đĩa.",
+            )),
+        )
+            .into_response();
+    };
+    Html(views::inbox_letter_page(
+        &row,
+        &views::SanitizedLetterBody::from_rendered(&page),
+    ))
+    .into_response()
+}
+
+/// The one 404 both unknown-letter cases answer with — an unknown project, an
+/// unknown file name, and a file that exists but could not be parsed all mean
+/// the same thing to the reader who followed the link: there is no letter here
+/// to read.
+fn not_found_letter() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Html(views::error_page(404, "Không có lá thư nào như vậy.")),
+    )
+        .into_response()
+}
+
+/// The flip control's form body ([`views::inbox_mark_form`]).
+#[derive(serde::Deserialize)]
+struct InboxMarkForm {
+    /// `read` or `unread` — human-mailbox's closed status set, checked here
+    /// rather than trusted, so an invented third value never reaches bee's
+    /// argv.
+    status: String,
+    /// Where to land after the mark. Same-site only, through the same
+    /// [`safe_redirect_path`] guard the refresh form's field goes through.
+    #[serde(default)]
+    back: Option<String>,
+}
+
+/// Every way a mark can fail, in the one shape its caller can read: this
+/// route's caller is a browser submitting a plain form (no `fetch`, no JSON
+/// reader), so a refusal is an HTML page carrying the reason — never a silent
+/// redirect back to a list that would then look like the mark had worked.
+fn mark_error(status: StatusCode, msg: &str) -> Response {
+    (status, Html(views::error_page(status.as_u16(), msg))).into_response()
+}
+
+/// `POST /inbox/:project/:letter/mark` — flip one letter between read and
+/// unread, BY CALLING BEE.
+///
+/// human-mailbox D6 is the whole shape of this handler: *"Read/unread is a
+/// field bee owns inside the letter file. The waggledance inbox flips it by
+/// calling a bee command, never by writing the file."* So there is no write
+/// here, and none anywhere else in waggledance: the letter is opened for
+/// reading exactly once, by [`inbox_letter_handler`], and for nothing else.
+/// The command is `bee mailbox mark --id <file name> --status read|unread
+/// --json`, run in the project's own root through the project's own
+/// `.bee/bin/bee` — [`bee_action_gate`]'s spawn verbatim, for its reasons: a
+/// PATH `bee` would move a letter in a repository that never vendored one,
+/// and the cwd is what decides *whose* mailbox this is.
+///
+/// `--id` takes the letter's FILE NAME, which human-mailbox D11 makes its only
+/// id and which [`waggledance_core::bee::BeeLetter::id`] already carries. The
+/// `:letter` segment is never handed to bee as it arrived: it is matched
+/// against the names the mailbox reader listed for that project and bee is
+/// given the matched entry's own name, so this route cannot name a file the
+/// reader never saw.
+///
+/// Four refusals, each an HTML page rather than a redirect, because a redirect
+/// to the list would read as success:
+/// - an unknown project, an unknown file name, or a file that could not be
+///   parsed as a letter → the same 404 the letter view answers
+///   ([`not_found_letter`]); an unreadable entry has no status field to move
+///   and bee would refuse it too;
+/// - a status outside `read|unread` → 400, without spawning anything;
+/// - a project with no vendored bee → 409, the same answer
+///   [`create_project_pbi`] gives for the same missing writer;
+/// - bee itself refusing → 502 carrying bee's own stderr tail, because bee is
+///   the only party that knows why it said no ("no letter … remedy: list that
+///   directory and pass a name it holds" is a real one).
+///
+/// Success is bee's own JSON, parsed — `{letter, path, status, previous_status,
+/// changed}`. `changed: false` is SUCCESS, not a warning: `mailbox mark` is
+/// idempotent and bee's own rule is that a retry must never be punished, so
+/// marking a letter to the status it already has lands exactly where a real
+/// flip lands. What is checked is `status`: it must equal what was asked for.
+/// A zero exit whose JSON is missing, unparseable, or reports some other
+/// status is a 502 too — we cannot say a letter is read on the strength of
+/// output we could not read, and quietly redirecting would be exactly the
+/// optimistic flip D6 forbids.
+///
+/// Nothing is cached past the write: the redirect's own GET re-reads the
+/// rollup, and `compute_bee_fingerprint` walks `.bee/` — the mailbox included
+/// — so the letter bee just rewrote invalidates its project's cache entry by
+/// itself, and the chip the reader lands on is what is on disk.
+async fn inbox_mark_handler(
+    State(st): State<AppState>,
+    Path((project_id, letter_id)): Path<(String, String)>,
+    Form(form): Form<InboxMarkForm>,
+) -> Response {
+    let rollups = inbox_rollups(&st).await;
+    let Some((project, rollup)) = rollups.iter().find(|(p, _)| p.id == project_id) else {
+        return not_found_letter();
+    };
+    let Some(letter) = rollup
+        .snapshot
+        .mailbox
+        .iter()
+        .find(|entry| entry.file() == letter_id)
+        .and_then(|entry| entry.letter())
+    else {
+        return not_found_letter();
+    };
+    let status = match form.status.as_str() {
+        "read" => "read",
+        "unread" => "unread",
+        _ => {
+            return mark_error(
+                StatusCode::BAD_REQUEST,
+                "Một lá thư chỉ có thể là đã đọc hoặc chưa đọc.",
+            )
+        }
+    };
+    let Some(bee) = project_bee_binary(&project.root_path) else {
+        return mark_error(
+            StatusCode::CONFLICT,
+            "Dự án này không có bee riêng, nên không có ai được phép đổi trạng thái lá thư.",
+        );
+    };
+
+    let out = tokio::process::Command::new(&bee)
+        .arg("mailbox")
+        .arg("mark")
+        .arg("--id")
+        .arg(&letter.id)
+        .arg("--status")
+        .arg(status)
+        .arg("--json")
+        .current_dir(&project.root_path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => {
+            return mark_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("Không chạy được bee của dự án này: {e}"),
+            )
+        }
+    };
+    if !out.status.success() {
+        return mark_error(StatusCode::BAD_GATEWAY, &stderr_tail(&out.stderr));
+    }
+    let confirmed = first_json_object(&String::from_utf8_lossy(&out.stdout))
+        .and_then(|v| v.get("status")?.as_str().map(str::to_string))
+        .is_some_and(|reported| reported == status);
+    if !confirmed {
+        return mark_error(
+            StatusCode::BAD_GATEWAY,
+            "bee chạy xong nhưng không xác nhận trạng thái mới, nên lá thư vẫn giữ nguyên như cũ.",
+        );
+    }
+
+    let fallback = "/inbox".to_string();
+    let target = match form.back.as_deref() {
+        Some(raw) => safe_redirect_path(raw, &fallback),
+        None => fallback,
+    };
+    Redirect::to(&target).into_response()
+}
+
 async fn settings_page_handler(
     State(st): State<AppState>,
     Query(flag): Query<SavedFlag>,
@@ -1271,9 +2099,16 @@ async fn settings_page_handler(
         st.config_data_dir.as_deref(),
     ));
     let notify_credential_view = current_notify_credential_view(&st);
-    // D6: the Orchestration section's own per-project rows — every
-    // registered project, same source `api_projects`/the homepage read.
-    let projects = st.engine.list_projects().unwrap_or_default();
+    let projects: Vec<_> = st
+        .engine
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| {
+            let unreadable = st.engine.project_settings(&p).0.unreadable;
+            (p, unreadable)
+        })
+        .collect();
     Html(views::settings_page(
         &cfg,
         flag.saved.is_some(),
@@ -1282,33 +2117,6 @@ async fn settings_page_handler(
         &projects,
     ))
     .into_response()
-}
-
-#[derive(serde::Deserialize, Default)]
-struct OrchestrationForm {
-    /// Presence/absence, matching every other checkbox-backed form on this
-    /// page (`SettingsForm::open_browser`'s own doc comment) — a submission
-    /// that omits the key means the box was left unchecked.
-    #[serde(default)]
-    enabled: Option<String>,
-}
-
-/// `POST /api/projects/:id/orchestration` — the settings page's per-project
-/// D6 toggle. Flips `Project::orchestration_enabled` through the cell-1
-/// engine accessor and redirects back to `/settings`, reusing the same
-/// `saved=1` banner `update_config`/`update_terminal_config` already use. An
-/// unknown project id is a no-op write (`set_orchestration_enabled` updates
-/// zero rows) followed by the same redirect — the settings page's own
-/// re-render is the truth a reader checks, not this response.
-async fn update_project_orchestration(
-    State(st): State<AppState>,
-    Path(id): Path<String>,
-    Form(form): Form<OrchestrationForm>,
-) -> Response {
-    let _ = st
-        .engine
-        .set_orchestration_enabled(&id, form.enabled.is_some());
-    Redirect::to("/settings?saved=1").into_response()
 }
 
 /// `POST /api/projects/:id/pbi` body (board-new-task N2) — one free-text
@@ -1406,31 +2214,15 @@ fn stderr_tail(stderr: &[u8]) -> String {
 /// printed. The CLI prints its JSON object and then a trailing
 /// `[bee] backlog pbi add 1ms` timing line on the same stream, so the
 /// whole stdout is not itself parseable JSON — the first balanced `{...}`
-/// block is. The scan below is the fallback for the one case that framing
-/// cannot survive: an unbalanced brace inside the echoed title.
+/// block is ([`first_json_object`]). [`scan_json_id`] below is the fallback
+/// for the one case that framing cannot survive: an unbalanced brace inside
+/// the echoed title.
 fn parse_pbi_id(stdout: &str) -> Option<String> {
-    if let Some(start) = stdout.find('{') {
-        let mut depth = 0usize;
-        for (i, ch) in stdout[start..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let block = &stdout[start..start + i + ch.len_utf8()];
-                        if let Some(id) = serde_json::from_str::<serde_json::Value>(block)
-                            .ok()
-                            .and_then(|v| v.get("id")?.as_str().map(str::to_string))
-                            .filter(|id| !id.is_empty())
-                        {
-                            return Some(id);
-                        }
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
+    if let Some(id) = first_json_object(stdout)
+        .and_then(|v| v.get("id")?.as_str().map(str::to_string))
+        .filter(|id| !id.is_empty())
+    {
+        return Some(id);
     }
     scan_json_id(stdout)
 }
@@ -2179,6 +2971,7 @@ async fn dispatch_board_run(
         Some(BOARD_RUN_PRESET_LABEL.to_string()),
     )
     .await
+    .map(|d| d.run)
     .map_err(dispatch_refusal_response)
 }
 
@@ -2277,7 +3070,8 @@ async fn bee_action_run(
                     Err(resp) => resp,
                 };
             }
-            let Some(argv) = waggledance_core::bee::herding_agent_argv(&project.root_path) else {
+            let Some(entry) = waggledance_core::bee::herding_default_entry(&project.root_path)
+            else {
                 return no_herding_preset_response();
             };
             // A feature with no worktree of its own is worked from the main
@@ -2285,7 +3079,10 @@ async fn bee_action_run(
             let cwd = feature_worktree_dir(project, &rollup, feature)
                 .unwrap_or_else(|| project.root_path.clone());
             let target = crate::orchestrate::DispatchTarget::Spawn {
-                argv,
+                // board-entry-conditions D1: the board reads the project's whole
+                // declaration, so `env` and `workspace_trust` are honoured here
+                // exactly as on the dispatch path — same code, not a second copy.
+                entry,
                 cwd: Some(cwd.to_string_lossy().into_owned()),
             };
             match dispatch_board_run(st, project, target, &task, feature).await {
@@ -2304,7 +3101,8 @@ async fn bee_action_run(
             // The argv is resolved BEFORE the worktree is opened: a project
             // with no preset must not be left holding a fresh worktree no
             // agent was ever started in.
-            let Some(argv) = waggledance_core::bee::herding_agent_argv(&project.root_path) else {
+            let Some(entry) = waggledance_core::bee::herding_default_entry(&project.root_path)
+            else {
                 return no_herding_preset_response();
             };
             let worktree = match feature_worktree_dir(project, &rollup, feature) {
@@ -2315,7 +3113,10 @@ async fn bee_action_run(
                 },
             };
             let target = crate::orchestrate::DispatchTarget::Spawn {
-                argv,
+                // board-entry-conditions D1: the board reads the project's whole
+                // declaration, so `env` and `workspace_trust` are honoured here
+                // exactly as on the dispatch path — same code, not a second copy.
+                entry,
                 cwd: Some(worktree.to_string_lossy().into_owned()),
             };
             let run = match dispatch_board_run(st, project, target, &task, feature).await {
@@ -2376,7 +3177,10 @@ async fn bee_action(
     if !project.orchestration_enabled {
         return action_error(
             StatusCode::FORBIDDEN,
-            "this project does not take board actions — enable orchestration for this project on the settings page",
+            format!(
+                "this project turned off board actions in its .waggledance.toml at {} — remove `orchestration = false` there, or fix the file if it does not parse, to allow them",
+                waggledance_core::project_settings::settings_path(&project.root_path).display()
+            ),
         );
     }
     if let Some(run) = kind.run() {
@@ -2432,6 +3236,18 @@ struct TerminalConfigJson {
     /// safely (reads as off) rather than with a hard parse error.
     #[serde(default)]
     unassigned_enabled: bool,
+    /// observer-tick-trigger (D6): the in-daemon fleet-transition trigger's
+    /// own switch, off unless the owner made a deliberate act — see
+    /// `TerminalConfig::trigger_enabled`'s doc for the full reasoning.
+    /// `#[serde(default)]` matches every other switch on this struct.
+    #[serde(default)]
+    trigger_enabled: bool,
+    /// observer-tick-trigger (D10): log-only preview of the trigger above —
+    /// see `TerminalConfig::trigger_dry_run`'s doc. Independent in meaning
+    /// from `trigger_enabled`, but only takes effect while it is also on
+    /// (`reconcile_trigger`'s `enabled` gate in `main.rs`).
+    #[serde(default)]
+    trigger_dry_run: bool,
     /// D7/D9 notification destination — a plain (non-secret) field, see
     /// `TerminalConfig::notify_chat_id`. Only overwrites the stored value
     /// when non-blank, matching every other optional field on this form
@@ -2482,6 +3298,8 @@ async fn update_terminal_config(
     cfg.terminal.supervisor_enabled = form.supervisor_enabled;
     cfg.terminal.notify_enabled = form.notify_enabled;
     cfg.terminal.unassigned_enabled = form.unassigned_enabled;
+    cfg.terminal.trigger_enabled = form.trigger_enabled;
+    cfg.terminal.trigger_dry_run = form.trigger_dry_run;
     if let Some(dest) = form
         .notify_chat_id
         .as_deref()
@@ -2932,15 +3750,15 @@ fn project_live_board_runs(
     snapshot: Option<&herdr::Snapshot>,
 ) -> views::BeeHubLiveRuns {
     let mut out = views::BeeHubLiveRuns::new();
-    let Some(snap) = snapshot else {
-        return out;
-    };
     let Ok(runs) = engine.list_runs(project_id, BOARD_LIVE_RUN_SCAN) else {
         return out;
     };
     for run in runs.iter().filter(|r| r.status == "working") {
         let feature = engine.run_feature(&run.id).ok().flatten();
-        let pane_alive = snap.panes.iter().any(|p| p.pane_id == run.pane_id);
+        let pane_alive = run
+            .pane_id
+            .starts_with(crate::orchestrate::PASEO_PANE_PREFIX)
+            || snapshot.is_some_and(|snap| snap.panes.iter().any(|p| p.pane_id == run.pane_id));
         if let Some((feature, live)) = views::bee_hub_live_run_entry(
             feature.as_deref(),
             &run.status,
@@ -3097,10 +3915,14 @@ async fn terminal_page_inner(
             // A boundary that fails to construct (e.g. a project registered
             // on top of the hard-deny list) can never accept any pane —
             // fail closed to zero panes, not a crash and not a laxer check.
-            let panes =
+            let mut panes =
                 waggledance_core::paths_boundary::Boundary::new(vec![project.root_path.clone()])
                     .map(|boundary| project_panes(&snapshot, &boundary))
                     .unwrap_or_default();
+            overlay_waggledance_dispatched_panes(
+                &mut panes,
+                &live_waggledance_dispatched_panes(&st.engine),
+            );
             let selected = match requested_pane_id {
                 Some(pane_id) => {
                     if !panes.iter().any(|p| p.pane_id == pane_id) {
@@ -4322,12 +5144,23 @@ async fn terminal_create_pane(
     let Some((workspace_id, cwd)) = project_creation_destination(&snapshot, &boundary) else {
         return destination_unresolved_response(&project.id);
     };
-    match st.herdr.tab_create(&workspace_id, Some(&cwd)).await {
-        Ok(created) => (
+    let created = match st.herdr.tab_create(&workspace_id, Some(&cwd)).await {
+        Ok(created) => created,
+        Err(e) => return create_error_response(e),
+    };
+    // Protocol 20's tab_created carries no pane id, so the pane this route
+    // must hand back is found by matching the tab — the same hop, and the
+    // same refusal, the spawn path uses.
+    match herdr::pane_of_tab(st.herdr.as_ref(), &created.tab_id).await {
+        Ok(Some(pane_id)) => (
             StatusCode::OK,
-            Json(json!({ "tab_id": created.tab_id, "pane_id": created.pane_id })),
+            Json(json!({ "tab_id": created.tab_id, "pane_id": pane_id })),
         )
             .into_response(),
+        Ok(None) => create_error_response(herdr::HerdrError::TabPaneUnresolved {
+            tab_id: created.tab_id,
+            workspace_id,
+        }),
         Err(e) => create_error_response(e),
     }
 }
@@ -4380,7 +5213,7 @@ async fn terminal_create_agent(
     let Some((workspace_id, cwd)) = project_creation_destination(&snapshot, &boundary) else {
         return destination_unresolved_response(&project.id);
     };
-    match st.herdr.agent_start(&workspace_id, Some(&cwd), &argv).await {
+    match herdr::start_agent_in_new_tab(st.herdr.as_ref(), &workspace_id, Some(&cwd), &argv).await {
         Ok(started) => (
             StatusCode::OK,
             Json(json!({
@@ -4475,6 +5308,56 @@ pub(crate) fn project_panes(
             })
         })
         .collect()
+}
+
+/// board-run-reaper's own guard (`SqliteStore::list_unattended_working_runs`:
+/// `status='working' AND preset_label IS NOT NULL`), read a second time here
+/// for the opposite reason it exists there — the reaper uses it to find a
+/// pane waggledance dispatched into and has since gone quiet; this uses it to
+/// find a pane waggledance dispatched into that is STILL live, keyed by pane
+/// id to the preset that spawned it. herdr classifies a pane by watching what
+/// it prints, which has nothing to do with who dispatched into it, so a
+/// freshly spawned pane can read as a plain shell to herdr right up until the
+/// dispatched program paints its first frame — this is the second witness
+/// [`overlay_waggledance_dispatched_panes`] joins against so that gap never
+/// reaches a reader. A store read failure answers the same as "no live runs"
+/// rather than fail the page: herdr's own classification is still the
+/// primary source of truth, so this join degrades to a no-op, never a 5xx.
+fn live_waggledance_dispatched_panes(engine: &Engine) -> std::collections::HashMap<String, String> {
+    engine
+        .store
+        .list_unattended_working_runs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|run| run.preset_label.map(|label| (run.pane_id, label)))
+        .collect()
+}
+
+/// Fills the one gap herdr's own pane/agent join leaves open: a pane
+/// waggledance itself dispatched a run into, still `working`, that herdr's
+/// snapshot has not (yet, or ever) classified as an agent. Only a pane
+/// [`project_panes`] already fell back to `"shell"` on is touched — a pane
+/// herdr DOES recognize as an agent keeps herdr's own kind/status untouched,
+/// exactly as before, so this never overrides a real classification with a
+/// guess. It reverts on its own the moment the run leaves `working` (done,
+/// blocked, failed, timeout): `live` is re-derived from the store on every
+/// request, so a finished run is simply absent from it next time and the
+/// pane reads as a plain shell again, with no separate cleanup step.
+fn overlay_waggledance_dispatched_panes(
+    panes: &mut [views::TerminalPaneView],
+    live: &std::collections::HashMap<String, String>,
+) {
+    for pane in panes.iter_mut() {
+        if pane.kind != "shell" {
+            continue;
+        }
+        let Some(preset_label) = live.get(&pane.pane_id) else {
+            continue;
+        };
+        pane.kind = preset_label.clone();
+        pane.name = preset_label.clone();
+        pane.status = "working".to_string();
+    }
 }
 
 /// A2's two joins for one project, built once from that project's own
@@ -4854,6 +5737,35 @@ fn key_main_panes_by_feature(
     out
 }
 
+/// `tab.create` plus the pane it brought, as one value — test-only.
+///
+/// Protocol 20's `tab_created` carries only the tab (`TabInfo` has no pane
+/// id), so production finds the pane by matching that tab against a fresh
+/// snapshot. Tests below want both ids, and they find the pane exactly the
+/// way production does rather than by a shortcut the real code cannot take.
+#[cfg(test)]
+struct CreatedTab {
+    tab_id: String,
+    pane_id: String,
+}
+
+#[cfg(test)]
+async fn create_tab_with_pane(
+    h: &dyn herdr::Herdr,
+    workspace_id: &str,
+    cwd: Option<&str>,
+) -> CreatedTab {
+    let created = h.tab_create(workspace_id, cwd).await.unwrap();
+    let pane_id = crate::herdr::pane_of_tab(h, &created.tab_id)
+        .await
+        .unwrap()
+        .expect("a created tab brings a pane");
+    CreatedTab {
+        tab_id: created.tab_id,
+        pane_id,
+    }
+}
+
 #[cfg(test)]
 mod key_main_panes_by_feature_tests {
     use super::*;
@@ -5188,7 +6100,11 @@ fn agent_title_for(snapshot: &herdr::Snapshot, pane_id: &str) -> String {
 /// membership complement, so no pane is ever listed under two rows. A
 /// `project_panes` row whose `status` reads `"shell"` (`project_panes`'s own
 /// doc comment: no agent behind it) is dropped here — a shell holds no
-/// agent to switch to. The panes no registered project's boundary claims
+/// agent to switch to, UNLESS [`overlay_waggledance_dispatched_panes`] has
+/// already turned it into a live one (`live_waggledance_panes`, run first)
+/// — a pane waggledance itself dispatched into and is still `working` is
+/// an agent pane by waggledance's own definition, whatever herdr currently
+/// calls it. The panes no registered project's boundary claims
 /// are appended last, straight from `unassigned_panes` — already
 /// agent-only by construction (its own doc comment: sourced from
 /// `snapshot.agents`, never `snapshot.panes`), so no separate shell filter
@@ -5201,6 +6117,7 @@ fn agent_pane_rows(
     snapshot: &herdr::Snapshot,
     projects: &[waggledance_core::domain::Project],
     bee: &std::collections::HashMap<String, ProjectBeeActivity>,
+    live_waggledance_panes: &std::collections::HashMap<String, String>,
 ) -> Vec<AgentPaneRow> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rows = Vec::new();
@@ -5212,6 +6129,7 @@ fn agent_pane_rows(
             continue;
         };
         let mut project_panes = project_panes(snapshot, &boundary);
+        overlay_waggledance_dispatched_panes(&mut project_panes, live_waggledance_panes);
         if let Some(activity) = bee.get(&project.id) {
             apply_bee_activity(&mut project_panes, &activity.pane);
         }
@@ -5327,41 +6245,65 @@ fn agent_pane_rows(
 /// path carrying a traversal component before it ever reaches the deny-list
 /// gate, so such a row's own register button could never succeed, whatever
 /// its path resolves to.
+///
+/// `snapshot` is `Option<&herdr::Snapshot>` rather than a required
+/// reference — a `None` snapshot (herdr down or timed out, `index_page`'s
+/// own D6 remedy) means an EMPTY pane set for this call only, never "skip
+/// suggestions altogether". `unassigned_panes`'s existing fail-closed
+/// semantics are kept exactly: it only ever runs when a snapshot was
+/// actually taken.
 fn suggested_projects(
-    snapshot: &herdr::Snapshot,
+    snapshot: Option<&herdr::Snapshot>,
     projects: &[waggledance_core::domain::Project],
 ) -> Vec<views::ProjectSuggestion> {
     // Never re-derive the assigned set by hand: `unassigned_panes` already
     // is the fail-closed complement this list aggregates over (D6: agents
-    // only, since it reads `snapshot.agents`).
-    let unassigned = unassigned_panes(snapshot, projects);
+    // only, since it reads `snapshot.agents`). A `None` snapshot yields an
+    // empty pane set — never a panicked or a skipped call.
+    let unassigned = match snapshot {
+        Some(snap) => unassigned_panes(snap, projects),
+        None => Vec::new(),
+    };
 
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut pane_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut paths: Vec<String> = Vec::new();
-    for pane in &unassigned {
-        if pane.cwd.is_empty() {
-            continue;
+
+    // D1: trim exactly one trailing slash so `/a/b` and `/a/b/` dedup to
+    // one row — never canonicalized, never walked up.
+    fn normalize(raw: &str) -> Option<&str> {
+        let trimmed = raw.strip_suffix('/').unwrap_or(raw);
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
         }
-        // D1: trim exactly one trailing slash so `/a/b` and `/a/b/` dedup
-        // to one row — never canonicalized, never walked up.
-        let normalized = pane.cwd.strip_suffix('/').unwrap_or(&pane.cwd);
-        if normalized.is_empty() {
-            continue;
-        }
-        let cwd_path = std::path::Path::new(normalized);
-        // project-suggestions-3: a raw traversal component is dropped
-        // before the second guard runs — a candidate carrying one can
-        // resolve to anywhere, including inside a registered project by a
-        // route `is_contained_in_root`'s raw component match cannot see
-        // (the doc comment above this function has the full story), and
-        // its own register button could never succeed regardless.
-        let has_traversal = cwd_path.components().any(|c| {
+    }
+
+    // project-suggestions-3: a raw traversal component is dropped before
+    // the second guard runs — a candidate carrying one can resolve to
+    // anywhere, including inside a registered project by a route
+    // `is_contained_in_root`'s raw component match cannot see (the doc
+    // comment above this function has the full story), and its own
+    // register button could never succeed regardless.
+    fn has_traversal(cwd_path: &std::path::Path) -> bool {
+        cwd_path.components().any(|c| {
             matches!(
                 c,
                 std::path::Component::ParentDir | std::path::Component::CurDir
             )
-        });
-        if has_traversal {
+        })
+    }
+
+    for pane in &unassigned {
+        if pane.cwd.is_empty() {
+            continue;
+        }
+        let Some(normalized) = normalize(&pane.cwd) else {
+            continue;
+        };
+        let cwd_path = std::path::Path::new(normalized);
+        if has_traversal(cwd_path) {
             continue;
         }
         // Owned-subtree second guard: a candidate that equals or sits
@@ -5374,10 +6316,10 @@ fn suggested_projects(
         {
             continue;
         }
-        if !counts.contains_key(normalized) {
+        if !pane_counts.contains_key(normalized) {
             paths.push(normalized.to_string());
         }
-        *counts.entry(normalized.to_string()).or_insert(0) += 1;
+        *pane_counts.entry(normalized.to_string()).or_insert(0) += 1;
     }
 
     paths.sort();
@@ -5385,7 +6327,7 @@ fn suggested_projects(
     paths
         .into_iter()
         .map(|path| {
-            let pane_count = counts[&path];
+            let pane_count = pane_counts.get(&path).copied().unwrap_or(0);
             views::ProjectSuggestion { path, pane_count }
         })
         .collect()
@@ -6110,15 +7052,252 @@ async fn jump_search(
     Json(hits).into_response()
 }
 
-async fn code_root(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    code_response(&st, &id, "").await
+/// composer-slash-suggest (D2): the slash commands and skills offerable in a
+/// composer on this project's pages — the project root's own set shadowing the
+/// user-level one, as JSON for the `/` popup. Shaped after `jump_search`
+/// above: project lookup, 404 when absent, `Json(...)` otherwise.
+///
+/// Read-only by construction. Nothing here runs or interprets a slash command;
+/// the browser inserts the name it picks into a reply box, and the agent CLI
+/// behind the pane stays the only thing that ever executes one.
+///
+/// slash-builtin-commands D2 `fe5b9256`: the optional `?pane=<pane_id>` names
+/// the composer's pane, whose agent kind decides which vendor's built-ins join
+/// the list. Absent, unresolvable, or a plain shell pane → the file-based
+/// entries alone, exactly as before this feature.
+async fn slash_suggest(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<SlashQuery>,
+) -> Response {
+    let Ok(Some(project)) = st.engine.get_project(&id) else {
+        return not_found("project not found");
+    };
+    let vendor = slash_vendor_for_pane(&st, query.pane.as_deref()).await;
+    Json(crate::slash::slash_entries(
+        Some(&project.root_path),
+        &slash_home(),
+        vendor,
+    ))
+    .into_response()
+}
+
+/// `slash_suggest`'s projectless half (D2): pages with no project — the
+/// the unassigned-pane composer — get the user-level list alone, plus
+/// the same pane-resolved built-ins.
+async fn slash_suggest_user(
+    State(st): State<AppState>,
+    Query(query): Query<SlashQuery>,
+) -> Response {
+    let vendor = slash_vendor_for_pane(&st, query.pane.as_deref()).await;
+    Json(crate::slash::slash_entries(None, &slash_home(), vendor)).into_response()
+}
+
+/// Which composer is asking (slash-builtin-commands D2). `pane` is the herdr
+/// pane id behind the composer; a composer with no pane behind it omits it.
+#[derive(serde::Deserialize)]
+struct SlashQuery {
+    #[serde(default)]
+    pane: Option<String>,
+}
+
+/// The built-in vendor for the agent running in `pane_id`, or `None`.
+///
+/// The join goes through the snapshot's `agents[]` because that is the only
+/// place a pane's kind exists (`herdr::wire::Agent`; `Pane` carries none) —
+/// and a plain shell pane is simply absent from it, which is precisely how a
+/// shell composer ends up offered no `/model`. Every failure is that same
+/// `None`: no pane parameter, an unknown pane, an unrecognised kind, or a
+/// herdr that is down. Suggestions are a convenience, never a reason to fail
+/// the request.
+async fn slash_vendor_for_pane(st: &AppState, pane_id: Option<&str>) -> Option<&'static str> {
+    let pane_id = pane_id?;
+    let snapshot = st.herdr.snapshot().await.ok()?;
+    let agent = snapshot.agents.iter().find(|a| a.pane_id == pane_id)?;
+    crate::slash::vendor_for_kind(&agent.kind)
+}
+
+/// Where the user-level `.claude/` tree lives. Falls back to the current
+/// directory the same way every other home lookup in this file does — an
+/// unresolvable home then simply finds nothing to suggest.
+fn slash_home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The base the Changes screen was asked for (D6). `?commit=<sha>` is the
+/// only value; anything else about the query string is ignored.
+///
+/// D7 is NOT enforced here on purpose: this layer does no validation, so
+/// there is exactly one gate to audit and it sits next to the git calls it
+/// protects (`git_diff::diff`). What this layer owes is that the value
+/// reaches that gate unchanged and never comes back out — an unresolvable
+/// commit renders the working tree, and the response carries no trace of
+/// what was sent.
+#[derive(serde::Deserialize)]
+struct ChangesQuery {
+    #[serde(default)]
+    commit: Option<String>,
+    /// D9's view flag, carried on the same query as `commit`. Read only by
+    /// [`page_chrome`], never by anything that touches the repository.
+    #[serde(default)]
+    embed: Option<String>,
+    /// home-terminal-panel D2's narrowing flag, read only beside `embed` and
+    /// only by [`page_chrome`] — same nothing-but-a-view-selector standing as
+    /// `embed` itself.
+    #[serde(default)]
+    nav: Option<String>,
+    /// The other narrowing flag (UAT): the embedded page without its own
+    /// in-page sidebar. Same standing again — read beside `embed`, by
+    /// [`page_chrome`] and nothing else.
+    #[serde(default)]
+    panel: Option<String>,
+}
+
+/// The two view flags alone, for the two Code routes — the same fields
+/// `ChangesQuery` carries, with nothing else on them.
+#[derive(serde::Deserialize)]
+struct CodeQuery {
+    #[serde(default)]
+    embed: Option<String>,
+    #[serde(default)]
+    nav: Option<String>,
+    #[serde(default)]
+    panel: Option<String>,
+}
+
+/// D9: how much chrome a Code or Changes page renders, decided from the
+/// `embed` query value and nothing else.
+///
+/// `embed=1` — and only that — asks for the chrome-less rendering. Absent,
+/// empty, `0`, `true`, or anything a reader made up all fall through to the
+/// full page, so an unrecognised value can never produce a stranger page
+/// than the one that route has always served. The value never reaches a
+/// filesystem path, a git argument, or the response body: it selects between
+/// two constants in `views` and stops there.
+///
+/// home-terminal-panel D2 adds `nav`, read the same exact-value way and only
+/// ever together with `embed`: `embed=1&nav=1` is the nav-only rendering,
+/// `embed=1` alone is unchanged, and `nav=1` WITHOUT `embed=1` is the full
+/// page — a narrowing of the embed mode is not something a URL can ask for
+/// on its own, so a stray `nav` in a bookmark can never strip a normal page
+/// down to a sidebar.
+///
+/// The UAT's `panel` is the third value on that same ladder and obeys every
+/// word of it: `embed=1&panel=1` is the embedded page without its own
+/// in-page sidebar, `panel=1` alone is the ordinary page, and anything but
+/// the exact `1` is nothing at all. `nav` wins where both are asked for —
+/// the nav IS a sidebar, so "no sidebar" has nothing to say to it.
+fn page_chrome(embed: Option<&str>, nav: Option<&str>, panel: Option<&str>) -> views::PageChrome {
+    match (
+        embed.map(str::trim),
+        nav.map(str::trim),
+        panel.map(str::trim),
+    ) {
+        (Some("1"), Some("1"), _) => views::PageChrome::Nav,
+        (Some("1"), _, Some("1")) => views::PageChrome::Panel,
+        (Some("1"), _, _) => views::PageChrome::Embed,
+        _ => views::PageChrome::Full,
+    }
+}
+
+/// The Changes screen: the project's working tree against HEAD (D2), or one
+/// commit against its parent when `?commit=<sha>` names one (D6). Every git
+/// call happens inside `Engine::changes`, on a blocking thread -- the calls
+/// have a 10 s budget of their own, and a request holding a runtime worker
+/// that long would starve every other page.
+///
+/// git missing, the project not being a repository, and a killed call are
+/// all a 200 carrying the explained empty state (D3), never a 500 and never
+/// a hidden entry point. So is a `?commit` value that names no commit: it
+/// falls back to the working-tree view (D7). Only an unknown project id is
+/// a 404.
+///
+/// Highlighting both sides of every section is as CPU-bound as the git calls
+/// are I/O-bound, so the whole page — read, highlight, format — is built on
+/// the same blocking thread and only the finished HTML crosses back.
+async fn changes_screen(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ChangesQuery>,
+) -> Response {
+    let Ok(Some(project)) = st.engine.get_project(&id) else {
+        return not_found("project not found");
+    };
+    let base = match query
+        .commit
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(sha) => DiffBase::Commit(sha.to_string()),
+        None => DiffBase::WorkingTree,
+    };
+    let chrome = page_chrome(
+        query.embed.as_deref(),
+        query.nav.as_deref(),
+        query.panel.as_deref(),
+    );
+    let engine = st.engine.clone();
+    let project_id = id.clone();
+    let page = tokio::task::spawn_blocking(move || {
+        engine
+            .changes(&project_id, &base)
+            .map(|view| views::changes_page(&project, &view, changes_highlighter(), chrome))
+    })
+    .await;
+    match page {
+        Ok(Ok(html)) => Html(html).into_response(),
+        _ => not_found("project not found"),
+    }
+}
+
+/// The syntax set the Changes screen highlights with. `Engine` keeps its own
+/// renderer private (the Code section reaches it through `Engine::code_path`,
+/// which returns one already-highlighted file), and the diff needs to
+/// highlight two reconstructed texts per section that never exist on disk —
+/// so this section owns a renderer of its own. Built once, on the first
+/// request that asks for it: `SyntaxSet::load_defaults_newlines` deserializes
+/// a several-megabyte dump, far too much to pay per request, and a project
+/// that never opens Changes never pays it at all.
+fn changes_highlighter() -> &'static RenderService {
+    static HIGHLIGHTER: OnceLock<RenderService> = OnceLock::new();
+    HIGHLIGHTER.get_or_init(RenderService::new)
+}
+
+async fn code_root(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CodeQuery>,
+) -> Response {
+    code_response(
+        &st,
+        &id,
+        "",
+        page_chrome(
+            query.embed.as_deref(),
+            query.nav.as_deref(),
+            query.panel.as_deref(),
+        ),
+    )
+    .await
 }
 
 async fn code_dir_or_file(
     State(st): State<AppState>,
     Path((id, path)): Path<(String, String)>,
+    Query(query): Query<CodeQuery>,
 ) -> Response {
-    code_response(&st, &id, &path).await
+    code_response(
+        &st,
+        &id,
+        &path,
+        page_chrome(
+            query.embed.as_deref(),
+            query.nav.as_deref(),
+            query.panel.as_deref(),
+        ),
+    )
+    .await
 }
 
 /// Shared body for both Code-section routes. Every filesystem access goes
@@ -6126,13 +7305,13 @@ async fn code_dir_or_file(
 /// this section — this function never computes a path itself. A denied path
 /// and a missing path return the identical 404 body: a distinguishing
 /// message would itself disclose that a denied file exists.
-async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
+async fn code_response(st: &AppState, id: &str, path: &str, chrome: views::PageChrome) -> Response {
     let Ok(Some(project)) = st.engine.get_project(id) else {
         return not_found("file not found");
     };
     match st.engine.code_path(id, path) {
         Ok(waggledance_core::engine::CodeView::Dir(listing)) => {
-            Html(views::code_dir_page(&project, &listing)).into_response()
+            Html(views::code_dir_page(&project, &listing, chrome)).into_response()
         }
         Ok(waggledance_core::engine::CodeView::File {
             highlighted,
@@ -6149,6 +7328,7 @@ async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
                     size,
                 },
                 &sidebar,
+                chrome,
             ))
             .into_response()
         }
@@ -6159,6 +7339,7 @@ async fn code_response(st: &AppState, id: &str, path: &str) -> Response {
                 path,
                 views::CodeBody::Binary { size },
                 &sidebar,
+                chrome,
             ))
             .into_response()
         }
@@ -6647,10 +7828,9 @@ mod bee_route_tests {
     }
 
     fn build_state() -> AppState {
-        let engine = Arc::new(Engine::new(
-            SqliteStore::open_in_memory().unwrap(),
-            Config::default(),
-        ));
+        let mut config = Config::default();
+        config.paseo.enabled = Some(false);
+        let engine = Arc::new(Engine::new(SqliteStore::open_in_memory().unwrap(), config));
         let (reload_tx, _) = broadcast::channel(4);
         AppState {
             engine,
@@ -6685,6 +7865,18 @@ mod bee_route_tests {
             // shares a cached rollup across states, matching every other
             // per-state fixture above.
             bee_cache: BeeSnapshotCache::default(),
+            agent_logs: Arc::default(),
+            agent_homes: Arc::new(no_agent_homes()),
+        }
+    }
+
+    fn no_agent_homes() -> waggledance_core::agent_usage::AgentHomes {
+        let none = std::env::temp_dir().join("waggledance-test-no-agent-homes");
+        waggledance_core::agent_usage::AgentHomes {
+            claude: none.clone(),
+            pi: none.clone(),
+            codex: none.clone(),
+            paseo: none,
         }
     }
 
@@ -6717,6 +7909,229 @@ mod bee_route_tests {
     async fn body_string(resp: Response) -> String {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn usage_fixture(name: &str) -> (AppState, Project) {
+        let root = fresh_root(name);
+        let now = time::OffsetDateTime::now_utc();
+        let ended = now - time::Duration::hours(1);
+        let ended_ms = (ended.unix_timestamp_nanos() / 1_000_000) as i64;
+        let closed_at = ended
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        write(
+            &root,
+            ".bee/usage/usage-shipped.json",
+            &format!(
+                r#"{{"schema":"bee-usage/v1","feature":"usage-shipped","closed_at":"{closed_at}","sessions":[{{"models":{{"claude-opus-5-5":{{"new":1000,"cached":5000}}}},"subagent_models":{{"claude-fable-5-1":{{"new":200,"cached":0}}}},"started_ms":{started},"ended_ms":{ended_ms}}}]}}"#,
+                started = ended_ms - 3_600_000,
+            ),
+        );
+        let mut st = build_state();
+        st.agent_homes = Arc::new(agent_homes_fixture(name, &root));
+        let project = register(&st, &root, name);
+        (st, project)
+    }
+
+    fn agent_homes_fixture(name: &str, cwd: &Path) -> waggledance_core::agent_usage::AgentHomes {
+        let dir = fresh_root(&format!("{name}-agent-homes"));
+        let ts = (time::OffsetDateTime::now_utc() - time::Duration::minutes(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let cwd = serde_json::to_string(&cwd.to_string_lossy()).unwrap();
+        write(
+            &dir,
+            "claude/projects/-work/sess-main.jsonl",
+            &format!(
+                r#"{{"type":"assistant","cwd":{cwd},"timestamp":"{ts}","requestId":"r1","message":{{"id":"m1","model":"claude-opus-5-5","usage":{{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":500}}}}}}"#
+            ),
+        );
+        write(
+            &dir,
+            "pi/agent/sessions/-work/run.jsonl",
+            &format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"type":"session","id":"pi-sess","cwd":{cwd},"timestamp":"{ts}"}}"#
+                ),
+                format_args!(
+                    r#"{{"type":"message","timestamp":"{ts}","message":{{"provider":"hive","model":"flash","usage":{{"input":30,"output":5,"cacheRead":7,"cacheWrite":0}}}}}}"#
+                ),
+            ),
+        );
+        write(
+            &dir,
+            "paseo/agents/work/parent.json",
+            r#"{"id":"paseo-parent","title":"Lead task","persistence":{"provider":"claude","sessionId":"sess-main"}}"#,
+        );
+        write(
+            &dir,
+            "paseo/agents/work/child.json",
+            r#"{"id":"paseo-child","title":"child","labels":{"bee_cell":"ud-x","paseo.parent-agent-id":"paseo-parent"},"persistence":{"provider":"pi","sessionId":"pi-sess"}}"#,
+        );
+        waggledance_core::agent_usage::AgentHomes {
+            claude: dir.join("claude"),
+            pi: dir.join("pi"),
+            codex: dir.join("codex"),
+            paseo: dir.join("paseo"),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_usage_returns_totals_and_the_closed_feature() {
+        let (st, _) = usage_fixture("usage-api");
+        let resp = get(router(st), "/api/usage?days=7").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["days"], 7);
+        assert_eq!(v["totals"]["main"]["new"], 120);
+        assert_eq!(v["totals"]["subagents"]["new"], 35);
+        assert_eq!(v["features"][0]["feature"], "usage-shipped");
+    }
+
+    #[tokio::test]
+    async fn api_usage_counts_agent_logs_in_a_non_bee_project_with_paseo_parents() {
+        let root = fresh_root("usage-non-bee");
+        let mut st = build_state();
+        st.agent_homes = Arc::new(agent_homes_fixture("usage-non-bee", &root));
+        let project = register(&st, &root, "plain");
+        let resp = get(router(st), "/api/usage?days=7").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["projects"][0]["id"], project.id.as_str(), "{v}");
+        assert_eq!(v["projects"][0]["spend"]["main"]["new"], 120, "{v}");
+        assert_eq!(v["projects"][0]["spend"]["subagents"]["cached"], 7, "{v}");
+        let runs = v["runs"].as_array().unwrap();
+        let run = |key: &str| runs.iter().find(|r| r["key"] == key).unwrap().clone();
+        let main = run("claude:sess-main");
+        assert_eq!(main["title"], "Lead task");
+        assert_eq!(main["project_id"], project.id.as_str());
+        assert_eq!(main["subagent"], false);
+        let child = run("pi:pi-sess");
+        assert_eq!(child["title"], "ud-x");
+        assert_eq!(child["subagent"], true);
+        assert_eq!(child["parent_key"], "claude:sess-main");
+        assert_eq!(child["model"], "hive/flash");
+        assert_eq!(child["project_id"], project.id.as_str());
+    }
+
+    #[tokio::test]
+    async fn api_usage_lists_only_paseo_managed_projects_and_folds_the_rest_into_other() {
+        let root = fresh_root("usage-paseo-managed");
+        let managed_root = fresh_root("usage-paseo-managed-kept");
+        let mut st = build_state();
+        let homes = agent_homes_fixture("usage-paseo-managed", &root);
+        let store = serde_json::json!([
+            {"projectId": "prj_kept", "rootPath": managed_root, "archivedAt": null},
+            {"projectId": "prj_old", "rootPath": root, "archivedAt": "2026-10-01T00:00:00Z"}
+        ]);
+        write(&homes.paseo, "projects/projects.json", &store.to_string());
+        st.agent_homes = Arc::new(homes);
+        let unmanaged = register(&st, &root, "unmanaged");
+        let kept = register(&st, &managed_root, "kept");
+        let resp = get(router(st), "/api/usage?days=7").await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let ids: Vec<_> = v["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&kept.id), "{v}");
+        assert!(!ids.contains(&unmanaged.id), "{v}");
+        let other = v["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "")
+            .unwrap();
+        assert_eq!(other["spend"]["main"]["new"], 120, "{v}");
+        assert_eq!(v["totals"]["main"]["new"], 120, "{v}");
+    }
+
+    #[tokio::test]
+    async fn api_usage_falls_back_to_seven_days_and_empties_on_an_unknown_project() {
+        let (st, _) = usage_fixture("usage-api-fallback");
+        let app = router(st);
+        let resp = get(app.clone(), "/api/usage?days=99").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["days"], 7);
+        let resp = get(app, "/api/usage?project=nope").await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["totals"]["all"]["new"], 0);
+    }
+
+    #[tokio::test]
+    async fn bee_tab_renders_current_with_the_no_source_message_on_an_empty_registry() {
+        let resp = get(router(build_state()), "/?tab=bee").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_string(resp).await;
+        assert!(
+            html.contains(r#"href="/?tab=bee" aria-current="page"><svg"#),
+            "{html}"
+        );
+        assert!(html.contains("no registered project holds"), "{html}");
+    }
+
+    async fn post_bee_upgrade(body: &'static str) -> Response {
+        router(build_state())
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .method("POST")
+                    .uri("/api/bee/upgrade")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bee_upgrade_post_without_project_or_all_is_refused_with_400() {
+        assert_eq!(post_bee_upgrade("").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post_bee_upgrade("project=").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn bee_upgrade_post_naming_a_project_renders_the_bee_tab() {
+        let resp = post_bee_upgrade("project=nope").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_string(resp).await;
+        assert!(
+            html.contains(r#"href="/?tab=bee" aria-current="page"><svg"#),
+            "{html}"
+        );
+        assert!(html.contains("no registered project holds"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn bee_upgrade_get_is_method_not_allowed() {
+        let resp = get(router(build_state()), "/api/bee/upgrade").await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn usage_tab_renders_current_and_names_the_closed_feature() {
+        let (st, project) = usage_fixture("usage-tab");
+        let resp = get(
+            router(st),
+            &format!("/?tab=usage&days=30&project={}", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_string(resp).await;
+        assert!(
+            html.contains(r#"href="/?tab=usage" aria-current="page"><svg"#),
+            "{html}"
+        );
+        assert!(html.contains("usage-shipped"), "{html}");
+        assert!(html.contains(r#"aria-current="true">30d</a>"#), "{html}");
     }
 
     /// The home page with the "+ New task" dialog removed (board-new-task
@@ -7717,6 +9132,223 @@ mod bee_route_tests {
         )
     }
 
+    #[tokio::test]
+    async fn api_board_lists_in_progress_waiting_first_and_ready_to_merge_without_paths() {
+        let root = fresh_root("api-board");
+        write(
+            &root,
+            ".bee/lanes/todo-feat.json",
+            &lane_json(
+                "todo-feat",
+                "swarming",
+                "standard",
+                "keep going",
+                None,
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/t.json",
+            &feature_cell_json("tf-1", "todo-feat", "open", None, None),
+        );
+        write(
+            &root,
+            ".bee/lanes/progress-feat.json",
+            &lane_json(
+                "progress-feat",
+                "swarming",
+                "standard",
+                "keep going",
+                Some(r#""context": true, "shape": true, "execution": true, "review": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/p.json",
+            &feature_cell_json("pf-1", "progress-feat", "claimed", None, None),
+        );
+        write(
+            &root,
+            ".bee/lanes/gated-feat.json",
+            &lane_json(
+                "gated-feat",
+                "swarming",
+                "standard",
+                "keep going",
+                Some(r#""context": true, "shape": false, "execution": false, "review": false"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/g.json",
+            &feature_cell_json("gf-1", "gated-feat", "claimed", None, None),
+        );
+        write(
+            &root,
+            ".bee/lanes/merge-feat.json",
+            &lane_json(
+                "merge-feat",
+                "swarming",
+                "standard",
+                "merge the worktree",
+                Some(r#""context": true, "shape": true, "execution": true, "uat": true"#),
+                None,
+            ),
+        );
+        write(
+            &root,
+            ".bee/cells/m.json",
+            &merge_cell_json("mf-1", "merge-feat", "capped", Some("2026-08-21T10:00:00Z")),
+        );
+        let sibling = make_worktree_sibling("api-board-merge-wt");
+        write(
+            &sibling,
+            ".bee/state.json",
+            r#"{"phase":"swarming","feature":"merge-feat","mode":"standard"}"#,
+        );
+        write(
+            &root,
+            ".bee/runtime/worktree-grants.json",
+            &grants_json(&["api-board-merge-wt"]),
+        );
+
+        let st = build_state();
+        let project = register(&st, &root, "api-board");
+        let resp = get(router(st), "/api/board").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        let in_progress = v["in_progress"].as_array().expect("in_progress array");
+        let features: Vec<&str> = in_progress
+            .iter()
+            .map(|c| c["feature"].as_str().unwrap())
+            .collect();
+        assert_eq!(features, ["gated-feat", "progress-feat"], "{body}");
+        assert_eq!(in_progress[0]["waiting"], true, "{body}");
+        assert!(
+            in_progress[0]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("Waiting on you"),
+            "{body}"
+        );
+        assert_eq!(in_progress[0]["project_id"], project.id.as_str());
+        assert_eq!(in_progress[0]["project_name"], "api-board");
+        assert_eq!(in_progress[0]["title"], "Gated Feat");
+        assert_eq!(in_progress[0]["done"], 0);
+        assert_eq!(in_progress[0]["total"], 1);
+        assert_eq!(
+            in_progress[0]["url"],
+            format!("/p/{}/_bee/feature/gated-feat", project.id)
+        );
+        assert_eq!(in_progress[1]["waiting"], false, "{body}");
+        assert!(in_progress[1]["reason"].is_null(), "{body}");
+
+        let ready = v["ready_to_merge"]
+            .as_array()
+            .expect("ready_to_merge array");
+        assert_eq!(ready.len(), 1, "{body}");
+        assert_eq!(ready[0]["feature"], "merge-feat");
+        assert_eq!(
+            ready[0]["url"],
+            format!("/p/{}/_bee/feature/merge-feat", project.id)
+        );
+
+        assert!(!body.contains("root_path"), "{body}");
+        assert!(!body.contains(root.to_str().unwrap()), "{body}");
+        assert!(!body.contains(sibling.to_str().unwrap()), "{body}");
+    }
+
+    #[tokio::test]
+    async fn api_board_lists_leader_waits_for_blocked_and_recent_lost_paseo_runs() {
+        let root = fresh_root("api-board-leader-waits");
+        write(
+            &root,
+            ".bee/lanes/wait-feat.json",
+            &lane_json(
+                "wait-feat",
+                "swarming",
+                "standard",
+                "keep going",
+                None,
+                None,
+            ),
+        );
+        let st = build_state();
+        let project = register(&st, &root, "api-board-leader-waits");
+        for (id, pane, status, updated_at) in [
+            ("run-blocked", "paseo:a", "blocked", rfc3339_minutes_ago(30)),
+            ("run-lost", "paseo:b", "lost", rfc3339_minutes_ago(10)),
+            ("run-working", "paseo:c", "working", rfc3339_minutes_ago(5)),
+            (
+                "run-stale-lost",
+                "paseo:d",
+                "lost",
+                rfc3339_minutes_ago(120),
+            ),
+            (
+                "run-herdr-blocked",
+                "w1:p1",
+                "blocked",
+                rfc3339_minutes_ago(5),
+            ),
+        ] {
+            st.engine
+                .insert_run(
+                    &waggledance_core::domain::Run {
+                        id: id.into(),
+                        project_id: project.id.clone(),
+                        pane_id: pane.into(),
+                        preset_label: Some("claude".into()),
+                        task: "lead the run".into(),
+                        baseline: String::new(),
+                        marker: "HERDR_DONE_abc123".into(),
+                        status: status.into(),
+                        created_at: updated_at.clone(),
+                        updated_at,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+
+        let resp = get(router(st), "/api/board").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        let waits = v["leader_waiting"]
+            .as_array()
+            .expect("leader_waiting array");
+        let ids: Vec<&str> = waits
+            .iter()
+            .map(|w| w["run_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["run-lost", "run-blocked"],
+            "only the blocked run and the freshly lost one are leader waits, newest first: {body}"
+        );
+        assert_eq!(waits[0]["project_id"], project.id.as_str());
+        assert_eq!(waits[0]["project_name"], "api-board-leader-waits");
+        assert_eq!(waits[0]["status"], "lost");
+        assert!(
+            waits[0]["since"].as_str().unwrap().starts_with("20"),
+            "{body}"
+        );
+        assert_eq!(waits[0]["url"], format!("/p/{}/", project.id));
+        assert_eq!(waits[1]["status"], "blocked");
+
+        assert!(v["in_progress"].is_array(), "{body}");
+        assert!(v["ready_to_merge"].is_array(), "{body}");
+        assert!(!body.contains(root.to_str().unwrap()), "{body}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// (console-theme-kanban ctk-8, widened by bee-agent-activity R1 —
     /// decision `63bffb34`, supersedes `420cec71`) The Ready to merge
     /// column's whole membership rule, proven at the HTTP layer over real
@@ -8630,6 +10262,170 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// composer-slash-suggest (D2): the whole path, not just the scanner —
+    /// the route is registered, the handler resolves the project, and the
+    /// body is the JSON array the popup parses. The user-level half of the
+    /// merge is the developer's real home here (the handler resolves it
+    /// through `slash_home`), so this asserts only that the project's own
+    /// entries are present; the merge and shadow rules are proven
+    /// hermetically in `crate::slash`'s own fixture tests.
+    #[tokio::test]
+    async fn slash_route_serves_the_projects_commands_and_skills_as_json() {
+        let root = fresh_root("slash-route");
+        write(
+            &root,
+            ".claude/commands/x.md",
+            "---\ndescription: run x\n---\n",
+        );
+        write(
+            &root,
+            ".claude/skills/y/SKILL.md",
+            "---\ndescription: do y\n---\n",
+        );
+
+        let st = build_state();
+        let project = register(&st, &root, "slash-route");
+        let app = router(st);
+
+        let resp = get(app, &format!("/p/{}/_slash", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let x = entries
+            .iter()
+            .find(|e| e["name"] == "x")
+            .unwrap_or_else(|| panic!("no x entry in {body}"));
+        assert_eq!(x["kind"], "command");
+        assert_eq!(x["description"], "run x");
+        let y = entries
+            .iter()
+            .find(|e| e["name"] == "y")
+            .unwrap_or_else(|| panic!("no y entry in {body}"));
+        assert_eq!(y["kind"], "skill");
+        assert_eq!(y["description"], "do y");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The projectless half and the missing-project refusal — `/_slash`
+    /// answers a JSON array with no project at all, and an unknown id on the
+    /// project route is the same 404 `_jump` gives.
+    #[tokio::test]
+    async fn bare_slash_route_answers_json_and_an_unknown_project_is_not_found() {
+        let st = build_state();
+        let app = router(st);
+
+        let resp = get(app.clone(), "/_slash").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&body).is_ok(),
+            "bare _slash must answer a JSON array: {body}"
+        );
+
+        let missing = get(app, "/p/no-such-project/_slash").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// slash-builtin-commands D2 `fe5b9256`: the whole path for the built-ins
+    /// — `?pane=` on a claude agent's pane joins the snapshot's `agents[]`,
+    /// resolves the vendor, and the body carries the agent's own commands
+    /// beside the project's. The seeded fake runs claude in `w1:p1` and keeps
+    /// `w2:p5` as a plain shell (never in `agents[]`), so both halves of the
+    /// join are real rather than mocked.
+    #[tokio::test]
+    async fn slash_route_adds_the_pane_agents_builtins_and_a_shell_pane_gets_none() {
+        let root = fresh_root("slash-builtins");
+        write(
+            &root,
+            ".claude/commands/x.md",
+            "---\ndescription: run x\n---\n",
+        );
+
+        let st = build_state();
+        let project = register(&st, &root, "slash-builtins");
+        let app = router(st);
+
+        let names = |body: &str| -> Vec<(String, String)> {
+            serde_json::from_str::<Vec<serde_json::Value>>(body)
+                .unwrap()
+                .into_iter()
+                .map(|e| {
+                    (
+                        e["name"].as_str().unwrap().to_string(),
+                        e["kind"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        let resp = get(app.clone(), &format!("/p/{}/_slash?pane=w1:p1", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let with = names(&body);
+        assert!(
+            with.contains(&("model".to_string(), "builtin".to_string())),
+            "a claude pane must be offered /model as a builtin: {body}"
+        );
+        assert!(
+            with.contains(&("usage".to_string(), "builtin".to_string())),
+            "and /usage: {body}"
+        );
+        assert!(
+            with.contains(&("x".to_string(), "command".to_string())),
+            "beside the project's own commands: {body}"
+        );
+
+        // w2:p5 is a shell pane: in `panes[]`, never in `agents[]`.
+        let shell = get(app.clone(), &format!("/p/{}/_slash?pane=w2:p5", project.id)).await;
+        assert_eq!(shell.status(), StatusCode::OK);
+        let shell_body = body_string(shell).await;
+        let shell_names = names(&shell_body);
+        assert!(
+            !shell_names.iter().any(|(_, kind)| kind == "builtin"),
+            "a shell pane answers no builtin at all: {shell_body}"
+        );
+        assert!(
+            shell_names.contains(&("x".to_string(), "command".to_string())),
+            "but still gets the file-based entries: {shell_body}"
+        );
+
+        // An unknown pane id degrades the same way — never a 500.
+        let unknown = get(
+            app.clone(),
+            &format!("/p/{}/_slash?pane=no-such-pane", project.id),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::OK);
+        assert!(
+            !names(&body_string(unknown).await)
+                .iter()
+                .any(|(_, kind)| kind == "builtin"),
+            "an unresolvable pane is not a builtin list"
+        );
+
+        // No pane parameter at all: exactly the pre-feature behaviour.
+        let bare = get(app.clone(), &format!("/p/{}/_slash", project.id)).await;
+        assert_eq!(bare.status(), StatusCode::OK);
+        assert!(
+            !names(&body_string(bare).await)
+                .iter()
+                .any(|(_, kind)| kind == "builtin"),
+            "no pane means no builtin"
+        );
+
+        // The projectless half carries the same join.
+        let unassigned = get(app, "/_slash?pane=w1:p1").await;
+        assert_eq!(unassigned.status(), StatusCode::OK);
+        let unassigned_body = body_string(unassigned).await;
+        assert!(
+            names(&unassigned_body).contains(&("model".to_string(), "builtin".to_string())),
+            "an unassigned pane's composer gets its agent's builtins too: {unassigned_body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn no_bee_dir_is_not_found_route_and_no_home_page_entry_point() {
         // No .bee/ and no markdown files either, so project_home renders a
@@ -8699,10 +10495,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-badged", "live-badged");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&config_dir);
         st.herdr = fake;
@@ -8760,10 +10560,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-quiet", "live-quiet");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_available(false);
 
         let mut st = build_state_with_dir(&config_dir);
@@ -10147,8 +11951,15 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        // Protocol 20 starts an agent INTO a pane, so make one first — the
+        // same two steps production takes.
+        let tab = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+        let pane_id = crate::herdr::pane_of_tab(fake.as_ref(), &tab.tab_id)
+            .await
+            .unwrap()
+            .expect("the created tab has a pane");
         let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
+            .agent_start(&pane_id, &["claude".to_string()])
             .await
             .unwrap();
 
@@ -12615,6 +14426,67 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// guide-vi: the guide answers on a host with nothing registered at all.
+    /// That is the whole point of compiling the chapters into the binary —
+    /// the one place a new operator goes to find out what any of this means
+    /// is the one place that must not depend on having set anything up yet.
+    /// Every chapter is walked, not a sample: a slug that made it into the
+    /// registry with a missing route is invisible until someone clicks it.
+    #[tokio::test]
+    async fn the_guide_answers_every_chapter_on_a_host_with_no_projects() {
+        let dir = fresh_root("guide-empty-host");
+        let app = router(build_state_with_dir(&dir));
+
+        let resp = get(app.clone(), "/guide").await;
+        assert_eq!(resp.status(), StatusCode::OK, "/guide must answer");
+        let index = body_string(resp).await;
+        for chapter in crate::guide::CHAPTERS {
+            assert!(
+                index.contains(&format!(r#"href="/guide/{}""#, chapter.slug)),
+                "the index must link /guide/{}",
+                chapter.slug
+            );
+        }
+
+        for chapter in crate::guide::CHAPTERS {
+            let resp = get(app.clone(), &format!("/guide/{}", chapter.slug)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "/guide/{} must answer",
+                chapter.slug
+            );
+            let body = body_string(resp).await;
+            assert!(
+                body.contains(&format!("Chương {} / ", chapter.number)),
+                "/guide/{} must head itself as chapter {}",
+                chapter.slug,
+                chapter.number
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A slug that names no chapter is a 404, never a quiet redirect to the
+    /// index: a stale bookmark that lands on chapter one looks like it worked.
+    #[tokio::test]
+    async fn an_unknown_guide_chapter_is_a_404_not_a_redirect() {
+        let dir = fresh_root("guide-unknown-slug");
+        let app = router(build_state_with_dir(&dir));
+
+        for slug in ["khong-ton-tai", "config.html", "BEE-LA-GI"] {
+            let resp = get(app.clone(), &format!("/guide/{slug}")).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "/guide/{slug} names no chapter and must 404"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `update_config` must save through the same injected path — a POST from
     /// a route test must never land in the real `~/.waggledance/config.toml`.
     #[tokio::test]
@@ -12772,71 +14644,73 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// D6: `POST /api/projects/:id/orchestration` flips
-    /// `Project::orchestration_enabled`, and the change is visible on the
-    /// settings page's own re-render — the must-have this cell names in
-    /// full: "the settings toggle flips orchestration_enabled and the
-    /// change is visible on reload".
     #[tokio::test]
-    async fn orchestration_toggle_route_flips_the_flag_and_is_visible_on_reload() {
-        let dir = fresh_root("orchestration-toggle");
-        let settings_dir = fresh_root("orchestration-toggle-settings");
+    async fn settings_lists_each_projects_effective_orchestration_without_a_toggle() {
+        let on_root = fresh_root("orchestration-state-on");
+        let off_root = fresh_root("orchestration-state-off");
+        let broken_root = fresh_root("orchestration-state-broken");
+        std::fs::write(
+            off_root.join(".waggledance.toml"),
+            "orchestration = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            broken_root.join(".waggledance.toml"),
+            "orchestration = tru\n",
+        )
+        .unwrap();
+        let settings_dir = fresh_root("orchestration-state-settings");
         let st = build_state_with_dir(&settings_dir);
-        let project = register(&st, &dir, "orch-proj");
-        assert!(
-            !project.orchestration_enabled,
-            "a freshly registered project must default to opted-out (D6)"
-        );
+        let on = register(&st, &on_root, "orch-on");
+        let off = register(&st, &off_root, "orch-off");
+        register(&st, &broken_root, "orch-broken");
+        st.engine.set_orchestration_enabled(&off.id, true).unwrap();
+        assert!(on.orchestration_enabled);
 
         let app = router(st.clone());
-        let on_req = Request::builder()
+        let html = body_string(get(app.clone(), "/settings").await).await;
+        let off_file = off.root_path.join(".waggledance.toml");
+        assert!(
+            html.contains("orch-on</span> <span class=\"fg-orch-state\">on</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "orch-off</span> <span class=\"fg-orch-state\">off — orchestration = false in {}</span>",
+                off_file.display()
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "orch-broken</span> <span class=\"fg-orch-state\">off — .waggledance.toml could not be read: "
+            ) && html.contains("failed to parse"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "Every project takes dispatched work unless its <code>.waggledance.toml</code> says <code>orchestration = false</code>"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("/orchestration\""), "{html}");
+
+        let old_route = Request::builder()
             .header(header::HOST, "127.0.0.1")
             .method("POST")
-            .uri(format!("/api/projects/{}/orchestration", project.id))
+            .uri(format!("/api/projects/{}/orchestration", on.id))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(Body::from("enabled=on"))
             .unwrap();
-        let resp = app.clone().oneshot(on_req).await.unwrap();
-        assert!(resp.status().is_redirection());
-
-        let reloaded = st.engine.get_project(&project.id).unwrap().unwrap();
+        let status = app.oneshot(old_route).await.unwrap().status();
         assert!(
-            reloaded.orchestration_enabled,
-            "the toggle route must flip the flag on"
+            status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "{status}"
         );
 
-        let settings_html = body_string(get(app.clone(), "/settings").await).await;
-        let row_start = settings_html
-            .find(&format!(
-                "action=\"/api/projects/{}/orchestration\"",
-                project.id
-            ))
-            .expect("the settings page must render this project's own toggle row");
-        let row = &settings_html[row_start..row_start + 200];
-        assert!(
-            row.contains(r#"name="enabled" checked"#),
-            "the reloaded settings page must show the flag as checked: {row}"
-        );
-
-        // Submitting the row with the box unchecked (no `enabled` key) must
-        // flip it back off — matching every other checkbox-backed form on
-        // this page.
-        let off_req = Request::builder()
-            .header(header::HOST, "127.0.0.1")
-            .method("POST")
-            .uri(format!("/api/projects/{}/orchestration", project.id))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(Body::empty())
-            .unwrap();
-        app.oneshot(off_req).await.unwrap();
-        let reloaded_off = st.engine.get_project(&project.id).unwrap().unwrap();
-        assert!(
-            !reloaded_off.orchestration_enabled,
-            "an unchecked submission must flip the flag back off"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&settings_dir).ok();
+        for d in [on_root, off_root, broken_root, settings_dir] {
+            std::fs::remove_dir_all(&d).ok();
+        }
     }
 
     /// P3: `POST /api/config` is unauthenticated (D4 leaves it that way), so
@@ -12925,6 +14799,55 @@ mod bee_route_tests {
         assert!(saved.terminal.supervisor_enabled);
         assert!(saved.terminal.notify_enabled);
         assert!(saved.terminal.unassigned_enabled);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// trigger-settings-toggle: `trigger_enabled` and `trigger_dry_run` had
+    /// no Settings checkbox and no field on this route's JSON body, so the
+    /// only way to reach them was hand-editing config.toml plus a daemon
+    /// restart. Proves the two new fields are saved AND, like every other
+    /// switch on this route (`gated_switch_route_starts_and_stops_the_live_background_tasks`),
+    /// reconciled into a live task synchronously with no restart — the
+    /// route already unconditionally passes `Some(st.engine.clone())` to
+    /// `reconcile`, and `trigger_runs_only_with_the_family_switch_and_its_own_switch_on`
+    /// (main.rs) already proves that combination arms the trigger.
+    #[tokio::test]
+    async fn json_post_saves_and_arms_the_observer_tick_trigger_with_no_restart() {
+        let dir = fresh_root("terminal-trigger-switch-live");
+        let st = build_state_with_dir(&dir);
+        let app = router(st.clone());
+
+        assert!(!st.terminal_background.trigger_running());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1")
+                    .method("POST")
+                    .uri("/api/terminal-config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "enabled": true,
+                            "trigger_enabled": true,
+                            "trigger_dry_run": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_redirection());
+
+        let saved = Config::load_from(&dir.join("config.toml"));
+        assert!(saved.terminal.trigger_enabled);
+        assert!(saved.terminal.trigger_dry_run);
+        assert!(
+            st.terminal_background.trigger_running(),
+            "turning trigger_enabled on through the gated route must arm the trigger task with no restart"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -13859,46 +15782,48 @@ mod bee_route_tests {
         std::os::unix::fs::symlink(&escape_target, &symlink_path).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let at_root = fake
-            .agent_start(
-                "w1",
-                Some(&root_a.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let above = fake
-            .agent_start(
-                "w1",
-                Some(&scratch.to_string_lossy()), // project-a's parent directory
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let below_agent = fake
-            .agent_start(
-                "w1",
-                Some(&below.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let via_symlink = fake
-            .agent_start(
-                "w1",
-                Some(&symlink_path.to_string_lossy()), // raw cwd is under root_a, resolves outside
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let other_project = fake
-            .agent_start(
-                "w1",
-                Some(&root_b.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let at_root = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root_a.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let above = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&scratch.to_string_lossy()),
+            // project-a's parent directory
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let below_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&below.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        // raw cwd is under root_a, resolves outside
+        let via_symlink = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&symlink_path.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let other_project = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root_b.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -14174,14 +16099,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -14259,10 +16184,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-revision-changed-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(&started.pane_id, "first frame", "first frame", None);
 
         let mut st = build_state_with_dir(&dir);
@@ -14309,10 +16238,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-doc-links-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let screen = "wrote docs/specs/agent-terminal.md and docs/assets/logo.png\n";
         fake.seed_scroll_pane(&started.pane_id, screen, screen, None);
 
@@ -14354,10 +16287,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-url-links-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let screen = "see https://example.dev/status and box.local:7700 too\n";
         fake.seed_scroll_pane(&started.pane_id, screen, screen, None);
 
@@ -14398,10 +16335,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-scrollback-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         // A pane whose scrollback runs well past both the visible frame and
         // the read limit, every line individually identifiable.
         let visible = "line 499";
@@ -14456,10 +16397,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-revision-unchanged-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(&started.pane_id, "steady frame", "steady frame", None);
 
         let mut st = build_state_with_dir(&dir);
@@ -14499,10 +16444,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-revision-empty-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(&started.pane_id, "", "", None);
 
         let mut st = build_state_with_dir(&dir);
@@ -14550,14 +16499,22 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-revision-two-panes-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let pane_a = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let pane_b = fake
-            .agent_start("w2", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane_a = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let pane_b = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(&pane_a.pane_id, "shared frame", "shared frame", None);
         fake.seed_scroll_pane(&pane_b.pane_id, "shared frame", "shared frame", None);
 
@@ -14629,10 +16586,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-utf8-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let screen_text = "屏幕内容 😀\n❯ ";
         fake.seed_scroll_pane(&started.pane_id, screen_text, screen_text, None);
 
@@ -14676,10 +16637,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-ansi-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let raw = "\u{1b}[31m<script>bad</script>\u{1b}[0m\u{1b}[2Jplain";
         fake.seed_scroll_pane(&started.pane_id, raw, raw, None);
 
@@ -14729,10 +16694,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-no-history-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let text = "live frame\n❯ ";
         fake.seed_scroll_pane(&started.pane_id, text, text, Some("older frame\n❯ "));
 
@@ -14781,10 +16750,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-history-2-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &started.pane_id,
@@ -14848,10 +16821,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-screen-live-after-history-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &started.pane_id,
@@ -15106,10 +17083,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("scroll-explicit-zero-with-record-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &started.pane_id,
@@ -15191,10 +17172,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("scroll-explicit-zero-no-record-project");
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &started.pane_id,
@@ -15787,14 +17772,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -15834,10 +17819,14 @@ mod bee_route_tests {
         let root = fresh_root("transcript-not-available-project");
         let transcript_root = fresh_root("transcript-not-available-claude");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -15877,10 +17866,14 @@ mod bee_route_tests {
         let root = fresh_root("transcript-cursor-project");
         let transcript_root = fresh_root("transcript-cursor-claude");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let cwd = canonical_cwd(&root);
         write_transcript(
             &transcript_root,
@@ -16011,10 +18004,14 @@ mod bee_route_tests {
         let root = fresh_root("transcript-bad-cursor-project");
         let transcript_root = fresh_root("transcript-bad-cursor-claude");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let cwd = canonical_cwd(&root);
         write_transcript(&transcript_root, &cwd, "s1", "");
 
@@ -16049,10 +18046,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("transcript-page-render-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16444,10 +18445,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-input-stage-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16498,10 +18503,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-input-submit-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16550,10 +18559,8 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-input-shell-join-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16603,10 +18610,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-input-agent-verbatim-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16652,10 +18663,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-keys-reach-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16712,14 +18727,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -16864,10 +18879,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -16934,14 +18953,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17320,10 +19339,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-reply-bar-render-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17363,58 +19386,95 @@ mod bee_route_tests {
         };
         let screen = at("class=\"term-screen\"");
         let scroll = at("class=\"term-scroll\"");
-        let arrows = at("class=\"term-keys term-keys--move\"");
+        let keys = at("class=\"term-keys\"");
         let reply = at("class=\"term-reply\"");
         let actions = at("class=\"term-reply__actions\"");
         assert!(
-            screen < scroll && scroll < arrows && arrows < reply && reply < actions,
-            "pane controls out of order (screen {screen}, scroll {scroll}, arrows {arrows}, reply {reply}, actions {actions}): {body}"
+            screen < scroll && scroll < keys && keys < reply && reply < actions,
+            "pane controls out of order (screen {screen}, scroll {scroll}, keys {keys}, reply {reply}, actions {actions}): {body}"
         );
         // The scroll pair belongs to the screen, inside its wrapper — not to
-        // the key row, which is where it used to live.
+        // the key grid, which is where it used to live.
         assert!(
             at("class=\"term-screen-wrap\"") < screen && scroll < at("class=\"term-controls\""),
-            "the scroll pair must ride on the screen, not sit in the key row: {body}"
+            "the scroll pair must ride on the screen, not sit in the key grid: {body}"
         );
-        // The arrows and the named keys now share one line inside a single
-        // control block — the second row they used to sit in is gone, and its
-        // wrapper must not come back, or the line splits in two again.
+        // The one 2×6 grid (tkg-1/D1) sits inside a single control block —
+        // the two-group wrapper it replaced must not come back.
         assert!(
             body.contains("class=\"term-controls\"") && !body.contains("term-controls__row"),
             "the controls must sit in one single-row block: {body}"
         );
-        // Both key groups are inside that block, the arrows first.
-        let named = body[arrows + 1..]
-            .find("class=\"term-keys\"")
-            .unwrap_or_else(|| panic!("missing the named-key group: {body}"))
-            + arrows
-            + 1;
+        // tkg-1/D1, amended by trc-2 (UAT round) and tks-1: the grid renders
+        // in one fixed order — row 1 Esc, Tab, Approve, ↑, Stage, Ctrl+C;
+        // row 2 ⇧Tab, Paste, ←, ↓, →, Enter. Ctrl and Shift are gone
+        // outright, their slots taken by Approve and Stage, and tks-1
+        // replaced the Alt latch with the plain `shift+tab` key — so a
+        // script that walks `.term-keys` children in DOM order tags each
+        // one correctly.
+        let esc_pos = at("data-key=\"escape\"");
+        let tab_pos = at("data-key=\"tab\"");
+        let approve_pos = at("class=\"term-reply__approve\"");
+        let up_pos = at("data-key=\"up\"");
+        let stage_pos = at("class=\"term-reply__stage\"");
+        let ctrlc_pos = at("data-key=\"ctrl+c\"");
+        let shifttab_pos = at("data-key=\"shift+tab\"");
+        let paste_pos = at("class=\"term-keys__paste\"");
+        let left_pos = at("data-key=\"left\"");
+        let down_pos = at("data-key=\"down\"");
+        let right_pos = at("data-key=\"right\"");
+        let enter_pos = at("data-key=\"enter\"");
         assert!(
-            named < reply,
-            "the named keys must sit in the control block, above the reply box: {body}"
+            esc_pos < tab_pos
+                && tab_pos < approve_pos
+                && approve_pos < up_pos
+                && up_pos < stage_pos
+                && stage_pos < ctrlc_pos
+                && ctrlc_pos < shifttab_pos
+                && shifttab_pos < paste_pos
+                && paste_pos < left_pos
+                && left_pos < down_pos
+                && down_pos < right_pos
+                && right_pos < enter_pos,
+            "the 2x6 grid must render Esc,Tab,Approve,↑,Stage,Ctrl+C / ⇧Tab,Paste,←,↓,→,Enter in that order: {body}"
+        );
+        // tks-1: every latching modifier is gone — Ctrl and Shift were
+        // replaced by Approve/Stage, and Alt's slot is the plain `shift+tab`
+        // key now. `data-mod` must not appear at all: a stray latch button
+        // would re-arm `wireTermKeysGrid`'s modifier path nothing else uses.
+        assert!(
+            !body.contains("data-mod="),
+            "no latching modifier button may remain in the grid: {body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// ctrl-c-key-1: the named-key row ends with Ctrl+C, the one key an
-    /// operator watching a runaway command reaches for. It carries the wire
-    /// name herdr's key channel accepts for an interrupt — `ctrl+c`, never
-    /// tmux's `C-c` — and it sits in the SAME group as Enter/Esc/Tab, after
-    /// Tab: the arrow group above it is styled for glyph keys, and a key that
-    /// stops the agent belongs beside the keys that answer it. No separate
-    /// wiring is asserted because none exists: `assets/app.js` binds every
-    /// `button[data-key]` in a key group, so the markup IS the feature.
+    /// ctrl-c-key-1, amended by tkg-1 for the 2×6 grid (D1): Ctrl+C keeps
+    /// its own dedicated slot — the interrupt path an operator watching a
+    /// runaway command reaches for — closing row 1 (Esc, Tab, Approve, ↑,
+    /// Stage, Ctrl+C, amended by trc-2's UAT round: Approve/Stage took
+    /// Ctrl/Shift's slots) right after Tab and right before row 2 opens
+    /// with ⇧Tab (tks-1: the Alt latch's old slot). It carries the wire
+    /// name herdr's key channel accepts
+    /// for an interrupt — `ctrl+c`, never tmux's `C-c`. No separate wiring
+    /// is asserted because none exists: `assets/app.js` binds every
+    /// `button[data-key]` in the grid, so the markup IS the feature.
     #[tokio::test]
-    async fn the_key_row_ends_with_an_interrupt() {
+    async fn ctrl_c_closes_the_first_grid_row() {
         let dir = fresh_root("terminal-ctrl-c-key");
         enable_terminal(&dir);
         let root = fresh_root("terminal-ctrl-c-key-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17427,32 +19487,25 @@ mod bee_route_tests {
 
         let interrupt = body
             .find("<button type=\"button\" data-key=\"ctrl+c\">Ctrl+C</button>")
-            .unwrap_or_else(|| panic!("no interrupt key in the row: {body}"));
+            .unwrap_or_else(|| panic!("no interrupt key in the grid: {body}"));
         assert!(
             !body.contains("data-key=\"C-c\"") && !body.contains("data-key=\"ctrl-c\""),
             "the wire name is ctrl+c; tmux spelling would be sent verbatim and ignored: {body}"
         );
-        // Same group as the other named keys, last in it: the named-key group
-        // opens after the arrow group, and the interrupt falls between Tab and
-        // that group's close.
-        let arrows = body
-            .find("class=\"term-keys term-keys--move\"")
-            .unwrap_or_else(|| panic!("no arrow group: {body}"));
-        let named = body[arrows + 1..]
+        // Same grid as every other key: Ctrl+C is the sixth button — row 1's
+        // last — sitting right after Tab and right before row 2's ⇧Tab opens.
+        let keys = body
             .find("class=\"term-keys\"")
-            .unwrap_or_else(|| panic!("no named-key group: {body}"))
-            + arrows
-            + 1;
+            .unwrap_or_else(|| panic!("no key grid: {body}"));
         let tab = body
             .find("data-key=\"tab\"")
             .unwrap_or_else(|| panic!("no Tab key: {body}"));
-        let group_end = body[named..]
-            .find("</div>")
-            .map(|i| named + i)
-            .unwrap_or_else(|| panic!("the named-key group must close: {body}"));
+        let shift_tab = body
+            .find("data-key=\"shift+tab\"")
+            .unwrap_or_else(|| panic!("no Shift+Tab key: {body}"));
         assert!(
-            named < tab && tab < interrupt && interrupt < group_end,
-            "the interrupt must be the last key in the named-key group (group {named}, tab {tab}, interrupt {interrupt}, end {group_end}): {body}"
+            keys < tab && tab < interrupt && interrupt < shift_tab,
+            "Ctrl+C must close row 1, right after Tab and before ⇧Tab opens row 2 (grid {keys}, tab {tab}, interrupt {interrupt}, shift_tab {shift_tab}): {body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -17469,10 +19522,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-ctrl-c-send-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -17520,10 +19577,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-scroll-fab-render-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17668,7 +19729,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -17737,14 +19799,16 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&owned_sub.to_string_lossy()),
             &["claude".to_string()],
         )
         .await
         .unwrap();
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -17797,9 +19861,7 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-shell-only-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.tab_create("w1", Some(&stray_root.to_string_lossy()))
-            .await
-            .unwrap();
+        create_tab_with_pane(fake.as_ref(), "w1", Some(&stray_root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17827,14 +19889,16 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-dedup-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
         )
         .await
         .unwrap();
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["codex".to_string()],
@@ -17887,12 +19951,22 @@ mod bee_route_tests {
         let with_slash = format!("{bare}/");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&bare), &["claude".to_string()])
-            .await
-            .unwrap();
-        fake.agent_start("w1", Some(&with_slash), &["codex".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&bare),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&with_slash),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17942,9 +20016,14 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&hostile_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&hostile_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -17987,14 +20066,14 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-empty-cwd-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_pane_dirs(&started.pane_id, None, None)
             .await
             .unwrap();
@@ -18028,14 +20107,14 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-empty-string-cwd-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -18102,7 +20181,8 @@ mod bee_route_tests {
         let project_root = fresh_root("suggest-own-root-project");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&project_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18144,7 +20224,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&pane_cwd).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&pane_cwd.to_string_lossy()),
             &["claude".to_string()],
@@ -18201,9 +20282,14 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&dotted_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&dotted_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -18251,9 +20337,14 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&dotted_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&dotted_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -18292,9 +20383,14 @@ mod bee_route_tests {
         let dotted_cwd = format!("{}/a/../b", scratch.to_string_lossy().trim_end_matches('/'));
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&dotted_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&dotted_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -18333,7 +20429,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&sibling_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&sibling_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18388,9 +20485,14 @@ mod bee_route_tests {
         let pane_cwd = link.to_string_lossy().to_string();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&pane_cwd), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&pane_cwd),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         st.herdr = fake;
 
         let resp = get(router(st), "/").await;
@@ -18427,7 +20529,8 @@ mod bee_route_tests {
         let pane_cwd = missing_root.join("sub");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&pane_cwd.to_string_lossy()),
             &["claude".to_string()],
@@ -18477,7 +20580,8 @@ mod bee_route_tests {
         let denied_root = PathBuf::from("/etc/waggledance-test-fixture-nonexistent");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18520,7 +20624,8 @@ mod bee_route_tests {
         write(&stray_root, "README.md", "# Stray\n");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18603,7 +20708,8 @@ mod bee_route_tests {
         let stray_root = fresh_root("suggest-double-register-stray");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18674,9 +20780,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some("/etc"), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some("/etc"),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -18737,7 +20848,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start(
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
             "w1",
             Some(&stray_root.to_string_lossy()),
             &["claude".to_string()],
@@ -18987,22 +21099,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let owned = fake
-            .agent_start(
-                "w1",
-                Some(&project_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let owned = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&project_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19215,10 +21327,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fixture = std::sync::Arc::new(FakeHerdr::new());
-        let started = fixture
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fixture.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = Arc::new(HangingHerdr);
@@ -19291,30 +21407,30 @@ mod bee_route_tests {
         }
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let parent_pane = fake
-            .agent_start(
-                "w1",
-                Some(&parent_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let branch_pane = fake
-            .agent_start(
-                "w1",
-                Some(&branch_root.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
-        let sibling_pane = fake
-            .agent_start(
-                "w1",
-                Some(&sibling_root.to_string_lossy()),
-                &["aider".to_string()],
-            )
-            .await
-            .unwrap();
+        let parent_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&parent_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let branch_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&branch_root.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
+        let sibling_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&sibling_root.to_string_lossy()),
+            &["aider".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19481,6 +21597,23 @@ mod bee_route_tests {
         ) -> herdr::Result<()> {
             unimplemented!("index_page never sends input")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unimplemented!("index_page never prompts an agent")
+        }
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unimplemented!("index_page never waits on an agent")
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unimplemented!("index_page never sends text")
         }
@@ -19496,11 +21629,13 @@ mod bee_route_tests {
         }
         async fn agent_start(
             &self,
-            _workspace_id: &str,
-            _cwd: Option<&str>,
+            _pane_id: &str,
             _argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
             unimplemented!("index_page never starts an agent")
+        }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unimplemented!("index_page never closes a pane")
         }
     }
 
@@ -19558,10 +21693,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19610,22 +21749,22 @@ mod bee_route_tests {
             PathBuf::from("/etc/waggledance-test-fixture-nonexistent-projects-home-1");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let ok_pane = fake
-            .agent_start(
-                "w1",
-                Some(&ok_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let denied_pane = fake
-            .agent_start(
-                "w1",
-                Some(&denied_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let ok_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&ok_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let denied_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&denied_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19691,38 +21830,51 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let working = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let working = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&working.pane_id, AgentStatus::Working)
             .await
             .unwrap();
-        let idle = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["codex".to_string()])
-            .await
-            .unwrap();
+        let idle = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&idle.pane_id, AgentStatus::Idle)
             .await
             .unwrap();
-        let done = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["aider".to_string()])
-            .await
-            .unwrap();
+        let done = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["aider".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&done.pane_id, AgentStatus::Done)
             .await
             .unwrap();
-        let blocked = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["cursor".to_string()])
-            .await
-            .unwrap();
+        let blocked = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["cursor".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&blocked.pane_id, AgentStatus::Blocked)
             .await
             .unwrap();
-        let shell = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let shell = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -19800,9 +21952,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -20279,10 +22436,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -20825,22 +22986,23 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let shell = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let shell = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -20913,24 +23075,36 @@ mod bee_route_tests {
         for seeded in ["w1:p1", "w1:p2", "w2:p3", "w2:p4"] {
             fake.set_status(seeded, AgentStatus::Idle).await.unwrap();
         }
-        let rest = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let rest = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&rest.pane_id, AgentStatus::Done)
             .await
             .unwrap();
-        let working = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["codex".to_string()])
-            .await
-            .unwrap();
+        let working = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&working.pane_id, AgentStatus::Working)
             .await
             .unwrap();
-        let blocked = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["aider".to_string()])
-            .await
-            .unwrap();
+        let blocked = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["aider".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&blocked.pane_id, AgentStatus::Blocked)
             .await
             .unwrap();
@@ -20968,22 +23142,26 @@ mod bee_route_tests {
         for seeded in ["w1:p1", "w1:p2", "w2:p3", "w2:p4"] {
             fake2.set_status(seeded, AgentStatus::Idle).await.unwrap();
         }
-        let rest2 = fake2
-            .agent_start(
-                "w1",
-                Some(&root2.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let rest2 = crate::herdr::start_agent_in_new_tab(
+            fake2.as_ref(),
+            "w1",
+            Some(&root2.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake2
             .set_status(&rest2.pane_id, AgentStatus::Done)
             .await
             .unwrap();
-        let working2 = fake2
-            .agent_start("w1", Some(&root2.to_string_lossy()), &["codex".to_string()])
-            .await
-            .unwrap();
+        let working2 = crate::herdr::start_agent_in_new_tab(
+            fake2.as_ref(),
+            "w1",
+            Some(&root2.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
         fake2
             .set_status(&working2.pane_id, AgentStatus::Working)
             .await
@@ -21027,10 +23205,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let _agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let _agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21129,18 +23311,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21200,10 +23386,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21259,18 +23449,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21295,10 +23489,10 @@ mod bee_route_tests {
         );
         assert!(
             project_body.contains(&format!(
-                r#"<div class="term-keys term-keys--move" data-pane-id="{}" data-term-base="{}""#,
+                r#"<div class="term-keys" data-pane-id="{}" data-term-base="{}""#,
                 project_agent.pane_id, project_base
             )),
-            "a project pane's move keys must carry the same base: {project_body}"
+            "a project pane's key grid must carry the same base: {project_body}"
         );
         assert!(
             project_body.contains(r#"data-key="enter">Enter</button>"#)
@@ -21324,10 +23518,10 @@ mod bee_route_tests {
         );
         assert!(
             unassigned_body.contains(&format!(
-                r#"<div class="term-keys term-keys--move" data-pane-id="{}" data-term-base="{}""#,
+                r#"<div class="term-keys" data-pane-id="{}" data-term-base="{}""#,
                 unassigned_agent.pane_id, unassigned_base
             )),
-            "an unassigned pane's move keys must carry the Unassigned base: {unassigned_body}"
+            "an unassigned pane's key grid must carry the Unassigned base: {unassigned_body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -21356,21 +23550,25 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&project_agent.pane_id, AgentStatus::Working)
             .await
             .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21429,18 +23627,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21471,8 +23673,12 @@ mod bee_route_tests {
             .await,
         )
         .await;
+        // A bare "term-attach" substring also matches the
+        // shared `.term-attach` card rule the inlined stylesheet now carries
+        // on every page — this checks the markup itself, the div's own
+        // opening tag.
         assert!(
-            !unassigned_body.contains("term-attach"),
+            !unassigned_body.contains("class=\"term-attach\""),
             "an unassigned pane must render no attach control: {unassigned_body}"
         );
 
@@ -21497,9 +23703,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21533,14 +23744,15 @@ mod bee_route_tests {
     /// is the only create route there is and an unassigned pane has no
     /// `:id` to build one against.
     ///
-    /// home-terminal-header: what those controls *offer* here is now agent
-    /// presets only. The plain "New shell" button is gone from this tab —
-    /// the Agents drawer is how a terminal is reached and started from the
-    /// home page, and a shell button above someone else's running screen
-    /// only ever meant "a shell in whichever project that screen belongs
-    /// to". It stays on the project terminal page, which
-    /// `terminal_page_drawer_and_create_controls_are_unchanged` and the
-    /// `views.rs` `terminal_page_*` tests still prove.
+    /// home-terminal-new-shell: what those controls offer here is exactly
+    /// what the project terminal page offers — the configured agent presets
+    /// AND the plain "New shell" button. `home-terminal-header` had withheld
+    /// the shell button on the grounds that a button above someone else's
+    /// running screen could only mean "a shell in whichever project that
+    /// screen belongs to"; that is now the whole point, because
+    /// `terminals-tab-project-scope-1` scoped this tab to the selected
+    /// pane's own project — the same project the assertion below reads off
+    /// `data-project-id`.
     #[tokio::test]
     async fn terminals_tab_create_controls_render_for_project_pane_and_absent_for_unassigned() {
         use crate::herdr::fake::FakeHerdr;
@@ -21556,18 +23768,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let unassigned_agent = fake
-            .agent_start(
-                "w2",
-                Some(&outside.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let unassigned_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w2",
+            Some(&outside.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21591,9 +23807,8 @@ mod bee_route_tests {
             "a configured agent preset must still be offered: {project_body}"
         );
         assert!(
-            !project_body.contains(">New shell<")
-                && !project_body.contains("class=\"term-create__pane\""),
-            "the Terminals tab must offer no plain-shell button: {project_body}"
+            project_body.contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "the Terminals tab must offer the plain-shell button too: {project_body}"
         );
 
         let unassigned_body = body_string(
@@ -21613,13 +23828,16 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&scratch).ok();
     }
 
-    /// home-terminal-header: with the plain-shell button gone from this tab,
-    /// a deployment that configures no agent presets has nothing left to
-    /// offer here — so the `.term-create` box itself must not ship, rather
-    /// than shipping empty. Same silence a selected unassigned pane already
-    /// gets, for the same reason: no control to render.
+    /// home-terminal-new-shell: the plain-shell button is back on this tab,
+    /// so a deployment that configures no agent presets still has something
+    /// to offer here — the `.term-create` box ships carrying New shell
+    /// alone, exactly as the project terminal page's does. `home-terminal-
+    /// header` used to pin the opposite (no preset, no button, no box); the
+    /// only silence left is the one a selected *unassigned* pane gets, and
+    /// that has a different cause — no `:id` to build a create route from,
+    /// pinned by the test above.
     #[tokio::test]
-    async fn terminals_tab_renders_no_create_box_when_no_preset_is_configured() {
+    async fn terminals_tab_renders_the_create_box_when_no_preset_is_configured() {
         use crate::herdr::fake::FakeHerdr;
 
         let dir = fresh_root("terminals-tab-create-none");
@@ -21630,10 +23848,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let project_agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let project_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21649,8 +23871,12 @@ mod bee_route_tests {
         )
         .await;
         assert!(
-            !body.contains("class=\"term-create\""),
-            "no configured preset and no plain-shell button must render no create box at all: {body}"
+            body.contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "no configured preset must still leave the shell button standing: {body}"
+        );
+        assert!(
+            !body.contains("data-preset="),
+            "nothing was configured, so no preset button may appear: {body}"
         );
         assert!(
             body.contains(r#"class="fg-card term-pane""#),
@@ -21678,9 +23904,14 @@ mod bee_route_tests {
         write_bee_project_fixture(&root, "feat-a");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -21704,6 +23935,65 @@ mod bee_route_tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// dispatched-pane-agent-visibility: the terminal page's own pane strip
+    /// is built through the same `project_panes` + overlay join the
+    /// `/api/agents` feed uses (`terminal_page_inner`), so a pane herdr
+    /// still calls a shell but waggledance has a live dispatched run on
+    /// reads its mark as the dispatching preset (`claude`), never the
+    /// generic shell prompt — and goes back to reading `title="shell"` the
+    /// moment that run leaves `working`.
+    #[tokio::test]
+    async fn terminal_page_labels_a_dispatched_pane_as_its_agent_while_the_run_is_live() {
+        let dir = fresh_root("dispatched-pane-label-data");
+        enable_terminal(&dir);
+        let root = fresh_root("dispatched-pane-label-project");
+
+        let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        let pane = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "dispatched-label");
+        let run = waggledance_core::domain::Run {
+            id: "run-dispatched-label-1".into(),
+            project_id: project.id.clone(),
+            pane_id: pane.pane_id.clone(),
+            preset_label: Some("claude".into()),
+            task: "do the thing".into(),
+            baseline: String::new(),
+            marker: "HERDR_DONE_ghi789".into(),
+            status: "working".into(),
+            created_at: "2026-08-31T00:00:00Z".into(),
+            updated_at: "2026-08-31T00:00:00Z".into(),
+        };
+        st.engine.insert_run(&run, None).unwrap();
+        let app = router(st.clone());
+
+        let body = body_string(get(app, &format!("/p/{}/_terminal", project.id)).await).await;
+        assert!(
+            body.contains(r#"title="claude""#),
+            "a pane with a live dispatched run must show the dispatching agent's mark, not a bare shell: {body}"
+        );
+        assert!(
+            !body.contains(r#"title="shell""#),
+            "a live dispatched pane must never still read as a plain shell: {body}"
+        );
+
+        st.engine
+            .update_run_status(&run.id, "done", "2026-08-31T00:05:00Z", None, None)
+            .unwrap();
+        let app = router(st);
+
+        let body = body_string(get(app, &format!("/p/{}/_terminal", project.id)).await).await;
+        assert!(
+            body.contains(r#"title="shell""#),
+            "once the dispatched run finishes the pane must read as a plain shell again: {body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // --- card-terminals-1: cross-project feature cards badge their own checkout's panes ---
@@ -21775,18 +24065,22 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let main_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let wt_pane = fake
-            .agent_start(
-                "w1",
-                Some(&sibling.to_string_lossy()),
-                &["codex".to_string()],
-            )
-            .await
-            .unwrap();
+        let main_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let wt_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&sibling.to_string_lossy()),
+            &["codex".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&config_dir);
         st.herdr = fake;
@@ -21922,10 +24216,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-main", "live-main");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&config_dir);
         st.herdr = fake;
@@ -21974,10 +24272,14 @@ mod bee_route_tests {
         );
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&config_dir);
         st.herdr = fake;
@@ -22231,14 +24533,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         // Switch off (default): the home page must carry no trace of the
         // feature at all — not even the word "Unassigned". Byte-identical
@@ -22418,22 +24720,22 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let owned = fake
-            .agent_start(
-                "w1",
-                Some(&project_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let owned = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&project_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -22525,14 +24827,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.seed_scroll_pane(
             &stray.pane_id,
             "unassigned first frame",
@@ -22604,14 +24906,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let text = "unassigned live frame";
         fake.seed_scroll_pane(&stray.pane_id, text, text, Some("unassigned older frame"));
 
@@ -22655,14 +24957,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let text = "see https://example.dev/status now";
         fake.seed_scroll_pane(&stray.pane_id, text, text, None);
 
@@ -22705,14 +25007,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         let live_bottom = "page0 (live)\n❯ ";
         fake.seed_scroll_pane(
             &stray.pane_id,
@@ -22876,22 +25178,22 @@ mod bee_route_tests {
         let fake = std::sync::Arc::new(FakeHerdr::new());
         // A pane whose cwd sits under the hard-deny-listed project's own
         // root -- this is the pane that must NOT leak into Unassigned.
-        let denied_project_pane = fake
-            .agent_start(
-                "w1",
-                Some(&denied_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let denied_project_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&denied_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -22926,10 +25228,14 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("terminal-keys-bound-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -22975,14 +25281,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let stray = fake
-            .agent_start(
-                "w1",
-                Some(&stray_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let stray = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&stray_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake.clone();
@@ -23021,7 +25327,7 @@ mod bee_route_tests {
     /// existing tab). Every other `Herdr` method is unreachable — the create
     /// routes never call them. Mirrors herdr-go's own `RecordingHerdr`
     /// (`herdr-go/src/web/create.rs`).
-    type AgentCallLog = Vec<(String, Option<String>, Vec<String>)>;
+    type AgentCallLog = Vec<(String, Vec<String>)>;
 
     struct RecordingHerdr {
         snap: herdr::Snapshot,
@@ -23084,6 +25390,27 @@ mod bee_route_tests {
         ) -> herdr::Result<()> {
             unreachable!("create routes never send input")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("create routes never prompt an agent")
+        }
+        /// The spawn DOES wait now: `start_declared_agent` asks the daemon to
+        /// confirm the agent is promptable before it returns
+        /// (dispatch-submit-and-reclaim D4), so this must answer ready rather
+        /// than be unreachable — a create route reaches it on every spawn.
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            Ok(herdr::AgentStatus::Idle)
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("create routes never send text")
         }
@@ -23104,28 +25431,29 @@ mod bee_route_tests {
             }
             Ok(herdr::TabCreated {
                 tab_id: format!("{workspace_id}:created-tab"),
-                pane_id: format!("{workspace_id}:created-pane"),
             })
         }
         async fn agent_start(
             &self,
-            workspace_id: &str,
-            cwd: Option<&str>,
+            pane_id: &str,
             argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
-            self.agent_calls.lock().unwrap().push((
-                workspace_id.to_string(),
-                cwd.map(str::to_string),
-                argv.to_vec(),
-            ));
+            self.agent_calls
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), argv.to_vec()));
             if let Some(err) = self.fail.lock().unwrap().take() {
                 return Err(err);
             }
             Ok(herdr::AgentStarted {
-                tab_id: format!("{workspace_id}:created-agent-tab"),
-                pane_id: format!("{workspace_id}:created-agent-pane"),
+                tab_id: "w:created-tab".into(),
+                pane_id: pane_id.to_string(),
                 name: "recorded-agent".into(),
             })
+        }
+
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unreachable!("spawn-recording tests never close a pane")
         }
     }
 
@@ -23151,13 +25479,26 @@ mod bee_route_tests {
                 tab_id: "w:t".into(),
                 focused_pane_id: Some("w:p".into()),
             }],
-            panes: vec![herdr::wire::Pane {
-                pane_id: "w:p".into(),
-                workspace_id: "w".into(),
-                tab_id: "w:t".into(),
-                cwd: Some(p.clone()),
-                foreground_cwd: Some(p),
-            }],
+            panes: vec![
+                herdr::wire::Pane {
+                    pane_id: "w:p".into(),
+                    workspace_id: "w".into(),
+                    tab_id: "w:t".into(),
+                    cwd: Some(p.clone()),
+                    foreground_cwd: Some(p.clone()),
+                },
+                // The pane `tab.create` brings with it. Protocol 20 does not
+                // return it, so the spawn path finds it here by tab_id — a
+                // double whose snapshot lacked it would make every spawn test
+                // fail for a reason the production code does not have.
+                herdr::wire::Pane {
+                    pane_id: "w:created-pane".into(),
+                    workspace_id: "w".into(),
+                    tab_id: "w:created-tab".into(),
+                    cwd: Some(p.clone()),
+                    foreground_cwd: Some(p),
+                },
+            ],
             ..herdr::Snapshot::default()
         }
     }
@@ -23197,6 +25538,23 @@ mod bee_route_tests {
         ) -> herdr::Result<()> {
             unreachable!("page-selection tests never send input")
         }
+        async fn agent_prompt(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("page-selection tests never prompt an agent")
+        }
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            unreachable!("page-selection tests never wait on an agent")
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("page-selection tests never send text")
         }
@@ -23212,11 +25570,13 @@ mod bee_route_tests {
         }
         async fn agent_start(
             &self,
-            _workspace_id: &str,
-            _cwd: Option<&str>,
+            _pane_id: &str,
             _argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
             unreachable!("page-selection tests never start an agent")
+        }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            unreachable!("page-selection tests never close a pane")
         }
     }
 
@@ -23274,14 +25634,22 @@ mod bee_route_tests {
         enable_terminal(&dir);
         let root = fresh_root("pane-scope-two-panes-project");
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let first = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let second = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let first = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let second = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -23344,14 +25712,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let outside_pane = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -23974,13 +26342,16 @@ mod bee_route_tests {
 
         let calls = herdr.agent_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "w");
+        assert_eq!(calls[0].0, "w:created-pane");
+        assert_eq!(calls[0].1, vec!["claude".to_string()]);
+        // Protocol 20's agent.start carries no directory — the pane is made
+        // first and the directory rides on that call, so that is where the
+        // destination is now asserted.
         let canonical_root = std::fs::canonicalize(&root).unwrap();
-        assert_eq!(
-            calls[0].1.as_deref(),
-            Some(canonical_root.to_str().unwrap())
-        );
-        assert_eq!(calls[0].2, vec!["claude".to_string()]);
+        let tabs = herdr.tab_calls.lock().unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].0, "w");
+        assert_eq!(tabs[0].1.as_deref(), Some(canonical_root.to_str().unwrap()));
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
@@ -24029,13 +26400,18 @@ mod bee_route_tests {
         let calls = herdr.agent_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].2,
+            calls[0].1,
             vec!["claude".to_string()],
             "the started argv must be the configured preset's own, never anything from the request body"
         );
+        // The security property is unchanged, only the call that carries the
+        // directory moved: under protocol 20 the pane is created first, so the
+        // request's own cwd must fail to reach THAT call.
         let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let tabs = herdr.tab_calls.lock().unwrap();
+        assert_eq!(tabs.len(), 1);
         assert_eq!(
-            calls[0].1.as_deref(),
+            tabs[0].1.as_deref(),
             Some(canonical_root.to_str().unwrap()),
             "the request's own bogus \"cwd\" must never reach herdr"
         );
@@ -24556,10 +26932,8 @@ mod bee_route_tests {
         let root = fresh_root("scope-shell-row-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -24594,10 +26968,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&outside.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&outside.to_string_lossy())).await;
         fake.set_pane_dirs(
             &created.pane_id,
             Some(&outside.to_string_lossy()),
@@ -24652,10 +27024,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
         fake.set_pane_dirs(
             &created.pane_id,
             Some(&root.to_string_lossy()),
@@ -24696,14 +27066,14 @@ mod bee_route_tests {
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
         // agent_start sets cwd == foreground_cwd, both outside the root.
-        let outside_agent = fake
-            .agent_start(
-                "w1",
-                Some(&outside.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let outside_agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&outside.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -24778,10 +27148,8 @@ mod bee_route_tests {
         std::os::unix::fs::symlink(&escape_target, &symlink_path).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
         // cwd absent: only foreground_cwd is consulted, and its raw path
         // sits under the root but resolves outside it.
         fake.set_pane_dirs(
@@ -24831,10 +27199,8 @@ mod bee_route_tests {
         let root = fresh_root("scope-no-dirs-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
         fake.set_pane_dirs(&created.pane_id, None, None)
             .await
             .unwrap();
@@ -24874,10 +27240,8 @@ mod bee_route_tests {
         std::fs::create_dir_all(&stray_root).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let stray = fake
-            .tab_create("w1", Some(&stray_root.to_string_lossy()))
-            .await
-            .unwrap();
+        let stray =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&stray_root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -24936,10 +27300,8 @@ mod bee_route_tests {
         // Sub-case: matched only via foreground_cwd -- nothing is ever
         // written at that path, so the transcript route must answer
         // available:false rather than 404 (membership already passed).
-        let fg_only = fake
-            .tab_create("w1", Some(&outside.to_string_lossy()))
-            .await
-            .unwrap();
+        let fg_only =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&outside.to_string_lossy())).await;
         fake.set_pane_dirs(
             &fg_only.pane_id,
             Some(&outside.to_string_lossy()),
@@ -24950,10 +27312,8 @@ mod bee_route_tests {
 
         // Sub-case: both directories validate -- the transcript is written
         // only at the cwd path, proving cwd wins the precedence.
-        let both_match = fake
-            .tab_create("w1", Some(&inner_cwd.to_string_lossy()))
-            .await
-            .unwrap();
+        let both_match =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&inner_cwd.to_string_lossy())).await;
         fake.set_pane_dirs(
             &both_match.pane_id,
             Some(&inner_cwd.to_string_lossy()),
@@ -25039,14 +27399,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&child_root).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let shared = fake
-            .agent_start(
-                "w1",
-                Some(&child_root.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let shared = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&child_root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -25107,9 +27467,14 @@ mod bee_route_tests {
         let root = fresh_root("scope-identity-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        fake.agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -25123,8 +27488,13 @@ mod bee_route_tests {
             .unwrap();
         assert_eq!(terminal_resp.status(), StatusCode::OK);
         let terminal_body = body_string(terminal_resp).await;
+        // "Shell", not "main": protocol 20's agent.start cannot create a
+        // pane, so a spawn now makes its OWN tab and starts there, instead of
+        // splitting into the workspace's active tab the way protocol 16 did.
+        // The card still names workspace and tab together, which is what this
+        // test is for — only which tab a spawn lands in changed.
         assert!(
-            terminal_body.contains("frontend-app · main"),
+            terminal_body.contains("frontend-app · Shell"),
             "the terminal card must name its workspace and tab together: {terminal_body}"
         );
 
@@ -25135,7 +27505,7 @@ mod bee_route_tests {
         assert_eq!(transcript_resp.status(), StatusCode::OK);
         let transcript_body = body_string(transcript_resp).await;
         assert!(
-            transcript_body.contains("frontend-app · main"),
+            transcript_body.contains("frontend-app · Shell"),
             "the transcript card must name its workspace and tab together: {transcript_body}"
         );
 
@@ -25159,31 +27529,47 @@ mod bee_route_tests {
         let root = fresh_root("scope-status-pill-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let working = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let working = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&working.pane_id, herdr::AgentStatus::Working)
             .await
             .unwrap();
-        let idle = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let idle = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&idle.pane_id, herdr::AgentStatus::Idle)
             .await
             .unwrap();
-        let done = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let done = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&done.pane_id, herdr::AgentStatus::Done)
             .await
             .unwrap();
-        let blocked = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let blocked = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&blocked.pane_id, herdr::AgentStatus::Blocked)
             .await
             .unwrap();
@@ -25270,10 +27656,14 @@ mod bee_route_tests {
         let root = fresh_root("scope-status-unknown-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let started = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let started = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         fake.set_status(&started.pane_id, herdr::AgentStatus::Unknown)
             .await
             .unwrap();
@@ -25316,10 +27706,8 @@ mod bee_route_tests {
         let root = fresh_root("scope-shell-identity-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let created = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let created =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -25389,14 +27777,16 @@ mod bee_route_tests {
         let root = fresh_root("scope-shell-aria-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let agent_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let shell_pane = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let agent_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let shell_pane =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -25465,14 +27855,16 @@ mod bee_route_tests {
         let root = fresh_root("scope-controls-survive-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let agent_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let shell_pane = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
+        let agent_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let shell_pane =
+            create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26419,10 +28811,14 @@ mod bee_route_tests {
         let root = fresh_root("drawer-mark-sprite-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26464,14 +28860,15 @@ mod bee_route_tests {
         let root = fresh_root("agent-switch-drawer-shell-filter-project");
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let shell = fake
-            .tab_create("w1", Some(&root.to_string_lossy()))
-            .await
-            .unwrap();
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let shell = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26495,6 +28892,105 @@ mod bee_route_tests {
         );
     }
 
+    /// dispatched-pane-agent-visibility: a pane waggledance itself
+    /// dispatched a run into is an agent pane by waggledance's own
+    /// definition even when herdr's own snapshot still calls it a bare
+    /// shell (herdr classifies a pane from what it prints, so a fresh pane
+    /// read before the dispatched program paints its first frame still
+    /// looks like a shell to it) — `GET /api/agents` must show it, joined
+    /// off the same guard the reaper uses to find its own dispatched panes
+    /// (`status = 'working' AND preset_label IS NOT NULL`).
+    #[tokio::test]
+    async fn api_agents_shows_a_dispatched_pane_herdr_still_calls_shell() {
+        let dir = fresh_root("dispatched-pane-visibility-data");
+        enable_terminal(&dir);
+        let root = fresh_root("dispatched-pane-visibility-project");
+
+        let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        let pane = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "dispatched-visibility");
+        st.engine
+            .insert_run(
+                &waggledance_core::domain::Run {
+                    id: "run-dispatched-1".into(),
+                    project_id: project.id.clone(),
+                    pane_id: pane.pane_id.clone(),
+                    preset_label: Some("claude".into()),
+                    task: "do the thing".into(),
+                    baseline: String::new(),
+                    marker: "HERDR_DONE_abc123".into(),
+                    status: "working".into(),
+                    created_at: "2026-08-31T00:00:00Z".into(),
+                    updated_at: "2026-08-31T00:00:00Z".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let app = router(st);
+
+        let resp = get(app, "/api/agents").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+
+        assert!(
+            rows.iter().any(|r| r["pane_id"] == pane.pane_id
+                && r["project_id"] == project.id
+                && r["status"] == "working"),
+            "a pane with a live waggledance-dispatched run must appear as an agent, not a shell: {body}"
+        );
+    }
+
+    /// dispatched-pane-agent-visibility: the override never outlives the run
+    /// it came from — once the dispatched run leaves `working` (here,
+    /// `done`), the pane goes right back to reading as a plain shell and
+    /// drops out of the feed again, exactly like a pane with no run ever
+    /// did.
+    #[tokio::test]
+    async fn api_agents_drops_the_pane_again_once_its_dispatched_run_finishes() {
+        let dir = fresh_root("dispatched-pane-reverts-data");
+        enable_terminal(&dir);
+        let root = fresh_root("dispatched-pane-reverts-project");
+
+        let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
+        let pane = create_tab_with_pane(fake.as_ref(), "w1", Some(&root.to_string_lossy())).await;
+
+        let mut st = build_state_with_dir(&dir);
+        st.herdr = fake;
+        let project = register(&st, &root, "dispatched-reverts");
+        st.engine
+            .insert_run(
+                &waggledance_core::domain::Run {
+                    id: "run-dispatched-2".into(),
+                    project_id: project.id.clone(),
+                    pane_id: pane.pane_id.clone(),
+                    preset_label: Some("claude".into()),
+                    task: "do the thing".into(),
+                    baseline: String::new(),
+                    marker: "HERDR_DONE_def456".into(),
+                    status: "done".into(),
+                    created_at: "2026-08-31T00:00:00Z".into(),
+                    updated_at: "2026-08-31T00:05:00Z".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let app = router(st);
+
+        let resp = get(app, "/api/agents").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+
+        assert!(
+            !rows.iter().any(|r| r["pane_id"] == pane.pane_id),
+            "a pane whose dispatched run has already finished must not linger in the feed: {body}"
+        );
+    }
+
     /// agent-switch-drawer-1: when a pane's cwd validates under two
     /// registered projects' own D2 boundaries at once (a project registered
     /// inside another project's own root), the pane appears exactly once —
@@ -26509,14 +29005,14 @@ mod bee_route_tests {
         std::fs::create_dir_all(&inner).unwrap();
 
         let fake = std::sync::Arc::new(crate::herdr::fake::FakeHerdr::new());
-        let agent = fake
-            .agent_start(
-                "w1",
-                Some(&inner.to_string_lossy()),
-                &["claude".to_string()],
-            )
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&inner.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26569,10 +29065,14 @@ mod bee_route_tests {
         // this pane is the titleless case; the seeded `w2:p3` agent
         // ("Finished the refactor") rides the Unassigned half untouched and
         // is the titled case.
-        let agent = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let agent = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -26836,6 +29336,116 @@ mod bee_route_tests {
         );
     }
 
+    /// S8 must-have: an ABSENT `Sec-Fetch-Site` header is allowed, so every
+    /// non-browser client (curl, a scripted CLI) keeps working unchanged.
+    #[test]
+    fn sec_fetch_is_allowed_when_the_site_header_is_absent() {
+        let headers = HeaderMap::new();
+        assert!(
+            sec_fetch_is_allowed(&Method::GET, &headers),
+            "an absent Sec-Fetch-Site header must be allowed"
+        );
+    }
+
+    /// S8 must-have: `same-origin` and `none` are allowed.
+    #[test]
+    fn sec_fetch_is_allowed_for_same_origin_and_none() {
+        for value in ["same-origin", "none"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", value.parse().unwrap());
+            assert!(
+                sec_fetch_is_allowed(&Method::GET, &headers),
+                "Sec-Fetch-Site {value:?} must be allowed"
+            );
+        }
+    }
+
+    /// S8 must-have: `cross-site` and `same-site` are refused when the
+    /// request is not a navigation -- here, with no `Sec-Fetch-Mode` or
+    /// `Sec-Fetch-Dest` at all, which is every cross-origin fetch this
+    /// guard exists to stop.
+    #[test]
+    fn sec_fetch_is_refused_for_cross_site_and_same_site_non_navigations() {
+        for value in ["cross-site", "same-site"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", value.parse().unwrap());
+            assert!(
+                !sec_fetch_is_allowed(&Method::GET, &headers),
+                "Sec-Fetch-Site {value:?} must be refused without a navigation"
+            );
+        }
+    }
+
+    /// cds-4 must-have: a cross-site TOP-LEVEL NAVIGATION is allowed -- the
+    /// shape an identity proxy's post-login redirect back to the configured
+    /// hostname arrives in. `same-site` navigations ride the same door.
+    #[test]
+    fn cross_site_top_level_navigation_is_allowed() {
+        for site in ["cross-site", "same-site"] {
+            for method in [Method::GET, Method::HEAD] {
+                let mut headers = HeaderMap::new();
+                headers.insert("sec-fetch-site", site.parse().unwrap());
+                headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+                headers.insert("sec-fetch-dest", "document".parse().unwrap());
+                assert!(
+                    sec_fetch_is_allowed(&method, &headers),
+                    "a {method} navigation from {site:?} must be allowed"
+                );
+            }
+        }
+    }
+
+    /// cds-4 must-have: the navigation door is safe-method only -- a
+    /// cross-site POST is refused even when it claims to be a navigation,
+    /// which is what keeps the CSRF half of this guard intact.
+    #[test]
+    fn cross_site_mutating_navigation_is_refused() {
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+            headers.insert("sec-fetch-dest", "document".parse().unwrap());
+            assert!(
+                !sec_fetch_is_allowed(&method, &headers),
+                "a cross-site {method} must be refused"
+            );
+        }
+    }
+
+    /// cds-4 must-have: a cross-site GET that is not a navigation --
+    /// `cors`, `no-cors`, or no `Sec-Fetch-Mode` at all -- stays refused.
+    #[test]
+    fn cross_site_non_navigate_mode_is_refused() {
+        for mode in ["cors", "no-cors", "same-origin", "websocket"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            headers.insert("sec-fetch-mode", mode.parse().unwrap());
+            headers.insert("sec-fetch-dest", "document".parse().unwrap());
+            assert!(
+                !sec_fetch_is_allowed(&Method::GET, &headers),
+                "a cross-site GET with Sec-Fetch-Mode {mode:?} must be refused"
+            );
+        }
+    }
+
+    /// cds-4 must-have: a cross-site navigate whose destination is not a
+    /// document -- an iframe, a script, an image -- stays refused, so
+    /// cross-origin embedding of this daemon is no more possible than it
+    /// was before the navigation allowance existed.
+    #[test]
+    fn cross_site_navigate_to_a_non_document_dest_is_refused() {
+        for dest in ["iframe", "frame", "image", "script", "empty"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+            headers.insert("sec-fetch-dest", dest.parse().unwrap());
+            assert!(
+                !sec_fetch_is_allowed(&Method::GET, &headers),
+                "a cross-site navigation to Sec-Fetch-Dest {dest:?} must be refused"
+            );
+        }
+    }
+
     /// D1 must-have 1: a loopback Host — in every spelling the decision
     /// names — passes an ordinary GET route through unchanged.
     #[tokio::test]
@@ -26918,6 +29528,147 @@ mod bee_route_tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    /// S8: a request with no `Sec-Fetch-Site` header at all -- every
+    /// non-browser client -- still reaches an ordinary GET route unchanged,
+    /// same as before this assertion existed.
+    #[tokio::test]
+    async fn absent_sec_fetch_site_reaches_a_plain_get_route_unchanged() {
+        let app = router(build_state());
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7700")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an absent Sec-Fetch-Site header must reach /health unchanged"
+        );
+    }
+
+    /// S8: `same-origin` and `none` reach an ordinary GET route unchanged.
+    #[tokio::test]
+    async fn same_origin_and_none_sec_fetch_site_reach_a_plain_get_route() {
+        for value in ["same-origin", "none"] {
+            let app = router(build_state());
+            let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7700")
+                .header("sec-fetch-site", value)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "Sec-Fetch-Site {value:?} must reach /health unchanged"
+            );
+        }
+    }
+
+    /// S8: `cross-site` and `same-site` fetches -- no `Sec-Fetch-Mode`, so
+    /// not navigations -- are refused with the same 421 shape the Host
+    /// guard uses: one consistent behaviour, not two dialects.
+    #[tokio::test]
+    async fn cross_site_and_same_site_sec_fetch_site_are_refused_with_421() {
+        for value in ["cross-site", "same-site"] {
+            let app = router(build_state());
+            let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7700")
+                .header("sec-fetch-site", value)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "Sec-Fetch-Site {value:?} must be refused with 421"
+            );
+        }
+    }
+
+    /// cds-4 must-have 1, through the whole router: the request an identity
+    /// proxy's post-login redirect actually makes -- the operator's
+    /// configured hostname in `Host`, a cross-site top-level navigation in
+    /// the Fetch-Metadata headers -- reaches an ordinary GET route instead
+    /// of 421ing the operator out of their own site.
+    #[tokio::test]
+    async fn cross_site_top_level_navigation_reaches_a_plain_get_route() {
+        let app = router(build_state_with_hostname("waggle.gogl.be"));
+        let req = Request::builder()
+            .header(header::HOST, "waggle.gogl.be")
+            .header("sec-fetch-site", "cross-site")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a cross-site top-level navigation must reach /health"
+        );
+    }
+
+    /// cds-4 must-have 2, on the state-changing route the original CSRF
+    /// finding named: a cross-site POST is still refused with 421 even
+    /// while claiming navigate/document -- and, per
+    /// `docs/history/learnings/20260805-toothless-security-assertions.md`,
+    /// the config on disk is untouched, not merely the response code.
+    #[tokio::test]
+    async fn cross_site_post_is_refused_with_421_and_leaves_config_unchanged() {
+        let dir = fresh_root("cds4-cross-site-api-config");
+        let st = build_state_with_dir(&dir);
+        let app = router(st);
+
+        let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7700")
+            .header("sec-fetch-site", "cross-site")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .method("POST")
+            .uri("/api/config")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("port=58314"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+
+        assert!(
+            !dir.join("config.toml").exists(),
+            "a cross-site POST must never reach update_config's write at all"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// cds-4 must-have 3, through the whole router: a cross-site GET that
+    /// is not a navigation -- a `cors` fetch, and a navigate aimed at an
+    /// `iframe` -- is still refused with 421.
+    #[tokio::test]
+    async fn cross_site_non_navigation_gets_are_refused_with_421() {
+        for (mode, dest) in [("cors", "empty"), ("navigate", "iframe")] {
+            let app = router(build_state());
+            let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7700")
+                .header("sec-fetch-site", "cross-site")
+                .header("sec-fetch-mode", mode)
+                .header("sec-fetch-dest", dest)
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "a cross-site GET (mode {mode:?}, dest {dest:?}) must be refused with 421"
+            );
+        }
     }
 
     /// D1 must-have 2, the CSRF-on-`/api/config` finding itself: a foreign
@@ -27811,10 +30562,14 @@ mod bee_route_tests {
         fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         // bap-6: the wake target is the pane whose own live session says it
         // is on this feature, so the fixture has to bind one — a bare pane in
         // the checkout is no longer enough, and the sibling test below proves
@@ -27861,39 +30616,45 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// D3, the must-have: a project that never opted in answers 403 with the
-    /// remedy in words, and NOTHING runs — the stub bee is right there on
-    /// disk and is never reached.
     #[cfg(unix)]
     #[tokio::test]
-    async fn bee_action_refuses_a_project_that_never_opted_in() {
+    async fn bee_action_refuses_a_project_that_turned_orchestration_off_and_runs_by_default() {
         let dir = fresh_root("action-optout-cfg");
         let root = fresh_root("action-optout-root");
         let log = fresh_root("action-optout-log").join("argv");
         write_cross_project_live_feature(&root, "feat-out", "live-out");
         fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
+        let file = root.join(".waggledance.toml");
+        std::fs::write(&file, "orchestration = false\n").unwrap();
 
         let st = build_state_with_dir(&dir);
         let project = register(&st, &root, "action-optout");
-        assert!(
-            !project.orchestration_enabled,
-            "a freshly registered project must default to opted-out (D3/D6)"
-        );
+        st.engine
+            .set_orchestration_enabled(&project.id, true)
+            .unwrap();
 
-        let resp = router(st)
+        let resp = router(st.clone())
             .oneshot(action_req(&project.id, "uat-approve", "feat-out"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let msg = error_of(resp).await;
         assert!(
-            msg.contains("enable orchestration for this project on the settings page"),
-            "the 403 must name the one thing that fixes it: {msg}"
+            msg.contains(&format!(
+                "turned off board actions in its .waggledance.toml at {} — remove `orchestration = false` there",
+                file.display()
+            )),
+            "{msg}"
         );
-        assert!(
-            !log.exists(),
-            "an opted-out project must never reach its own bee at all"
-        );
+        assert!(!log.exists());
+
+        std::fs::remove_file(&file).unwrap();
+        let resp = router(st)
+            .oneshot(action_req(&project.id, "uat-approve", "feat-out"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(log.exists());
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&root).ok();
@@ -28026,10 +30787,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-perm", "live-perm");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         write(
             &root,
             ".bee/sessions/live-blocked.json",
@@ -28094,10 +30859,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-quiet", "live-quiet");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         // The agent is live and bound to the feature — just working, not
         // blocked. That is precisely the case an Approve must not reach.
         write(
@@ -28161,10 +30930,14 @@ mod bee_route_tests {
         fake_bee(&root, &log, "{\"ok\":true}\n", "", 0);
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
 
         let mut st = build_state_with_dir(&dir);
         st.herdr = fake;
@@ -28231,10 +31004,14 @@ mod bee_route_tests {
         write_cross_project_live_feature(&root, "feat-off-perm", "live-off-perm");
 
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         write(
             &root,
             ".bee/sessions/live-off-blocked.json",
@@ -28488,9 +31265,6 @@ mod bee_route_tests {
 
         let st = build_state();
         let project = register(&st, &root, "board-uat-round-trip");
-        st.engine
-            .set_orchestration_enabled(&project.id, true)
-            .unwrap();
 
         let before =
             body_string(get(router(st.clone()), &format!("/p/{}/_bee", project.id)).await).await;
@@ -28561,14 +31335,22 @@ mod bee_route_tests {
         // has a worktree, so `project_feature_panes` maps both onto both
         // cards. Only `activity.feature` tells them apart.
         let fake = std::sync::Arc::new(FakeHerdr::new());
-        let alpha_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
-        let beta_pane = fake
-            .agent_start("w1", Some(&root.to_string_lossy()), &["claude".to_string()])
-            .await
-            .unwrap();
+        let alpha_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
+        let beta_pane = crate::herdr::start_agent_in_new_tab(
+            fake.as_ref(),
+            "w1",
+            Some(&root.to_string_lossy()),
+            &["claude".to_string()],
+        )
+        .await
+        .unwrap();
         for (session, feature, pane_id) in [
             ("live-alpha-agent", "feat-alpha", &alpha_pane.pane_id),
             ("live-beta-agent", "feat-beta", &beta_pane.pane_id),
@@ -28752,8 +31534,14 @@ mod bee_route_tests {
 
     #[derive(Default)]
     struct RunHerdrLog {
-        /// `(workspace_id, cwd, argv)` per `agent_start`, in order.
-        starts: Vec<(String, Option<String>, Vec<String>)>,
+        /// `(pane_id, argv)` per `agent_start`, in order. Protocol 20's
+        /// agent.start carries no directory — it attaches to a pane that
+        /// already exists — so the destination is recorded on `tabs` below.
+        starts: Vec<(String, Vec<String>)>,
+        /// `(workspace_id, cwd)` per `tab_create`, in order. This is where a
+        /// spawn's directory is now decided, and therefore where a test
+        /// asserting "the agent starts in the feature's own worktree" looks.
+        tabs: Vec<(String, Option<String>)>,
         /// `(pane_id, text)` per `send_input`, in order.
         inputs: Vec<(String, String)>,
     }
@@ -28773,8 +31561,12 @@ mod bee_route_tests {
             }
         }
 
-        fn starts(&self) -> Vec<(String, Option<String>, Vec<String>)> {
+        fn starts(&self) -> Vec<(String, Vec<String>)> {
             self.log.lock().unwrap().starts.clone()
+        }
+
+        fn tabs(&self) -> Vec<(String, Option<String>)> {
+            self.log.lock().unwrap().tabs.clone()
         }
 
         fn inputs(&self) -> Vec<(String, String)> {
@@ -28785,7 +31577,18 @@ mod bee_route_tests {
     #[async_trait::async_trait]
     impl herdr::Herdr for RunHerdr {
         async fn snapshot(&self) -> herdr::Result<herdr::Snapshot> {
-            Ok(self.snap.clone())
+            let mut snap = self.snap.clone();
+            // The pane the spawn's own tab brings with it. Production finds
+            // it here by tab_id; a double whose snapshot lacked it would fail
+            // every spawn test for a reason the real code does not have.
+            snap.panes.push(herdr::wire::Pane {
+                pane_id: self.spawned_pane.clone(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:spawned-tab".into(),
+                cwd: None,
+                foreground_cwd: None,
+            });
+            Ok(snap)
         }
         async fn ping(&self) -> herdr::Result<herdr::ProtocolInfo> {
             unreachable!("the run actions never ping")
@@ -28809,6 +31612,39 @@ mod bee_route_tests {
                 .push((pane_id.to_string(), text.to_string()));
             Ok(())
         }
+        /// The run actions DO prompt now: `orchestrate::send_task` submits
+        /// through `agent.prompt` so a swallowed Enter refuses the dispatch
+        /// instead of hanging the run (dispatch-submit-and-reclaim defect
+        /// A). Logged as an input, exactly like the `send_input(.., true)`
+        /// it replaced, so every assertion about what reached a pane still
+        /// reads one list.
+        async fn agent_prompt(
+            &self,
+            pane_id: &str,
+            text: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            self.log
+                .lock()
+                .unwrap()
+                .inputs
+                .push((pane_id.to_string(), text.to_string()));
+            Ok(herdr::AgentStatus::Working)
+        }
+        /// A spawn waits for its agent to report ready before the dispatch
+        /// prompts it (dispatch-submit-and-reclaim D4), so this is on the
+        /// run-action path and answers ready. Nothing is logged: the wait is
+        /// not something that reached a PANE, and folding it into `inputs`
+        /// would corrupt every assertion about what the agent was sent.
+        async fn agent_wait(
+            &self,
+            _pane_id: &str,
+            _until: &[herdr::AgentStatus],
+            _timeout_ms: u64,
+        ) -> herdr::Result<herdr::AgentStatus> {
+            Ok(herdr::AgentStatus::Idle)
+        }
         async fn send_text(&self, _pane_id: &str, _bytes: &str) -> herdr::Result<()> {
             unreachable!("the run actions never send raw bytes")
         }
@@ -28817,27 +31653,40 @@ mod bee_route_tests {
         }
         async fn tab_create(
             &self,
-            _workspace_id: &str,
-            _cwd: Option<&str>,
+            workspace_id: &str,
+            cwd: Option<&str>,
         ) -> herdr::Result<herdr::TabCreated> {
-            unreachable!("the run actions never create a tab")
+            // A spawn creates a tab now — protocol 20's agent.start cannot.
+            self.log
+                .lock()
+                .unwrap()
+                .tabs
+                .push((workspace_id.to_string(), cwd.map(str::to_string)));
+            Ok(herdr::TabCreated {
+                tab_id: "w1:spawned-tab".into(),
+            })
         }
         async fn agent_start(
             &self,
-            workspace_id: &str,
-            cwd: Option<&str>,
+            pane_id: &str,
             argv: &[String],
         ) -> herdr::Result<herdr::AgentStarted> {
-            self.log.lock().unwrap().starts.push((
-                workspace_id.to_string(),
-                cwd.map(str::to_string),
-                argv.to_vec(),
-            ));
+            self.log
+                .lock()
+                .unwrap()
+                .starts
+                .push((pane_id.to_string(), argv.to_vec()));
             Ok(herdr::AgentStarted {
                 tab_id: "w1:t1".into(),
                 pane_id: self.spawned_pane.clone(),
                 name: "board-agent".into(),
             })
+        }
+        async fn close_pane(&self, _pane_id: &str) -> herdr::Result<()> {
+            // The run-action tests never reach a marker completion, the one
+            // path that closes a pane -- and a close arriving here would be
+            // the guard leaking, worth a panic rather than a silent Ok.
+            unreachable!("run-action tests never close a pane")
         }
     }
 
@@ -29029,7 +31878,7 @@ mod bee_route_tests {
         let starts = herdr_double.starts();
         assert_eq!(starts.len(), 1, "exactly one agent is started: {starts:?}");
         assert_eq!(
-            starts[0].2,
+            starts[0].1,
             vec![
                 "claude".to_string(),
                 "--model".to_string(),
@@ -29037,8 +31886,12 @@ mod bee_route_tests {
             ],
             "the argv is the project's own recorded preset (D4)"
         );
+        // Protocol 20 moved the directory onto the call that creates the
+        // pane; the property is unchanged, only the call that carries it.
+        let tabs = herdr_double.tabs();
+        assert_eq!(tabs.len(), 1, "exactly one tab is created: {tabs:?}");
         assert_eq!(
-            starts[0].1.as_deref().map(std::path::Path::new),
+            tabs[0].1.as_deref().map(std::path::Path::new),
             Some(sibling.as_path()),
             "the agent starts in the feature's own worktree"
         );
@@ -29141,8 +31994,12 @@ mod bee_route_tests {
 
         let starts = herdr_double.starts();
         assert_eq!(starts.len(), 1);
+        // The directory rides on tab.create under protocol 20 — agent.start
+        // only names the pane it attaches to.
+        let tabs = herdr_double.tabs();
+        assert_eq!(tabs.len(), 1);
         assert_eq!(
-            starts[0].1.as_deref().map(std::path::Path::new),
+            tabs[0].1.as_deref().map(std::path::Path::new),
             Some(sibling.as_path()),
             "the agent starts in the worktree bee just made"
         );
@@ -29335,6 +32192,51 @@ mod bee_route_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn board_counts_a_working_paseo_run_alive_without_a_herdr_snapshot() {
+        let engine = Engine::new(
+            waggledance_core::SqliteStore::open_in_memory().unwrap(),
+            waggledance_core::Config::default(),
+        );
+        let now = now_rfc3339();
+        engine
+            .store
+            .upsert_project(&waggledance_core::domain::Project {
+                id: "proj-1".into(),
+                name: "proj".into(),
+                root_path: PathBuf::from("/tmp/board-paseo"),
+                created_at: now.clone(),
+                last_seen_at: now.clone(),
+                orchestration_enabled: true,
+            })
+            .unwrap();
+        for (id, pane, feature) in [
+            ("run-paseo", "paseo:agent-1", "paseo-feat"),
+            ("run-herdr", "w1:p1", "herdr-feat"),
+        ] {
+            engine
+                .insert_run(
+                    &waggledance_core::domain::Run {
+                        id: id.into(),
+                        project_id: "proj-1".into(),
+                        pane_id: pane.into(),
+                        preset_label: None,
+                        task: "/bee-capturing compound feature x".into(),
+                        baseline: String::new(),
+                        marker: String::new(),
+                        status: "working".into(),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                    Some(feature),
+                )
+                .unwrap();
+        }
+        let live = project_live_board_runs(&engine, "proj-1", None);
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live["paseo-feat"].pane_id, "paseo:agent-1");
+    }
+
     /// bra-3, over the vendored client source `views::APP_JS`, beside the
     /// bap-3 grep test above: the run half of the same handler. Each of the
     /// three buttons must ask before it starts an agent — naming the feature
@@ -29443,7 +32345,8 @@ mod bee_route_tests {
         write_herding_config(&root);
         write_cross_project_live_feature(&root, "feat-switch", "live-switch");
 
-        // Terminal family ON, project opted OUT.
+        let off_file = root.join(".waggledance.toml");
+        std::fs::write(&off_file, "orchestration = false\n").unwrap();
         let dir = fresh_root("action-run-switch-on-cfg");
         enable_terminal(&dir);
         let herdr_double = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
@@ -29462,11 +32365,11 @@ mod bee_route_tests {
             assert_eq!(
                 resp.status(),
                 StatusCode::FORBIDDEN,
-                "{kind} on a project that never opted in"
+                "{kind} on a project that turned orchestration off"
             );
         }
 
-        // Project opted IN, terminal family OFF.
+        std::fs::remove_file(&off_file).unwrap();
         let dir_off = fresh_root("action-run-switch-off-cfg");
         let herdr_off = std::sync::Arc::new(RunHerdr::new(one_agent_snapshot(
             &root,
@@ -29476,10 +32379,6 @@ mod bee_route_tests {
         let mut st_off = build_state_with_dir(&dir_off);
         st_off.herdr = herdr_off.clone();
         let project_off = register(&st_off, &root, "action-run-switch-on");
-        st_off
-            .engine
-            .set_orchestration_enabled(&project_off.id, true)
-            .unwrap();
         for kind in ["run-review", "run-compound", "start-todo"] {
             let resp = router(st_off.clone())
                 .oneshot(action_req(&project_off.id, kind, "feat-switch"))
@@ -29651,6 +32550,1576 @@ mod bee_route_tests {
         assert!(
             catch_body.contains("location.reload();"),
             "the one catch is where every failure actually reloads: {catch_body}"
+        );
+    }
+
+    // -- board-visibility bi-2: the inbox, end to end ---------------------
+    //
+    // These drive `router()` rather than `views::inbox_page` directly, and
+    // they start from a letter file on disk. That is the point: the promise
+    // is user-visible ("I can see what happened in every project"), and every
+    // seam between the mailbox reader, the cross-project roll-up, the route
+    // and the view belongs to no single unit test
+    // (`docs/knowledge/patterns/prove-the-whole-path.md`). There are zero real
+    // letters on this machine — bee files one only from an unattended run and
+    // no checkout has armed one — so the fixtures below are written in bee's
+    // own emitter shape (`verbs/mailbox.rs::render_letter`).
+
+    /// One letter on disk, in the bytes bee's emitter writes.
+    fn letter_file(
+        dir: &Path,
+        name: &str,
+        subject: &str,
+        project: &str,
+        filed_at: &str,
+        status: &str,
+        body: &str,
+    ) {
+        write(
+            dir,
+            &format!(".bee/human-mailbox/{name}"),
+            &format!(
+                "---\nsubject: {}\nrun: {}\nproject: {}\nfiled_at: {}\nstatus: {}\nitems: []\nneeds_you: []\n---\n\n{body}\n",
+                serde_json::to_string(subject).unwrap(),
+                serde_json::to_string("2026-08-30-run").unwrap(),
+                serde_json::to_string(project).unwrap(),
+                serde_json::to_string(filed_at).unwrap(),
+                serde_json::to_string(status).unwrap(),
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_inbox_lists_every_projects_letters_newest_first() {
+        let alpha = fresh_root("inbox-alpha");
+        let beta = fresh_root("inbox-beta-two");
+        letter_file(
+            &alpha,
+            "2026-08-30T04-12-07Z-late.md",
+            "Alpha's newest night",
+            "alpha",
+            "2026-08-30T04:12:07Z",
+            "unread",
+            "## Đã làm\n\n- alpha work\n",
+        );
+        letter_file(
+            &alpha,
+            "2026-08-28T01-00-00Z-early.md",
+            "Alpha's oldest night",
+            "alpha",
+            "2026-08-28T01:00:00Z",
+            "read",
+            "nothing much\n",
+        );
+        letter_file(
+            &beta,
+            "2026-08-29T02-00-00Z-mid.md",
+            "Beta's one night",
+            "beta",
+            "2026-08-29T02:00:00Z",
+            "unread",
+            "beta work\n",
+        );
+        let st = build_state();
+        register(&st, &alpha, "Alpha");
+        register(&st, &beta, "Beta");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("the inbox must carry {needle}: {body}"))
+        };
+        let (newest, middle, oldest) = (
+            at("Alpha's newest night"),
+            at("Beta's one night"),
+            at("Alpha's oldest night"),
+        );
+        assert!(
+            newest < middle && middle < oldest,
+            "newest first, interleaving projects rather than grouping them: {body}"
+        );
+        // The row's own three facts, and the read state as a word.
+        assert!(body.contains("2026-08-29T02:00:00Z"), "{body}");
+        assert!(body.contains("beta"), "{body}");
+        assert!(
+            body.contains("2 chưa đọc"),
+            "the page counts what it is showing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_letter_reaches_the_inbox_naming_its_file() {
+        let root = fresh_root("inbox-unreadable");
+        letter_file(
+            &root,
+            "2026-08-30T05-00-00Z-fine.md",
+            "A readable one",
+            "gamma",
+            "2026-08-30T05:00:00Z",
+            "read",
+            "ok\n",
+        );
+        // `filed_at` is one of the five human-mailbox D3 requires at read.
+        write(
+            &root,
+            ".bee/human-mailbox/2026-08-30T06-00-00Z-torn.md",
+            "---\nsubject: \"Half a letter\"\nrun: \"r\"\nproject: \"gamma\"\nstatus: \"unread\"\nitems: []\nneeds_you: []\n---\n\nbody\n",
+        );
+        let st = build_state();
+        register(&st, &root, "Gamma");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        assert!(
+            body.contains("2026-08-30T06-00-00Z-torn.md"),
+            "the torn letter is on the page, by name: {body}"
+        );
+        assert!(
+            body.contains("Không đọc được"),
+            "and says plainly that it could not be read: {body}"
+        );
+        assert!(
+            body.contains("A readable one"),
+            "without costing the readable letter beside it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inbox_with_no_letters_explains_why_rather_than_showing_a_zero() {
+        let root = fresh_root("inbox-empty-state");
+        write(&root, ".bee/state.json", "{}");
+        let st = build_state();
+        register(&st, &root, "Quiet");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        assert!(body.contains("Chưa có lá thư nào"), "{body}");
+        assert!(
+            body.contains("không có người ngồi trực"),
+            "the empty page names the one thing that files a letter: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_letter_renders_its_body_through_the_sanitizing_pipeline() {
+        let root = fresh_root("inbox-open-letter");
+        letter_file(
+            &root,
+            "2026-08-30T07-00-00Z-open.md",
+            "The night's work, in one page",
+            "delta",
+            "2026-08-30T07:00:00Z",
+            "unread",
+            "## Đã làm\n\n- một việc thật\n\n<script>alert(1)</script>\n",
+        );
+        let st = build_state();
+        let project = register(&st, &root, "Delta");
+        let app = router(st);
+
+        let list = body_string(get(app.clone(), "/inbox").await).await;
+        let href = format!("/inbox/{}/2026-08-30T07-00-00Z-open.md", project.id);
+        assert!(
+            list.contains(&format!("href=\"{href}\"")),
+            "the row must link to its own letter: {list}"
+        );
+
+        let letter = body_string(get(app, &href).await).await;
+        assert!(
+            letter.contains("một việc thật") && letter.contains("Đã làm"),
+            "the letter's own prose renders: {letter}"
+        );
+        assert!(
+            !letter.contains("<script>alert(1)</script>"),
+            "through the SANITIZING pipeline, never the guide's trusted path: {letter}"
+        );
+        assert!(
+            letter.contains("2026-08-30T07:00:00Z") && letter.contains("delta"),
+            "and the header keeps the letter's own frontmatter: {letter}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_letter_url_that_names_nothing_answers_not_found() {
+        let root = fresh_root("inbox-unknown-letter");
+        letter_file(
+            &root,
+            "2026-08-30T08-00-00Z-real.md",
+            "Real",
+            "eps",
+            "2026-08-30T08:00:00Z",
+            "read",
+            "ok\n",
+        );
+        let st = build_state();
+        let project = register(&st, &root, "Eps");
+        let app = router(st);
+
+        for uri in [
+            format!("/inbox/{}/nothing-like-this.md", project.id),
+            // The segment is matched against the names the reader listed, so
+            // it never reaches the filesystem as a path fragment.
+            format!("/inbox/{}/..%2f..%2fetc%2fpasswd", project.id),
+            "/inbox/no-such-project/2026-08-30T08-00-00Z-real.md".to_string(),
+        ] {
+            let resp = get(app.clone(), &uri).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} names no letter, so it must say so rather than render one"
+            );
+        }
+    }
+
+    // -- mailbox-inbox mi-2: digests and unfinished runs, end to end ------
+    //
+    // Same reasoning as the block above: the promise is user-visible ("the
+    // fold bee wrote is in the same inbox, and I can open it"), and the seams
+    // between the reader's new `Digest` entry, the roll-up, the route and the
+    // view belong to no single unit test
+    // (`docs/knowledge/patterns/prove-the-whole-path.md`). The fixture is
+    // bee's own emitter shape (`verbs/mailbox_digest.rs::render_digest`).
+
+    /// One digest on disk. `type: "digest"` is what makes it one
+    /// (mailbox-inbox D1) — the `digest-` file name is bee's convention and
+    /// nothing here reads it.
+    fn digest_file(
+        dir: &Path,
+        name: &str,
+        subject: &str,
+        period: &str,
+        period_id: &str,
+        body: &str,
+    ) {
+        write(
+            dir,
+            &format!(".bee/human-mailbox/{name}"),
+            &format!(
+                "---\nsubject: {}\ntype: \"digest\"\nperiod: {}\nperiod_id: {}\nfiled_at: \"2026-08-31T00:04:00Z\"\nletters:\n  - \"2026-08-30T04-12-07Z-late.md\"\nunreadable: []\n---\n\n{body}\n",
+                serde_json::to_string(subject).unwrap(),
+                serde_json::to_string(period).unwrap(),
+                serde_json::to_string(period_id).unwrap(),
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_digest_rides_the_same_inbox_list_and_opens_through_the_same_route() {
+        let root = fresh_root("inbox-digest");
+        letter_file(
+            &root,
+            "2026-08-30T04-12-07Z-late.md",
+            "Đêm qua ở alpha",
+            "alpha",
+            "2026-08-30T04:12:07Z",
+            "unread",
+            "alpha work\n",
+        );
+        digest_file(
+            &root,
+            "digest-2026-08-30.md",
+            "What happened on 2026-08-30.",
+            "day",
+            "2026-08-30",
+            "## alpha\n\n- Run finished: 3 cells capped\n\n<script>alert(1)</script>\n",
+        );
+        let st = build_state();
+        let project = register(&st, &root, "Alpha");
+        let app = router(st);
+
+        let list = body_string(get(app.clone(), "/inbox").await).await;
+        assert!(
+            list.contains("What happened on 2026-08-30.") && list.contains("Đêm qua ở alpha"),
+            "the digest and the letter share one list: {list}"
+        );
+        assert_eq!(
+            list.matches(r#"<main class="fg-page">"#).count(),
+            1,
+            "one section — the digest never opens a second one (D1): {list}"
+        );
+        assert!(
+            list.contains("Bản tổng hợp · ngày"),
+            "the digest says what it is and which period it folds: {list}"
+        );
+        assert!(
+            list.contains("1 chưa đọc"),
+            "and is never counted as a letter: only the one unread letter is: {list}"
+        );
+
+        // D3: the same `/inbox/:project/:file` route, the same renderer.
+        let href = format!("/inbox/{}/digest-2026-08-30.md", project.id);
+        assert!(
+            list.contains(&format!("href=\"{href}\"")),
+            "the digest row links to itself: {list}"
+        );
+        let page = body_string(get(app, &href).await).await;
+        assert!(
+            page.contains("Run finished: 3 cells capped"),
+            "the digest's own prose renders: {page}"
+        );
+        assert!(
+            !page.contains("<script>alert(1)</script>"),
+            "through the same sanitizing pipeline a letter takes: {page}"
+        );
+        assert!(
+            !page.contains("/mark") && !page.contains("Đánh dấu"),
+            "and read-only: no flip control, because a digest has no read state: {page}"
+        );
+    }
+
+    /// mailbox-inbox D2, from the file bee wrote to the badge on the page:
+    /// the mark rides the subject (`UNFINISHED_SUBJECT_MARK`), and the inbox
+    /// transcribes it without touching the subject it shows.
+    #[tokio::test]
+    async fn an_unfinished_letter_reaches_the_inbox_badged_and_subject_intact() {
+        let root = fresh_root("inbox-unfinished");
+        letter_file(
+            &root,
+            "2026-08-30T04-12-07Z-silent.md",
+            "Unfinished run: nightly on alpha",
+            "alpha",
+            "2026-08-30T04:12:07Z",
+            "unread",
+            "nothing came back\n",
+        );
+        letter_file(
+            &root,
+            "2026-08-29T04-12-07Z-fine.md",
+            "Đêm yên ả",
+            "alpha",
+            "2026-08-29T04:12:07Z",
+            "unread",
+            "ok\n",
+        );
+        let st = build_state();
+        register(&st, &root, "Alpha");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        assert!(
+            body.contains("Lượt chạy chưa kết thúc"),
+            "the run that went silent says so: {body}"
+        );
+        assert_eq!(
+            body.matches("Lượt chạy chưa kết thúc").count(),
+            1,
+            "and only that one letter does: {body}"
+        );
+        assert!(
+            body.contains("Unfinished run: nightly on alpha"),
+            "the subject is still shown exactly as bee filed it: {body}"
+        );
+        assert!(
+            body.contains("2 chưa đọc"),
+            "an unfinished letter is still a letter, still counted: {body}"
+        );
+    }
+
+    /// The other half of "no read state": not just no button, but no route
+    /// either. A hand-made POST at a digest finds no letter behind the name
+    /// and is refused before any bee is reached — `bee mailbox mark` names a
+    /// letter, and a digest is not one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marking_a_digest_read_is_refused_rather_than_reaching_bee() {
+        let root = fresh_root("inbox-digest-mark");
+        let log = fresh_root("inbox-digest-mark-log").join("argv");
+        digest_file(
+            &root,
+            "digest-2026-08-30.md",
+            "What happened on 2026-08-30.",
+            "day",
+            "2026-08-30",
+            "## alpha\n\n- ok\n",
+        );
+        fake_bee(&root, &log, "{}", "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Alpha");
+        let app = router(st);
+
+        let resp = app
+            .oneshot(mark_req(
+                &project.id,
+                "digest-2026-08-30.md",
+                "status=read&back=%2Finbox",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !log.exists(),
+            "no bee was run for it either: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+
+    // -- board-visibility bi-3: read and unread, flipped BY BEE -----------
+    //
+    // human-mailbox D6 is absolute: the field lives inside the letter and
+    // `bee mailbox mark` is the only thing allowed to move it. So the
+    // contract under test is an argv and a working directory, not a file
+    // waggledance wrote — these put a real executable at `<root>/.bee/bin/bee`
+    // (`fake_bee`, the board-new-task idiom) and read back what it was handed.
+    // `a_mark_leaves_the_letter_file_byte_identical` is the other half: with a
+    // bee that changes nothing, the file on disk must be untouched, which is
+    // what "waggledance never opens a letter for writing" means on disk rather
+    // than in a comment.
+
+    /// bee's own success shape for this verb — `{letter, path, status,
+    /// previous_status, changed}` under the trailing timing line the CLI
+    /// prints on the same stream.
+    #[cfg(unix)]
+    fn mark_json(name: &str, status: &str, previous: &str, changed: bool) -> String {
+        format!(
+            "{{\"letter\":\"{name}\",\"path\":\".bee/human-mailbox/{name}\",\"status\":\"{status}\",\"previous_status\":\"{previous}\",\"changed\":{changed}}}\n[bee] mailbox mark 1ms\n"
+        )
+    }
+
+    #[cfg(unix)]
+    fn mark_req(project_id: &str, letter: &str, form: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1")
+            .method("POST")
+            .uri(format!("/inbox/{project_id}/{letter}/mark"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(form.to_string()))
+            .unwrap()
+    }
+
+    /// The letter's bytes on disk, and when they were last modified.
+    #[cfg(unix)]
+    fn letter_on_disk(root: &Path, name: &str) -> (Vec<u8>, std::time::SystemTime) {
+        let p = root.join(".bee/human-mailbox").join(name);
+        let meta = std::fs::metadata(&p).unwrap();
+        (std::fs::read(&p).unwrap(), meta.modified().unwrap())
+    }
+
+    /// The whole path, end to end: a row's flip control posts, and what comes
+    /// out the other side is `bee mailbox mark --id <the letter's own file
+    /// name> --status read --json`, run in that project's own root — the cwd
+    /// being what decides whose mailbox is touched at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marking_a_letter_read_calls_bee_with_that_letters_own_file_name() {
+        let root = fresh_root("inbox-mark-read");
+        let log = fresh_root("inbox-mark-read-log").join("argv");
+        let name = "2026-08-30T09-00-00Z-night.md";
+        letter_file(
+            &root,
+            name,
+            "Đêm qua",
+            "zeta",
+            "2026-08-30T09:00:00Z",
+            "unread",
+            "ok\n",
+        );
+        fake_bee(&root, &log, &mark_json(name, "read", "unread", true), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Zeta");
+        let app = router(st);
+
+        // The control the list actually renders, with the action it carries.
+        let list = body_string(get(app.clone(), "/inbox").await).await;
+        assert!(
+            list.contains(&format!(r#"action="/inbox/{}/{name}/mark""#, project.id))
+                && list.contains(r#"name="status" value="read""#),
+            "an unread row must offer the flip to read: {list}"
+        );
+
+        let resp = app
+            .oneshot(mark_req(&project.id, name, "status=read&back=%2Finbox"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "a mark that bee accepted lands the reader back where they were"
+        );
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/inbox");
+        let (cwd, argv) = recorded(&log);
+        assert_eq!(
+            std::fs::canonicalize(&cwd).unwrap(),
+            std::fs::canonicalize(&project.root_path).unwrap(),
+            "bee must run in the project's own root, or it marks another project's letter"
+        );
+        assert_eq!(
+            argv,
+            vec!["mailbox", "mark", "--id", name, "--status", "read", "--json"],
+            "--id is the letter's file name, which is its only id (human-mailbox D11)"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A read letter offers the way back, and the same route carries it —
+    /// `--status unread`, the other member of bee's closed set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marking_a_read_letter_unread_calls_bee_with_the_other_status() {
+        let root = fresh_root("inbox-mark-unread");
+        let log = fresh_root("inbox-mark-unread-log").join("argv");
+        let name = "2026-08-30T10-00-00Z-again.md";
+        letter_file(
+            &root,
+            name,
+            "Đã xem rồi",
+            "eta",
+            "2026-08-30T10:00:00Z",
+            "read",
+            "ok\n",
+        );
+        fake_bee(&root, &log, &mark_json(name, "unread", "read", true), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Eta");
+        let app = router(st);
+
+        let list = body_string(get(app.clone(), "/inbox").await).await;
+        assert!(
+            list.contains(r#"name="status" value="unread""#),
+            "a read row must offer the flip back to unread: {list}"
+        );
+
+        let resp = app
+            .oneshot(mark_req(&project.id, name, "status=unread&back=%2Finbox"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let (_, argv) = recorded(&log);
+        assert_eq!(
+            argv,
+            vec!["mailbox", "mark", "--id", name, "--status", "unread", "--json"]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `mailbox mark` is idempotent and bee's own source says a retry must
+    /// never be punished: marking a letter to the status it already has
+    /// answers `changed: false` and that is a SUCCESS. Two clicks on the same
+    /// button — a double submit, a refresh — must land exactly where one did.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn re_marking_a_letter_to_the_status_it_already_has_is_success() {
+        let root = fresh_root("inbox-mark-idempotent");
+        let log = fresh_root("inbox-mark-idempotent-log").join("argv");
+        let name = "2026-08-30T11-00-00Z-twice.md";
+        letter_file(
+            &root,
+            name,
+            "Hai lần",
+            "theta",
+            "2026-08-30T11:00:00Z",
+            "read",
+            "ok\n",
+        );
+        // changed:false, previous_status == status — bee's own answer to a
+        // no-op mark, exit 0.
+        fake_bee(&root, &log, &mark_json(name, "read", "read", false), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Theta");
+        let app = router(st);
+
+        let resp = app
+            .oneshot(mark_req(&project.id, name, "status=read&back=%2Finbox"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "changed:false is bee saying the letter is already where you asked for it, \
+             not a failure to report"
+        );
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/inbox");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A refusal reaches the human in bee's own words — bee is the only party
+    /// that knows why it said no — and the letter's state is untouched: the
+    /// list still says "chưa đọc" afterwards, because nothing here ever flips
+    /// a row on the strength of a click.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_mark_surfaces_bees_reason_and_leaves_the_row_unread() {
+        let root = fresh_root("inbox-mark-refused");
+        let log = fresh_root("inbox-mark-refused-log").join("argv");
+        let name = "2026-08-30T12-00-00Z-refuse.md";
+        letter_file(
+            &root,
+            name,
+            "Chưa đụng tới",
+            "iota",
+            "2026-08-30T12:00:00Z",
+            "unread",
+            "ok\n",
+        );
+        // bee's real refusal text, from a live probe against this very verb.
+        fake_bee(
+            &root,
+            &log,
+            "",
+            "bee mailbox mark: no letter in .bee/human-mailbox — remedy: list that directory and pass a name it holds",
+            1,
+        );
+        let st = build_state();
+        let project = register(&st, &root, "Iota");
+        let app = router(st);
+
+        let resp = app
+            .clone()
+            .oneshot(mark_req(&project.id, name, "status=read&back=%2Finbox"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "a refused mark must not answer like one that worked"
+        );
+        let page = body_string(resp).await;
+        assert!(
+            page.contains("remedy: list that directory and pass a name it holds"),
+            "bee's own reason must reach the reader, never a generic failure: {page}"
+        );
+
+        let list = body_string(get(app, "/inbox").await).await;
+        assert!(
+            list.contains("Chưa đọc") && list.contains("1 chưa đọc"),
+            "the row must be exactly as it was — a refused mark flips nothing: {list}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D6 on disk: with a bee that reports success and changes nothing, the
+    /// letter file must be byte-identical and its mtime untouched afterwards.
+    /// If any code path in this server opened a letter to write the status
+    /// itself, this is the assertion that would fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mark_leaves_the_letter_file_byte_identical() {
+        let root = fresh_root("inbox-mark-no-write");
+        let log = fresh_root("inbox-mark-no-write-log").join("argv");
+        let name = "2026-08-30T13-00-00Z-intact.md";
+        letter_file(
+            &root,
+            name,
+            "Nguyên vẹn",
+            "kappa",
+            "2026-08-30T13:00:00Z",
+            "unread",
+            "ok\n",
+        );
+        fake_bee(&root, &log, &mark_json(name, "read", "unread", true), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Kappa");
+        let before = letter_on_disk(&root, name);
+
+        let resp = router(st)
+            .oneshot(mark_req(&project.id, name, "status=read&back=%2Finbox"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let after = letter_on_disk(&root, name);
+        assert_eq!(
+            before.0, after.0,
+            "waggledance must never write a letter's bytes — bee owns that field"
+        );
+        assert_eq!(
+            before.1, after.1,
+            "and must not so much as touch the file's mtime"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two ways a mark can be wrong before bee is ever worth running: a status
+    /// outside bee's closed set, and a letter name the reader never listed. In
+    /// both, no process is spawned at all — the log file the fake bee would
+    /// have written does not exist.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mark_that_bee_would_refuse_never_reaches_bee() {
+        let root = fresh_root("inbox-mark-guarded");
+        let log = fresh_root("inbox-mark-guarded-log").join("argv");
+        let name = "2026-08-30T14-00-00Z-guard.md";
+        letter_file(
+            &root,
+            name,
+            "Có thật",
+            "lambda",
+            "2026-08-30T14:00:00Z",
+            "unread",
+            "ok\n",
+        );
+        fake_bee(&root, &log, &mark_json(name, "read", "unread", true), "", 0);
+        let st = build_state();
+        let project = register(&st, &root, "Lambda");
+        let app = router(st);
+
+        let bad_status = app
+            .clone()
+            .oneshot(mark_req(&project.id, name, "status=archived"))
+            .await
+            .unwrap();
+        assert_eq!(
+            bad_status.status(),
+            StatusCode::BAD_REQUEST,
+            "read|unread is a closed set, checked here rather than in bee's argv"
+        );
+
+        let unknown = app
+            .oneshot(mark_req(&project.id, "nothing-like-this.md", "status=read"))
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.status(),
+            StatusCode::NOT_FOUND,
+            "the :letter segment is matched against the names the reader listed"
+        );
+
+        assert!(
+            !log.exists(),
+            "neither refusal may spawn the project's bee at all"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D6 as a property of the source rather than of one traced path: the only
+    /// way anything here names a letter's location on disk is
+    /// `waggledance_core::bee`'s mailbox-directory helper, and its single use
+    /// in this server is a read. The view layer never names one at all.
+    ///
+    /// The needle is assembled rather than written out, so this test's own
+    /// source does not match itself.
+    #[test]
+    fn the_only_place_a_letter_path_is_built_is_a_read() {
+        let needle = format!("mailbox_{}(", "dir");
+        let write_apis = [
+            "fs::write",
+            "File::create",
+            "OpenOptions",
+            "write_all",
+            "create_new",
+            "remove_file",
+        ];
+        let read_source = |name: &str| {
+            std::fs::read_to_string(format!("{}/src/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        };
+
+        let views = read_source("views.rs");
+        assert_eq!(
+            views.matches(&needle).count(),
+            0,
+            "the view layer builds no path to a letter — it renders what it is handed"
+        );
+
+        let server = read_source("server.rs");
+        assert_eq!(
+            server.matches(&needle).count(),
+            1,
+            "exactly one place in this server resolves a letter's path: the one that reads it"
+        );
+        let lines: Vec<&str> = server.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains(&needle))
+            .expect("the one occurrence was just counted");
+        let window = lines[at..(at + 8).min(lines.len())].join("\n");
+        assert!(
+            window.contains("read_to_string"),
+            "that one occurrence must feed a read: {window}"
+        );
+        for api in write_apis {
+            assert!(
+                !window.contains(api),
+                "no letter path may reach {api} — human-mailbox D6 gives that field to bee: {window}"
+            );
+        }
+    }
+
+    // -- board-visibility bi-5: the same routes, against a letter bee
+    //    actually composed -----------------------------------------------
+    //
+    // Every fixture above this line was written by the same hands that wrote
+    // the parser and the view, so it agrees with them by construction. The
+    // bytes below did not come from here at all: bee composed them, in a
+    // scratch store under `target/`, out of its own real verbs — `bee cells
+    // finish` for the capped item, `bee cells block` for the blocker that
+    // carries the `needs_you`, then `bee work set --status done` firing the
+    // composer — and `bee mailbox mark --id … --status read` is why the
+    // `status` field reads `read` rather than `unread`.
+    //
+    // They are kept as a literal, not read off `target/`, because that tree is
+    // scratch and a clean checkout has none of it; the SHAPE is what must not
+    // regress. Two parts of that shape no hand-written fixture here had ever
+    // forced: `items[].files` as a NESTED BLOCK SEQUENCE under an indented
+    // key, and explicit `null` scalars where a fixture would simply have
+    // omitted the key. The twin of this constant, same bytes and same sha,
+    // pins the reader in `waggledance-core/src/bee/mailbox.rs`.
+    //
+    // Recorded leg by leg in `docs/history/board-visibility/proof-slice-2.md`.
+    //
+    // sha256 f48f7c17d453cb9ae2c18978c1d48a20dee909d0d96f22c7b3a1eb744ac15e00
+    const REAL_BEE_LETTER: &str = r#"---
+subject: "Add the scratch reader file"
+run: "bi5-scratch-run"
+project: "bi5-scratch"
+filed_at: "2026-08-30T11:46:15.336Z"
+status: "read"
+items:
+  - what: "Add the scratch reader file"
+    files:
+      - "reader.txt"
+    commit: null
+    proof: "true — green — scratch fixture, one file"
+    departure: null
+  - what: "the store path is not settled — the scratch reader needs a decision on where it reads from"
+    files: []
+    commit: null
+    proof: null
+    departure: null
+needs_you:
+  - id: "sx-2"
+    what: "the store path is not settled — the scratch reader needs a decision on where it reads from"
+    blocks: "Point the scratch reader at the store"
+    kind: "question"
+    needs_human_decision: true
+---
+
+## Done
+
+- Add the scratch reader file
+
+## Broken or unfinished
+
+- the store path is not settled — the scratch reader needs a decision on where it reads from
+
+## Needs your call
+
+- [sx-2] the store path is not settled — the scratch reader needs a decision on where it reads from — blocks: Point the scratch reader at the store
+"#;
+
+    /// The letter's own file name, which human-mailbox D11 makes its only id.
+    const REAL_BEE_LETTER_NAME: &str = "20260830T114615Z-bi5-scratch-run.md";
+
+    fn real_letter_file(dir: &Path, name: &str, bytes: &str) {
+        write(dir, &format!(".bee/human-mailbox/{name}"), bytes);
+    }
+
+    /// Leg (b): what `GET /inbox` makes of the real letter. Each assertion
+    /// names the frontmatter field it is checking against, so the render is
+    /// held to the DATA rather than to itself.
+    ///
+    /// The `println!` is the proof artifact: `cargo test … -- --nocapture`
+    /// dumps the rendered page verbatim into the proof document. cargo
+    /// captures it on an ordinary run, so a normal test run pays nothing.
+    #[tokio::test]
+    async fn the_inbox_renders_the_letter_bee_actually_composed() {
+        let root = fresh_root("inbox-real-letter");
+        real_letter_file(&root, REAL_BEE_LETTER_NAME, REAL_BEE_LETTER);
+        let st = build_state();
+        let project = register(&st, &root, "Scratch");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        println!("--- GET /inbox ---\n{body}\n--- end ---");
+
+        // `subject: "Add the scratch reader file"`
+        assert!(body.contains("Add the scratch reader file"), "{body}");
+        // `project: "bi5-scratch"` — the row says whose night it was.
+        assert!(body.contains("bi5-scratch"), "{body}");
+        // `filed_at: "2026-08-30T11:46:15.336Z"`, rendered as bee filed it.
+        assert!(body.contains("2026-08-30T11:46:15.336Z"), "{body}");
+        // `status: "read"` — as a word, and never as the unread chip.
+        assert!(body.contains("Đã đọc"), "{body}");
+        assert!(!body.contains("Chưa đọc"), "{body}");
+        // The row opens the letter under its own name, the id D11 gives it.
+        assert!(
+            body.contains(&format!("/inbox/{}/{REAL_BEE_LETTER_NAME}", project.id)),
+            "{body}"
+        );
+        // Nothing here parsed as unreadable.
+        assert!(!body.contains("Không đọc được"), "{body}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Leg (c): the same real letter with one of human-mailbox D3's five
+    /// required fields cut out. It must reach the page BY NAME and say it
+    /// could not be read — bee's own rule, that a silently missing letter
+    /// reads to the human as a quiet night rather than as a broken store.
+    #[tokio::test]
+    async fn a_real_letter_with_a_required_field_removed_renders_as_unreadable() {
+        let root = fresh_root("inbox-real-letter-torn");
+        let torn: String = REAL_BEE_LETTER
+            .lines()
+            .filter(|l| !l.starts_with("filed_at:"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(!torn.contains("filed_at:"), "the cut must have landed");
+        real_letter_file(&root, REAL_BEE_LETTER_NAME, &torn);
+        let st = build_state();
+        register(&st, &root, "Scratch");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        println!("--- GET /inbox (filed_at removed) ---\n{body}\n--- end ---");
+
+        assert!(body.contains(REAL_BEE_LETTER_NAME), "by name: {body}");
+        assert!(body.contains("Không đọc được"), "{body}");
+        assert!(
+            body.contains("filed_at"),
+            "and names the field that is missing, not just the file: {body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Leg (d), the render half. `bee mailbox mark --id … --status read`
+    /// answered `{"status":"read","previous_status":"unread","changed":true}`
+    /// and flipped the field inside the file; this is the page reading that
+    /// flipped field back — the letter opened, shown as read, offering the
+    /// flip in the other direction and nothing else.
+    #[tokio::test]
+    async fn opening_the_real_letter_shows_the_state_the_mark_command_set() {
+        let root = fresh_root("inbox-real-letter-open");
+        real_letter_file(&root, REAL_BEE_LETTER_NAME, REAL_BEE_LETTER);
+        let st = build_state();
+        let project = register(&st, &root, "Scratch");
+
+        let uri = format!("/inbox/{}/{REAL_BEE_LETTER_NAME}", project.id);
+        let body = body_string(get(router(st), &uri).await).await;
+        println!("--- GET {uri} ---\n{body}\n--- end ---");
+
+        assert!(
+            body.contains("Đã đọc"),
+            "the flipped state, as a word: {body}"
+        );
+        assert!(
+            body.contains(r#"name="status" value="unread""#),
+            "a read letter offers only the flip back: {body}"
+        );
+        // The prose below the frontmatter, through the markdown pipeline.
+        assert!(body.contains("Add the scratch reader file"), "{body}");
+        assert!(
+            body.contains("the store path is not settled"),
+            "the unfinished item reaches the page: {body}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Leg (f): zero letters. Printed whole, because the empty state is a
+    /// first-class deliverable of this slice (D6) and its whole job is to be
+    /// read by someone who does not know bee's internals.
+    #[tokio::test]
+    async fn the_zero_letter_inbox_renders_its_whole_explanation() {
+        let root = fresh_root("inbox-real-empty");
+        write(&root, ".bee/state.json", "{}");
+        let st = build_state();
+        register(&st, &root, "Scratch");
+
+        let body = body_string(get(router(st), "/inbox").await).await;
+        println!("--- GET /inbox (no letters) ---\n{body}\n--- end ---");
+
+        assert!(body.contains("Chưa có lá thư nào"), "{body}");
+        assert!(body.contains("không có người ngồi trực"), "{body}");
+        assert!(
+            body.contains("bình thường"),
+            "it must say the emptiness is normal, not a fault: {body}"
+        );
+        assert!(!body.contains("Không đọc được"), "{body}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// cds-1: the Changes screen end to end — a real fixture repository, the
+    /// real route, the real page. The parsers have their own unit tests in
+    /// `waggledance-core::git_diff`; what only a route test can prove is that
+    /// `/p/:id/_changes` resolves above the `/p/:id/*path` catch-all and that
+    /// what git reported actually reaches the rendered HTML.
+    fn git_fixture(dir: &Path, args: &[&str]) -> bool {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/nonexistent/waggledance-git-global")
+            .env("GIT_CONFIG_SYSTEM", "/nonexistent/waggledance-git-system")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(s) if s.success())
+    }
+
+    #[tokio::test]
+    async fn changes_route_renders_the_real_working_tree_diff() {
+        let dir = fresh_root("changes-diff");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        // cds-2: a file with a syntax, so the page's highlighting is provable
+        // from the route rather than only from the view unit tests.
+        write(&dir, "src/lib.rs", "fn main() {\n    let old = 1;\n}\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+        write(&dir, "src/lib.rs", "fn main() {\n    let new = 2;\n}\n");
+        write(&dir, "fresh.txt", "brand new\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-diff");
+        let resp = get(router(st), &format!("/p/{}/_changes", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        assert!(
+            body.contains("mod.txt"),
+            "the changed file is named: {body}"
+        );
+        assert!(
+            body.contains("fresh.txt"),
+            "the untracked file is a row too"
+        );
+        assert!(
+            body.contains("beta") && body.contains("BETA"),
+            "both reconstructed sides reach the page"
+        );
+        assert!(
+            body.contains("brand new"),
+            "an untracked file's content is its added side"
+        );
+        assert!(
+            body.contains("working tree"),
+            "the header says what is being compared (D2)"
+        );
+        // cds-2: the polished screen, proved through the same real route —
+        // the sidebar row, the section it anchors to, and both panes coming
+        // back highlighted rather than as plain text.
+        assert!(
+            body.contains("class=\"chap-file chg-row\" href=\"#f0\"")
+                && body.contains("<section class=\"changeset\" id=\"f0\""),
+            "a sidebar row links to a section that exists: {body}"
+        );
+        // cds-3: the reviewed layer, through the same real route. The marks
+        // themselves never leave the browser (D4), so what the response owes
+        // is the addressing they hang on.
+        assert!(
+            body.contains(&format!("data-project-id=\"{}\"", project.id))
+                && body.contains("data-path=\"mod.txt\" data-key=\"")
+                && body.contains("class=\"changeset__review-box\"")
+                && body.contains("reviewed</span>"),
+            "the page carries the project scope, a per-file content key, the checkbox and the counter: {body}"
+        );
+        assert!(
+            body.contains("diffrow__side--old") && body.contains("diffrow__side--new"),
+            "both panes render, each addressable by side: {body}"
+        );
+        assert!(
+            body.contains("<span class=\"source rust\">"),
+            "the panes come back syntax-highlighted: {body}"
+        );
+        assert!(
+            body.contains("href=\"/p/") && body.contains("_changes\" aria-current=\"page\""),
+            "the topbar marks Changes as the section being read: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_route_on_a_project_with_no_repository_is_a_page_not_an_error() {
+        let dir = fresh_root("changes-norepo");
+        write(&dir, "readme.md", "# plain\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-norepo");
+        let resp = get(router(st), &format!("/p/{}/_changes", project.id)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "D3: a non-repo project explains itself, never a 500 and never a 404"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("not a git repository") || body.contains("git command line"),
+            "the empty state says why there is nothing to show: {body}"
+        );
+    }
+
+    /// A fixture git call whose stdout is the answer: the commit-mode route
+    /// tests have to learn the sha they are about to put in a URL.
+    fn git_fixture_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/nonexistent/waggledance-git-global")
+            .env("GIT_CONFIG_SYSTEM", "/nonexistent/waggledance-git-system")
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// cds-5 / D6: `?commit=<sha>` end to end. The parsers have their own
+    /// unit tests; what only the route can prove is that the query value
+    /// reaches the git layer and that the page comes back showing THAT
+    /// commit — the working tree is dirtied first so the two are
+    /// distinguishable in the response body.
+    #[tokio::test]
+    async fn changes_route_in_commit_mode_shows_that_commit_not_the_working_tree() {
+        let dir = fresh_root("changes-commit");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "first"]);
+        write(&dir, "mod.txt", "alpha\nCOMMITTED\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "the second commit"]);
+        let sha = git_fixture_out(&dir, &["rev-parse", "HEAD"]);
+        // Noise the commit view must not pick up: an edit and an untracked
+        // file, both real on disk and both absent from the commit.
+        write(&dir, "mod.txt", "alpha\nDIRTYWORKTREE\n");
+        write(&dir, "loosefile.txt", "untracked\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-commit");
+        let resp = get(
+            router(st),
+            &format!("/p/{}/_changes?commit={sha}", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        assert!(
+            body.contains("COMMITTED"),
+            "the commit's own new side renders: {body}"
+        );
+        assert!(
+            !body.contains("DIRTYWORKTREE"),
+            "a commit base never shows what the working tree holds now: {body}"
+        );
+        assert!(
+            !body.contains("loosefile.txt"),
+            "no untracked call runs in commit mode: {body}"
+        );
+        assert!(
+            body.contains("the second commit") && body.contains(&sha[..7]),
+            "the header names the commit being read: {body}"
+        );
+        assert!(
+            !body.contains("working tree"),
+            "and no longer claims to be the working tree: {body}"
+        );
+    }
+
+    /// D7 through the route: a `?commit` value that is not a commit renders
+    /// the working tree, with a 200 and with no trace of what was sent —
+    /// the daemon is unauthenticated on the LAN, so a reflected value is a
+    /// finding on its own.
+    #[tokio::test]
+    async fn changes_route_with_an_unusable_commit_falls_back_without_echoing_it() {
+        let dir = fresh_root("changes-badcommit");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return;
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nWORKTREEONLY\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-badcommit");
+        let app = router(st);
+        for raw in [
+            "zzz",
+            "--upload-pack=x",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            let resp = get(
+                app.clone(),
+                &format!("/p/{}/_changes?commit={raw}", project.id),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "D7: never a 500 for {raw}");
+            let body = body_string(resp).await;
+            assert!(
+                body.contains("working tree") && body.contains("WORKTREEONLY"),
+                "the fallback is the real working-tree view: {body}"
+            );
+            assert!(
+                !body.contains(raw),
+                "the refused value is never echoed back: {raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_route_resolves_above_the_project_path_catch_all() {
+        let dir = fresh_root("changes-catchall");
+        write(&dir, "readme.md", "# plain\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-catchall");
+        let body = body_string(get(router(st), &format!("/p/{}/_changes", project.id)).await).await;
+        assert!(
+            body.contains("class=\"changes\""),
+            "the Changes screen answered, not the document catch-all: {body}"
+        );
+    }
+
+    /// cds-7 / D9: `?embed=1` on the Changes route serves the same screen
+    /// with no topbar, so a same-origin iframe carries one application bar
+    /// rather than two. The whole point is that only the bar goes: the
+    /// changed-file sidebar, the base picker and the reviewed marks are all
+    /// still on the page, and a real repository is what proves it — the
+    /// picker only renders where there is a diff to pick a base for.
+    #[tokio::test]
+    async fn changes_route_with_embed_drops_the_topbar_and_keeps_the_screen() {
+        let dir = fresh_root("changes-embed");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the view unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-embed");
+        let app = router(st);
+
+        let plain =
+            body_string(get(app.clone(), &format!("/p/{}/_changes", project.id)).await).await;
+        assert!(
+            plain.contains("<header class=\"topbar\">"),
+            "the ordinary page still has its bar: {plain}"
+        );
+
+        let resp = get(app.clone(), &format!("/p/{}/_changes?embed=1", project.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("<header class=\"topbar\">") && !body.contains("section-switch"),
+            "embed=1 serves the screen with no outer chrome: {body}"
+        );
+        assert!(
+            body.contains("class=\"layout layout--embed\""),
+            "and says so, so app.css can drop the topbar offset: {body}"
+        );
+        assert!(
+            body.contains("changes-nav") && body.contains("mod.txt"),
+            "the changed-file sidebar is still the point of the screen: {body}"
+        );
+        assert!(
+            body.contains("changes__base-select") && body.contains("data-embed=\"1\""),
+            "the base picker stays and keeps the reader in the frame: {body}"
+        );
+        assert!(
+            body.contains("changeset__review"),
+            "the reviewed marks stay: {body}"
+        );
+
+        // Anything that is not `embed=1` is the page as it always was.
+        for raw in ["0", "true", "", "yes"] {
+            let body = body_string(
+                get(
+                    app.clone(),
+                    &format!("/p/{}/_changes?embed={raw}", project.id),
+                )
+                .await,
+            )
+            .await;
+            assert!(
+                body.contains("<header class=\"topbar\">"),
+                "an unrecognised embed value renders normal chrome ({raw}): {body}"
+            );
+        }
+    }
+
+    /// cds-7 / D9 on the Code section: the tree is the whole reason to embed
+    /// this page, so its links have to keep the reader inside the frame they
+    /// were clicked in.
+    #[tokio::test]
+    async fn code_routes_with_embed_drop_the_topbar_and_keep_the_tree_embedded() {
+        let dir = fresh_root("code-embed");
+        write(&dir, "src/main.rs", "fn main() {}\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "code-embed");
+        let app = router(st);
+
+        for path in ["_code/", "_code/src", "_code/src/main.rs"] {
+            let resp = get(app.clone(), &format!("/p/{}/{path}?embed=1", project.id)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = body_string(resp).await;
+            assert!(
+                !body.contains("<header class=\"topbar\">") && !body.contains("section-switch"),
+                "embed=1 drops the chrome on {path}: {body}"
+            );
+            assert!(
+                body.contains("class=\"layout layout--embed\""),
+                "and marks the layout embedded on {path}: {body}"
+            );
+            assert!(
+                body.contains(&format!("href=\"/p/{}/_code/?embed=1\"", project.id)),
+                "the tree's root crumb carries embed on {path}: {body}"
+            );
+        }
+
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_code/src", project.id)).await).await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && !body.contains("embed=1"),
+            "without the param the Code page is untouched: {body}"
+        );
+    }
+
+    /// htp-1 / D2: `?embed=1&nav=1` on the Changes route serves the
+    /// changed-file list alone, headed by `<base target="wd-term-panel">` so
+    /// every file row opens in the panel above the terminal rather than
+    /// replacing the sidebar it was clicked in. The route is the proof that
+    /// matters here: the view already knows how to render this, and what this
+    /// test pins is that the query reaches it.
+    #[tokio::test]
+    async fn changes_route_with_nav_serves_the_file_list_alone() {
+        let dir = fresh_root("changes-nav");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the view unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-nav");
+        let app = router(st);
+
+        let resp = get(
+            app.clone(),
+            &format!("/p/{}/_changes?embed=1&nav=1", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("<base target=\"wd-term-panel\">"),
+            "the nav names the panel frame its rows load into: {body}"
+        );
+        assert!(
+            body.contains("class=\"nav-only nav-only--changes\"") && body.contains("mod.txt"),
+            "and is the changed-file list: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "href=\"/p/{}/_changes?embed=1&amp;panel=1#f0\"",
+                project.id
+            )),
+            "each row deep-links the embedded page at its own section, without \
+             the in-page sidebar this nav already is: {body}"
+        );
+        assert!(
+            !body.contains("changeset__head") && !body.contains("class=\"layout"),
+            "with no diff sections and no page shell beside it: {body}"
+        );
+
+        // The narrowing is a narrowing of embed mode, never something a URL
+        // can ask for on its own.
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_changes?nav=1", project.id)).await).await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && !body.contains("nav-only"),
+            "nav=1 without embed=1 is the ordinary page: {body}"
+        );
+    }
+
+    /// htp-1 / D2-D3 on the Code section: nav mode is the tree, and the two
+    /// kinds of link in it go to two different frames — a folder re-renders
+    /// the sidebar, a file fills the panel.
+    #[tokio::test]
+    async fn code_routes_with_nav_serve_the_tree_with_split_link_targets() {
+        let dir = fresh_root("code-nav");
+        write(&dir, "src/main.rs", "fn main() {}\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "code-nav");
+        let app = router(st);
+
+        let resp = get(
+            app.clone(),
+            &format!("/p/{}/_code/?embed=1&nav=1", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("<base target=\"wd-term-panel\">"),
+            "the nav names the panel frame: {body}"
+        );
+        assert!(
+            body.contains("class=\"nav-only nav-only--code\""),
+            "and is the tree alone: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "href=\"/p/{}/_code/src?embed=1&amp;nav=1\" target=\"_self\"",
+                project.id
+            )),
+            "a folder re-renders this frame, keeping nav mode: {body}"
+        );
+        assert!(
+            !body.contains("codelist__"),
+            "the main pane's own listing is not built: {body}"
+        );
+
+        // One level down, where the files live: file rows leave for the panel.
+        let body = body_string(
+            get(
+                app.clone(),
+                &format!("/p/{}/_code/src?embed=1&nav=1", project.id),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            body.contains(&format!(
+                "href=\"/p/{}/_code/src/main.rs?embed=1&amp;panel=1\"",
+                project.id
+            )),
+            "a file row is an absolute embed link the base target carries away, \
+             sidebar-less because this nav is that sidebar: {body}"
+        );
+        assert!(
+            !body.contains("_code/src/main.rs?embed=1&amp;nav=1"),
+            "and never a nav link, which would put a file page in the sidebar: {body}"
+        );
+
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_code/src?nav=1", project.id)).await)
+                .await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && !body.contains("nav-only"),
+            "nav=1 without embed=1 is the ordinary Code page: {body}"
+        );
+    }
+
+    /// UAT / htp-3: `?embed=1&panel=1` on the Changes route serves the
+    /// embedded screen without its own changed-file sidebar — the homepage
+    /// panel this renders into already has that list beside it — and keeps
+    /// the header the user reads it by. The route is what this pins: the
+    /// view tests own the markup, this owns the query reaching them.
+    #[tokio::test]
+    async fn changes_route_with_panel_drops_the_in_page_sidebar_only() {
+        let dir = fresh_root("changes-panel");
+        if !git_fixture(&dir, &["init", "-q", "."]) {
+            return; // no git on this machine: the view unit tests cover the rest
+        }
+        git_fixture(&dir, &["config", "core.autocrlf", "false"]);
+        write(&dir, "mod.txt", "alpha\nbeta\n");
+        git_fixture(&dir, &["add", "-A"]);
+        git_fixture(&dir, &["commit", "-q", "-m", "init"]);
+        write(&dir, "mod.txt", "alpha\nBETA\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "changes-panel");
+        let app = router(st);
+
+        let resp = get(
+            app.clone(),
+            &format!("/p/{}/_changes?embed=1&panel=1", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("<aside id=\"sidebar\"") && !body.contains("changes-nav"),
+            "the duplicated changed-file column is gone: {body}"
+        );
+        assert!(
+            body.contains("class=\"layout layout--embed layout--panel\""),
+            "and the layout says so beside the embed class: {body}"
+        );
+        assert!(
+            body.contains("changes__count")
+                && body.contains("changes__base-select")
+                && body.contains("changes__reviewed"),
+            "the header — count, picker, reviewed counter — stays: {body}"
+        );
+        assert!(
+            body.contains("changeset__head") && body.contains("mod.txt"),
+            "and so does the diff the frame was opened for: {body}"
+        );
+
+        // The narrowing is a narrowing of embed mode, never something a URL
+        // can ask for on its own.
+        let body =
+            body_string(get(app.clone(), &format!("/p/{}/_changes?panel=1", project.id)).await)
+                .await;
+        assert!(
+            body.contains("<header class=\"topbar\">")
+                && body.contains("<aside id=\"sidebar\"")
+                && !body.contains("layout--panel"),
+            "panel=1 without embed=1 is the ordinary page, sidebar and all: {body}"
+        );
+    }
+
+    /// UAT / htp-3 on the Code section: same narrowing, same one column
+    /// removed — the file tree, whose copy is the sidebar beside the panel.
+    #[tokio::test]
+    async fn code_routes_with_panel_drop_the_tree_and_keep_the_file() {
+        let dir = fresh_root("code-panel");
+        write(&dir, "src/main.rs", "fn main() {}\n");
+
+        let st = build_state();
+        let project = register(&st, &dir, "code-panel");
+        let app = router(st);
+
+        let resp = get(
+            app.clone(),
+            &format!("/p/{}/_code/src/main.rs?embed=1&panel=1", project.id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("<aside id=\"sidebar\"") && !body.contains("chap-crumbs"),
+            "the tree column the sidebar beside the panel already shows is gone: {body}"
+        );
+        assert!(
+            body.contains("class=\"codeview__table\"")
+                && body.contains("class=\"layout layout--embed layout--panel\""),
+            "the file itself is served, in a layout that names the mode: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "href=\"/p/{}/_code/?embed=1&amp;panel=1\"",
+                project.id
+            )),
+            "and its breadcrumb keeps the reader in the panel: {body}"
+        );
+
+        let body = body_string(
+            get(
+                app.clone(),
+                &format!("/p/{}/_code/src/main.rs?panel=1", project.id),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            body.contains("<header class=\"topbar\">") && body.contains("<aside id=\"sidebar\""),
+            "panel=1 without embed=1 is the ordinary Code page: {body}"
         );
     }
 }

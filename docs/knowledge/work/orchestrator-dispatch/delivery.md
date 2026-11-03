@@ -22,6 +22,11 @@ bee:
 
 The surface: an external LLM orchestrator holds only the three MCP tools — waggledance executes the mechanics, the orchestrator decides, workers code. Dispatch is refused unless the project's `orchestration_enabled` flag AND the global terminal family are both on (default off; the board stays read-only until a human opts a project in). Run state is durable in the registry DB, so a restarted orchestrator recovers its fleet by reading state rather than carrying a prompt roster.
 
+## Later amendments
+
+- **observer-tick-trigger D1** carves one narrow, logged exception into "the orchestrator decides": a daemon background task (`crates/waggledance/src/trigger.rs`) may autonomously call `dispatch_run` with a fixed, content-invariant task string on a mechanical fleet transition (run capped, pane blocked, run overrun, new escalation row). It never chooses WHAT to dispatch — the string never varies — so the surface's "an external agent decides" invariant still holds for every other caller; only this one task gets to fire the fixed string on its own. See decisions log `45a554bb-1832-4243-8a72-6327aec1e215`.
+- **observer-tick-trigger D7** adds a second, autonomous consumer of the same `orchestration_enabled` per-project gate this delivery introduced: the trigger task only dispatches into a project that already opted in, reusing this flag rather than adding a parallel consent lever.
+
 ## Verify
 
 Each cell below was capped only against a recorded passing verify result — bee refuses a cap without one.

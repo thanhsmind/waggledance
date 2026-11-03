@@ -4,8 +4,10 @@
 //! (SQLite, notify) live here behind ports; the HTTP/MCP/CLI wiring is in the
 //! `waggledance` binary crate.
 
+pub mod agent_usage;
 pub mod ansi;
 pub mod bee;
+pub mod bee_upgrade;
 pub mod code_source;
 pub mod config;
 pub mod daemon;
@@ -14,15 +16,18 @@ pub mod domain;
 pub mod engine;
 pub mod error;
 pub mod fuzzy;
+pub mod git_diff;
 pub mod indexer;
 pub mod link_resolver;
 pub mod notify_store;
 pub mod paths_boundary;
 pub mod process;
+pub mod project_settings;
 pub mod render;
 pub mod repository;
 pub mod short_link;
 pub mod transcript;
+pub mod usage;
 
 pub use config::Config;
 pub use engine::Engine;

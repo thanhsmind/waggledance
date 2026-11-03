@@ -1,7 +1,7 @@
 ---
 area: agent-terminal
-updated: 2026-08-23
-sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact]
+updated: 2026-08-25
+sources: [agent-terminal, terminal-open-access, scroll-fab-follow, bee-agent-activity, scroll-fab-clears-tabbar, term-keys-one-row, rail-agents-compact, herdr-protocol-20, herding-entry-conditions, terminal-image-attach, terminal-button-surface, unassigned-poller-guard, scroll-keep-position, terminal-scroll-perf, scroll-fab, term-frame-blocks, bundle-mono-font, terminal-pane-scope, home-terminal-header, pane-bar-mobile-menu, screen-revision]
 decisions: [D1, D2, D3, D4, D5, D6, D7, D8, D9, D10]
 coverage: partial
 ---
@@ -81,6 +81,13 @@ implementation. Code entry points are listed in `reading-map.md`.
 - **Starting another session:** the control that starts one shares the strip's
   own row, at that row's right end, so the list of sessions and the way to add
   one read as a single band rather than two stacked controls.
+- **The strip on a narrow screen:** below the shared narrow-screen threshold the
+  strip is always exactly one line. It shows only the session being viewed, and a
+  single menu control holds everything else — every other session, and the controls
+  that start one. Above the threshold the strip is unchanged, because there the full
+  list fits and reading it is faster than opening a menu. The rule exists because a
+  wrapped strip pushes the screen itself down the page, and the screen is what the
+  operator opened the tab to read.
 - **Which one is shown:** the entry the address names. Opening the tab
   without naming one shows the session the operator is currently focused on
   when it belongs to this project, and otherwise the first in the strip, so
@@ -92,6 +99,13 @@ implementation. Code entry points are listed in `reading-map.md`.
   that way is left entirely alone by that page: its screen is not polled and no
   reply reaches it from there, so an open page never spends requests on, nor
   paints a false "reconnecting" state over, a pane that is not its own to drive.
+- **When the view repaints:** a shown screen is redrawn only when it reports a
+  revision different from the one already on the page, so an idle pane costs
+  nothing to keep open. That revision is derived from the rendered text itself —
+  same text, same revision; different text, different revision — and never from any
+  counter the terminal multiplexer keeps on its own behalf. A multiplexer's counter
+  can sit still while output scrolls, and a view that trusted it froze on its first
+  frame while the pane beneath it was plainly moving.
 - **How the screen renders:** a path to one of the project's own markdown
   docs, wherever it appears in the screen or the transcript, is shown as a
   clickable link to that doc. The monospaced type used for the screen ships
@@ -269,15 +283,60 @@ implementation. Code entry points are listed in `reading-map.md`.
   A preset-started agent appears in the Terminal tab's listing on its next
   poll; a plain shell does not, because that listing enumerates agents, and
   a plain shell has no agent record (see Open Gaps).
+- **Where it lands:** a started agent gets a **tab of its own**, never a split
+  of whichever tab the operator happened to be looking at. The session host
+  creates the tab, the pane inside it is found, and the agent starts in that
+  pane; a tab that yields no pane is refused outright, naming the empty tab,
+  and nothing is started in some other pane instead. One consequence is
+  visible on the card: a started session is labelled by its workspace and the
+  shell it occupies, not by the tab the operator was on.
+- **A pane that is not ready yet is waited for, briefly.** For a fraction of a
+  second after a new pane exists, the host can still answer that it is not an
+  available shell. That one answer alone is retried — a handful of attempts a
+  fifth of a second apart — because it means "not yet" rather than "no". Every
+  other refusal (a name already taken, an unreachable host, the agent itself
+  declining) surfaces on the first attempt and is never retried. When the
+  waiting runs out, the operator is shown the host's own last words rather
+  than a rewritten message.
+- **What a project declares about an agent is honoured, not just its
+  command.** A project's own record of an agent kind may carry more than the
+  program to run: environment the agent should inherit, and a note that the
+  tool keeps a per-workspace trust list of its own. Both are applied before
+  the agent runs — the environment is set in the session it will occupy, and
+  the workspace is added to that tool's trust list — because an agent started
+  without them either runs as a different program than the one declared, or
+  stops at a trust question the operator never sees.
+- **What is never done to a trust list.** Only the one folder the agent is
+  about to start in is added, and only after that folder has been proven to
+  belong to this project. Nothing is ever removed, no other setting is
+  rewritten, and a folder already trusted is left exactly as it is — starting
+  an agent is not an occasion to edit somebody's settings.
+- **A trust list that cannot be updated does not stop the agent, and does not
+  go quiet.** The agent starts anyway, and the same answer that reports it
+  started also reports that the trust could not be set. Refusing instead would
+  strand every agent whose tool keeps such a list; staying silent would be
+  worse than either, because the operator would then meet a session that
+  simply sits there with nothing to attribute it to. Environment is the
+  opposite case and deliberately so: if it cannot be set, the start fails,
+  since an agent running without its declared environment is not the agent
+  that was asked for.
 - **Blocked when:** no such destination can be found under this project's
   boundary, the named preset is not one an operator configured, or the
   underlying start attempt itself fails — each of these is refused
-  distinctly, with nothing started in any case.
-- **Where each control appears:** the project terminal page offers both the
-  presets and the plain shell; the homepage's Terminals tab offers the
-  presets only — no plain-shell control there. When a surface would show no
-  creation control at all (no presets configured and no plain shell offered),
-  the creation box is omitted entirely rather than shipped empty.
+  distinctly, with nothing started in any case. A named agent that the project
+  declares but that carries no runnable command is refused as that, and never
+  as an unknown name: the name exists, so calling it unknown sends the reader
+  looking for a spelling mistake that is not there.
+- **Where each control appears:** both surfaces offer the same controls — the
+  configured presets and the plain shell. The homepage's Terminals tab withheld
+  the plain-shell control for a time, on the reasoning that a page not scoped to
+  one project could only guess where a new shell belonged; that stopped being
+  true once the tab's switcher and its creation controls both took the selected
+  pane's own project, so "new shell here" now names the same project on either
+  page. The creation box is therefore never empty, and never omitted for want of
+  something to put in it. The one surface that shows no creation control is a
+  selected pane belonging to no registered project: creation is addressed per
+  project, so a pane outside every project has no address to create into.
 
 ### The pane's header
 
@@ -508,6 +567,15 @@ authentication, and each still holds:
   keeps waggledance silent about panes another operator's run owns reaches
   these messages too, on the session's own pane when it has one. A project
   registered while the daemon is already running is picked up on the next tick.
+- **What a dispatched run adds to that duty:** a run started through the agent-facing
+  tool surface raises its own alert the moment it reaches a state only a person can
+  clear. It is raised exactly once per run per state, from the single place that
+  transition is already recorded, so a retry or a second reader cannot double it,
+  and the message names the project, the pane and the run and nothing else. While a
+  dispatched run owns a pane, the older pane-status alert for that pane stays
+  silent — one event reaches the person once, not twice from two duties. The alert
+  is armed and disarmed by this same switch, so an installation that never turned
+  notification on stays as silent about dispatched runs as about everything else.
 - Both duties, together with the notification destination and credential,
   are switched on and changed from the settings page, the same as every
   other setting on that same page (see Actors & Access) — no separate

@@ -1,7 +1,7 @@
 ---
 area: bee-cockpit
 updated: 2026-08-25
-sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness, session-work-line, board-live-morph]
+sources: [feature-close, agent-board, bee-artifact-rename, archive-visibility, feature-hub, board-declutter, board-trim, feature-titles, hub-fallbacks, detail-desc-wrap, cross-board, board-drop-live, card-terminals, gate-stop-superseded, console-theme-kanban, console-rail-orchestrator, console-phone-layout, bee-agent-activity, board-new-task, board-topbar-polish, rail-icons, card-agent-logos, rail-collapse, rail-agents-compact, herdr-session-liveness, session-work-line, board-live-morph, bee-board-pm, backlog-groom-2, card-badge-inside, home-board-perf, homepage-tabs, kanban-live-signals, tabbar-collapse, project-color-identity]
 decisions: []
 coverage: partial
 ---
@@ -43,6 +43,16 @@ page for it returns not-found rather than an empty bee page. The absence of a st
 never rendered as an empty dashboard.
 
 A qualifying project gains an entry point on its home page leading to its board.
+
+The home page's surfaces are chosen by a strip at its top, and each choice is a
+real address of its own — copying the address shares the surface it was on, the
+browser's back button steps between them, and the choice survives the page
+reloading itself. Only the chosen surface is built, so the page never pays to
+render the one nobody asked for. The strip is always present, including when the
+chosen surface has nothing to show, so an empty board never strands the reader
+with no way to reach another. The registered-project list is *not* one of these
+choices: it sits in the rail beside the board rather than behind a choice of its
+own (see `web-interface.md`, which owns those rows).
 
 On a wide desktop screen the board pages — the home board and a project's own
 bee board — span the full width of the window instead of stopping at the reading
@@ -112,7 +122,10 @@ now, then what there is to work on:
   **…** disclosure menu offering **Docs** (the project's reading pages) and
   **Remove** (unregister, with the usual confirmation) — the menu, not a bare
   remove control, and it stays reachable while the group is closed. A worktree
-  branch row keeps only its dot, never a glyph.
+  branch row keeps only its dot, never a glyph. A project row additionally
+  names its own active feature, that feature's phase, and the project's own
+  live wait — the same subject-aware wording the Feature Hub's In Progress
+  card uses; an idle project's row renders none of that.
   Everything a collapsed group should fold away sits in the body — the markdown
   count and last-seen line, the badges, and the worktree branches. Groups open
   by default; the set a reader leaves closed is remembered for that browser
@@ -130,19 +143,20 @@ At most one thing in this frame is marked the current page: the Orchestrator
 link while the board is showing, or, on the terminals view, the pinned row of
 the terminal actually on screen.
 
-On a handset the same frame answers, narrowed rather than replaced: one page,
-one address, one reading, laid out in a single column below the narrow-screen
-width the rest of this surface already uses. What changes is where the frame's
-parts sit, never what they say:
+On a handset or an iPad-width display, the same frame answers, narrowed rather
+than replaced: one page, one address, and one reading. Through 900 CSS pixels,
+the frame uses one column. At 901 CSS pixels, the wide-screen layout returns.
+What changes is where the frame's parts sit, never what they say:
 
 - The rail leaves the flow and becomes a drawer over the page, opened from a
   **Projects** item and dismissed by tapping the page behind it. It needs no
   scripting, so it survives the reload the page performs on its own, and a
   reader's collapsed project groups are still collapsed when the drawer opens.
-- A **bottom bar** carries four items — **Board**, **Agents**, **Projects**,
-  **Settings** — and marks the section on screen by more than colour alone.
-  Board and Agents are the frame's two existing addresses, Projects is the
-  drawer, Settings the settings page. The Orchestrator link stands down at
+- A **bottom bar** carries five items: **Board**, **Agents**, **Projects**,
+  **Hướng dẫn**, and **Settings**. It marks the section on screen by more than
+  colour alone. Board and Agents are the frame's two existing addresses,
+  Projects is the drawer, Hướng dẫn is the built-in guide, and Settings is the
+  settings page. The Orchestrator link stands down at
   this width because the Board item already answers it, which keeps the rule
   above intact: exactly one thing still marks itself the current page.
 - The board opens with three figures — **working**, **need you** and
@@ -224,18 +238,31 @@ a card that arrives fades in, and nothing inside a card animates. Every failure 
 — an unreadable response, a shape the reconciler does not recognise — falls back to a
 full page reload, so the worst case is exactly the behaviour this replaced.
 
+Matching by key settles what happens to the things that have one; the reconcile owns
+what is left over too. Not everything the board draws carries a key of its own — a
+row's action controls sit beside the row rather than inside it, so no key ever claims
+them. Anything standing in the patched area without a key is the reconcile's own
+leftover and is removed on every pass. Without that rule each patch left one more copy
+of those controls beside the last, and a column that emptied still showed the controls
+of the rows that had left it. The arrival fade belongs to keyed things only, which is
+the same rule as before read from the other side: motion marks a card or a row
+appearing, never a control reappearing beside one.
+
 ## The reading order — and why it is the feature
 
 The board answers, top to bottom, in a fixed order:
 
 1. A top bar naming the project and the instant this snapshot was read.
 2. **Live** — a single dense strip of what is running at this moment, one line each.
-3. The **Feature Hub** — one card per feature, grouped by whether it is waiting on a
+3. The **headline numbers** — a single row of counts standing between the live strip
+   and the cards, so the size of each group is answered before the reader starts
+   reading cards to work it out.
+4. The **Feature Hub** — one card per feature, grouped by whether it is waiting on a
    person, still in progress, or finished.
-4. **Finished (shipped) list** — the complete, permanent record of every feature that
+5. **Finished (shipped) list** — the complete, permanent record of every feature that
    has fully shipped, collapsed by default so it never crowds out the live work above
    it.
-5. **Backlog & Review** — the backlog of proposed work and the state of every review
+6. **Backlog & Review** — the backlog of proposed work and the state of every review
    candidate, for the reader who wants to go one level deeper than the headline view.
 
 This order is not decoration; it is the feature. It mirrors the sequence a project
@@ -309,6 +336,11 @@ full rather than truncating, so nothing a row says is ever hidden behind an elli
   say, and naming an earlier one would claim a decision is owed that nobody is
   waiting on. A feature whose interview genuinely stopped for an answer — nothing
   approved after it — still carries the line, which is the case it exists to catch.
+  The line renders the wait's own recorded subject when it beats the derived
+  wording (a bare "gate"/"question" label), and keeps the derived wording
+  otherwise; a turn-end wait — the harness's own end-of-turn mark, set on every
+  ordinary turn end — is never live and never raises this line, only a gate, a
+  question, or an unrecognised kind is.
 - **Review** — a feature with no live work that still holds an unsettled review
   candidate.
 - **Compound** — a feature whose own phase is exactly the compounding step.
@@ -352,6 +384,16 @@ text, then the most recent decision scoped to the feature, then the title of its
 cell. A long description wraps and is visually clamped — on the card, and on the
 feature's own detail page too — rather than overflowing or forcing either page to
 scroll sideways. A card links onward to the feature's own detail page.
+
+On the board that spans every project, a card's subtitle names its project rather
+than the feature's slug, and the card carries that project's own fixed accent
+colour — the same colour for the same project on every visit, so a reader
+scanning many projects groups the cards by eye before reading a word. That colour
+is the one coloured thing on the card. A project's own board does not repeat the
+project name it is already titled with: a card there keeps the feature's slug and
+keeps its worktree visible. A card with no recorded title names its worktree
+state in the subtitle instead of dropping the line, with no slug half and no
+separator left behind.
 
 ### Live signals on a card
 
@@ -446,7 +488,12 @@ agent is doing and which cell it holds, never who it is.
 On the cross-project board, an In Progress card also carries one marker per
 terminal session running in that feature's own checkout, each showing that
 session's state and the program it runs, and each opening that session's own
-terminal view. A collapsed card badges only the sessions that are working or
+terminal view. Those markers sit inside the card's own frame, at its
+foot, divided from the card's lines by a hairline rule — they belong to the card
+that owns them, and hanging them below it on the page background read as though
+they belonged to the gap between two cards rather than to either one. The card's
+own text stays a single link to the feature and remains the whole reading surface;
+each marker is its own link to its terminal. A collapsed card badges only the sessions that are working or
 blocked; the quiet ones move inside the card's expandable body, and the card
 states how many it folded away so a closed card never understates what is
 behind it. Finished rows carry none.

@@ -868,9 +868,9 @@ html[data-scheme="dark"] .topbar .home {
    active row, a step up from the rail in both schemes.
 
    console-phone-layout (P1/P2) settled the phone phase this block once
-   owed: under 700px the shell is one column, the rail is an off-canvas
+   owed: under 900px the shell is one column, the rail is an off-canvas
    drawer over it, and a fixed bottom bar carries the four sections. That
-   answer lives in the `@media (max-width: 700px)` block below
+   answer lives in the `@media (max-width: 900px)` block below
    `.home-sidebar__foot`, together with the two defaults — a hidden tab bar
    and a hidden backdrop — that keep every wider screen exactly as it was.
    ───────────────────────────────────────────────── */
@@ -979,12 +979,12 @@ html[data-scheme="dark"] .topbar .home {
 .home-sidebar__collapse-icon--out {
   display: none;
 }
-/* The collapsed strip is a WIDE-SCREEN state only: under 700px the rail is
+/* The collapsed strip is a WIDE-SCREEN state only: under 900px the rail is
    an off-canvas drawer that is already fully out of the way, and a second
    way to hide it would only be a control the drawer has no room for. Every
    rule the collapse adds is scoped here, so the handset block below sees
    none of them however `waggledance-rail-hidden` was left. */
-@media (min-width: 701px) {
+@media (min-width: 901px) {
   .home-sidebar--collapsed {
     /* Structural: the head's two `--space-2` paddings plus the button's own
        24px box — the strip is exactly the expand control and nothing else. */
@@ -1029,9 +1029,9 @@ html[data-scheme="dark"] .topbar .home {
 .home-rail__backdrop {
   display: none;
 }
-/* 700px is the breakpoint the board's own narrow block already uses
+/* 900px is the breakpoint the board's own narrow block already uses
    (`bee_hub_style`); one number for one phone layout. */
-@media (max-width: 700px) {
+@media (max-width: 900px) {
   /* One column. `block` rather than a one-column grid because the rail is
      about to leave the flow entirely — what is left in it is `<main>`
      alone. */
@@ -1107,14 +1107,14 @@ html[data-scheme="dark"] .topbar .home {
   }
   .home-tabbar {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(7, 1fr);
     position: fixed;
     left: 0;
     right: 0;
     bottom: 0;
     /* The safe-area inset is added to the height and paid back as padding,
-       so the four targets keep their full 56px above a home indicator
-       rather than being squeezed by it. */
+       so the targets keep their full 56px above a home indicator rather
+       than being squeezed by it. */
     height: calc(56px + env(safe-area-inset-bottom));
     padding-bottom: env(safe-area-inset-bottom);
     background: var(--color-surface-sunken);
@@ -1129,7 +1129,7 @@ html[data-scheme="dark"] .topbar .home {
     gap: 2px;
     /* The current item is not marked by colour alone: it also carries a
        rule along the top edge of its own cell. `transparent` here rather
-       than no border, so marking one never shifts the other three. */
+       than no border, so marking one never shifts the others. */
     border-top: 2px solid transparent;
     color: var(--color-text-muted);
     font-size: 11px;
@@ -2023,6 +2023,68 @@ html[data-scheme="dark"] .topbar .home {
   text-overflow: ellipsis;
 }
 
+/* ── Slash-command suggestions in a reply composer (csl-2) ───── */
+/* The jump palette's list above, re-hosted: the same raised surface,
+   radius, elevation and hover row — but anchored to the composer it
+   belongs to instead of a full-screen scrim, since this menu is an
+   aid to what the reader is typing, not a mode they entered. It sits
+   ABOVE the box (`bottom: 100%`) so it never covers the text being
+   composed, and at `--z-popover` so a real modal still wins. Its host
+   (the composer form) is given `position: relative` by app.js. */
+.slash-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + var(--space-1));
+  z-index: var(--z-popover);
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: var(--space-1);
+  background: var(--color-surface-raised);
+  border: var(--border-width-hairline) solid var(--color-border-strong);
+  border-radius: var(--card-radius);
+  box-shadow: var(--elevation-lg);
+}
+.slash-menu[hidden] {
+  display: none;
+}
+.slash-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--nav-item-radius);
+  cursor: pointer;
+}
+.slash-item:hover,
+.slash-item.active {
+  background: var(--color-surface-hover);
+}
+.slash-item__name {
+  color: var(--color-text);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--type-body-sm-size);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+}
+.slash-item__kind {
+  flex: none;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+}
+.slash-item__desc {
+  color: var(--color-text-muted);
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── "+ New task" dialog (board-new-task N1) ─────────────────── */
 /* The same overlay mechanism the jump palette above uses — one fixed
    scrim at `--z-modal`, one raised box inside it — so the board's two
@@ -2643,8 +2705,8 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 1.75rem;
-  height: 1.75rem;
+  width: 39px;
+  height: 39px;
   padding: 0;
   border: var(--border-width-hairline) solid var(--color-border);
   border-radius: 50%;
@@ -2652,7 +2714,7 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
   color: var(--color-text);
   cursor: pointer;
   line-height: 1;
-  font-size: var(--type-body-size);
+  font-size: var(--type-title-size, 1.25rem);
 }
 .term-attach__btn:hover { border-color: var(--color-action); color: var(--color-action); }
 .term-attach__chips {
@@ -2910,4 +2972,1265 @@ pre.mermaid.zoomable:focus-within .mermaid-controls {
 .bee-hub-theme .fg-card__title {
   font-family: system-ui, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial,
     sans-serif;
+}
+
+/* ── The built-in guide (guide-vi) ────────────────────────────────────
+   `/guide` and `/guide/<slug>`. The guide's whole method is the picture:
+   a chapter opens on a diagram and only then spends words, so the rules
+   below are mostly about giving a figure room and keeping its labels
+   legible in both themes.
+
+   Everything is drawn from the design tokens and `currentColor`, never a
+   literal colour — the guide has no palette of its own, so the theme
+   toggle is the only thing that decides how it looks, exactly as on
+   every other page.
+
+   The page reuses `.layout` / `.sidebar` / `.content` from the file view,
+   so the chapter rail inherits that column's sticky behaviour and its
+   handset drawer for free; `.layout--guide` only widens the reading
+   column, since a guide has no right-hand table of contents to leave
+   room for. */
+.layout--guide > .content {
+  padding: var(--space-5) var(--space-5) var(--space-8);
+  display: flex;
+  justify-content: center;
+}
+.guide-prose {
+  /* Wider than `--reading-measure`: the diagrams are the content, and a
+     figure clamped to a paragraph's measure is a figure nobody can read. */
+  max-width: 820px;
+  width: 100%;
+  color: var(--color-text);
+}
+
+/* ── The chapter rail ─────────────────────────────────────────────── */
+.guide-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.guide-rail__head {
+  font-family: var(--type-label-font);
+  font-size: 11px;
+  letter-spacing: var(--type-label-tracking);
+  text-transform: uppercase;
+  color: var(--color-text-subtle);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+}
+.guide-rail__item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  text-decoration: none;
+  font-size: 13px;
+  line-height: 1.35;
+}
+.guide-rail__item:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+/* The current chapter is never marked by colour alone — it also carries
+   the rule down its own left edge, the same shape cue the tab bar and the
+   project rail already use. */
+.guide-rail__item--on {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+  font-weight: 600;
+  box-shadow: inset 2px 0 0 0 var(--color-action);
+}
+.guide-rail__num {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-subtle);
+  min-width: 1.4em;
+  text-align: right;
+  flex-shrink: 0;
+}
+.guide-rail__item--home {
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: var(--space-2);
+}
+
+/* ── A chapter's own head ─────────────────────────────────────────── */
+.guide-head {
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  padding-bottom: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+.guide-head__eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-subtle);
+}
+.guide-head__title {
+  font-family: var(--font-display);
+  font-size: clamp(28px, 5vw, 40px);
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+  margin: var(--space-2) 0 0;
+}
+.guide-head__blurb {
+  font-size: 17px;
+  line-height: 1.55;
+  color: var(--color-text-muted);
+  margin: var(--space-3) 0 0;
+  max-width: 60ch;
+}
+
+/* ── The prose inside a chapter ───────────────────────────────────── */
+.guide-prose h2 {
+  font-family: var(--font-display);
+  font-size: clamp(22px, 3.4vw, 28px);
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+  color: var(--color-text);
+  margin: var(--space-7) 0 var(--space-3);
+}
+.guide-prose h3 {
+  font-family: var(--font-display);
+  font-size: 19px;
+  line-height: 1.3;
+  color: var(--color-text);
+  margin: var(--space-5) 0 var(--space-2);
+}
+.guide-prose p {
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--color-text-muted);
+  margin: 0 0 var(--space-3);
+  max-width: 68ch;
+}
+.guide-prose strong {
+  color: var(--color-text);
+  font-weight: 650;
+}
+.guide-prose ul,
+.guide-prose ol {
+  margin: 0 0 var(--space-4);
+  padding-left: 1.35em;
+  max-width: 68ch;
+}
+.guide-prose li {
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-2);
+}
+.guide-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: var(--color-surface-sunken);
+  border-radius: var(--radius-xs);
+  padding: 0.12em 0.36em;
+}
+.guide-prose a {
+  color: var(--color-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+  text-decoration-color: var(--color-border-strong);
+}
+.guide-prose a:hover {
+  text-decoration-color: currentColor;
+}
+
+/* ── The figure: a chapter's opening picture ──────────────────────── */
+.guide-fig {
+  margin: var(--space-5) 0 var(--space-6);
+  padding: var(--space-5);
+  background: var(--color-surface);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  /* A wide diagram scrolls inside its own frame; the page body never
+     scrolls sideways. */
+  overflow-x: auto;
+}
+.guide-fig svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+}
+.guide-fig__cap {
+  margin: var(--space-3) 0 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-text-subtle);
+  text-align: center;
+  max-width: none;
+}
+/* SVG text and strokes take the theme's own colours, so a diagram never
+   goes invisible on the other side of the toggle. */
+.guide-fig .fig-line { stroke: var(--color-border-strong); }
+.guide-fig .fig-box { fill: var(--color-surface-raised); stroke: var(--color-border-strong); }
+.guide-fig .fig-box--on { fill: var(--color-surface-sunken); stroke: var(--color-action); }
+.guide-fig .fig-t {
+  fill: var(--color-text);
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 13px;
+}
+.guide-fig .fig-t--sm { fill: var(--color-text-subtle); font-size: 11px; }
+.guide-fig .fig-t--mono { font-family: var(--font-mono); font-size: 11px; }
+.guide-fig .fig-fill-gate { fill: var(--color-warning-tint); stroke: var(--color-warning); }
+.guide-fig .fig-fill-agent { fill: var(--color-info-tint); stroke: var(--color-info); }
+.guide-fig .fig-fill-ok { fill: var(--color-success-tint); stroke: var(--color-success); }
+.guide-fig .fig-fill-stop { fill: var(--color-danger-tint); stroke: var(--color-danger); }
+.guide-fig a:hover .fig-box { stroke-width: 2; }
+
+/* ── Callouts ─────────────────────────────────────────────────────── */
+.guide-note {
+  margin: var(--space-4) 0;
+  padding: var(--space-4);
+  border-left: 3px solid var(--color-info);
+  background: var(--color-info-tint);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+}
+.guide-note--warn { border-left-color: var(--color-warning); background: var(--color-warning-tint); }
+.guide-note--stop { border-left-color: var(--color-danger); background: var(--color-danger-tint); }
+.guide-note--ok { border-left-color: var(--color-success); background: var(--color-success-tint); }
+.guide-note > :last-child { margin-bottom: 0; }
+.guide-note__title {
+  display: block;
+  font-weight: 700;
+  color: var(--color-text);
+  margin-bottom: var(--space-2);
+  font-size: 14px;
+}
+.guide-note p,
+.guide-note li { color: var(--color-text); }
+
+/* One idea per row: the plain-language sentence on the left, the exact
+   thing you type on the right. */
+.guide-table-wrap { overflow-x: auto; margin: var(--space-4) 0 var(--space-5); }
+.guide-table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 520px;
+  font-size: 14px;
+}
+.guide-table th,
+.guide-table td {
+  text-align: left;
+  vertical-align: top;
+  padding: var(--space-3);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  line-height: 1.55;
+}
+.guide-table th {
+  font-family: var(--type-label-font);
+  font-size: 11px;
+  letter-spacing: var(--type-label-tracking);
+  text-transform: uppercase;
+  color: var(--color-text-subtle);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.guide-table td { color: var(--color-text-muted); }
+.guide-table td code { white-space: nowrap; }
+.guide-table tr:last-child td { border-bottom: 0; }
+
+/* A block you type, verbatim. Not syntect-highlighted — these are shell
+   lines and JSON, and a wrong guess at the language reads worse than
+   no highlight at all. */
+.guide-code {
+  margin: var(--space-3) 0 var(--space-5);
+  padding: var(--space-4);
+  background: var(--color-surface-sunken);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--color-text);
+  white-space: pre;
+}
+.guide-code .c { color: var(--color-text-subtle); }
+
+/* ── The index page's chapter cards ───────────────────────────────── */
+.guide-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-3);
+  margin: var(--space-5) 0 0;
+}
+.guide-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  background: var(--color-surface-raised);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  text-decoration: none;
+}
+.guide-card:hover { border-color: var(--color-border-strong); }
+.guide-card__num {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-subtle);
+}
+.guide-card__title {
+  font-family: var(--font-display);
+  font-size: 17px;
+  line-height: 1.25;
+  color: var(--color-text);
+  font-weight: 600;
+}
+.guide-card__blurb {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+/* ── Previous / next ──────────────────────────────────────────────── */
+.guide-steps {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-8);
+  padding-top: var(--space-5);
+  border-top: var(--border-width-hairline) solid var(--color-border);
+}
+.guide-step {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-3) var(--space-4);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+}
+.guide-step:hover { border-color: var(--color-border-strong); }
+/* With no previous chapter the next one still sits at the right-hand end,
+   where it always is — a lone `Chương sau` sliding left would read as
+   `Chương trước` at a glance. */
+.guide-step--next { text-align: right; margin-left: auto; }
+.guide-step__rel {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-subtle);
+}
+.guide-step__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+@media (max-width: 700px) {
+  .layout--guide > .content { padding: var(--space-4) var(--space-4) var(--space-8); }
+  .guide-fig { padding: var(--space-3); }
+  .guide-steps { flex-direction: column; }
+  .guide-step--next { text-align: left; margin-left: 0; }
+}
+
+/* ============================================================
+   Changes screen (the working-tree diff, D2)
+
+   Layout, sidebar and mobile drawer are the Code section's own:
+   `.layout` + `#sidebar` + `.chapter`/`.chap-sec`/`.chap-file`
+   render the changed-file list, so nothing here re-implements
+   navigation — this block adds the diff palette, the status
+   badges and the two-pane table.
+
+   The panes sit on `--signature-dark-bg` for the same reason
+   `.codeview` does: /highlight.css is built for one dark syntect
+   theme regardless of the page scheme, so a light page painting
+   those token colors on a light pane would be unreadable. That
+   makes the diff palette below a mix INTO that pane colour rather
+   than into `--color-bg` — one derivation that is legible under
+   both page schemes, and that follows a theme which re-points
+   either the pane or the status colours.
+   ============================================================ */
+/* One bar at a time in the 53px slot under the topbar: the breadcrumb here
+   is a plain header row, and the slot belongs to whichever file section the
+   reader is currently inside. */
+.content--changes > .breadcrumb {
+  position: static;
+}
+.changes {
+  --diff-add-row: color-mix(in srgb, var(--color-success) 15%, var(--signature-dark-bg));
+  --diff-add-gutter: color-mix(in srgb, var(--color-success) 32%, var(--signature-dark-bg));
+  --diff-del-row: color-mix(in srgb, var(--color-danger) 15%, var(--signature-dark-bg));
+  --diff-del-gutter: color-mix(in srgb, var(--color-danger) 32%, var(--signature-dark-bg));
+  /* The side a row has no line on: dimmer than the pane, so a missing
+     counterpart reads as absence rather than as unchanged content. */
+  --diff-none-row: color-mix(in srgb, var(--signature-dark-text) 5%, var(--signature-dark-bg));
+  --diff-rule: color-mix(in srgb, var(--signature-dark-text) 14%, var(--signature-dark-bg));
+  --diff-gutter-text: color-mix(in srgb, var(--signature-dark-text) 55%, var(--signature-dark-bg));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4) 0 var(--space-8);
+}
+
+/* ── Header: what is being compared, and what is not shown ─────── */
+.changes__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: 0 var(--space-4);
+}
+.changes__count {
+  font-family: var(--type-heading-sm-font);
+  font-size: var(--type-heading-sm-size);
+  font-weight: var(--type-heading-sm-weight);
+  color: var(--color-text);
+}
+/* D6's base picker, sitting where the scope label used to sit: the same
+   quiet pill, now something you can change. The `<select>` keeps the
+   platform's own control — its arrow, its keyboard handling, its sheet on
+   mobile — and borrows nothing but this site's tokens. */
+.changes__base {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.changes__base-label {
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.changes__base-select,
+.changes__base-go {
+  max-width: 100%;
+  padding: var(--space-0) var(--space-2);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text);
+}
+.changes__base-select {
+  /* A long subject must not push the counter off the line. */
+  max-width: 26rem;
+  text-overflow: ellipsis;
+}
+.changes__base-go {
+  cursor: pointer;
+}
+.changes__base-go[hidden] {
+  display: none;
+}
+.changes__base-select:hover,
+.changes__base-go:hover {
+  border-color: var(--color-border-strong);
+}
+.changes__base-select:focus-visible,
+.changes__base-go:focus-visible {
+  outline: var(--border-width-strong) solid var(--focus-color);
+  outline-offset: 2px;
+}
+/* D4's N/M counter: the same pill as the scope chip beside it, so the two
+   read as one line of header state. It ships `hidden` and app.js unhides
+   it — this file only has to make sure the `display` below does not outrank
+   the UA sheet's `[hidden] { display: none }` (the trap `.proj-row[hidden]`
+   documents). At N == M it takes the site's own success accent plus the
+   checkmark app.js puts in the text: a quiet "that's all of them", not a
+   banner. */
+.changes__reviewed {
+  display: inline-block;
+  padding: var(--space-0) var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-family: var(--num-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.changes__reviewed[hidden] {
+  display: none;
+}
+.changes__reviewed--done {
+  background: var(--color-success-tint);
+  color: var(--color-success);
+}
+/* diff-file-collapse D3: Collapse all / Expand all, one control whose label
+   app.js flips by state. It borrows the base picker's pill so the head reads
+   as one line of chips, and it is scripting-only like everything else here:
+   shipped `hidden`, with its own `[hidden]` guard so the `display` implied
+   below cannot outrank the UA sheet's rule. */
+.changes__fold-all {
+  display: inline-block;
+  padding: var(--space-0) var(--space-2);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+.changes__fold-all[hidden] {
+  display: none;
+}
+.changes__fold-all:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+.changes__fold-all:focus-visible {
+  outline: var(--border-width-strong) solid var(--focus-color);
+  outline-offset: 2px;
+}
+/* D5: an aggregate count, never a name. */
+.changes__hidden,
+.changes__note,
+.changes__empty {
+  font-family: var(--type-body-sm-font);
+  font-size: var(--type-body-sm-size);
+  color: var(--color-text-muted);
+}
+.changes__note,
+.changes__empty {
+  margin: 0 var(--space-4);
+}
+.changes__note {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-warning-tint);
+  color: var(--color-text);
+}
+
+/* ── Sidebar rows: the Code section's `.chap-file` with a status badge
+   and the file's own +n −m appended. ──────────────────────────── */
+.chg-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.chg-row__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The sidebar's mirror of the section checkbox (D4). It holds its column
+   whether or not it is showing, so ticking a file never shifts the row's
+   name under the pointer. */
+.chg-row__check {
+  flex: none;
+  visibility: hidden;
+  color: var(--color-success);
+  font-size: var(--type-tag-size);
+}
+.chg-row--reviewed .chg-row__check {
+  visibility: visible;
+}
+.chg-row--reviewed .chg-row__name {
+  color: var(--color-text-muted);
+}
+.changes-nav__empty {
+  margin: 0;
+  padding: 0 var(--space-2);
+  font-family: var(--type-body-sm-font);
+  font-size: var(--type-body-sm-size);
+  color: var(--color-text-muted);
+}
+
+/* ── Status badge: one letter, colour by status. ───────────────── */
+.chg-badge {
+  flex: none;
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-xs);
+  font-family: var(--font-mono);
+  font-size: var(--type-tag-size);
+  line-height: 18px;
+  font-weight: var(--weight-semibold);
+  text-align: center;
+}
+.chg-badge--m {
+  background: var(--color-warning-tint);
+  color: var(--color-warning);
+}
+.chg-badge--a {
+  background: var(--color-success-tint);
+  color: var(--color-success);
+}
+.chg-badge--d {
+  background: var(--color-danger-tint);
+  color: var(--color-danger);
+}
+.chg-badge--r {
+  background: var(--color-info-tint);
+  color: var(--color-info);
+}
+.chg-stat {
+  flex: none;
+  display: inline-flex;
+  gap: var(--space-1);
+  font-family: var(--num-font);
+  font-size: var(--type-tag-size);
+}
+.chg-stat__add {
+  color: var(--color-success);
+}
+.chg-stat__del {
+  color: var(--color-danger);
+}
+
+/* ── One file's section: a sticky header over its own diff pane. The
+   header stops under the topbar (53px, the same structural offset the
+   sidebar and breadcrumb use) so the path stays readable while a long
+   file scrolls past. ──────────────────────────────────────────── */
+.changeset {
+  border-top: var(--border-width-hairline) solid var(--color-border);
+}
+.changeset__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  position: sticky;
+  top: 53px;
+  z-index: var(--z-nav);
+  background: var(--color-surface);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  font-family: var(--type-body-sm-font);
+  font-size: var(--type-body-sm-size);
+  font-weight: var(--weight-regular);
+}
+/* diff-file-collapse D1: the per-file fold, first in the sticky header so
+   the chevrons line up down the page. Scripting-only like the checkbox at
+   the other end of the header, so it ships `hidden` and carries its own
+   `[hidden]` guard - the `display` here would otherwise outrank the UA
+   sheet's `[hidden] { display: none }` (the trap `.proj-row[hidden]`
+   documents). */
+.changeset__fold {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-5);
+  height: var(--space-5);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-text-subtle);
+  font-size: var(--type-body-sm-size);
+  line-height: 1;
+  cursor: pointer;
+}
+.changeset__fold[hidden] {
+  display: none;
+}
+.changeset__fold:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+.changeset__fold:focus-visible {
+  outline: var(--border-width-strong) solid var(--focus-color);
+  outline-offset: 2px;
+}
+/* Open points down at the diff, folded points along the header - the same
+   glyph and the same quarter turn the Docs subfolder disclosure uses. */
+.changeset__fold-chev {
+  display: block;
+  transform: rotate(90deg);
+  transition: transform var(--motion-fast) var(--ease-standard);
+}
+.changeset--collapsed .changeset__fold-chev {
+  transform: none;
+}
+.changeset__path {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  color: var(--color-text);
+  word-break: break-all;
+}
+/* The reviewed checkbox, at the far end of the sticky header where the
+   reader's eye lands after the path and the counts. Scripting-only, so it
+   ships `hidden`; the `display` here would otherwise outrank the UA sheet's
+   `[hidden]` rule and show a box that remembers nothing. */
+.changeset__review {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--type-caption-font);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.changeset__review[hidden] {
+  display: none;
+}
+.changeset__review-box {
+  margin: 0;
+  accent-color: var(--color-success);
+}
+/* Reviewed: the section steps back rather than disappearing — the header
+   stays fully legible so the file is still findable by name. */
+.changeset--reviewed .changeset__path {
+  color: var(--color-text-muted);
+}
+.changeset--reviewed .changeset__review {
+  color: var(--color-success);
+}
+.changeset--reviewed .changeset__body {
+  opacity: 0.55;
+}
+/* Folded away. Clicking the header brings it back (app.js), which is why the
+   header itself is never hidden with it. */
+.changeset--collapsed .changeset__body {
+  display: none;
+}
+.changeset--collapsed .changeset__head {
+  cursor: pointer;
+}
+.changeset__note {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  font-size: var(--type-tag-size);
+  color: var(--color-text-muted);
+}
+.changeset__flat {
+  margin: 0;
+  padding: var(--space-4);
+  background: var(--signature-dark-bg);
+  color: var(--signature-dark-text);
+  font-family: var(--type-body-sm-font);
+  font-size: var(--type-body-sm-size);
+}
+.changeset__open {
+  color: var(--color-link);
+}
+.changeset__scroll {
+  overflow-x: auto;
+  background: var(--signature-dark-bg);
+  color: var(--signature-dark-text);
+}
+.changeset__table {
+  width: 100%;
+  min-width: 560px;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--fs-prose-code);
+  line-height: var(--lh-prose-code);
+}
+
+/* ── Diff rows: gutter, pane, gutter, pane. The tint says which side a
+   line belongs to; the gutter carries a stronger shade of the same
+   colour so the two read as one row even at a glance. ─────────── */
+.diffrow__num {
+  box-sizing: border-box;
+  width: 3.5em;
+  padding: 0 var(--space-2);
+  text-align: right;
+  vertical-align: top;
+  user-select: none;
+  color: var(--diff-gutter-text);
+  border-right: var(--border-width-hairline) solid var(--diff-rule);
+}
+.diffrow__num--new {
+  border-left: var(--border-width-hairline) solid var(--diff-rule);
+}
+.diffrow__side {
+  box-sizing: border-box;
+  width: calc(50% - 3.5em);
+  padding: 0 var(--space-3);
+  vertical-align: top;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.diffrow__side code {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+}
+.diffrow--del .diffrow__side--old,
+.diffrow--chg .diffrow__side--old {
+  background: var(--diff-del-row);
+}
+.diffrow--del .diffrow__num--old,
+.diffrow--chg .diffrow__num--old {
+  background: var(--diff-del-gutter);
+}
+.diffrow--add .diffrow__side--new,
+.diffrow--chg .diffrow__side--new {
+  background: var(--diff-add-row);
+}
+.diffrow--add .diffrow__num--new,
+.diffrow--chg .diffrow__num--new {
+  background: var(--diff-add-gutter);
+}
+.diffrow__side--none {
+  background: var(--diff-none-row);
+}
+
+@media (max-width: 700px) {
+  .changes__head,
+  .changeset__head {
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+}
+
+/* ============================================================
+   TERMINAL WORKSPACE — FILES | DIFF SIDEBAR + PANEL
+   (changes-diff-screen D8 · terminal panel D1/D2 · unified by
+   term-workspace-unify)
+   ONE layout, rendered the same way by the homepage terminals tab and by a
+   project's terminal page: the terminal in the left column, a sidebar on the
+   right carrying the Files | Diff tabs over one lazy nav frame, and the panel
+   those frames open into sitting above the terminal, splitting the area in
+   half.
+   Closed costs nothing: `.term-work__panel` and the nav frames carry the
+   `hidden` attribute and NO rule here sets `display` on them unconditionally
+   (`:not([hidden])` is what turns the panel into a column), so a page where
+   nobody opens a file is the page it has always been, plus the sidebar.
+   ============================================================ */
+.term-work { display: flex; align-items: stretch; gap: var(--space-3); min-width: 0; }
+.term-work__col { display: flex; flex-direction: column; gap: var(--space-2); flex: 1 1 auto; min-width: 0; min-height: 0; }
+/* Judged against the nav pages it holds: the Code tree's own sidebar is
+   240px wide and the changed-file list's rows carry a badge and ± counts
+   beside the name, so 280px is the width where a middling path stops
+   wrapping — and it is taken from a `<main>` that already stretches to fill
+   whatever room is left beside it (the homepage's 320px rail is the
+   narrowest case). */
+.term-work__side { display: flex; flex-direction: column; gap: var(--space-2); flex: 0 0 280px; min-width: 0; min-height: 0; }
+.term-work__tabs { display: flex; gap: var(--space-1); min-width: 0; }
+/* Halved across the sidebar's width, so the pair reads as one control rather
+   than two loose buttons. */
+.term-work__tab { flex: 1 1 0; padding: var(--space-1) var(--space-3); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); letter-spacing: .04em; cursor: pointer; }
+.term-work__tab:hover { border-color: var(--color-border-strong); color: var(--color-text); }
+.term-work__tab--on { border-color: var(--color-action); color: var(--color-text); font-weight: var(--weight-semibold); }
+/* The hint is what the sidebar says before either tab is opened; once one
+   is, the frame below says it better. */
+.term-work__side--open .term-work__hint { display: none; }
+.term-work__navs { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; }
+.term-work__nav { flex: 1 1 auto; width: 100%; min-height: 360px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); }
+.term-work__panel { min-height: 0; min-width: 0; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); overflow: hidden; }
+.term-work__panel:not([hidden]) { display: flex; flex-direction: column; }
+.term-work__panel-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: var(--space-1) var(--space-2); border-bottom: var(--border-width-hairline) solid var(--color-border); }
+.term-work__panel-name { font-size: var(--type-tag-size); letter-spacing: .04em; color: var(--color-text-muted); }
+.term-work__close { padding: var(--space-1) var(--space-2); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-muted); font-size: var(--type-tag-size); cursor: pointer; }
+.term-work__close:hover { border-color: var(--color-border-strong); color: var(--color-text); }
+.term-work__frame { display: block; flex: 1 1 auto; width: 100%; min-height: 0; border: 0; }
+/* The split itself, applied by `assets/app.js` to `<main>` while a panel is
+   open: the page stops scrolling as one column and becomes a fixed frame
+   divided in half — panel on top, terminal below. 53px is the topbar's own
+   pinned height (see `.topbar` above), the one thing between the viewport
+   top and this element. The terminal half scrolls inside itself, which is
+   what lets `.term-screen` keep the `height: auto` full-frame rendering the
+   page has always given it; its WIDTH is untouched, so the screen poller's
+   font fit reads exactly what it read before. Both pages put the same class
+   on the same element, so there is ONE definition of what "split" means. */
+main.fg-page.term-split { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }
+main.fg-page.term-split .term-work { height: 100%; min-height: 0; }
+main.fg-page.term-split .term-work__panel { flex: 1 1 50%; }
+/* The slim rule between the two halves — one hairline, so the boundary reads
+   as a boundary without spending a band on it. */
+main.fg-page.term-split .term-work__screen { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top: var(--border-width-hairline) solid var(--color-border); padding-top: var(--space-2); }
+/* Narrow: the sidebar goes UNDER the terminal rather than squeezing it —
+   the same answer the rail already gives at this width (it becomes a
+   drawer), for the same reason. A fixed-height split has nothing to divide
+   on a handset either, so the page goes back to scrolling as one column
+   with the panel taking a readable slice of the viewport. The rules below
+   are unscoped on purpose: both pages carry `main.fg-page.term-split`, and
+   only one of them sits inside `.home-shell`. 700px is the one breakpoint
+   this layout uses. */
+@media (max-width: 700px) {
+  .term-work { flex-direction: column; }
+  .term-work__side { flex: none; width: auto; }
+  .term-work__nav { min-height: 60vh; }
+  main.fg-page.term-split { height: auto; overflow: visible; }
+  main.fg-page.term-split .term-work { height: auto; }
+  main.fg-page.term-split .term-work__panel { flex: none; height: 60vh; }
+  main.fg-page.term-split .term-work__screen { flex: none; overflow: visible; }
+}
+
+/* ============================================================
+   EMBED MODE (changes-diff-screen, D9)
+   `?embed=1` renders the Code and Changes pages without the topbar, for a
+   same-origin iframe (the terminal screen's FILES | DIFF panel). The markup
+   below the bar is unchanged — the only thing that has to move is the sticky
+   geometry, because every offset above was measured against the topbar's
+   53px and there is now nothing above them at all. Each rule here is exactly
+   one of those offsets, zeroed. Placed last in the file on purpose: the
+   drawer rules it overrides carry the same specificity, so source order is
+   what decides.
+   ============================================================ */
+.layout--embed > .sidebar,
+.layout--embed > .rightbar {
+  height: 100vh;
+  top: 0;
+}
+.layout--embed > .content--code {
+  height: 100vh;
+}
+/* A file section's own sticky header: it stopped under the bar, now it stops
+   at the frame's top edge. */
+.layout--embed .changeset__head {
+  top: 0;
+}
+/* Anchor navigation (a sidebar row jumping to its section) reserved the bar's
+   height so the target never landed under it; with no bar, that reserve is
+   just a gap above every jump. */
+html:has(.layout--embed) {
+  scroll-padding-top: var(--space-3);
+}
+@media (max-width: 700px) {
+  .layout--embed.sidebar-open .sidebar {
+    top: 0;
+  }
+  .layout--embed.sidebar-open .sidebar-backdrop {
+    inset: 0;
+  }
+}
+
+/* ============================================================
+   NAV-ONLY MODE (home-terminal-panel, D2)
+   `?embed=1&nav=1` serves a Code or Changes page as its NAVIGATION alone —
+   the tree, or the changed-file list — for the two narrow iframes in the
+   homepage terminals tab's right sidebar. The rows themselves are the
+   sidebar rows the full pages already ship (`.chapter`, `.chap-file`,
+   `.chg-row`), unchanged and unduplicated; what this block does is put them
+   in a document that is nothing but them, at roughly a third of the width
+   `.sidebar` was drawn for. Placed after the embed rules for the same
+   reason those were placed last: source order decides between rules of
+   equal specificity.
+   ============================================================ */
+.nav-only {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: var(--space-3) var(--space-2);
+  background: var(--color-surface);
+}
+/* No topbar above this document, so an anchored jump has nothing to clear —
+   the reserve `html` keeps for the 53px bar would just be a gap here. */
+html:has(.nav-only) {
+  scroll-padding-top: var(--space-3);
+}
+/* The Diff nav's header strip: the base picker, ruled off from the list it
+   governs so a long file list scrolling past it stays legible. */
+.nav-only__head {
+  margin-bottom: var(--space-2);
+  padding-bottom: var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+}
+/* The picker at sidebar width: the label sits above its control rather than
+   beside it, and the select gives up the 26rem it holds on the full screen —
+   at this width that cap is wider than the frame. */
+.nav-only .changes__base {
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.nav-only .changes__base-select {
+  flex: 1 1 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.nav-only .changes__base-go {
+  flex: none;
+}
+/* The Files nav's own search box is inert on these pages (the Code tree
+   ships it disabled); it keeps its place but not the full sidebar's gap. */
+.nav-only .fg-sidebar-search {
+  margin-bottom: var(--space-2);
+}
+/* A file's `+n −m` must not push its name out of the row: the name is the
+   part that ellipses, the counts hold their width. */
+.nav-only .chg-stat {
+  flex: none;
+}
+
+/* ============================================================
+   PANEL MODE (home-terminal-panel, UAT)
+   `?embed=1&panel=1` is embed mode minus the page's OWN sidebar. The frame
+   this renders into — the panel above the homepage terminal — sits directly
+   beside the sidebar that already lists these changed files (or this file
+   tree), so a second copy inside the frame is the same list twice at half
+   the width each. The markup drops `#sidebar` and its backdrop; `.content`
+   then takes the whole frame from `.layout`'s own flex, and this block only
+   states what must stay true of it. `layout--panel` always rides BESIDE
+   `layout--embed`, so every sticky offset above is already handled and
+   nothing here repeats it.
+   ============================================================ */
+.layout--panel > .content {
+  width: 100%;
+  max-width: none;
+}
+
+.usage {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.usage__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+.usage__title {
+  margin: 0;
+  margin-right: auto;
+}
+.usage__h2 {
+  margin: 0;
+  font-size: var(--type-body-sm-size);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text-muted);
+}
+.usage__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.usage__chip {
+  padding: var(--space-1) var(--space-2);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-pill);
+  color: var(--color-text-muted);
+  font-size: var(--type-caption-size);
+  text-decoration: none;
+}
+.usage__chip:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+.usage__chip--on {
+  border-color: var(--color-action);
+  color: var(--color-action);
+  font-weight: var(--weight-semibold);
+}
+.usage__kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-2);
+}
+.usage__kpi {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+}
+.usage__kpi-label {
+  color: var(--color-text-subtle);
+  font-size: var(--type-caption-size);
+}
+.usage__kpi-value {
+  font-family: var(--font-mono);
+  font-size: 1.25rem;
+  color: var(--color-text);
+}
+.usage__bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 96px;
+  padding: var(--space-2);
+  border: var(--border-width-hairline) solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+}
+.usage__bar {
+  flex: 1 1 0;
+  min-height: 1px;
+  background: var(--color-action);
+  border-radius: 2px 2px 0 0;
+}
+.usage__scroll {
+  overflow-x: auto;
+}
+.usage__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--type-body-sm-size);
+}
+.usage__table th,
+.usage__table td {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  text-align: left;
+  white-space: nowrap;
+}
+.usage__table th {
+  color: var(--color-text-subtle);
+  font-weight: var(--weight-semibold);
+}
+.usage__model {
+  margin-right: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-muted);
+}
+.usage__runs {
+  display: flex;
+  flex-direction: column;
+  font-size: var(--type-body-sm-size);
+}
+.usage__group {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--type-body-sm-size);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+.usage__group-total {
+  font-family: var(--font-mono);
+  color: var(--color-text-muted);
+}
+.usage__run-row {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) 4.5rem minmax(6rem, 10rem) 8.5rem 4.5rem 4.5rem 5rem;
+  gap: var(--space-2);
+  align-items: baseline;
+  padding: var(--space-1) var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+}
+.usage__run-row > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage__runs-head {
+  color: var(--color-text-subtle);
+  font-weight: var(--weight-semibold);
+}
+details.usage__run > summary {
+  cursor: pointer;
+  list-style: none;
+}
+details.usage__run > summary::-webkit-details-marker {
+  display: none;
+}
+details.usage__run > summary .usage__task::before {
+  content: "▸ ";
+  color: var(--color-text-subtle);
+}
+details.usage__run[open] > summary .usage__task::before {
+  content: "▾ ";
+}
+details.usage__run > summary:hover {
+  background: var(--color-surface-hover);
+}
+.usage__subagents {
+  margin: 0;
+  padding: var(--space-1) var(--space-2) var(--space-2) var(--space-5);
+  list-style: none;
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  background: var(--color-surface-sunken);
+}
+.usage__subagent {
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1) 0;
+  min-width: 0;
+}
+.usage__subagent-title {
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+.usage__subagent-meta {
+  font-size: var(--type-caption-size);
+  color: var(--color-text-subtle);
+  overflow-wrap: anywhere;
+}
+@media (max-width: 720px) {
+  .usage__run-row {
+    grid-template-columns: repeat(3, auto);
+    justify-content: start;
+    column-gap: var(--space-3);
+  }
+  .usage__run-row > .usage__task {
+    grid-column: 1 / -1;
+    white-space: normal;
+  }
+  .usage__runs-head {
+    display: none;
+  }
+}
+.usage__sub {
+  margin-left: var(--space-1);
+  font-size: var(--type-caption-size);
+  color: var(--color-text-subtle);
+}
+.usage__more {
+  margin: 0;
+  font-size: var(--type-caption-size);
+  color: var(--color-text-subtle);
+}
+.bee-upgrade {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.bee-upgrade__title,
+.bee-upgrade__source,
+.bee-upgrade__note,
+.bee-upgrade__error {
+  margin: 0;
+}
+.bee-upgrade__note {
+  color: var(--color-text-subtle);
+  font-size: var(--type-caption-size);
+}
+.bee-upgrade__dirty,
+.bee-upgrade__error {
+  color: var(--color-danger);
+}
+.bee-upgrade__scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+.bee-upgrade__table {
+  border-collapse: collapse;
+  font-size: var(--type-caption-size);
+  white-space: nowrap;
+}
+.bee-upgrade__table th,
+.bee-upgrade__table td {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: var(--border-width-hairline) solid var(--color-border);
+  text-align: left;
+}
+.bee-upgrade__status {
+  font-family: var(--font-mono, monospace);
+}
+.bee-upgrade__row--pending .bee-upgrade__status {
+  color: var(--color-action);
+}
+.bee-upgrade__row--failed .bee-upgrade__status,
+.bee-upgrade__row--applied_not_committed .bee-upgrade__status {
+  color: var(--color-danger);
+}
+.bee-upgrade__detail {
+  white-space: normal;
+  min-width: 16rem;
+}
+.bee-upgrade__form {
+  margin: 0;
 }

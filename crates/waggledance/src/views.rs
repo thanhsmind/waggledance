@@ -2,16 +2,25 @@
 //! Theme is CSS-variable driven (no-flash head script); code colors come from
 //! `/highlight.css` (syntect class-based), so themes switch without re-render.
 
+use crate::guide;
 use waggledance_core::bee::{
     feature_cell_span, list_archived_feature_dirs, BeeActivity, BeeActivityState, BeeApprovedGates,
     BeeBacklog, BeeBuckets, BeeCell, BeeDecisionSummary, BeeDeferredEntry, BeeFeaturePhase, BeePbi,
     BeeProjectRollup, BeeReview, BeeReviewStatus, BeeSession, BeeShippedFeature, BeeSignal,
     BeeSnapshot, BeeWorkspace, BeeWorktree,
 };
+use waggledance_core::bee_upgrade::{Outcome, UpgradeReport};
 use waggledance_core::code_source::DirListing;
 use waggledance_core::config::Config;
 use waggledance_core::domain::{IndexedFile, Project, RenderedPage, Run, SearchResult};
-use waggledance_core::render::HighlightedSource;
+use waggledance_core::engine::{ChangesContent, ChangesView};
+use waggledance_core::git_diff::{
+    ActiveBase, ChangeBody, ChangeStatus, CommitEntry, DiffLine, FileChange, GitDiffError,
+    LineKind, WorkingTreeDiff,
+};
+use waggledance_core::render::{HighlightedSource, RenderService};
+use waggledance_core::short_link::{path_hash, short_code};
+use waggledance_core::usage::{ModelSpend, RunRow, UsageSummary};
 
 pub fn layout(title: &str, head_extra: &str, body: &str) -> String {
     let title = esc(title);
@@ -172,6 +181,8 @@ pub enum HomeTab {
     /// [`terminals_tab`] is what tells the herdr-off and no-agent empty
     /// causes apart once this section is actually selected.
     Terminals,
+    Usage,
+    Bee,
 }
 
 /// cross-board (D1, superseded) / homepage-tabs: the home page `/` used to
@@ -230,6 +241,14 @@ pub fn home_page(
     // already does — threaded through so `terminals_tab` can offer the
     // same "New shell"/preset buttons the project terminal page offers.
     terminals_presets: &[String],
+    // board-visibility bv-4: the per-project bee roll-up `server.rs::index_page`
+    // already read for the Kanban section, keyed by project id and forwarded
+    // verbatim into [`project_sidebar`] — plumbing only, never a second read.
+    // A project with no `.bee/` (or with the roll-up read skipped entirely) is
+    // simply absent from the map and its row stays exactly as it was.
+    bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
+    leader_waits: &LeaderWaitsByProject,
+    tab_html: &str,
 ) -> String {
     // console-theme-kanban (ctk-12), retargeting homepage-tabs edge (b):
     // this line used to force the Projects tab, because that was the only
@@ -278,6 +297,8 @@ pub fn home_page(
                     // still be in the query — the topbar's Orchestrator
                     // button is what is current here.
                     None,
+                    bee_by_project,
+                    leader_waits,
                 ),
                 // D1 (backlog-groom-2): an empty `cross_features_html`
                 // (D9 — no registered project carries a `.bee` board) used
@@ -330,12 +351,39 @@ pub fn home_page(
                     // reader is actually looking at.
                     effective_pane(terminals_panes, terminals_selected_pane)
                         .map(|p| p.view.pane_id.as_str()),
+                    bee_by_project,
+                    leader_waits,
                 ),
                 body = terminals_tab(
                     terminals_panes,
                     terminals_selected_pane,
                     terminals_herdr_ok,
                     terminals_presets,
+                ),
+            ),
+        ),
+        HomeTab::Usage | HomeTab::Bee => (
+            if tab == HomeTab::Bee { "Bee" } else { "Usage" },
+            format!(
+                r#"<div class="home-shell">
+{toggle}
+{sidebar}
+{backdrop}
+<main class="fg-page">
+  {tab_html}
+</main>
+</div>"#,
+                toggle = HOME_RAIL_TOGGLE,
+                backdrop = HOME_RAIL_BACKDROP,
+                sidebar = project_sidebar(
+                    projects,
+                    unassigned_visible,
+                    suggestions,
+                    register_error,
+                    terminals_panes,
+                    None,
+                    bee_by_project,
+                    leader_waits,
                 ),
             ),
         ),
@@ -366,9 +414,23 @@ pub fn home_page(
     // it". A button and not an anchor — unlike Orchestrator it has no
     // destination to survive a reload to, and its whole behaviour is the
     // overlay below.
+    let tab_link = |on: bool, slug: &str, label: &str| {
+        let (on_class, aria) = if on {
+            (" topbar__orchestrator--on", r#" aria-current="page""#)
+        } else {
+            ("", "")
+        };
+        format!(
+            r#"<a class="fg-btn fg-btn--ghost topbar__orchestrator{on_class}" href="/?tab={slug}"{aria}>{label}</a>"#
+        )
+    };
+    let usage = tab_link(tab == HomeTab::Usage, "usage", "Usage");
+    let bee = tab_link(tab == HomeTab::Bee, "bee", "Bee");
     let actions = format!(
         r#"<button type="button" class="fg-btn fg-btn--ghost topbar__new-task" data-new-task-open>+ New task</button>
-    {orchestrator}"#
+    {orchestrator}
+    {usage}
+    {bee}"#
     );
     let body = format!(
         r#"{topbar}
@@ -473,10 +535,21 @@ const HOME_RAIL_BACKDROP: &str =
     r#"<label for="rail-toggle" class="home-rail__backdrop" aria-hidden="true"></label>"#;
 
 /// console-phone-layout (P2): the handset's bottom bar — `Board` · `Agents`
-/// · `Projects` · `Settings`, in that order, hidden above 700px by
-/// `app.css` and never rendered conditionally (see [`home_page`]'s call).
+/// · `Projects` · `Hướng dẫn` · `Settings`, in that order, hidden above
+/// 900px by `app.css` and never rendered conditionally (see [`home_page`]'s
+/// call). guide-vi added the fourth destination: the built-in guide is
+/// reachable from a phone without opening the top bar's menu, and the CSS
+/// grid widened to five columns in the same edit.
 ///
-/// Three of the four are real anchors, for the same reason every other
+/// board-visibility bi-2 stopped there: the inbox (`/inbox`) is reached from
+/// the top bar menu on every page ([`topbar_full`]) and is deliberately NOT a
+/// sixth column here. Widening this bar is a layout decision its owner took
+/// once already (dcfbda20, four columns to five, with the stylesheet's grid
+/// changed to match), and a sixth 60px-wide destination on a handset is a
+/// decision to take deliberately rather than inherit from whoever adds the
+/// next page. The menu has no such ceiling, so nothing is unreachable.
+///
+/// Four of the five are real anchors, for the same reason every other
 /// navigation control on this page is: they have to survive the full page
 /// reload and work with scripting off. `Projects` is the exception, and
 /// cannot be an anchor — there is no separate projects route to point at
@@ -487,7 +560,7 @@ const HOME_RAIL_BACKDROP: &str =
 /// Accessibility: the bar is a named `<nav>` landmark, separate from the
 /// topbar's own; exactly one item claims `aria-current="page"` — `Board` on
 /// the board, `Agents` on the terminals view, and neither `Projects` (which
-/// navigates nowhere) nor `Settings` (a different page) ever. The current
+/// navigates nowhere) nor `Settings`/`Hướng dẫn` (other pages) ever. The current
 /// item is not marked by colour alone: it also carries a heavier top rule
 /// (`.home-tabbar__item--on` in app.css). Each glyph is decorative and the
 /// visible label beside it is the accessible name.
@@ -504,7 +577,7 @@ const HOME_RAIL_BACKDROP: &str =
 ///
 /// That order is also the whole scripting-off fallback: with no script the
 /// bar stays visible and the handle stays `hidden`, so a phone without
-/// JavaScript keeps all four destinations and is never offered a control
+/// JavaScript keeps every destination and is never offered a control
 /// that does nothing. Both chevrons ride in the markup and CSS shows exactly
 /// one, so a flip is a class on the `<nav>`, never a script rewriting an
 /// icon.
@@ -516,15 +589,18 @@ fn home_tabbar(tab: HomeTab) -> String {
             ("", "")
         }
     };
-    let (board_on, agents_on) = match tab {
-        HomeTab::Kanban => (mark(true), mark(false)),
-        HomeTab::Terminals => (mark(false), mark(true)),
-    };
+    let board_on = mark(tab == HomeTab::Kanban);
+    let agents_on = mark(tab == HomeTab::Terminals);
+    let usage_on = mark(tab == HomeTab::Usage);
+    let bee_on = mark(tab == HomeTab::Bee);
     format!(
         r#"<nav class="home-tabbar" id="home-tabbar" aria-label="Sections">
 <a class="home-tabbar__item{board_class}" href="/?tab=kanban"{board_aria}>{board_icon}<span class="home-tabbar__label">Board</span></a>
 <a class="home-tabbar__item{agents_class}" href="/?tab=terminals"{agents_aria}>{agents_icon}<span class="home-tabbar__label">Agents</span></a>
+<a class="home-tabbar__item{usage_class}" href="/?tab=usage"{usage_aria}>{usage_icon}<span class="home-tabbar__label">Usage</span></a>
+<a class="home-tabbar__item{bee_class}" href="/?tab=bee"{bee_aria}>{bee_icon}<span class="home-tabbar__label">Bee</span></a>
 <label class="home-tabbar__item" for="rail-toggle">{projects_icon}<span class="home-tabbar__label">Projects</span></label>
+<a class="home-tabbar__item" href="/guide">{guide_icon}<span class="home-tabbar__label">Hướng dẫn</span></a>
 <a class="home-tabbar__item" href="/settings">{settings_icon}<span class="home-tabbar__label">Settings</span></a>
 </nav>
 <button type="button" class="home-tabbar__toggle" hidden aria-controls="home-tabbar" aria-expanded="false">{show_icon}{hide_icon}</button>"#,
@@ -532,9 +608,16 @@ fn home_tabbar(tab: HomeTab) -> String {
         board_aria = board_on.1,
         agents_class = agents_on.0,
         agents_aria = agents_on.1,
+        usage_class = usage_on.0,
+        usage_aria = usage_on.1,
+        usage_icon = TABBAR_ICON_USAGE,
+        bee_class = bee_on.0,
+        bee_aria = bee_on.1,
+        bee_icon = TABBAR_ICON_BEE,
         board_icon = TABBAR_ICON_BOARD,
         agents_icon = TABBAR_ICON_AGENTS,
         projects_icon = TABBAR_ICON_PROJECTS,
+        guide_icon = TABBAR_ICON_GUIDE,
         settings_icon = TABBAR_ICON_SETTINGS,
         show_icon = TABBAR_ICON_SHOW,
         hide_icon = TABBAR_ICON_HIDE,
@@ -550,9 +633,15 @@ const TABBAR_ICON_BOARD: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 2
 /// The terminal prompt of [`agent_toggle`], redrawn at this bar's weight —
 /// the same mark for the same thing (a live agent screen) in both places.
 const TABBAR_ICON_AGENTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>"#;
+const TABBAR_ICON_USAGE: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="20" x2="20" y2="20"></line><line x1="7" y1="16" x2="7" y2="11"></line><line x1="12" y1="16" x2="12" y2="6"></line><line x1="17" y1="16" x2="17" y2="9"></line></svg>"#;
+const TABBAR_ICON_BEE: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 3 19 7 19 17 12 21 5 17 5 7"></polygon><polyline points="9 12 12 9 15 12"></polyline><line x1="12" y1="9" x2="12" y2="16"></line></svg>"#;
 const TABBAR_ICON_PROJECTS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>"#;
 /// The topbar gear's own outline, so Settings is the same mark wherever the
 /// reader meets it.
+/// guide-vi: the built-in guide's own mark — an open book, the same
+/// 1.5-weight outline every other tab bar glyph is drawn at.
+const TABBAR_ICON_GUIDE: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>"#;
+
 const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>"#;
 
 /// The handle's two chevrons, drawn to the same recipe as the four tab
@@ -562,6 +651,442 @@ const TABBAR_ICON_SETTINGS: &str = r#"<svg class="home-tabbar__icon" viewBox="0 
 /// down means "hide it".
 const TABBAR_ICON_SHOW: &str = r#"<svg class="home-tabbar__toggle-icon home-tabbar__toggle-icon--show" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 15 12 9 18 15"></polyline></svg>"#;
 const TABBAR_ICON_HIDE: &str = r#"<svg class="home-tabbar__toggle-icon home-tabbar__toggle-icon--hide" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>"#;
+
+pub fn bee_tab(report: Option<&UpgradeReport>, error: Option<&str>) -> String {
+    let report = match (report, error) {
+        (Some(r), None) => r,
+        (_, e) => {
+            return format!(
+                r#"<section class="bee-upgrade">
+<h1 class="bee-upgrade__title">Bee upgrade</h1>
+<p class="bee-upgrade__error">{}</p>
+</section>"#,
+                esc(e.unwrap_or("no report"))
+            )
+        }
+    };
+    let opt = |v: &Option<String>| esc(v.as_deref().unwrap_or("-"));
+    let offer = !report.applied;
+    let mut any_pending = false;
+    let mut rows = String::new();
+    for p in &report.projects {
+        let (word, files, detail) = match &p.outcome {
+            Outcome::UpToDate => ("up_to_date", 0, String::new()),
+            Outcome::Pending { files } => ("pending", files.len(), String::new()),
+            Outcome::Upgraded { commit, files } => ("upgraded", files.len(), esc(commit)),
+            Outcome::AppliedNotCommitted { files, error } => {
+                ("applied_not_committed", files.len(), esc(error))
+            }
+            Outcome::Skipped { reason, files } if files.is_empty() => ("skipped", 0, esc(reason)),
+            Outcome::Skipped { reason, files } => (
+                "skipped",
+                files.len(),
+                format!("{}: {}", esc(reason), esc(&files.join(", "))),
+            ),
+            Outcome::Failed { error } => ("failed", 0, esc(error)),
+        };
+        let action = if offer && word == "pending" {
+            any_pending = true;
+            format!(
+                r#"<form class="bee-upgrade__form" method="post" action="/api/bee/upgrade"><input type="hidden" name="project" value="{}"><button type="submit" class="fg-btn fg-btn--ghost">Upgrade</button></form>"#,
+                esc(&p.id)
+            )
+        } else {
+            String::new()
+        };
+        rows.push_str(&format!(
+            r#"<tr class="bee-upgrade__row bee-upgrade__row--{word}"><td>{name}</td><td>{branch}</td><td>{from}</td><td>{to}</td><td class="bee-upgrade__status">{word}</td><td>{files}</td><td class="bee-upgrade__detail">{detail}</td><td>{notices}</td><td>{action}</td></tr>
+"#,
+            name = esc(&p.name),
+            branch = opt(&p.branch),
+            from = opt(&p.from_version),
+            to = opt(&p.to_version),
+            notices = p.notices.len(),
+        ));
+    }
+    let all = if any_pending {
+        r#"<form class="bee-upgrade__form" method="post" action="/api/bee/upgrade"><input type="hidden" name="all" value="1"><button type="submit" class="fg-btn fg-btn--primary">Upgrade all pending</button></form>"#
+    } else {
+        ""
+    };
+    let dirty = if report.source_dirty {
+        r#" <span class="bee-upgrade__dirty">source has uncommitted changes</span>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<section class="bee-upgrade">
+<header class="bee-upgrade__head">
+<h1 class="bee-upgrade__title">Bee upgrade</h1>
+<p class="bee-upgrade__source">source <code>{root}</code> @ {branch} {sha}{dirty} · target {target}</p>
+</header>
+<p class="bee-upgrade__note">An upgrade commits only bee's files, and skips projects with overlapping uncommitted edits or a live bee session.</p>
+{all}
+<div class="bee-upgrade__scroll">
+<table class="bee-upgrade__table">
+<thead><tr><th>Project</th><th>Branch</th><th>From</th><th>To</th><th>Status</th><th>Files</th><th>Detail</th><th>Notices</th><th></th></tr></thead>
+<tbody>
+{rows}</tbody>
+</table>
+</div>
+</section>"#,
+        root = esc(&report.source_root.to_string_lossy()),
+        branch = opt(&report.source_branch),
+        sha = opt(&report.source_head),
+        target = opt(&report.target_version),
+    )
+}
+
+pub const USAGE_WINDOWS: [u32; 4] = [1, 7, 14, 30];
+
+pub fn usage_tab(
+    summary: &UsageSummary,
+    days: u32,
+    project: Option<&str>,
+    projects: &[(String, String)],
+) -> String {
+    let href = |d: u32, p: Option<&str>| match p {
+        Some(id) => format!("/?tab=usage&amp;days={d}&amp;project={}", query_escape(id)),
+        None => format!("/?tab=usage&amp;days={d}"),
+    };
+    let chip = |label: String, url: String, on: bool| {
+        let (class, aria) = if on {
+            (" usage__chip--on", r#" aria-current="true""#)
+        } else {
+            ("", "")
+        };
+        format!(r#"<a class="usage__chip{class}" href="{url}"{aria}>{label}</a>"#)
+    };
+    let windows: String = USAGE_WINDOWS
+        .iter()
+        .map(|&d| chip(format!("{d}d"), href(d, project), d == days))
+        .collect();
+    let mut filters = chip("All".to_string(), href(days, None), project.is_none());
+    for (id, name) in projects {
+        filters.push_str(&chip(
+            esc(name),
+            href(days, Some(id)),
+            project == Some(id.as_str()),
+        ));
+    }
+    let head = format!(
+        r#"<header class="usage__head">
+  <h1 class="usage__title">Token usage</h1>
+  <nav class="usage__chips" aria-label="Window">{windows}</nav>
+  <nav class="usage__chips" aria-label="Project">{filters}</nav>
+</header>"#
+    );
+    if summary.totals.all.total() == 0 {
+        return format!(
+            r#"<section class="usage">
+{head}
+<p class="fg-empty">No agent activity in this window.</p>
+</section>"#
+        );
+    }
+    let all = summary.totals.all.total();
+    let sub_share = summary.totals.subagents.total() * 100 / all;
+    let features_done: usize = summary.projects.iter().map(|p| p.features_done).sum();
+    let active_ms: i64 = summary.projects.iter().map(|p| p.active_ms).sum();
+    let kpi = |label: &str, value: String| {
+        format!(
+            r#"<div class="usage__kpi"><span class="usage__kpi-label">{label}</span><span class="usage__kpi-value">{value}</span></div>"#
+        )
+    };
+    let kpis = [
+        kpi("All tokens", compact(all)),
+        kpi("New", compact(summary.totals.all.new)),
+        kpi("Cache-read", compact(summary.totals.all.cached)),
+        kpi("Subagent share", format!("{sub_share}%")),
+        kpi("Features done", features_done.to_string()),
+        kpi("Active time", hours_minutes(active_ms)),
+    ]
+    .concat();
+    let peak = summary
+        .per_day
+        .iter()
+        .map(|d| d.spend.total())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let bars: String = summary
+        .per_day
+        .iter()
+        .map(|d| {
+            format!(
+                r#"<div class="usage__bar" style="height:{pct}%" title="{date} · {new} new · {cached} cache-read"></div>"#,
+                pct = d.spend.total() * 100 / peak,
+                date = esc(&d.date),
+                new = compact(d.spend.new),
+                cached = compact(d.spend.cached),
+            )
+        })
+        .collect();
+    let project_rows: String = summary
+        .projects
+        .iter()
+        .map(|p| {
+            format!(
+                "<tr><td>{name}</td><td>{all}</td><td>{new}</td><td>{cached}</td><td>{sub}</td><td>{done}</td><td>{active}</td></tr>",
+                name = esc(&p.name),
+                all = compact(p.spend.all.total()),
+                new = compact(p.spend.all.new),
+                cached = compact(p.spend.all.cached),
+                sub = compact(p.spend.subagents.total()),
+                done = p.features_done,
+                active = hours_minutes(p.active_ms),
+            )
+        })
+        .collect();
+    let feature_rows: String = summary
+        .features
+        .iter()
+        .map(|f| {
+            let breakdown: String = f
+                .models
+                .iter()
+                .map(|m| {
+                    format!(
+                        r#"<span class="usage__model">{name} {total}</span>"#,
+                        name = esc(&m.model),
+                        total = compact(m.main.total() + m.subagents.total()),
+                    )
+                })
+                .collect();
+            format!(
+                "<tr><td>{project}</td><td>{feature}</td><td>{closed}</td><td>{cells}</td><td>{active}</td><td>{span}</td><td>{all}</td><td>{breakdown}</td></tr>",
+                project = esc(&f.project_name),
+                feature = esc(&f.feature),
+                closed = f.closed_at_ms.map(local_date_time).unwrap_or_default(),
+                cells = f.cells_capped,
+                active = hours_minutes(f.active_ms),
+                span = f.span_ms.map(hours_minutes).unwrap_or_default(),
+                all = compact(f.spend.all.total()),
+            )
+        })
+        .collect();
+    format!(
+        r#"<section class="usage">
+{head}
+<div class="usage__kpis">{kpis}</div>
+<div class="usage__bars" aria-label="Tokens per day">{bars}</div>
+<h2 class="usage__h2">Projects</h2>
+<div class="usage__scroll"><table class="usage__table">
+<thead><tr><th>Project</th><th>All</th><th>New</th><th>Cache-read</th><th>Subagents</th><th>Features</th><th>Active</th></tr></thead>
+<tbody>{project_rows}</tbody>
+</table></div>
+<h2 class="usage__h2">Models</h2>
+{models}
+<h2 class="usage__h2">Agent runs</h2>
+{runs}
+<h2 class="usage__h2">Finished features</h2>
+<div class="usage__scroll"><table class="usage__table">
+<thead><tr><th>Project</th><th>Feature</th><th>Closed</th><th>Cells</th><th>Active</th><th>Span</th><th>Tokens</th><th>By model</th></tr></thead>
+<tbody>{feature_rows}</tbody>
+</table></div>
+</section>"#,
+        models = usage_model_table(&summary.models),
+        runs = usage_runs_table(&summary.runs, project.is_some()),
+    )
+}
+
+const USAGE_RUNS_CAP: usize = 300;
+
+fn usage_runs_table(runs: &[RunRow], filtered: bool) -> String {
+    use std::collections::HashMap;
+    let by_key: HashMap<&str, &RunRow> = runs.iter().map(|r| (r.key.as_str(), r)).collect();
+    let mut children: HashMap<&str, Vec<&RunRow>> = HashMap::new();
+    for r in runs {
+        if let Some(parent) = r.parent_key.as_deref().filter(|k| by_key.contains_key(k)) {
+            children.entry(parent).or_default().push(r);
+        }
+    }
+    let task = |r: &RunRow| {
+        if r.title.is_empty() {
+            let id = r.key.split_once(':').map_or(r.key.as_str(), |(_, id)| id);
+            id.chars().take(8).collect()
+        } else {
+            r.title.clone()
+        }
+    };
+    type Item<'a> = (&'a RunRow, u64, u64, Vec<&'a RunRow>);
+    let mut groups: Vec<(&RunRow, u64, Vec<Item>)> = Vec::new();
+    for root in runs.iter().filter(|r| {
+        r.parent_key
+            .as_deref()
+            .is_none_or(|k| !by_key.contains_key(k))
+    }) {
+        let mut subs = Vec::new();
+        let mut stack = vec![root.key.as_str()];
+        while let Some(key) = stack.pop() {
+            for c in children.get(key).into_iter().flatten() {
+                subs.push(*c);
+                stack.push(c.key.as_str());
+            }
+        }
+        subs.sort_by(|a, b| {
+            a.started_ms
+                .cmp(&b.started_ms)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        let new = root.spend.new + subs.iter().map(|s| s.spend.new).sum::<u64>();
+        let cached = root.spend.cached + subs.iter().map(|s| s.spend.cached).sum::<u64>();
+        let item = (root, new, cached, subs);
+        match groups
+            .iter_mut()
+            .find(|g| g.0.project_id == root.project_id)
+        {
+            Some(g) => {
+                g.1 += new + cached;
+                g.2.push(item);
+            }
+            None => groups.push((root, new + cached, vec![item])),
+        }
+    }
+    groups.sort_by(|a, b| {
+        a.0.project_id
+            .is_empty()
+            .cmp(&b.0.project_id.is_empty())
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.project_name.cmp(&b.0.project_name))
+    });
+    let top_level: usize = groups.iter().map(|g| g.2.len()).sum();
+    let mut left = USAGE_RUNS_CAP;
+    let mut body = String::new();
+    for (first, total, items) in &groups {
+        if left == 0 {
+            break;
+        }
+        if !filtered {
+            body.push_str(&format!(
+                r#"<h3 class="usage__group"><span>{name}</span><span class="usage__group-total">{total}</span></h3>"#,
+                name = esc(&first.project_name),
+                total = compact(*total),
+            ));
+        }
+        for (r, new, cached, subs) in items.iter().take(left) {
+            let tag = match (subs.len(), r.subagent) {
+                (0, true) => r#" <span class="usage__sub">subagent</span>"#.to_string(),
+                (0, false) => String::new(),
+                (1, _) => r#" <span class="usage__sub">1 subagent</span>"#.to_string(),
+                (n, _) => format!(r#" <span class="usage__sub">{n} subagents</span>"#),
+            };
+            let row = format!(
+                r#"<span class="usage__task">{name}{tag}</span><span>{provider}</span><span>{model}</span><span>{started}</span><span>{duration}</span><span>{new}</span><span>{cached}</span>"#,
+                name = esc(&task(r)),
+                provider = esc(&r.provider),
+                model = esc(&r.model),
+                started = local_date_time(r.started_ms),
+                duration = hours_minutes(r.duration_ms),
+                new = compact(*new),
+                cached = compact(*cached),
+            );
+            if subs.is_empty() {
+                body.push_str(&format!(
+                    r#"<div class="usage__run usage__run-row">{row}</div>"#
+                ));
+                continue;
+            }
+            let lines: String = subs
+                .iter()
+                .map(|s| {
+                    format!(
+                        r#"<li class="usage__subagent"><span class="usage__subagent-title">{title}</span><span class="usage__subagent-meta">{provider} · {model} · {duration} · {new} new · {cached} cache</span></li>"#,
+                        title = esc(&task(s)),
+                        provider = esc(&s.provider),
+                        model = esc(&s.model),
+                        duration = hours_minutes(s.duration_ms),
+                        new = compact(s.spend.new),
+                        cached = compact(s.spend.cached),
+                    )
+                })
+                .collect();
+            body.push_str(&format!(
+                r#"<details class="usage__run"><summary class="usage__run-row">{row}</summary><ul class="usage__subagents">{lines}</ul></details>"#
+            ));
+        }
+        left = left.saturating_sub(items.len());
+    }
+    let more = match top_level.saturating_sub(USAGE_RUNS_CAP) {
+        0 => String::new(),
+        n => format!(r#"<p class="usage__more">{n} more runs not shown.</p>"#),
+    };
+    format!(
+        r#"<div class="usage__runs">
+<div class="usage__run-row usage__runs-head"><span>Task</span><span>Provider</span><span>Model</span><span>Started</span><span>Duration</span><span>New</span><span>Cache-read</span></div>
+{body}
+</div>{more}"#
+    )
+}
+
+fn usage_model_table(models: &[ModelSpend]) -> String {
+    let rows: String = models
+        .iter()
+        .map(|m| {
+            format!(
+                "<tr><td>{name}</td><td>{mn}</td><td>{mc}</td><td>{sn}</td><td>{sc}</td></tr>",
+                name = esc(&m.model),
+                mn = compact(m.main.new),
+                mc = compact(m.main.cached),
+                sn = compact(m.subagents.new),
+                sc = compact(m.subagents.cached),
+            )
+        })
+        .collect();
+    format!(
+        r#"<div class="usage__scroll"><table class="usage__table">
+<thead><tr><th>Model</th><th>Main new</th><th>Main cache-read</th><th>Subagent new</th><th>Subagent cache-read</th></tr></thead>
+<tbody>{rows}</tbody>
+</table></div>"#
+    )
+}
+
+fn compact(n: u64) -> String {
+    let scaled = |div: f64, unit: &str| format!("{:.1}{unit}", n as f64 / div);
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => scaled(1e3, "k"),
+        1_000_000..=999_999_999 => scaled(1e6, "M"),
+        _ => scaled(1e9, "B"),
+    }
+}
+
+fn hours_minutes(ms: i64) -> String {
+    let minutes = ms.max(0) / 60_000;
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("{m}m"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+fn local_date_time(ms: i64) -> String {
+    let offset = time::UtcOffset::from_whole_seconds(waggledance_core::usage::local_offset_secs())
+        .unwrap_or(time::UtcOffset::UTC);
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .map(|t| {
+            let t = t.to_offset(offset);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute()
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn query_escape(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
 
 /// Rail-icons: the leading glyphs the rail and the board cards carry so a
 /// row reads by shape before by word — a pin on the Agents eyebrow, a
@@ -774,11 +1299,7 @@ fn bee_hub_agent_mark_svg_sized(
     class: &str,
     label: Option<&str>,
 ) -> String {
-    let paint = if mark.stroked {
-        r#"fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round""#
-    } else {
-        r#"fill="currentColor" stroke="none""#
-    };
+    let paint = agent_mark_paint(mark);
     let class_attr = if class.is_empty() {
         String::new()
     } else {
@@ -800,6 +1321,19 @@ fn bee_hub_agent_mark_svg_sized(
         paint = paint,
         body = mark.body,
     )
+}
+
+/// The `fill`/`stroke` presentation attributes an agent mark's artwork needs
+/// so `currentColor` actually reaches it -- shared by
+/// [`bee_hub_agent_mark_svg_sized`] (every server-rendered surface) and
+/// [`agent_mark_sprite`] (the drawer's client-cloned `<symbol>`s) so the two
+/// can never disagree about how a mark is painted again.
+fn agent_mark_paint(mark: &AgentMark) -> &'static str {
+    if mark.stroked {
+        r#"fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round""#
+    } else {
+        r#"fill="currentColor" stroke="none""#
+    }
 }
 
 /// Every mark this file draws, in the order [`AGENT_MARKS`] lists them --
@@ -840,9 +1374,10 @@ pub fn agent_mark_sprite() -> String {
         .iter()
         .map(|mark| {
             format!(
-                r#"<symbol id="agent-mark-{id}" viewBox="{view_box}">{body}</symbol>"#,
+                r#"<symbol id="agent-mark-{id}" viewBox="{view_box}" {paint}>{body}</symbol>"#,
                 id = mark.id,
                 view_box = mark.view_box,
+                paint = agent_mark_paint(mark),
                 body = mark.body,
             )
         })
@@ -1068,6 +1603,11 @@ fn bee_hub_kind_naming_columnar(agent: Option<&BeeCardAgent>) -> String {
 ///
 /// Returns the `<nav>` element alone; the shell around it, the topbar and
 /// `layout` wrapping stay the caller's own job.
+// Same reason [`home_page`] carries this allow: every parameter is an
+// independent render input assembled by `server.rs::index_page`, and each
+// one is documented where it stands — bundling them into a struct would
+// move those doc comments away from the thing they describe.
+#[allow(clippy::too_many_arguments)]
 fn project_sidebar(
     projects: &[(Project, usize, Vec<TerminalPaneView>)],
     unassigned_visible: bool,
@@ -1084,6 +1624,14 @@ fn project_sidebar(
     // button in the topbar is what is current there — so the rail never
     // carries more than one `aria-current="page"` across the two views.
     terminals_selected_pane: Option<&str>,
+    // board-visibility bv-4: see [`home_page`]'s own parameter of the same
+    // name — looked up per row by project id and rendered by
+    // [`proj_row_bee`] into the same `{badges}` slot.
+    // This rail is the page's per-project surface, so "what is this project
+    // doing, and does it want me" belongs on the row rather than in the
+    // feature-column section beside it.
+    bee_by_project: &std::collections::HashMap<String, &BeeProjectRollup>,
+    leader_waits: &LeaderWaitsByProject,
 ) -> String {
     let listing = if projects.is_empty() {
         "<p class=\"fg-empty\">Chưa có project nào trong Waggle Dance. Đăng ký: <code>waggledance register &lt;dir&gt;</code> hoặc gọi MCP <code>waggledance_view_file</code>.</p>".to_string()
@@ -1153,6 +1701,18 @@ fn project_sidebar(
                 // name (see the grouping above), so it is never indented
                 // under a row that is not there.
                 let label = branch.unwrap_or(bp.name.as_str());
+                let badges = format!(
+                    "{}{}",
+                    // board-visibility bv-4: a worktree branch is its own
+                    // registered project with its own `.bee/`, so it reads
+                    // its own row's line here rather than borrowing its
+                    // parent's.
+                    proj_row_bee(
+                        bee_by_project.get(&bp.id).copied(),
+                        leader_waits.get(&bp.id).map(Vec::as_slice).unwrap_or(&[]),
+                    ),
+                    project_badges(&bp.id, bpanes),
+                );
                 // D1/D1a/D2/D3/D5: a sibling of `proj-row__link`, never
                 // nested inside it -- an anchor inside an anchor is invalid
                 // HTML and browsers unnest it, which would break the row
@@ -1169,7 +1729,7 @@ fn project_sidebar(
                     id = esc(&bp.id),
                     label = esc(label),
                     meta = proj_row_meta(*bcount, &bp.last_seen_at),
-                    badges = project_badges(&bp.id, bpanes),
+                    badges = badges,
                     row_menu = proj_row_menu(&bp.id, &bp.name),
                 ));
             }
@@ -1185,6 +1745,18 @@ fn project_sidebar(
                     branches = branches,
                 )
             };
+            let badges = format!(
+                "{}{}",
+                // board-visibility bv-4: the bee line leads the row's
+                // badge block — what the project is DOING is what the
+                // reader came to this rail for; the agents running there
+                // annotate it.
+                proj_row_bee(
+                    bee_by_project.get(&p.id).copied(),
+                    leader_waits.get(&p.id).map(Vec::as_slice).unwrap_or(&[]),
+                ),
+                project_badges(&p.id, panes),
+            );
             // The summary is the name line and nothing else: the dot, the
             // name, and the actions menu. Everything a collapsed group is
             // meant to fold away -- the meta line, the badges, the branches
@@ -1216,7 +1788,7 @@ fn project_sidebar(
                 folder = RAIL_ICON_FOLDER,
                 row_menu = proj_row_menu(&p.id, &p.name),
                 meta = proj_row_meta(*count, &p.last_seen_at),
-                badges = project_badges(&p.id, panes),
+                badges = badges,
                 branch_list = branch_list,
             ));
         }
@@ -1239,11 +1811,16 @@ fn project_sidebar(
             // construction rather than by two separate `esc()` calls that
             // could drift apart.
             let path = esc(&s.path);
+            let meta = format!(
+                "{count} pane{plural}",
+                count = s.pane_count,
+                plural = if s.pane_count == 1 { "" } else { "s" },
+            );
             rows.push_str(&format!(
                 r#"<li class="proj-row proj-suggestion">
   <div class="proj-row__link proj-suggestion__info">
     <span class="proj-row__name proj-suggestion__path">{path}</span>
-    <span class="proj-row__meta">{count} pane{plural}</span>
+    <span class="proj-row__meta">{meta}</span>
   </div>
   <form class="proj-suggestion__register" method="post" action="/api/projects/register">
     <input type="hidden" name="path" value="{path}">
@@ -1251,8 +1828,7 @@ fn project_sidebar(
   </form>
 </li>"#,
                 path = path,
-                count = s.pane_count,
-                plural = if s.pane_count == 1 { "" } else { "s" },
+                meta = meta,
             ));
         }
         format!(
@@ -1442,8 +2018,8 @@ fn pinned_group(panes: &[TerminalsMenuPane], selected: Option<&str>) -> String {
 /// narrow strip carrying nothing but this same button, and the choice is
 /// remembered per browser in `localStorage["waggledance-rail-hidden"]` --
 /// which is what makes it survive the whole-page reload `assets/app.js`
-/// performs on every watched change. The handset drawer (<=700px) is
-/// untouched: the CSS scopes every collapsed rule to `min-width: 701px`.
+/// performs on every watched change. The handset drawer (<=900px) is
+/// untouched: the CSS scopes every collapsed rule to `min-width: 901px`.
 ///
 /// Like the filter field above it, the button ships `hidden` and
 /// `assets/app.js` unhides it -- collapsing is a client-side act with no
@@ -1492,6 +2068,209 @@ fn proj_row_meta(count: usize, last_seen_at: &str) -> String {
         seen = esc(last_seen_at),
         seen_short = esc(&short_instant(last_seen_at)),
     )
+}
+
+/// (board-visibility bv-6) The bare words the rail's wait pill says when it
+/// has nothing better -- the "derived" side of the quality comparison in
+/// [`proj_row_bee`], exactly as the card's derived sentence is the derived
+/// side of its own.
+const RAIL_WAIT_LABEL: &str = "Waiting on you";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderWait {
+    pub status: String,
+    pub since: String,
+}
+
+pub type LeaderWaitsByProject = std::collections::HashMap<String, Vec<LeaderWait>>;
+
+pub const LEADER_WAIT_BLOCKED: &str = "Leader waiting — permission";
+const LEADER_WAIT_LOST: &str = "Leader lost — may still be finishing";
+/// (board-visibility bv-6) How much of a recorded subject the rail pill
+/// spends on screen. The rail is a 259px column (`app.css`, ctk-13) and this
+/// row must stay ONE line, so a subject that is free text of any length gets
+/// a hard character budget here rather than being handed to the layout to
+/// cope with. The full text is never lost -- it rides the pill's `title`,
+/// and the nested `.proj-row__badge-title` (the same clip-and-ellipsis span
+/// a pane's own free-text title already wears) adds the browser's ellipsis
+/// on top for a column narrower than even this budget.
+const RAIL_WAIT_SUBJECT_CHARS: usize = 48;
+
+/// (board-visibility bv-6) Clip a recorded subject to the rail's budget on a
+/// word boundary, ending in an ellipsis so a reader can see it was cut.
+///
+/// Cuts at the last space inside the budget when that space still leaves at
+/// least two thirds of the budget standing; a subject whose first word runs
+/// longer than that is cut mid-word instead, because dropping it whole would
+/// say less than a truncated version of it. Trailing punctuation goes before
+/// the ellipsis, so the pill never reads `"foo,…"`.
+///
+/// Character counts, never byte counts: this store's own live subject is
+/// Vietnamese (`"Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"`
+/// is the one mark that reaches this pill today, and its neighbours carry
+/// diacritics), and a byte slice landing inside a multi-byte char panics.
+fn bee_rail_wait_clip(subject: &str, max_chars: usize) -> String {
+    let subject = subject.trim();
+    if subject.chars().count() <= max_chars {
+        return subject.to_string();
+    }
+    let cut = subject
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(subject.len());
+    let head = &subject[..cut];
+    let kept = match head
+        .rfind(char::is_whitespace)
+        .filter(|i| head[..*i].chars().count() * 3 >= max_chars * 2)
+    {
+        Some(i) => &head[..i],
+        None => head,
+    };
+    let kept = kept
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-' | '—'));
+    let kept = if kept.is_empty() { head } else { kept };
+    format!("{kept}…")
+}
+
+/// board-visibility bv-4: one rail row's own bee line -- what this project
+/// is working on, and whether it is waiting on the reader.
+///
+/// Two facts, and deliberately only two. D3 refuses a section unless the
+/// owner can ACT on it from this page AND its number can go DOWN: a feature
+/// finishes and a gate gets answered, and the row is already a link into
+/// the project where both happen. Knowledge-debt fails that test in the
+/// second half -- it only ever climbs, and nothing on this page lowers it --
+/// so it is absent here on purpose, as are `config.gate_bypass` and
+/// `running_workers`, which are recorded deletions from this board
+/// (board-trim D1, board-declutter) and not this function's to reverse.
+///
+/// The wait is `BeeState.waiting_on_live`, which board-visibility D4 taught
+/// to exclude the `turn-end` idle mark, so a project reads "Waiting on you"
+/// here only when something is actually owed. The phase comes from
+/// `phase_board` -- the same lanes-∪-active-feature union
+/// [`bee_live_strip_section`] reads -- falling back to `state.phase` for an
+/// active feature whose lane record carries none.
+///
+/// A project with no active feature and no live wait renders the EMPTY
+/// STRING: no container, no placeholder, no "idle" word. An idle row must
+/// stay exactly the row it was before this feature, so the rail's ink is
+/// spent only where something is happening.
+///
+/// (bv-6) The wait pill also NAMES what is owed, when the project recorded
+/// something worth naming. The judgment is [`bee_hub_subject_beats_derived`]
+/// -- bv-3's rule, CALLED here and not copied here -- with the pill's own
+/// generic label as the derived side: a subject that is blank, one bare word
+/// (`"AskUserQuestion"`, which four lanes of this store record), or an echo
+/// of "waiting on you" keeps the plain pill, and a sentence a human actually
+/// wrote wins it. This is the surface that widening lives on because it is
+/// the surface that renders: measured against all three registered projects
+/// (`docs/history/board-visibility/proof.md`), the card's waiting sentence
+/// appeared zero times and this pill appeared once, so a subject placed
+/// anywhere else on this page says nothing to anybody today.
+///
+/// Markup reuses the row's existing badge vocabulary (`.proj-row__badges`
+/// plus `.proj-row__badge`, the same classes the herdr badges
+/// wear) rather than minting a rail stylesheet of its own -- the block is
+/// one flex line under the name, and the modifier classes are style hooks
+/// that need no rule to render correctly. The wait says its own word, so it
+/// never depends on colour to be read.
+fn proj_row_bee(rollup: Option<&BeeProjectRollup>, leader_waits: &[LeaderWait]) -> String {
+    let mut pills = proj_row_bee_pills(rollup);
+    if let Some(wait) = leader_wait(leader_waits) {
+        pills.push_str(&format!(
+            r#"<span class="proj-row__badge proj-row__badge--leader-wait" title="{since}">{label}</span>"#,
+            label = wait.label,
+            since = esc(&wait.since),
+        ));
+    }
+    if pills.is_empty() {
+        return String::new();
+    }
+    format!(r#"<div class="proj-row__badges proj-row__badges--bee">{pills}</div>"#)
+}
+
+struct LeaderWaitPill<'a> {
+    label: &'static str,
+    since: &'a str,
+}
+
+fn leader_wait(waits: &[LeaderWait]) -> Option<LeaderWaitPill<'_>> {
+    if let Some(w) = waits.iter().find(|w| w.status == "blocked") {
+        return Some(LeaderWaitPill {
+            label: LEADER_WAIT_BLOCKED,
+            since: &w.since,
+        });
+    }
+    let w = waits.iter().find(|w| w.status == "lost")?;
+    Some(LeaderWaitPill {
+        label: LEADER_WAIT_LOST,
+        since: &w.since,
+    })
+}
+
+fn proj_row_bee_pills(rollup: Option<&BeeProjectRollup>) -> String {
+    let Some(rollup) = rollup else {
+        return String::new();
+    };
+    let Some(state) = rollup.snapshot.state.as_ref() else {
+        return String::new();
+    };
+    let work = state
+        .feature
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|feature| {
+            let phase = rollup
+                .snapshot
+                .phase_board
+                .iter()
+                .find(|f| f.feature == feature)
+                .and_then(|f| f.phase.as_deref())
+                .or(state.phase.as_deref())
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            match phase {
+                Some(phase) => format!("{} · {}", esc(feature), esc(phase)),
+                None => esc(feature),
+            }
+        });
+    if work.is_none() && !state.waiting_on_live {
+        return String::new();
+    }
+    let mut pills = String::new();
+    if let Some(work) = work {
+        pills.push_str(&format!(
+            r#"<span class="proj-row__badge proj-row__badge--bee">{work}</span>"#,
+        ));
+    }
+    if state.waiting_on_live {
+        // (bv-6) The recorded subject is offered THE SAME pill -- never a
+        // second pill, never a second line -- and wins it only by beating the
+        // bare label, which is `bee_hub_subject_beats_derived`'s judgment
+        // rather than a second copy of it. `waiting_on_live` already stands
+        // in front of this, so a `turn-end` mark never lends its words to a
+        // wait (D4); and since a live mark always carries a well-formed
+        // `waiting_on`, the `None` arm below is the REFUSED-subject arm, not
+        // the absent-mark one.
+        let subject = state
+            .waiting_on
+            .as_ref()
+            .map(|w| w.subject.trim())
+            .filter(|s| bee_hub_subject_beats_derived(s, RAIL_WAIT_LABEL));
+        match subject {
+            Some(subject) => pills.push_str(&format!(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="{full}">{RAIL_WAIT_LABEL}<span class="proj-row__badge-title">— {shown}</span></span>"#,
+                full = esc(&format!("{RAIL_WAIT_LABEL} — {subject}")),
+                shown = esc(&bee_rail_wait_clip(subject, RAIL_WAIT_SUBJECT_CHARS)),
+            )),
+            None => pills.push_str(&format!(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait">{RAIL_WAIT_LABEL}</span>"#
+            )),
+        }
+    }
+    pills
 }
 
 /// A rail row's actions menu -- a native `<details>`, so it opens and
@@ -1942,38 +2721,44 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
    the edge. */
 @media (max-width: 720px) {
   .term-screen { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: hidden; }
-  .term-keys button, .term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-2) var(--space-3); }
-  .term-reply__actions { justify-content: stretch; }
-  .term-reply__actions button { flex: 1; }
-  /* term-keys-one-row: on a handset all eight keys share ONE line — the two
-     groups stop wrapping and every key takes an equal share of the width,
-     so the arrows and the named keys read as one band instead of two rows
-     with a gap. The 44px minimum the arrows keep at desktop width would
-     push the row past a 390px screen, so it yields to the equal share here;
-     the 44px height stays. */
-  .term-controls { flex-wrap: nowrap; gap: var(--space-1); }
-  .term-keys { flex: 1 1 0; flex-wrap: nowrap; min-width: 0; }
-  .term-keys button { flex: 1 1 0; min-width: 0; padding-inline: var(--space-1); }
-  .term-controls .term-keys--move button { min-width: 0; }
+  /* trc-2: Approve/Stage are `.term-keys` children now, so the grid's own
+     `button` rule already sizes them here — this used to also list
+     `.term-reply__send`/`__stage`/`__approve` and stretch the actions row
+     to full width, back when all three were pill-shaped siblings in that
+     row. Send is the row's only reply-button survivor now, and it is a
+     fixed-size round icon button (below) that must NOT stretch or take
+     this padding. */
+  .term-keys button { padding: var(--space-2) var(--space-3); }
+  /* term-keys-grid (D1): the 2×6 grid holds its shape on a handset too —
+     six columns, two rows, never collapsing into the old one-row band —
+     because the base `.term-keys` rule's own column tracks
+     (`repeat(6, minmax(44px, 1fr))`) already floor every key at the touch
+     target whatever the card's own width is; nothing here needs to
+     override that layout. */
 }
 /* The controls read top to bottom in the order they are reached: the screen,
    then the two controls that move the screen, then the keys that drive the
-   agent, then the box you write in with its own send row under it. The reply
-   box owns the full width — squeezing it beside two buttons left barely a
-   phone's worth of room for the one field an operator actually types into. */
+   agent, then the composer card you write and send in. The reply card owns
+   the full width — squeezing it beside two buttons left barely a phone's
+   worth of room for the one field an operator actually types into. */
 .term-reply { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); }
-/* compact-attach: the box an operator writes in is drawn by this wrapper,
-   not by the textarea, so the attach icon can sit inside the same outline
-   instead of taking a row of its own beneath it. The icon is pinned to the
-   top-left and the textarea takes the rest of the width; both stay on one
-   line however tall the textarea is dragged. `align-items: flex-start`
-   keeps the icon by the first line of type rather than floating to the
-   middle of a resized box. */
-.term-reply__field { display: flex; align-items: flex-start; gap: var(--space-1); width: 100%; min-width: 0; box-sizing: border-box; padding: var(--space-1) var(--space-2); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-bg); }
-/* The field wrapper owns the focus ring the textarea's own outline used to
-   give, so focusing the box still reads as focused. */
-.term-reply__field:focus-within { border-color: var(--color-action); }
-.term-reply__text { flex: 1 1 auto; width: auto; min-width: 0; box-sizing: border-box; padding: 0; border: 0; border-radius: 0; font-family: var(--font-mono, monospace); font-size: var(--type-body-sm-size); line-height: 1.35; background: transparent; color: var(--color-text); resize: vertical; outline: none; }
+/* term-reply-composer (D1): the whole composer is one
+   bordered rounded card, never a field with a separate actions row sitting
+   under it — the shape a chat composer takes. `.term-attach` draws that
+   card directly for attach-capable panes: its picker, chip list and error
+   banner already have to nest under it for `assets/app.js`'s own
+   `attachBox.querySelector(...)` lookups, so the card boundary and the
+   attach boundary are the same element there (its own base layout lives in
+   `app.css`; this re-declares the shared box and layers the border on top,
+   since this block is inlined after that stylesheet and wins the cascade).
+   `.term-reply__field` draws the identical card for panes with no attach
+   control. Rounded large, like the reference — `--radius-lg`, not the
+   hairline `--radius-sm` the rest of this page's chrome uses. */
+.term-attach, .term-reply__field { display: flex; flex-direction: column; gap: var(--space-2); width: 100%; min-width: 0; box-sizing: border-box; padding: var(--space-2) var(--space-3); border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-bg); }
+/* The card owns the focus ring the textarea's own outline used to give, so
+   focusing the box still reads as focused. */
+.term-attach:focus-within, .term-reply__field:focus-within { border-color: var(--color-action); }
+.term-reply__text { width: 100%; min-width: 0; box-sizing: border-box; padding: 0; border: 0; border-radius: 0; font-family: var(--font-mono, monospace); font-size: var(--type-body-sm-size); line-height: 1.35; background: transparent; color: var(--color-text); resize: vertical; outline: none; }
 /* Safari on iOS zooms the page whenever it focuses a control smaller than
    16px, and the zoom sticks — on a phone, one tap into the reply box left
    the operator looking at a magnified card. The box is deliberately 13px on
@@ -1988,29 +2773,69 @@ const PROJECT_TAB_STYLE: &str = r#"<style>
 @media (pointer: coarse) {
   .term-reply__text { font-size: 16px; }
 }
-.term-reply__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
-.term-reply__send, .term-reply__stage, .term-reply__approve { padding: var(--space-1) var(--space-3); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; }
+/* The controls row sits at the bottom of the card, inside its border — the
+   attach icon (attach-capable panes only) pinned to the left via its own
+   `margin-right: auto`, Send alone crowding the right edge (trc-2: Approve
+   and Stage moved into the key grid, so this row is `+` and Send only). */
+.term-reply__actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2); }
+.term-attach__btn { margin-right: auto; }
+/* trc-2/trc-5: Send reads as a round chat-style send button — a fixed
+   39px circle (equal to the attach + button) filled with the action
+   colour, carrying an up-arrow glyph instead of the word "Send" (the
+   accessible name moves to `aria-label`). */
+.term-reply__send { display: flex; align-items: center; justify-content: center; flex: none; width: 39px; height: 39px; padding: 0; border: var(--border-width-hairline) solid var(--color-action); border-radius: 50%; background: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); font-size: var(--type-body-size); cursor: pointer; }
 /* A4: Approve is withheld unless bee says this agent is at a permission
-   prompt. It stays in place, same size, so the row never reflows as a state
-   changes — only its weight drops, and its `title` says why. */
+   prompt. It stays in place, same size, so the grid never reflows as a
+   state changes — only its weight drops, and its `title` says why. Its
+   base shape now comes from `.term-keys button` below (trc-2: Approve
+   lives in the key grid), so only the disabled dimming stays specific to
+   it here. */
 .term-reply__approve:disabled { opacity: .5; cursor: not-allowed; }
-/* Send is the primary of the pair — Stage beside it stays the quiet one. */
-.term-reply__send { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); font-weight: var(--weight-semibold); }
-/* One tight control block under the screen, on a single line: the arrows and
-   the named keys read as one row of controls rather than two bands with a
-   gap between them. The row carries no margin of its own and wraps only when
-   the card is too narrow to hold both groups. */
-.term-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: 0; }
-.term-keys { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+/* tkg-1 (D1): the two key groups merge into one 2×6 grid, so the wrapper
+   holds just that single grid now — no more "wrap only when too narrow to
+   hold both groups" balancing act the two-group layout used to need. */
+.term-controls { display: flex; align-items: center; gap: var(--space-2); margin-top: 0; }
+/* D5/tkg-1: `minmax(44px, 1fr)` floors every column at the 44px touch
+   target and lets it grow to share the row evenly — one rule now covers the
+   width floor every key used to need its own `--move`-only modifier for,
+   because the merge (D1) makes every key in the grid equally "the direct
+   child of `.term-controls`". */
+.term-keys { display: grid; grid-template-columns: repeat(6, minmax(44px, 1fr)); gap: var(--space-1); }
 .term-keys button { padding: var(--space-1) var(--space-2); min-height: 44px; border: var(--border-width-hairline) solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text); cursor: pointer; font-size: var(--type-caption-size); }
-/* D5, amended 2026-08-08: every key in the row stands 44px tall so the row
-   reads as one control band — Enter, Esc and Tab match the arrows. The
-   arrows alone keep the 44px minimum WIDTH and the body-size glyph (pressed
-   repeatedly, often with a thumb); the named keys keep their padding-driven
-   width. The `--move` modifier picks the arrows out rather than position:
-   once both groups share one row, "the direct child of `.term-controls`"
-   reaches the named keys too. */
-.term-keys--move button { min-width: 44px; font-size: var(--type-body-size); }
+/* term-keys-nav-tint D1b (`816f4993`, superseding `334b8353`): the four
+   arrows are NAVIGATION, a different class of control from the keys around
+   them — Esc/Tab/⇧Tab/Ctrl+C/Enter send a key to the program,
+   Approve/Stage/Paste act on the session — so they read as their own cluster
+   instead of four more action buttons. The tint is `--color-info`, never
+   `--color-action` (what Send and a latched modifier wear, and it would say
+   "act" over a control that only moves the cursor) and never an
+   `accent-alt` slot: those look like a neutral accent ramp in
+   `contract.css`, but `console.css` — the theme actually live — redefines
+   the whole set as BOARD LANE IDENTITY, so alt-2 is the orange that means
+   "needs you". A cursor key must not wear a status colour. `color-mix` over the
+   same surface token every other key uses keeps both themes correct with no
+   literal colour (the idiom `.fg-callout` and `.bee-hub__group-waiting`
+   already use).
+
+   The cluster is selected by its own class, never by per-arrow attribute
+   selectors: any such literal in this stylesheet sits BEFORE the markup and
+   is what every assertion locating a key by its bare attribute would find
+   first. That is not hypothetical — it is how the grid-order test broke on
+   the first attempt here, and then a second time from this very comment
+   quoting the selector it was warning about
+   (`docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`).
+   Nothing in this block may spell one out, prose included. */
+.term-keys button.term-keys__nav { background: color-mix(in srgb, var(--color-info) 22%, var(--color-surface-raised)); border-color: color-mix(in srgb, var(--color-info) 60%, var(--color-border)); color: var(--color-info); }
+/* D2: a latched modifier (Ctrl/Shift/Alt) reads the same way Send already
+   does — filled with the action colour — so the one lit key is obvious
+   before the next tap combines with it and clears the latch. The arrow
+   tint above is deliberately declared BEFORE this rule: a latched arrow (a
+   combo like Ctrl+←) must still light up the same as any other key. */
+.term-keys button[aria-pressed="true"] { background: var(--color-action); border-color: var(--color-action); color: var(--color-bg); }
+/* D3: Paste dims exactly like Approve does when it is withheld — the same
+   rule, the same reason: a control that cannot act yet must look like it
+   cannot. */
+.term-keys__paste:disabled { opacity: .5; cursor: not-allowed; }
 /* scroll-fab: the three screen-moving controls (Older, Newer, Live) belong
    to the screen, not to the keys that type into the pane, so they ride on
    it as a small round-button column in its lower-right corner. Two elements
@@ -2432,16 +3257,22 @@ fn terminals_tab(
     // home-terminal-parity-2: create targets the *selected* pane's own
     // project, so a new agent starts where the terminal being
     // watched lives — never a default or the first project in the list.
-    // home-terminal-header: agent presets only here (`plain_shell: false`) —
-    // the plain "New shell" button belongs to a page that is already scoped
-    // to one project, which this tab is not.
+    // home-terminal-new-shell: this tab offers the plain "New shell" button
+    // too, so its switcher is the project terminal page's switcher and not a
+    // near-copy of it. `home-terminal-header` had withheld the button on the
+    // grounds that a page not scoped to one project could only guess which
+    // project a new shell belonged to — true when it was written, and retired
+    // by `terminals-tab-project-scope-1`: the tab IS scoped now. The line
+    // above resolves the project from the pane the reader is actually
+    // watching, and the switcher beside it lists only that project's panes,
+    // so "new shell here" names exactly the same project here as there.
     // A selected pane resolved through `unassigned_panes` (`project_id:
     // None`) renders no create controls at all: `/p/:id/_terminal/create/…`
     // is the only create route that exists, and there is no `:id` for a
     // pane outside every registered project.
     let create = effective
         .and_then(|pane| pane.project_id.as_deref())
-        .map(|project_id| terminal_create_controls(project_id, presets, false))
+        .map(|project_id| terminal_create_controls(project_id, presets))
         .unwrap_or_default();
 
     // D7: reproduces the tab's own `/?tab=terminals&pane={pane_id}`
@@ -2480,16 +3311,144 @@ fn terminals_tab(
         format!("/?tab=terminals&pane={}", pane_id)
     });
 
+    // home-terminal-panel D1/D2, term-workspace-unify: the frame around the
+    // switcher, the panel and the screen is [`term_workspace`]'s, shared with
+    // the project terminal page — this tab composes none of it inline any
+    // more. The sidebar it renders is scoped to the *effective* pane's
+    // project, the same pane the body is showing, resolved once above, so the
+    // files beside a terminal always belong to the terminal being watched.
+    //
+    // A pane outside every registered project (`project_id: None`, the
+    // `unassigned_panes` shape) gets the sidebar's explained empty state and
+    // no panel at all: there is no `:id` for `/p/:id/_code` or
+    // `/p/:id/_changes` to embed, exactly as `create` above has no create
+    // route for it.
+    //
     // agents-drawer-global: this used to splice its own
     // `agent_switch_drawer(true)` in here — now [`home_page`] (the only
     // caller of this tab) renders the drawer once, through
     // `layout_with_drawer`, wrapping every home tab alike. A second drawer
     // here would duplicate `#agent-drawer-toggle`.
+    let project_id = effective.and_then(|pane| pane.project_id.as_deref());
+    term_workspace(&bar, &body, project_id)
+}
+
+/// home-terminal-panel D1/D2, term-workspace-unify: the terminal workspace
+/// itself — the two-column frame BOTH terminal surfaces render, the homepage
+/// Terminals tab ([`terminals_tab`]) and a project's own terminal page
+/// ([`terminal_page`]). Left column: the switcher `bar`, the panel above the
+/// screen, and `screen_html` (the selected pane's card on the tab, the
+/// `.term-panes` list on the project page). Right: the Files | Diff sidebar.
+/// One function so the two pages cannot drift into two shapes again.
+///
+/// `project_id` is the project whose files sit beside the terminal — the
+/// *effective* pane's project on the homepage tab, the page's own project on
+/// the project page. `None` (the tab's `unassigned_panes` shape) renders the
+/// sidebar's explained empty state and no panel at all: there is no `:id` for
+/// `/p/:id/_code` or `/p/:id/_changes` to embed.
+///
+/// `data-panel-project` is deliberately NOT `data-project-id`:
+/// homepage-terminal-full D5 forbids a page-root project id on the Terminals
+/// tab — every pane control reads its own `data-term-base` instead, and a
+/// test pins that the tab's only `data-project-id` is `.term-create`'s own
+/// (the create route's target), so no later widget can quietly reintroduce
+/// the fallback beside it. This attribute scopes ONE widget, the sidebar's
+/// sessionStorage key, and is named for that widget so the two can never be
+/// read as the same thing. The project page does carry `data-project-id`, on
+/// its own `<main>` for the screen poller ([`terminal_page`]); this attribute
+/// sits inside it still naming only the sidebar's key.
+///
+/// Laziness lives in the markup, not in script: the panel frame and the two
+/// nav frames ship with no `src` at all, so a workspace nobody opens a file
+/// from fetches nothing. See [`term_work_panel`] and [`term_work_sidebar`].
+fn term_workspace(bar: &str, screen_html: &str, project_id: Option<&str>) -> String {
+    let panel_project = project_id
+        .map(|id| format!(" data-panel-project=\"{}\"", esc(id)))
+        .unwrap_or_default();
     format!(
-        r#"{bar}
-  {body}"#,
+        r#"<div class="term-work"{panel_project}>
+  <div class="term-work__col">
+    {bar}
+    {panel}
+    <div class="term-work__screen">{screen_html}</div>
+  </div>
+  {side}
+</div>"#,
+        panel_project = panel_project,
         bar = bar,
-        body = body,
+        panel = term_work_panel(project_id),
+        screen_html = screen_html,
+        side = term_work_sidebar(project_id),
+    )
+}
+
+/// home-terminal-panel D2: the panel frame above the terminal, in the
+/// [`term_workspace`] both terminal pages render — with the one difference
+/// that is the whole feature: nothing HERE picks what it shows. The frame is
+/// NAMED with [`PANEL_FRAME_NAME`], and every nav page in the sidebar beside
+/// it carries `<base target>` with that same name, so a file row clicked over
+/// there lands in this frame with no script in between and no `postMessage`.
+///
+/// It ships with no `src` at all — the laziness is in the markup: a workspace
+/// nobody opens a file from fetches nothing. `assets/app.js` opens the split
+/// the first time this frame actually loads a page, and the close control
+/// folds the split away without tearing the frame down, so reopening shows a
+/// page already there.
+///
+/// Empty for a pane with no project: there is no project to embed, and the
+/// sidebar beside it says so rather than leaving a dead control here.
+fn term_work_panel(project_id: Option<&str>) -> String {
+    if project_id.is_none() {
+        return String::new();
+    }
+    format!(
+        r#"<div class="term-work__panel" hidden>
+  <div class="term-work__panel-head">
+    <span class="term-work__panel-name">Files &amp; diff</span>
+    <button type="button" class="term-work__close" data-panel-close aria-label="Close the panel above the terminal">Close</button>
+  </div>
+  <iframe class="term-work__frame" name="{name}" title="Project files and diff"></iframe>
+</div>"#,
+        name = PANEL_FRAME_NAME,
+    )
+}
+
+/// home-terminal-panel D1/D2: the right-hand column of every
+/// [`term_workspace`] — Files and Diff over two lazy nav frames.
+///
+/// D2's addresses are all built HERE, escaped here: the two `nav=1` pages
+/// the sidebar itself shows, and (on the sidebar element) the embedded
+/// Changes page the Diff tab drops into the panel at the same time (D1).
+/// `assets/app.js` only ever copies one of these attributes onto a frame —
+/// a project id is never assembled in script, and no URL that is not one of
+/// these can reach either frame.
+///
+/// Both nav frames ship without `src`, like the panel: the sidebar renders,
+/// and the two requests do not happen until a tab is opened. Two frames
+/// rather than one so switching back to a tab already opened costs nothing.
+///
+/// `project_id: None` renders the sidebar and nothing else — an explanation
+/// in place of controls with no project to point at, and zero iframes.
+fn term_work_sidebar(project_id: Option<&str>) -> String {
+    let Some(project_id) = project_id else {
+        return r#"<aside class="term-work__side term-work__side--empty" aria-label="Files and diff">
+  <p class="fg-empty">This terminal is not inside a registered project, so there are no files or diff to show here.</p>
+</aside>"#
+            .to_string();
+    };
+    format!(
+        r#"<aside class="term-work__side" aria-label="Files and diff" data-panel-src="/p/{pid}/_changes?embed=1&amp;panel=1">
+  <div class="term-work__tabs" role="group" aria-label="Show this project's files or diff">
+    <button type="button" class="term-work__tab" data-nav-tab="files" data-nav-src="/p/{pid}/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>
+    <button type="button" class="term-work__tab" data-nav-tab="diff" data-nav-src="/p/{pid}/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>
+  </div>
+  <p class="term-work__hint fg-empty">Pick Files or Diff to browse this project beside the terminal.</p>
+  <div class="term-work__navs">
+    <iframe class="term-work__nav" data-nav-for="files" title="Files in this project" hidden></iframe>
+    <iframe class="term-work__nav" data-nav-for="diff" title="Changed files in this project" hidden></iframe>
+  </div>
+</aside>"#,
+        pid = esc(project_id),
     )
 }
 
@@ -2713,30 +3672,44 @@ fn pane_controls(
     // would take away a working control on the evidence of nothing.
     let approve_btn = match bee_state {
         Some(state) if !matches!(state, BeeActivityState::Blocked) => format!(
-            r#"<button type="button" class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is {word}">Approve</button>"#,
+            r#"<button type="button" class="term-reply__approve" data-pane-id="{pane_id}" disabled title="Approve answers a permission prompt; this agent is {word}">Approve</button>"#,
+            pane_id = esc(pane_id),
             word = esc(state.word()),
         ),
-        _ => r#"<button type="button" class="term-reply__approve">Approve</button>"#.to_string(),
+        _ => format!(
+            r#"<button type="button" class="term-reply__approve" data-pane-id="{pane_id}">Approve</button>"#,
+            pane_id = esc(pane_id),
+        ),
     };
-    // compact-attach: the picker is an icon that rides INSIDE the writing
-    // box, on its left edge, rather than a labelled button parked under it —
-    // the shape every chat composer has settled on. The wrapper that draws
-    // the box is `.term-reply__field`; the textarea inside it gives up its
-    // own border so the two read as one control. Everything the attach
-    // wiring in `assets/app.js` looks up still hangs off the same
-    // `.term-attach[data-pane-id]` box (input, button, chips, error), so
-    // only the nesting moved, never a selector.
+    // term-reply-composer (D1): the whole composer — the
+    // writing surface AND every control — reads as one bordered rounded
+    // card, never a field with a separate actions row sitting under it.
+    // `.term-attach` draws that card directly for attach-capable panes: its
+    // picker, chip list and error banner already have to nest under it for
+    // `assets/app.js`'s own `attachBox.querySelector(...)` lookups
+    // (`.term-attach[data-pane-id]` stays the box those four live in), so
+    // the card boundary and the attach boundary are the same element there.
+    // `.term-reply__field` draws the identical card for panes with no
+    // attach control. trc-2: the bottom row keeps the `.term-reply__actions`
+    // class but now only the `+` attach (left) and Send (right) — Approve
+    // and Stage moved into the key grid below, so a one-tap reply reads
+    // beside the other soft keys instead of at the bottom of the card. Send
+    // renders as a round icon button (an up-arrow glyph, `aria-label="Send"`
+    // carrying the accessible name text used to give) rather than the word
+    // "Send", but keeps the `.term-reply__send` class so the submit wiring
+    // in `assets/app.js` is untouched.
     let field = if attach {
         format!(
             r#"
     <div class="term-attach" data-pane-id="{pane_id}"{base_attr}>
       <input type="file" class="term-attach__input" data-pane-id="{pane_id}" accept="image/*" multiple aria-label="Attach images to send to {name}" hidden>
       <ul class="term-attach__chips" data-pane-id="{pane_id}"></ul>
-      <div class="term-reply__field">
-        <button type="button" class="term-attach__btn" data-pane-id="{pane_id}" title="Attach images" aria-label="Attach images to send to {name}">+</button>
-        <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
-      </div>
+      <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
       <p class="term-attach__error" data-pane-id="{pane_id}" role="alert" hidden></p>
+      <div class="term-reply__actions">
+        <button type="button" class="term-attach__btn" data-pane-id="{pane_id}" title="Attach images" aria-label="Attach images to send to {name}">+</button>
+        <button type="submit" class="term-reply__send" aria-label="Send">↑</button>
+      </div>
     </div>"#,
             pane_id = esc(pane_id),
             name = esc(name),
@@ -2747,31 +3720,45 @@ fn pane_controls(
             r#"
     <div class="term-reply__field">
       <textarea class="term-reply__text" rows="3" placeholder="Type a reply… (Ctrl+Enter to send)" aria-label="Reply to {name}" autocomplete="off"></textarea>
+      <div class="term-reply__actions">
+        <button type="submit" class="term-reply__send" aria-label="Send">↑</button>
+      </div>
     </div>"#,
             name = esc(name),
         )
     };
+    // trc-2: row 1 of the key grid is Esc, Tab, Approve, ↑, Stage, Ctrl+C —
+    // Approve and Stage take the slots Ctrl and Shift used to hold, which
+    // are removed outright. tks-1 (D1 `c6c086a0`) retires the last latching
+    // modifier too: Alt's slot now opens row 2 as a plain `shift+tab` key —
+    // the back-tab herdr delivers as ESC[Z, the key Claude Code reads to
+    // cycle its permission modes — leaving zero `data-mod` buttons in the
+    // grid (`assets/app.js`'s `wireTermKeysGrid` reads `button[data-mod]`
+    // generically, so an empty modifier set needs no JS change).
+    // Approve/Stage keep their `.term-reply__approve`/
+    // `.term-reply__stage` classes and A4's disabled/title gating — they
+    // just render here, inside `.term-keys`, instead of inside the
+    // `.term-reply` form; `assets/app.js`'s handlers find them via the
+    // shared `.term-pane` card ancestor now that they are no longer form
+    // descendants.
     format!(
         r#"<div class="term-controls">
-    <div class="term-keys term-keys--move" data-pane-id="{pane_id}"{base_attr} aria-label="Move around {name}'s screen">
-      <button type="button" data-key="up">↑</button>
-      <button type="button" data-key="down">↓</button>
-      <button type="button" data-key="left">←</button>
-      <button type="button" data-key="right">→</button>
-    </div>
     <div class="term-keys" data-pane-id="{pane_id}"{base_attr} aria-label="Send a key to {name}">
-      <button type="button" data-key="enter">Enter</button>
       <button type="button" data-key="escape">Esc</button>
       <button type="button" data-key="tab">Tab</button>
+      {approve_btn}
+      <button type="button" class="term-keys__nav" data-key="up">↑</button>
+      <button type="button" class="term-reply__stage" data-pane-id="{pane_id}">Stage</button>
       <button type="button" data-key="ctrl+c">Ctrl+C</button>
+      <button type="button" data-key="shift+tab">⇧Tab</button>
+      <button type="button" class="term-keys__paste" aria-label="Paste into the reply to {name}">Paste</button>
+      <button type="button" class="term-keys__nav" data-key="left">←</button>
+      <button type="button" class="term-keys__nav" data-key="down">↓</button>
+      <button type="button" class="term-keys__nav" data-key="right">→</button>
+      <button type="button" data-key="enter">Enter</button>
     </div>
   </div>
   <form class="term-reply" data-pane-id="{pane_id}"{base_attr}{state_attr}>{field}
-    <div class="term-reply__actions">
-      {approve_btn}
-      <button type="button" class="term-reply__stage">Stage</button>
-      <button type="submit" class="term-reply__send">Send</button>
-    </div>
   </form>"#,
         pane_id = esc(pane_id),
         name = esc(name),
@@ -2792,18 +3779,22 @@ fn pane_controls(
 /// route-level half of that same truth is `terminal_create_agent`'s own
 /// refusal when `body.preset` matches nothing.
 ///
-/// home-terminal-header: `plain_shell` gates that always-offered button, and
-/// only the homepage Terminals tab passes `false`. There, the Agents drawer
-/// is already the way a terminal is reached and started, and a second,
-/// project-guessing "New shell" sitting above someone else's running screen
-/// only offered a shell in whichever project the *watched* pane happened to
-/// belong to. The project terminal page passes `true` and is untouched — a
-/// page scoped to one project is exactly where "new shell here" means
-/// something. With `plain_shell` false and no presets configured, nothing
-/// would render at all, so the `.term-create` box itself is omitted rather
-/// than shipped empty — the same silence a pane outside every registered
-/// project already gets from [`terminals_tab`].
-fn terminal_create_controls(project_id: &str, presets: &[String], plain_shell: bool) -> String {
+/// home-terminal-new-shell: "New shell" is unconditional, and the
+/// `plain_shell` flag `home-terminal-header` introduced to withhold it from
+/// the homepage Terminals tab is gone with it. That flag had exactly one
+/// caller passing `false`, on the reasoning that the tab was not scoped to a
+/// single project and so could only guess where a new shell belonged;
+/// `terminals-tab-project-scope-1` scoped the tab, and
+/// [`terminals_tab`] now passes the project of the pane the reader is
+/// watching, so both callers mean the same thing by "new shell here" and a
+/// flag with one live value is no flag at all.
+///
+/// Every caller therefore always has at least this one button to offer, and
+/// the `.term-create` box is never empty — the earlier early-return that
+/// omitted it went with the flag. A caller with no project to name renders
+/// nothing at all, but that decision belongs to the caller: see
+/// [`terminals_tab`]'s own `project_id: None` case.
+fn terminal_create_controls(project_id: &str, presets: &[String]) -> String {
     let preset_buttons: String = presets
         .iter()
         .map(|label| {
@@ -2814,21 +3805,12 @@ fn terminal_create_controls(project_id: &str, presets: &[String], plain_shell: b
             )
         })
         .collect();
-    if !plain_shell && preset_buttons.is_empty() {
-        return String::new();
-    }
-    let pane_button = if plain_shell {
-        r#"<button type="button" class="term-create__pane">New shell</button>
-  "#
-    } else {
-        ""
-    };
     format!(
         r#"<div class="term-create" data-project-id="{pid}">
-  {pane_button}{preset_buttons}
+  <button type="button" class="term-create__pane">New shell</button>
+  {preset_buttons}
 </div>"#,
         pid = esc(project_id),
-        pane_button = pane_button,
         preset_buttons = preset_buttons,
     )
 }
@@ -2906,12 +3888,18 @@ pub fn terminal_page(
     let bar = pane_bar(
         panes,
         selected,
-        &terminal_create_controls(&project.id, presets, true),
+        &terminal_create_controls(&project.id, presets),
         &|pane_id: &str| format!("/p/{}/_terminal/pane/{}", project.id, pane_id),
     );
     // `data-project-id` lets `assets/app.js`'s screen poller build each
     // pane's `/p/:id/_terminal/:pane_id/screen` URL without threading the id
-    // through every `.term-screen` element individually.
+    // through every `.term-screen` element individually — [`pane_cards`]
+    // above passes `base: None` precisely because this page-root id is here.
+    // term-workspace-unify: everything inside the `<main>` is
+    // [`term_workspace`]'s now, the same frame the homepage Terminals tab
+    // renders — this page composes no panel of its own. What stays its own is
+    // page navigation, not terminal presentation: the topbar, the
+    // `name · terminal` crumb and the Overview/Terminal/Transcript nav.
     // agents-drawer-global: this used to splice its own
     // `agent_switch_drawer(false)` in here — `layout_with_drawer` below now
     // renders it once for every page. A second drawer here would duplicate
@@ -2920,8 +3908,7 @@ pub fn terminal_page(
         r#"{topbar}
 {tab_style}
 <main class="fg-page fg-page--tight" data-project-id="{pid}">
-  {bar}
-  <div class="term-panes">{rows}</div>
+  {workspace}
 </main>"#,
         topbar = topbar_full(
             "",
@@ -2934,8 +3921,11 @@ pub fn terminal_page(
         ),
         tab_style = PROJECT_TAB_STYLE,
         pid = esc(&project.id),
-        bar = bar,
-        rows = rows,
+        workspace = term_workspace(
+            &bar,
+            &format!(r#"<div class="term-panes">{rows}</div>"#, rows = rows),
+            Some(&project.id),
+        ),
     );
     layout_with_drawer(&format!("{} · terminal", project.name), "", &body, false)
 }
@@ -3304,6 +4294,17 @@ fn bee_hub_style() -> String {
   --bee-hub-project-10: #E873A9;
 }
 .bee-hub { margin-bottom: var(--space-4); }
+/* board-visibility bi-4: the home board's unread-letter strip
+   (`bee_cross_project_unread_strip`) is the shared `.fg-banner` component
+   wearing an anchor instead of a div, so the whole strip is the click target
+   that reaches `/inbox`. These two lines are the entire difference: undo the
+   link underline the banner was never drawn with, and light the text on hover
+   the way `.bee-hub__row` does, so it still reads as somewhere to go.
+   board-live-morph D2: deliberately NO transition and NO animation here --
+   motion belongs to a card that moved, never to a count that changed, and a
+   rule added here would be exactly that mistake. */
+.bee-hub__inbox { text-decoration: none; }
+.bee-hub__inbox:hover { color: var(--color-action); }
 /* board-liveness-3: the live strip's own dense-row idiom, one row per live
    session or granted worktree — deliberately never `.bee-hub__row`'s
    feature-link styling, since a strip row never links anywhere of its
@@ -3931,7 +4932,7 @@ fn bee_hub_style() -> String {
    breakpoint in app.css) so a phone never needs the page itself to scroll
    sideways — a genuinely wide container (the agent board's columns) keeps
    its own `overflow-x` above instead of forcing the page wider. */
-@media (max-width: 700px) {
+@media (max-width: 900px) {
   .bee-hub__groups,
   .bee-panels,
   .bee-done-grid {
@@ -4135,7 +5136,11 @@ fn bee_live_strip_section(snapshot: &BeeSnapshot) -> String {
                     None => String::new(),
                 };
                 (
-                    format!(" data-work-status=\"{}\"{}", esc(&work.status), acceptance_attr),
+                    format!(
+                        " data-work-status=\"{}\"{}",
+                        esc(&work.status),
+                        acceptance_attr
+                    ),
                     format!(
                         r#"<span class="bee-strip__work">“{}”</span>"#,
                         esc(&work.title)
@@ -4508,6 +5513,42 @@ fn bee_phase_is_terminal(phase: Option<&str>) -> bool {
     matches!(phase, Some("idle") | Some("compounding-complete"))
 }
 
+/// (board-visibility bv-3) Does `state.json`'s recorded `waiting_on.subject`
+/// tell the reader more than the sentence the card derives on its own?
+///
+/// The whole point of the widening this answers is that the card's derived
+/// wording is already good — *"Shape gate awaiting your decision"* — so a
+/// recorded subject only ever replaces it by being BETTER. The reader
+/// (`BeeState::waiting_on`) deliberately passes no judgment on the string;
+/// this is where the judgment lives, at the one surface that knows what it
+/// would be giving up.
+///
+/// Three refusals, each measured against what this repo's own store
+/// actually records:
+///
+/// - **Blank.** Nothing to say. (The reader already turns a blank field into
+///   `None`, so this is belt-and-braces, not the live path.)
+/// - **A single word.** Four lanes in this store record the literal subject
+///   `"AskUserQuestion"` — the name of the tool that asked — and a bare
+///   `"shape"` is no better. One token names a mechanism or a gate key; it
+///   never names a decision, and the derived sentence already says the gate.
+/// - **An echo.** A subject the derived sentence already contains
+///   (case-insensitively) adds nothing by definition, so the wording that
+///   was written for the card wins on punctuation and capitalisation.
+///
+/// Everything else wins — including a subject this function has never seen
+/// the shape of. That default is the same one `waiting_on_is_live` takes for
+/// unknown kinds: a real sentence a human wrote is the thing the board is
+/// short of, so the doubt goes to rendering it, and the refusals grow only
+/// on evidence, one measured shape at a time.
+fn bee_hub_subject_beats_derived(subject: &str, derived: &str) -> bool {
+    let subject = subject.trim();
+    if subject.is_empty() || subject.split_whitespace().count() < 2 {
+        return false;
+    }
+    !derived.to_lowercase().contains(&subject.to_lowercase())
+}
+
 fn bee_classify_features(
     snapshot: &BeeSnapshot,
     archived_features: &std::collections::HashSet<String>,
@@ -4671,13 +5712,38 @@ fn bee_classify_features(
             // gate stop or a paused handoff no longer moves the feature to
             // a separate column, it only adds the `Waiting on you — ` line
             // to this same card.
+            //
+            // (board-visibility bv-3) `state.json`'s recorded
+            // `waiting_on.subject` is offered THAT SAME sentence — never a
+            // second line, never a second surface — and wins it only when
+            // it beats the derived wording
+            // ([`bee_hub_subject_beats_derived`]). Two gates stand before
+            // that comparison, both deliberate: `is_active`, because
+            // `state.json` names one feature at a time and a sibling card's
+            // wait is not this card's; and `waiting_on_live`, so a
+            // `turn-end` mark — D4's "nothing owed" — never lends its words
+            // to a sentence about a real stop.
+            let live_wait = if is_active {
+                snapshot
+                    .state
+                    .as_ref()
+                    .filter(|s| s.waiting_on_live)
+                    .and_then(|s| s.waiting_on.as_ref())
+            } else {
+                None
+            };
             let reason = if !working_now && (gate_stop.is_some() || waiting_via_handoff) {
-                Some(match gate_stop {
-                    Some((_, label)) => {
-                        format!("Waiting on you — {label} gate awaiting your decision")
-                    }
-                    None => "Waiting on you — Work is parked, waiting on your decision".to_string(),
-                })
+                let derived = match gate_stop {
+                    Some((_, label)) => format!("{label} gate awaiting your decision"),
+                    None => "Work is parked, waiting on your decision".to_string(),
+                };
+                let recorded = live_wait
+                    .map(|w| w.subject.as_str())
+                    .filter(|s| bee_hub_subject_beats_derived(s, &derived));
+                Some(format!(
+                    "Waiting on you — {}",
+                    recorded.unwrap_or(derived.as_str())
+                ))
             } else {
                 None
             };
@@ -4848,6 +5914,55 @@ fn bee_hub_in_progress_tier(panes: &[TerminalPaneView]) -> u8 {
     } else {
         2
     }
+}
+
+pub(crate) fn bee_board_json(rollups: &[(&Project, &BeeProjectRollup)]) -> serde_json::Value {
+    type Key = (u8, Option<time::OffsetDateTime>, String);
+    let mut in_progress: Vec<(Key, serde_json::Value)> = Vec::new();
+    let mut ready_to_merge: Vec<(Key, serde_json::Value)> = Vec::new();
+    for (project, rollup) in rollups {
+        let archived: std::collections::HashSet<String> = rollup
+            .archived_features
+            .iter()
+            .map(|a| a.feature.clone())
+            .collect();
+        let row = |feature: &str, docs: Option<&waggledance_core::bee::BeeFeatureDocs>| {
+            serde_json::json!({
+                "project_id": project.id,
+                "project_name": project.name,
+                "feature": feature,
+                "title": docs.and_then(|d| d.title.as_deref()).unwrap_or(feature),
+                "url": format!("/p/{}/_bee/feature/{}", project.id, feature),
+            })
+        };
+        for placement in bee_classify_features(&rollup.snapshot, &archived) {
+            match placement {
+                BeeHubPlacement::InProgress(c) => {
+                    let waiting = c.reason.as_deref().is_some_and(|r| !r.is_empty());
+                    let (_, since, feature) =
+                        bee_hub_in_progress_sort_key(&c.feature, c.last_activity.as_deref(), &[]);
+                    let mut value = row(&c.feature, c.docs.as_ref());
+                    value["done"] = c.done.into();
+                    value["total"] = c.total.into();
+                    value["waiting"] = waiting.into();
+                    value["reason"] = c.reason.into();
+                    value["last_activity"] = c.last_activity.into();
+                    in_progress.push(((u8::from(!waiting), since, feature), value));
+                }
+                BeeHubPlacement::ReadyToMerge(d, merge) => ready_to_merge.push((
+                    bee_hub_ready_to_merge_key(&merge, &d.feature),
+                    row(&d.feature, d.docs.as_ref()),
+                )),
+                _ => {}
+            }
+        }
+    }
+    in_progress.sort_by(|a, b| bee_hub_in_progress_cmp(&a.0, &b.0));
+    ready_to_merge.sort_by(|a, b| bee_hub_ready_to_merge_cmp(&a.0, &b.0));
+    serde_json::json!({
+        "in_progress": in_progress.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        "ready_to_merge": ready_to_merge.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+    })
 }
 
 /// D7's own sort key for one In Progress card: its terminal tier
@@ -5201,6 +6316,64 @@ fn bee_cross_project_read_errors_strip(rollups: &[(&Project, &BeeProjectRollup)]
     )
 }
 
+/// board-visibility D3 on the cross-project home page: ONE number — how many
+/// letters bee has filed and nobody has read yet, summed across every
+/// registered project — and a link to `/inbox`, where the reading happens.
+///
+/// **Why a count and not a list.** D3 refuses a home-page section unless the
+/// owner can act on it AND its number can go down. An unread count passes both
+/// clauses: reading a letter lowers it, and the act of reading is one click
+/// away. A list of letter rows here would pass the first and fail the second
+/// the moment letters accumulate — which is not a hypothetical, it is why a
+/// list-shaped block was deleted from this board once already. So the subject
+/// lines stay on `/inbox` ([`inbox_page`]) and only the number comes home.
+///
+/// **Zero renders nothing at all** — no strip, no placeholder, no "0". That is
+/// the same rule [`bee_cross_project_read_errors_strip`] answers to directly
+/// above, and it does not contradict the stat tiles' "a zero tile still
+/// renders": a tile is a fixed slot in a three-up row whose shape would break
+/// with a hole in it, while this is a strip that either has something to say
+/// or has no reason to exist. On this machine zero is the ordinary state (bee
+/// files a letter only from an unattended run), so a permanent "0 unread"
+/// would be furniture, not information.
+///
+/// **Unread only, never the unreadable ones.** `BeeMailboxEntry::is_unread`
+/// is false for an entry that failed to parse — an unreadable letter is its
+/// own, louder signal and the inbox names it there; folding it into this
+/// number would let a broken store read as "one more thing to read".
+///
+/// **board-live-morph D1/D2.** This strip is a DIRECT child of the
+/// `data-feature-hub` section, sitting outside `.bee-hub__groups` and
+/// `.bee-hub__archive` — which is exactly the set `app.js`'s
+/// `hubPatchWholesale` keeps in place and re-parents around. Every other
+/// direct child is removed and re-inserted from the freshly fetched section
+/// on each patch, so this number is replaced wholesale on every update:
+/// never appended twice, never left showing a stale count. It carries no
+/// `data-hub-key` and neither of the two keyed classes (`.bee-hub__shell`,
+/// `.bee-hub__row`) the patch moves or fades, and `bee_hub_style` gives
+/// `.bee-hub__inbox` no transition of its own — D2 spends motion on the card,
+/// never on a count that changed.
+fn bee_cross_project_unread_strip(rollups: &[(&Project, &BeeProjectRollup)]) -> String {
+    let count: usize = rollups
+        .iter()
+        .map(|(_, rollup)| {
+            rollup
+                .snapshot
+                .mailbox
+                .iter()
+                .filter(|entry| entry.is_unread())
+                .count()
+        })
+        .sum();
+    if count == 0 {
+        return String::new();
+    }
+    format!(
+        r#"<a class="fg-banner fg-banner--info bee-hub__inbox" href="/inbox" data-bee-unread="{count}"><span class="fg-banner__dot"></span><span class="fg-banner__body">{count} lá thư chưa đọc từ các lượt chạy</span><span class="fg-banner__act">Mở hộp thư</span></a>"#,
+        count = count,
+    )
+}
+
 /// board-run-actions D3 hands in `live_runs`, every project's own live board
 /// runs, keyed by project id exactly like the pane map beside it — this page
 /// merges several projects' rows into one column, so a feature name alone
@@ -5459,11 +6632,17 @@ pub fn bee_cross_project_features_section(
     let ready_to_merge_cards = bee_hub_finished_rows(&ready_to_merge_rows);
     let finished_cards = bee_hub_finished_rows(&finished_rows);
     let read_errors_strip = bee_cross_project_read_errors_strip(rollups);
+    // board-visibility bi-4: a direct child of the section, beside the read
+    // errors strip and outside `.bee-hub__groups` -- see
+    // `bee_cross_project_unread_strip` for why that placement is what makes
+    // the in-place board patch replace it rather than duplicate or strand it.
+    let unread_strip = bee_cross_project_unread_strip(rollups);
 
     format!(
         r#"<section class="fg-card bee-hub" data-feature-hub="cross-project">
   <h3 class="bee-panel__head">Features</h3>
   {read_errors_strip}
+  {unread_strip}
   {stat_tiles}
   <div class="bee-hub__groups">
     {todo_group}
@@ -5475,6 +6654,7 @@ pub fn bee_cross_project_features_section(
   {archive_bar}
 </section>"#,
         read_errors_strip = read_errors_strip,
+        unread_strip = unread_strip,
         stat_tiles = bee_hub_stat_tiles(
             in_progress_count,
             in_progress_waiting_count,
@@ -8376,7 +9556,14 @@ pub fn file_page(
 ) -> String {
     let tree = file_tree(project, files, &file.rel_path);
     let right = right_panel(project, page, backlinks);
-    let breadcrumb = breadcrumb(project, "", &file.rel_path, true, copy_md_button());
+    let breadcrumb = breadcrumb(
+        project,
+        "",
+        &file.rel_path,
+        true,
+        copy_md_button(),
+        PageChrome::Full,
+    );
     // Raw markdown source for copy-as-markdown: the client maps a DOM selection
     // (via data-sourcepos line ranges) back to these source lines. Escape `<`
     // so a source containing "</script>" can't break out of the tag.
@@ -8513,12 +9700,24 @@ fn right_panel(project: &Project, page: &RenderedPage, backlinks: &[(String, Str
 /// copy-as-markdown button, or a code file's type/size) — `""` for pages
 /// with nothing to put there. `narrow`, true for Docs only, caps the bar's
 /// width to match `.fg-reading` (the markdown column below it); Code's bar
-/// stays full-width, matching its own full-width main pane.
-fn breadcrumb(project: &Project, base: &str, rel_path: &str, narrow: bool, right: &str) -> String {
+/// stays full-width, matching its own full-width main pane. `chrome` is D9:
+/// the one crumb that IS a link carries `?embed=1` when the page is
+/// embedded, so clicking the project root inside a frame stays inside it.
+/// Docs always passes `PageChrome::Full` — `/p/:id/` has no embed mode to
+/// carry into.
+fn breadcrumb(
+    project: &Project,
+    base: &str,
+    rel_path: &str,
+    narrow: bool,
+    right: &str,
+    chrome: PageChrome,
+) -> String {
     let mut crumbs = format!(
-        "<a href=\"/p/{pid}/{base}\">{name}</a>",
+        "<a href=\"/p/{pid}/{base}{q}\">{name}</a>",
         pid = esc(&project.id),
         base = base,
+        q = chrome.link_query(),
         name = esc(&project.name)
     );
     for seg in rel_path.split('/').filter(|s| !s.is_empty()) {
@@ -8539,6 +9738,156 @@ fn breadcrumb(project: &Project, base: &str, rel_path: &str, narrow: bool, right
 enum Section {
     Docs,
     Code,
+    /// The Changes screen — the working-tree diff (D2).
+    Changes,
+}
+
+/// home-terminal-panel D2: the name of the iframe a nav-mode link loads
+/// into — the panel above the terminal, on both pages [`term_workspace`]
+/// frames.
+///
+/// One name, two ends: the nav pages below put it in a `<base target>`, and
+/// [`term_work_panel`] names its panel iframe with it. They are the same
+/// string on purpose — a typo on either end would silently open a new
+/// browser tab instead of filling the panel, which is why neither end
+/// spells it out.
+pub const PANEL_FRAME_NAME: &str = "wd-term-panel";
+
+/// The head tag that makes every un-targeted link on a nav page load into
+/// the panel frame (D2). `<base>` with no `href` changes nothing about how
+/// URLs resolve — it sets the default target and only that — so the nav's
+/// own absolute links are unaffected in every way except where they land.
+fn panel_base_tag() -> String {
+    format!("<base target=\"{PANEL_FRAME_NAME}\">")
+}
+
+/// D9: how much of the outer chrome a Code or Changes page renders.
+///
+/// `Embed` is what `?embed=1` asks for: the SAME page, minus the topbar —
+/// so a same-origin iframe (the panel above the terminal, D8)
+/// shows the file list, the base picker and the reviewed marks without a
+/// second application bar stacked inside the frame. Everything inside the
+/// `.layout` is untouched; only the bar above it, and the sticky offsets
+/// that were measured against it, differ.
+///
+/// It is not a second render path (D9): the same functions render both,
+/// and any value other than `embed=1` — absent, empty, `0`, anything —
+/// lands on `Full`, which is byte-for-byte the page as it was before this
+/// existed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PageChrome {
+    Full,
+    Embed,
+    /// home-terminal-panel D2: `embed=1&nav=1` — the page reduced to its
+    /// navigation alone (the changed-file list, or the Code tree), for the
+    /// terminal workspace's right sidebar. It is not a third render
+    /// path either: the SAME `changes_nav` / `code_tree` fragments render
+    /// here, minus every pane beside them, with
+    /// `<base target="wd-term-panel">` in the head so a file row loads the
+    /// panel frame above the terminal instead of replacing this narrow
+    /// sidebar with a full diff (D3).
+    Nav,
+    /// home-terminal-panel (UAT): `embed=1&panel=1` — the whole page as
+    /// `Embed` renders it, minus the one thing the frame it lands in already
+    /// has beside it. The panel above the terminal sits next to the
+    /// sidebar that IS this page's changed-file list (or its file tree), so
+    /// an in-page `#sidebar` inside the frame is the same list twice, at half
+    /// the width each. Only that column goes: the header — file count, base
+    /// picker, reviewed counter — the diff sections and the reviewed marks
+    /// are every bit of them still here, now across the whole frame.
+    ///
+    /// It is meaningful only WITH `embed=1` (`server.rs`'s `page_chrome`
+    /// reads it exactly like `nav`), and it is not a fourth render path
+    /// either: the same functions render it, one `if` shorter.
+    Panel,
+}
+
+impl PageChrome {
+    /// True for `Nav` and `Panel` as well: both ARE embeds — same dropped
+    /// topbar, same flag on the links they emit — each narrowed one step
+    /// further, one to the navigation alone and one to the page without its
+    /// duplicate of that navigation. Nothing that asks this question wants
+    /// either narrowing to answer differently.
+    fn is_embed(self) -> bool {
+        matches!(
+            self,
+            PageChrome::Embed | PageChrome::Nav | PageChrome::Panel
+        )
+    }
+
+    /// D2's nav-only rendering, the one thing `is_embed` deliberately does
+    /// not distinguish.
+    fn is_nav(self) -> bool {
+        self == PageChrome::Nav
+    }
+
+    /// The sidebar-less embed (UAT): true only for the mode that drops the
+    /// page's own `#sidebar`, and never for `Embed`, whose whole promise is
+    /// that everything below the bar is untouched.
+    fn is_panel(self) -> bool {
+        self == PageChrome::Panel
+    }
+
+    /// The query an in-page link must carry to stay inside the frame it was
+    /// clicked in. Only ever appended to a URL this module builds with no
+    /// query of its own, so `?` is always the right separator.
+    ///
+    /// Nav mode answers the PANEL's query, not `?embed=1&nav=1`, because the
+    /// links this decides are the FILE links (D3): they leave the sidebar for
+    /// the panel frame and must arrive there as the whole page — sidebar-less
+    /// (UAT), because the nav they were clicked in IS that sidebar. The links
+    /// that stay in the sidebar — folders and crumbs — ask
+    /// [`PageChrome::self_link_query`] instead.
+    ///
+    /// Panel mode answers the same string for the same reason: a link
+    /// followed inside the panel must not grow the duplicate column back.
+    /// Ampersand-escaped, because every one of these lands in an `href`.
+    fn link_query(self) -> &'static str {
+        match self {
+            PageChrome::Nav | PageChrome::Panel => "?embed=1&amp;panel=1",
+            PageChrome::Embed => "?embed=1",
+            PageChrome::Full => "",
+        }
+    }
+
+    /// The query a link that re-renders THIS frame must carry (D3): nav mode
+    /// keeps itself, every other mode is unchanged from `link_query`.
+    /// Ampersand-escaped, because it lands in an HTML attribute.
+    fn self_link_query(self) -> &'static str {
+        if self.is_nav() {
+            "?embed=1&amp;nav=1"
+        } else {
+            self.link_query()
+        }
+    }
+
+    /// The attribute a self-navigating link needs to escape the injected
+    /// `<base target>` (D3, and the CONTEXT's named discretion: a per-link
+    /// override, not a second mode). Empty outside nav mode, where there is
+    /// no base target to escape.
+    fn self_link_target(self) -> &'static str {
+        if self.is_nav() {
+            " target=\"_self\""
+        } else {
+            ""
+        }
+    }
+
+    /// The `.layout` element's class list. `layout--embed` is what app.css
+    /// hangs the dropped topbar offset on — with no 53px bar above them,
+    /// the sticky sidebar, the code pane and a file section's sticky header
+    /// stick to the frame's own top edge instead.
+    /// `layout--panel` rides BESIDE `layout--embed`, never instead of it:
+    /// panel mode is embed mode with one column gone, so every sticky offset
+    /// the embed rules zero stays zeroed and app.css has one thing to say
+    /// about the missing sidebar rather than a second copy of the first.
+    fn layout_class(self) -> &'static str {
+        match self {
+            PageChrome::Panel => "layout layout--embed layout--panel",
+            _ if self.is_embed() => "layout layout--embed",
+            _ => "layout",
+        }
+    }
 }
 
 /// Docs|Code toggle for the top bar. The only change `file_page` makes to
@@ -8555,9 +9904,35 @@ fn section_switch(project: &Project, active: Section) -> String {
     } else {
         ""
     };
+    // The third link ships on EVERY page the switch renders on, Docs and Code
+    // included — a section the reader can only reach from one of the three is
+    // not a section of this viewer.
+    let changes_current = if active == Section::Changes {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
     format!(
-        "<nav class=\"section-switch\"><a href=\"/p/{pid}/\"{docs_current}>Docs</a><a href=\"/p/{pid}/_code/\"{code_current}>Code</a></nav>"
+        "<nav class=\"section-switch\"><a href=\"/p/{pid}/\"{docs_current}>Docs</a><a href=\"/p/{pid}/_code/\"{code_current}>Code</a><a href=\"/p/{pid}/_changes\"{changes_current}>Changes</a></nav>"
     )
+}
+
+/// The top bar a Code or Changes page renders — or, under D9's `embed=1`,
+/// the nothing it renders instead.
+///
+/// The whole of the outer chrome these two sections carry lives on that one
+/// bar: the section switch, the mobile drawer's hamburger, the menu, the
+/// agent and theme toggles. Dropping the bar therefore drops all of it in
+/// one place, and every element the page is actually FOR — the sidebar, the
+/// base picker, the reviewed marks — is below it and untouched. The
+/// `.layout` class beside this ([`PageChrome::layout_class`]) is what tells
+/// app.css that the 53px every sticky offset below assumes is no longer
+/// there.
+fn section_topbar(project: &Project, section: Section, chrome: PageChrome) -> String {
+    if chrome.is_embed() {
+        return String::new();
+    }
+    topbar_full(sidebar_toggle(), &section_switch(project, section), "", "")
 }
 
 /// What the main pane of a Code-section file page shows: highlighted source,
@@ -8583,9 +9958,17 @@ pub fn code_page(
     rel_path: &str,
     body: CodeBody,
     sidebar: &DirListing,
+    chrome: PageChrome,
 ) -> String {
     let active = base_name(rel_path);
-    let tree = code_tree(project, sidebar, Some(active));
+    // D2: nav mode is the tree alone. Returning before the source is
+    // line-numbered and highlighted is the point — a sidebar that renders a
+    // whole file's markup and then throws it away costs the same as the page
+    // it is meant to be cheaper than.
+    if chrome.is_nav() {
+        let tree = code_tree(project, sidebar, Some(active), chrome);
+        return code_nav_page(active, &tree);
+    }
 
     let (main, meta) = match body {
         CodeBody::Binary { size } => (
@@ -8631,25 +10014,19 @@ pub fn code_page(
             (main, meta)
         }
     };
-    let breadcrumb = breadcrumb(project, "_code/", rel_path, false, &meta);
+    let breadcrumb = breadcrumb(project, "_code/", rel_path, false, &meta, chrome);
 
     let body_html = format!(
         r#"{topbar}
-<div class="layout">
-  <aside id="sidebar" class="sidebar">{tree}</aside>
-  <div class="sidebar-backdrop"></div>
-  <main class="content content--code">
+<div class="{layout_cls}">
+  {side}<main class="content content--code">
     {breadcrumb}
     <div class="codeview">{main}</div>
   </main>
 </div>"#,
-        topbar = topbar_full(
-            sidebar_toggle(),
-            &section_switch(project, Section::Code),
-            "",
-            "",
-        ),
-        tree = tree,
+        topbar = section_topbar(project, Section::Code, chrome),
+        layout_cls = chrome.layout_class(),
+        side = code_side(project, sidebar, Some(active), chrome),
         breadcrumb = breadcrumb,
         main = main,
     );
@@ -8659,17 +10036,28 @@ pub fn code_page(
 /// A directory in the Code section: the same listing rendered both in the
 /// sidebar (compact nav) and the main pane (with sizes) — the two panes
 /// serve different roles, same as a file-explorer's tree-plus-detail split.
-pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
-    let tree = code_tree(project, listing, None);
-    let breadcrumb = breadcrumb(project, "_code/", &listing.rel_path, false, "");
+pub fn code_dir_page(project: &Project, listing: &DirListing, chrome: PageChrome) -> String {
+    // D2: the tree alone, before the main pane's own copy of this listing is
+    // built.
+    if chrome.is_nav() {
+        let tree = code_tree(project, listing, None, chrome);
+        let title = if listing.rel_path.is_empty() {
+            project.name.as_str()
+        } else {
+            listing.rel_path.as_str()
+        };
+        return code_nav_page(title, &tree);
+    }
+    let breadcrumb = breadcrumb(project, "_code/", &listing.rel_path, false, "", chrome);
 
     let mut rows = String::new();
     if !listing.rel_path.is_empty() {
         let parent = parent_dir(&listing.rel_path);
         rows.push_str(&format!(
-            "<a class=\"codelist__row codelist__row--dir\" href=\"/p/{pid}/_code/{parent}\">.. </a>",
+            "<a class=\"codelist__row codelist__row--dir\" href=\"/p/{pid}/_code/{parent}{q}\">.. </a>",
             pid = esc(&project.id),
             parent = esc(parent),
+            q = chrome.link_query(),
         ));
     }
     for entry in &listing.entries {
@@ -8690,10 +10078,11 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
             format_size(entry.size)
         };
         rows.push_str(&format!(
-            "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}\"><span class=\"codelist__name\">{label}</span><span class=\"codelist__size\">{size}</span></a>",
+            "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}{q}\"><span class=\"codelist__name\">{label}</span><span class=\"codelist__size\">{size}</span></a>",
             cls = cls,
             pid = esc(&project.id),
             rel = esc(&rel),
+            q = chrome.link_query(),
             label = esc(&label),
             size = size,
         ));
@@ -8706,25 +10095,899 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
     };
     let body_html = format!(
         r#"{topbar}
-<div class="layout">
-  <aside id="sidebar" class="sidebar">{tree}</aside>
-  <div class="sidebar-backdrop"></div>
-  <main class="content content--code">
+<div class="{layout_cls}">
+  {side}<main class="content content--code">
     {breadcrumb}
     <div class="codelist">{rows}</div>
   </main>
 </div>"#,
-        topbar = topbar_full(
-            sidebar_toggle(),
-            &section_switch(project, Section::Code),
-            "",
-            "",
-        ),
-        tree = tree,
+        topbar = section_topbar(project, Section::Code, chrome),
+        layout_cls = chrome.layout_class(),
+        side = code_side(project, listing, None, chrome),
         breadcrumb = breadcrumb,
         rows = rows,
     );
     layout_with_drawer(&title, "", &body_html, false)
+}
+
+/// The `#sidebar` column and the drawer backdrop under it, as the three
+/// pages that carry them have always emitted the pair — trailing indent
+/// included, so the markup around the call is byte-for-byte what it was.
+/// One place to build it is what lets panel mode (UAT) drop it in one place.
+fn sidebar_column(tree: &str) -> String {
+    format!(
+        "<aside id=\"sidebar\" class=\"sidebar\">{tree}</aside>\n  \
+         <div class=\"sidebar-backdrop\"></div>\n  "
+    )
+}
+
+/// The sidebar column of a Code page — or, in panel mode (UAT), the nothing
+/// that stands in for it.
+///
+/// The frame this page loads into on the homepage sits beside the file tree
+/// it was opened FROM, so a tree inside the frame is that tree twice. Panel
+/// mode drops the column and never builds [`code_tree`] for it; every other
+/// mode gets exactly the column both Code pages have always shown.
+fn code_side(
+    project: &Project,
+    listing: &DirListing,
+    active_file: Option<&str>,
+    chrome: PageChrome,
+) -> String {
+    if chrome.is_panel() {
+        return String::new();
+    }
+    sidebar_column(&code_tree(project, listing, active_file, chrome))
+}
+
+/// home-terminal-panel D2: a Code page reduced to its tree, for the terminal
+/// workspace's right sidebar.
+///
+/// Not a second renderer: `tree` is `code_tree`'s own output, already built
+/// by the page this replaces, with nav mode's link rules baked in by
+/// [`PageChrome::self_link_query`] — folders and crumbs re-render this frame,
+/// file rows leave it. The `<base target>` in the head is what sends those
+/// file rows to the panel above the terminal (D3), and the body is the tree
+/// with nothing beside it: no topbar, no drawer (`layout`, not
+/// `layout_with_drawer` — a nav frame 240px wide has nowhere to put a drawer
+/// and no reason to carry a second copy of one already open behind it), no
+/// main pane.
+fn code_nav_page(title: &str, tree: &str) -> String {
+    let body = format!("<div class=\"nav-only nav-only--code\">{tree}</div>");
+    layout(title, &panel_base_tag(), &body)
+}
+
+/// home-terminal-panel D2/D3: the Changes screen reduced to its changed-file
+/// list plus the base picker, for the terminal workspace's right sidebar.
+///
+/// The list is `changes_nav`'s own grouping, badges and counts — the same
+/// fragment the full screen puts in its sidebar — with one difference the
+/// mode forces: every row is an absolute deep link into the embedded Changes
+/// page at that file's section, because there are no sections in this frame
+/// for a bare `#f<i>` to reach. The picker rides along so the sidebar can
+/// change what it is comparing without the panel having to be open at all;
+/// it navigates this frame, not the panel ([`base_picker`]).
+///
+/// The unavailable and no-changes states are the same two the full screen
+/// shows, with the unavailable one carrying its explanation into the list
+/// itself: the full screen can say "see the note beside it" because a note
+/// is beside it, and here nothing is.
+fn changes_nav_page(project: &Project, view: &ChangesView, picker: &str) -> String {
+    let tree = match &view.content {
+        ChangesContent::Unavailable(reason) => changes_nav_empty(changes_unavailable_text(reason)),
+        ChangesContent::Diff(diff) if diff.files.is_empty() => {
+            changes_nav_empty("No changed files.")
+        }
+        ChangesContent::Diff(diff) => changes_nav(diff, &changes_deep_link_prefix(project, view)),
+    };
+    let body = format!(
+        "<div class=\"nav-only nav-only--changes\" data-project-id=\"{pid}\" data-base=\"{base}\">\
+         <div class=\"nav-only__head\">{picker}</div>{tree}</div>",
+        pid = esc(&project.id),
+        base = esc(active_sha(&view.base)),
+        picker = picker,
+        tree = tree,
+    );
+    layout("Changes", &panel_base_tag(), &body)
+}
+
+/// D3: what a nav row's `href` is, before its own `#f<i>` — the embedded
+/// Changes page for this project, on the base this nav was itself loaded
+/// with, so opening a file from a commit's list lands on that commit's diff
+/// rather than silently on the working tree.
+///
+/// The ampersand is entity-escaped because this string is built straight
+/// into an `href` attribute, and the sha is a value this server read out of
+/// git, escaped here like every other string this module renders.
+fn changes_deep_link_prefix(project: &Project, view: &ChangesView) -> String {
+    let sha = active_sha(&view.base);
+    if sha.is_empty() {
+        format!(
+            "/p/{pid}/_changes?embed=1&amp;panel=1",
+            pid = esc(&project.id)
+        )
+    } else {
+        format!(
+            "/p/{pid}/_changes?embed=1&amp;panel=1&amp;commit={sha}",
+            pid = esc(&project.id),
+            sha = esc(sha),
+        )
+    }
+}
+
+/// The Changes screen: the project's working tree against HEAD (D2), one
+/// stacked section per changed file, each a side-by-side two-column diff,
+/// beside a sidebar listing every changed file grouped by directory.
+///
+/// The sidebar is the Code section's own `.chapter` / `.chap-sec` /
+/// `.chap-file` markup, inside the same `#sidebar` / `.layout` /
+/// `.sidebar-backdrop` shell — the mobile drawer script in `app.js` finds
+/// this page's sidebar exactly as it finds Code's, with no change of its
+/// own. Server-rendered rather than a `#filelist` JSON blob: the changed
+/// list is fixed for the life of the page, so there is nothing for a
+/// client renderer to re-render.
+///
+/// Both sides are syntax-highlighted through `render`: `highlight_source`
+/// is handed each reconstructed side WHOLE, so multi-line parse state (a
+/// block comment, a raw string) stays correct, and the per-line fragments
+/// it returns drop straight into the table cells.
+///
+/// Reviewed marks are the reader's own, not the server's (D4): this page
+/// only lays the ground for them — `data-project-id` on the screen root,
+/// `data-path` and a content [`changeset_key`] on every section, a checkbox
+/// in each sticky header and a tick on each sidebar row. Which of them are
+/// ticked lives in the browser's `localStorage` and is never sent anywhere.
+///
+/// Git being unavailable, the project not being a repository, and a call
+/// that had to be killed all render an explained empty state here (D3) —
+/// the entry point stays, only its content changes.
+///
+/// `chrome` is D9: `PageChrome::Embed` renders this exact page without the
+/// topbar, for a same-origin iframe. Nothing inside the `.layout` changes —
+/// the changed-file sidebar, the base picker and the reviewed marks are all
+/// still here — and the picker carries the flag onward so a base change
+/// inside a frame stays inside it.
+pub fn changes_page(
+    project: &Project,
+    view: &ChangesView,
+    render: &RenderService,
+    chrome: PageChrome,
+) -> String {
+    let scope = base_label(&view.base);
+    let picker = base_picker(project, view, chrome);
+    // D2: nav mode is the changed-file list alone, and it returns before
+    // `changes_body` runs. `render` goes untouched on this path on purpose —
+    // highlighting both sides of every changed file is the whole cost of this
+    // screen, and a frame that shows none of them must not pay it.
+    if chrome.is_nav() {
+        return changes_nav_page(project, view, &picker);
+    }
+    let main = match &view.content {
+        ChangesContent::Unavailable(reason) => changes_unavailable(reason),
+        ChangesContent::Diff(diff) => {
+            changes_body(project, diff, &picker, render, chrome.link_query())
+        }
+    };
+    // UAT: in panel mode the changed-file list is already on screen — it is
+    // the sidebar this frame was opened FROM — so the page renders without
+    // its own copy, and without the backdrop the mobile drawer opens behind
+    // it. `changes_nav` is not built at all on that path: a list nobody can
+    // see is markup nobody asked for.
+    let side = if chrome.is_panel() {
+        String::new()
+    } else {
+        let tree = match &view.content {
+            ChangesContent::Unavailable(_) => {
+                changes_nav_empty("No file list — see the note beside it.")
+            }
+            ChangesContent::Diff(diff) if diff.files.is_empty() => {
+                changes_nav_empty("No changed files.")
+            }
+            ChangesContent::Diff(diff) => changes_nav(diff, ""),
+        };
+        sidebar_column(&tree)
+    };
+    let body_html = format!(
+        r#"{topbar}
+<div class="{layout_cls}">
+  {side}<main class="content content--changes">
+    <nav class="breadcrumb"><div class="breadcrumb__left"><a href="/p/{pid}/">{name}</a> <span class="sep">/</span> Changes</div><div class="breadcrumb__right"><span class="breadcrumb__meta-lang">{scope}</span></div></nav>
+    <div class="changes" data-project-id="{pid}" data-base="{base}">{main}</div>
+  </main>
+</div>"#,
+        topbar = section_topbar(project, Section::Changes, chrome),
+        layout_cls = chrome.layout_class(),
+        side = side,
+        pid = esc(&project.id),
+        name = esc(&project.name),
+        scope = esc(&scope),
+        base = esc(active_sha(&view.base)),
+        main = main,
+    );
+    layout_with_drawer("Changes", "", &body_html, false)
+}
+
+/// What the screen says it is comparing (D6). The working tree keeps the
+/// words it has always had, so a page without `?commit` reads exactly as it
+/// did; a commit names itself by git's own abbreviation and its subject.
+///
+/// The subject is whatever a commit author typed — it is escaped by every
+/// caller here, like every other string this module renders.
+fn base_label(base: &ActiveBase) -> String {
+    match base {
+        ActiveBase::WorkingTree => "working tree".to_string(),
+        ActiveBase::Commit(commit) if commit.subject.is_empty() => {
+            format!("commit {}", commit.short)
+        }
+        ActiveBase::Commit(commit) => {
+            let condensed = condense_bee_subject(&commit.subject);
+            format!(
+                "{} — {}",
+                commit.short,
+                condensed.as_deref().unwrap_or(&commit.subject)
+            )
+        }
+    }
+}
+
+/// The base a reviewed mark and the picker are keyed by: the empty string
+/// for the working tree, the full sha for a commit. Not a label — a value.
+fn active_sha(base: &ActiveBase) -> &str {
+    match base {
+        ActiveBase::WorkingTree => "",
+        ActiveBase::Commit(commit) => commit.sha.as_str(),
+    }
+}
+
+/// D6's base picker: the working tree and the repository's recent commits,
+/// as one `<select>` sitting where the scope label used to sit.
+///
+/// Every option value is either empty or a sha this server itself read out
+/// of git — never anything a reader typed, and never a label. The reader's
+/// choice becomes `?commit=<sha>`, which D7 checks again before git sees
+/// it; nothing here is trusted twice over.
+///
+/// The `<form>` around it is the no-scripting path: submitting posts the
+/// same `commit` field to the same screen, and an empty value falls back to
+/// the working tree exactly like any other unusable one. With scripting,
+/// `app.js` hides the button and navigates on `change`, so the plain URL
+/// (not `?commit=`) is what a working-tree choice leaves in the address bar.
+///
+/// The working-tree option is capitalised on purpose: "working tree" in
+/// lower case is the page's own claim about what it is showing (the
+/// breadcrumb, the header's empty state), and a picker that always offers
+/// the choice must not be mistaken for the page making that claim.
+fn base_picker(project: &Project, view: &ChangesView, chrome: PageChrome) -> String {
+    let active = active_sha(&view.base);
+    let mut options = format!(
+        "<option value=\"\"{sel}>Working tree</option>",
+        sel = if active.is_empty() { " selected" } else { "" },
+    );
+    // A commit older than the listed window would otherwise vanish from its
+    // own picker; it leads the list instead, so what the page shows is
+    // always something the picker shows too.
+    if let ActiveBase::Commit(commit) = &view.base {
+        if !view.commits.iter().any(|e| e.sha == commit.sha) {
+            options.push_str(&commit_option(commit, true));
+        }
+    }
+    for commit in &view.commits {
+        options.push_str(&commit_option(commit, commit.sha == active));
+    }
+    // D9: a picked base must not navigate the frame out of embed mode. A GET
+    // form drops any query already in its `action`, so the flag rides as a
+    // field of the form itself; `data-embed` is the same answer for the
+    // scripted path, which builds its own URL in `app.js`.
+    //
+    // home-terminal-panel D2/D3: in nav mode the picker changes the SIDEBAR's
+    // own base, so the form targets itself past the injected base target and
+    // carries `nav=1` beside `embed=1`. It also drops `data-base-url`, which
+    // is what `app.js` selects the scripted `change` handler on: that handler
+    // rebuilds the URL from `data-embed` alone and would drop `nav=1`,
+    // replacing this narrow sidebar with a whole diff page. Without the
+    // attribute the handler never binds here, and the plain GET form — the
+    // scripting-off path this element has always carried — does the
+    // navigating, Show button and all.
+    let (embed_field, embed_attr, hook_attr, form_target) = if chrome.is_nav() {
+        (
+            "<input type=\"hidden\" name=\"embed\" value=\"1\">\
+             <input type=\"hidden\" name=\"nav\" value=\"1\">",
+            "",
+            String::new(),
+            " target=\"_self\"",
+        )
+    } else if chrome.is_panel() {
+        // UAT: the picker is one of the header controls panel mode KEEPS, so
+        // both of its paths carry `panel=1` the way they already carry
+        // `embed=1` — the GET form as a second hidden field, the scripted
+        // handler as a second data attribute. A base picked inside the panel
+        // must come back as a panel page, not as one with the duplicate
+        // sidebar grown back.
+        (
+            "<input type=\"hidden\" name=\"embed\" value=\"1\">\
+             <input type=\"hidden\" name=\"panel\" value=\"1\">",
+            " data-embed=\"1\" data-panel=\"1\"",
+            format!(
+                "data-base-url=\"/p/{pid}/_changes\"",
+                pid = esc(&project.id)
+            ),
+            "",
+        )
+    } else if chrome.is_embed() {
+        (
+            "<input type=\"hidden\" name=\"embed\" value=\"1\">",
+            " data-embed=\"1\"",
+            format!(
+                "data-base-url=\"/p/{pid}/_changes\"",
+                pid = esc(&project.id)
+            ),
+            "",
+        )
+    } else {
+        (
+            "",
+            "",
+            format!(
+                "data-base-url=\"/p/{pid}/_changes\"",
+                pid = esc(&project.id)
+            ),
+            "",
+        )
+    };
+    format!(
+        "<form class=\"changes__base\" method=\"get\" action=\"/p/{pid}/_changes\"{form_target}>\
+         <label class=\"changes__base-label\" for=\"changes-base\">Comparing</label>\
+         <select class=\"changes__base-select\" id=\"changes-base\" name=\"commit\" \
+         {hook_attr}{embed_attr}>{options}</select>\
+         {embed_field}\
+         <button class=\"changes__base-go\" type=\"submit\">Show</button>\
+         </form>",
+        pid = esc(&project.id),
+        form_target = form_target,
+        hook_attr = hook_attr,
+        embed_attr = embed_attr,
+        options = options,
+        embed_field = embed_field,
+    )
+}
+
+/// commit-label-condense D1: bee's own machinery names one feature three
+/// ways inside a commit subject — the bare slug, the worktree directory
+/// `<project>--wt--<slug>`, and the branch `wt/<slug>` — so a picker that
+/// shows those subjects verbatim makes one feature read as three. The three
+/// machine shapes condense to `<slug> · <action>` at display time only; the
+/// stored subject and sha are untouched, and any subject a human typed
+/// renders exactly as typed.
+fn condense_bee_subject(subject: &str) -> Option<String> {
+    if let Some(rest) = subject.strip_prefix("Merge worktree ") {
+        if let Some(rest) = rest.strip_suffix(" via bee worktree merge") {
+            if let Some((_, branch)) = rest.split_once(" (branch wt/") {
+                if let Some(slug) = branch.strip_suffix(')') {
+                    if !slug.is_empty() {
+                        return Some(format!("{slug} · worktree merge"));
+                    }
+                }
+            }
+        }
+    }
+    if subject.starts_with("Auto-commit ") {
+        if let Some((_, dir)) = subject.split_once(" bookkeeping before merging worktree ") {
+            if let Some(slug) = wt_dir_slug(dir) {
+                return Some(format!("{slug} · pre-merge bookkeeping"));
+            }
+        }
+    }
+    if let Some(rest) = subject.strip_prefix("Commit ") {
+        if let Some((_, dir)) = rest.split_once(" lane rewrite after merging worktree ") {
+            if let Some(slug) = wt_dir_slug(dir) {
+                return Some(format!("{slug} · lane bookkeeping"));
+            }
+        }
+    }
+    None
+}
+
+/// The slug a worktree directory name carries at its tail
+/// (`<project>--wt--<slug>`), or nothing when the name has no such tail.
+fn wt_dir_slug(dir: &str) -> Option<&str> {
+    match dir.rsplit_once("--wt--") {
+        Some((_, slug)) if !slug.is_empty() => Some(slug),
+        _ => None,
+    }
+}
+
+/// One commit as the picker lists it. The subject is whatever its author
+/// typed — untrusted text, escaped here like everything else this module
+/// renders, and never part of a URL — except that a bee machine subject is
+/// condensed first (commit-label-condense D1).
+fn commit_option(commit: &CommitEntry, selected: bool) -> String {
+    let condensed = condense_bee_subject(&commit.subject);
+    let subject = condensed.as_deref().unwrap_or(&commit.subject);
+    let label = if subject.is_empty() {
+        format!("{} · {}", commit.short, commit.date)
+    } else {
+        format!("{} — {} · {}", commit.short, subject, commit.date)
+    };
+    format!(
+        "<option value=\"{sha}\"{sel}>{label}</option>",
+        sha = esc(&commit.sha),
+        sel = if selected { " selected" } else { "" },
+        label = esc(&label),
+    )
+}
+
+/// D3's empty state, in the user's terms: what the screen would show, why it
+/// cannot, and never git's own stderr — a path or a repository name from
+/// inside that message would be the one thing this daemon must not disclose.
+fn changes_unavailable(reason: &GitDiffError) -> String {
+    format!(
+        "<p class=\"changes__empty\">{}</p>",
+        esc(changes_unavailable_text(reason))
+    )
+}
+
+/// The words alone, without the paragraph around them — [`changes_nav_page`]
+/// puts the same explanation inside the nav list, where a `<p class="changes__empty">`
+/// would be a main-pane element in a sidebar.
+fn changes_unavailable_text(reason: &GitDiffError) -> &'static str {
+    match reason {
+        GitDiffError::NotARepo => {
+            "This project is not a git repository, so there is no working tree to compare."
+        }
+        GitDiffError::GitUnavailable(_) => {
+            "The Changes screen reads the working tree with the git command line, and this machine has none available."
+        }
+        GitDiffError::Timeout(_) => {
+            "git took too long to answer for this project, so the call was stopped. A very large working tree can do this."
+        }
+    }
+}
+
+fn plural_files(n: usize) -> &'static str {
+    if n == 1 {
+        "file"
+    } else {
+        "files"
+    }
+}
+
+/// The directory a changed file is listed under in the sidebar. Files at the
+/// project root group under `/` rather than an empty header, so every row on
+/// the list sits below a heading that says where it lives.
+fn changes_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "/",
+    }
+}
+
+/// The changed-file sidebar: one `.chap-sec` header per directory, its files
+/// indented below it as `.chap-file` rows carrying the status badge and the
+/// file's own `+n −m`. Each row links to its section's anchor, so clicking
+/// scrolls there with no script at all; `app.js` only adds the "which
+/// section am I looking at" highlight on top.
+/// `href_prefix` is home-terminal-panel D3, and is `""` for every page that
+/// renders the diff sections beside this list — the bare `#f<i>` anchor
+/// those pages have always emitted, byte for byte. Nav mode (D2) has no
+/// sections beside it, so a bare fragment would scroll a narrow sidebar to
+/// nowhere; it passes the embedded Changes page's own absolute URL instead,
+/// and each row becomes a deep link that fills the panel frame already
+/// scrolled to that file.
+fn changes_nav(diff: &WorkingTreeDiff, href_prefix: &str) -> String {
+    // First-seen directory order (git lists paths sorted), so the sidebar
+    // reads in the same order as the sections beside it.
+    let mut groups: Vec<(&str, Vec<(usize, &FileChange)>)> = Vec::new();
+    for (i, file) in diff.files.iter().enumerate() {
+        let dir = changes_dir(&file.path);
+        match groups.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, files)) => files.push((i, file)),
+            None => groups.push((dir, vec![(i, file)])),
+        }
+    }
+    let mut out = String::from("<nav class=\"chapter changes-nav\">");
+    for (dir, files) in groups {
+        out.push_str(&format!(
+            "<div class=\"chap-sec\">{dir}</div>",
+            dir = esc(dir)
+        ));
+        for (i, file) in files {
+            let label = match &file.old_path {
+                Some(old) => format!("{} → {}", old, file.path),
+                None => file.path.clone(),
+            };
+            // The tick mirrors the section header's checkbox and is never read
+            // back: `app.js` paints it from that one checkbox, which is the
+            // single source of truth for a file's reviewed mark (D4). It ships
+            // in the markup and hides in CSS, so a page with scripting off
+            // shows no tick rather than a control that never moves.
+            out.push_str(&format!(
+                "<a class=\"chap-file chg-row\" href=\"{prefix}#f{i}\" title=\"{title}\">\
+                 {badge}<span class=\"chg-row__name\">{name}</span>{stat}\
+                 <span class=\"chg-row__check\" aria-hidden=\"true\">\u{2713}</span></a>",
+                prefix = href_prefix,
+                i = i,
+                title = esc(&label),
+                badge = chg_badge(file),
+                name = esc(base_name(&file.path)),
+                stat = chg_stat(file),
+            ));
+        }
+    }
+    out.push_str("</nav>");
+    out
+}
+
+/// The sidebar when there is nothing to list — the shell still renders, so
+/// the drawer toggle and the layout columns behave the same as on a page
+/// with a hundred changed files.
+fn changes_nav_empty(note: &str) -> String {
+    format!(
+        "<nav class=\"chapter changes-nav\"><div class=\"chap-sec\">Changed files</div>\
+         <p class=\"changes-nav__empty\">{note}</p></nav>",
+        note = esc(note)
+    )
+}
+
+/// The status letter as the screenshot shows it: one square, one letter, the
+/// colour carried by a modifier class so the palette lives in CSS.
+fn chg_badge(file: &FileChange) -> String {
+    let (letter, modifier, label) = match file.status {
+        ChangeStatus::Modified => ("M", "m", "Modified"),
+        ChangeStatus::Added => ("A", "a", "Added"),
+        ChangeStatus::Deleted => ("D", "d", "Deleted"),
+        ChangeStatus::Renamed => ("R", "r", "Renamed"),
+    };
+    format!(
+        "<span class=\"chg-badge chg-badge--{modifier}\" title=\"{label}\">{letter}</span>",
+        modifier = modifier,
+        label = label,
+        letter = letter,
+    )
+}
+
+fn chg_stat(file: &FileChange) -> String {
+    format!(
+        "<span class=\"chg-stat\"><span class=\"chg-stat__add\">+{added}</span>\
+         <span class=\"chg-stat__del\">&minus;{removed}</span></span>",
+        added = file.added,
+        removed = file.removed,
+    )
+}
+
+fn changes_body(
+    project: &Project,
+    diff: &WorkingTreeDiff,
+    picker: &str,
+    render: &RenderService,
+    open_q: &str,
+) -> String {
+    let mut out = String::new();
+    // The scope label the screen shipped with is now something you can
+    // change (D6): the picker renders here, already carrying the active
+    // base as its selected option, and the breadcrumb keeps the words.
+    let mut head = format!(
+        "<span class=\"changes__count\">{n} {word} changed</span>{picker}",
+        n = diff.files.len(),
+        word = plural_files(diff.files.len()),
+        picker = picker,
+    );
+    if !diff.files.is_empty() {
+        // D4's N/M counter. It ships `hidden` and `app.js` unhides it, the
+        // same way every other scripting-only control on this site does: with
+        // scripting off there is no storage to read and no checkbox to count,
+        // and a counter frozen at zero would be a number that lies.
+        head.push_str(&format!(
+            "<span class=\"changes__reviewed\" hidden>0/{n} reviewed</span>",
+            n = diff.files.len(),
+        ));
+        // diff-file-collapse D3: ONE control for the whole screen, its label
+        // and `aria-expanded` flipped by app.js as the sections open and
+        // close — Collapse all while any is open, Expand all once every one
+        // is folded. Hidden until app.js takes it, for the reason above.
+        head.push_str(
+            "<button type=\"button\" class=\"changes__fold-all\" hidden>Collapse all</button>",
+        );
+    }
+    if diff.hidden > 0 {
+        // D5: the count, never the names — naming them would disclose
+        // exactly what the project's exclude rules exist to hide.
+        head.push_str(&format!(
+            "<span class=\"changes__hidden\">{n} {word} hidden by this project's exclude rules</span>",
+            n = diff.hidden,
+            word = plural_files(diff.hidden),
+        ));
+    }
+    out.push_str(&format!("<header class=\"changes__head\">{head}</header>"));
+    if diff.stdout_truncated {
+        out.push_str("<p class=\"changes__note\">This diff was too large to read whole — part of it is missing.</p>");
+    }
+    if diff.sections_capped {
+        out.push_str("<p class=\"changes__note\">Only the first files are shown with their contents; the rest are listed without.</p>");
+    }
+    if diff.files.is_empty() {
+        out.push_str(match diff.base {
+            ActiveBase::WorkingTree => {
+                "<p class=\"changes__empty\">Nothing has changed in the working tree.</p>"
+            }
+            ActiveBase::Commit(_) => "<p class=\"changes__empty\">This commit changed nothing.</p>",
+        });
+        return out;
+    }
+    for (i, file) in diff.files.iter().enumerate() {
+        out.push_str(&changes_section(project, i, file, render, open_q));
+    }
+    out
+}
+
+fn changes_section(
+    project: &Project,
+    index: usize,
+    file: &FileChange,
+    render: &RenderService,
+    open_q: &str,
+) -> String {
+    let name = match &file.old_path {
+        Some(old) => format!("{} → {}", old, file.path),
+        None => file.path.clone(),
+    };
+    let note = match &file.note {
+        Some(n) => format!(" <span class=\"changeset__note\">{}</span>", esc(n)),
+        None => String::new(),
+    };
+    let body = match &file.body {
+        ChangeBody::Text {
+            old_text,
+            new_text,
+            lines,
+            truncated,
+        } => {
+            let banner = if *truncated {
+                format!(
+                    "<p class=\"changes__note\">Truncated — too large to show whole. {link}</p>",
+                    link = code_view_link(project, &file.path, open_q),
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{banner}<div class=\"changeset__scroll\"><table class=\"changeset__table\">{rows}</table></div>",
+                banner = banner,
+                rows = changes_rows(file, old_text, new_text, lines, render),
+            )
+        }
+        ChangeBody::Binary => {
+            "<p class=\"changeset__flat\">Binary file changed — no line diff.</p>".to_string()
+        }
+        ChangeBody::Submodule => {
+            "<p class=\"changeset__flat\">Submodule — changed at its own commit.</p>".to_string()
+        }
+        ChangeBody::NoContentChange => {
+            "<p class=\"changeset__flat\">No content changes (a rename, a mode, or line endings).</p>"
+                .to_string()
+        }
+        ChangeBody::Omitted(why) => format!(
+            "<p class=\"changeset__flat\">{why} {link}</p>",
+            why = esc(why),
+            link = code_view_link(project, &file.path, open_q),
+        ),
+    };
+    // diff-file-collapse D1: the two-way fold sits FIRST in the sticky
+    // header, so every file's chevron lines up down the left edge and the
+    // path still starts where it always did. It ships `hidden` and app.js
+    // unhides it — the same contract `.changeset__review` follows, because a
+    // control that remembers nothing must not appear with scripting off.
+    // `aria-controls` names the body it folds, which is why the body div now
+    // carries an id of its own.
+    format!(
+        "<section class=\"changeset\" id=\"f{index}\" data-path=\"{path}\" data-key=\"{key}\">\
+         <h2 class=\"changeset__head\">\
+         <button type=\"button\" class=\"changeset__fold\" aria-expanded=\"true\" \
+         aria-controls=\"f{index}-body\" aria-label=\"Fold {name}\" hidden>\
+         <span class=\"changeset__fold-chev\" aria-hidden=\"true\">›</span></button>\
+         {badge}\
+         <span class=\"changeset__path\">{name}</span>{note}{stat}\
+         <label class=\"changeset__review\" hidden>\
+         <input type=\"checkbox\" class=\"changeset__review-box\">\
+         <span class=\"changeset__review-text\">Reviewed</span></label></h2>\
+         <div class=\"changeset__body\" id=\"f{index}-body\">{body}</div></section>",
+        index = index,
+        path = esc(&file.path),
+        key = changeset_key(file),
+        badge = chg_badge(file),
+        name = esc(&name),
+        note = note,
+        stat = chg_stat(file),
+        body = body,
+    )
+}
+
+/// The content key a reviewed mark is stored against (D4).
+///
+/// A mark is a statement about what the reader SAW, never about a file name,
+/// so it hangs on the section's content: status, the counts, and both
+/// reconstructed sides. Edit a marked file and this key moves, the mark
+/// stored in the reader's browser stops matching, and `app.js` drops it on
+/// the next load — a tick can never end up hiding a change nobody has read.
+///
+/// FNV-1a through [`path_hash`], which is the one hash in this repo written
+/// to stay byte-identical across Rust releases; `DefaultHasher` explicitly
+/// does not promise that, and a value living in someone's `localStorage`
+/// between browser sessions is exactly where that promise matters.
+///
+/// Named limit: a binary file's bytes are not in the diff at all
+/// ([`ChangeBody::Binary`] carries no content), so re-editing one leaves its
+/// key unmoved and its mark standing. There is nothing to hash short of
+/// reading the file, and the section shows no content to re-review.
+fn changeset_key(file: &FileChange) -> String {
+    // \u{1} separates the fields so no concatenation of two of them can be
+    // read as a different pair (a path ending in a digit beside a count).
+    let body = match &file.body {
+        ChangeBody::Text {
+            old_text,
+            new_text,
+            truncated,
+            ..
+        } => format!("text\u{1}{truncated}\u{1}{old_text}\u{1}{new_text}"),
+        ChangeBody::Binary => "binary".to_string(),
+        ChangeBody::Submodule => "submodule".to_string(),
+        ChangeBody::NoContentChange => "unchanged".to_string(),
+        ChangeBody::Omitted(why) => format!("omitted\u{1}{why}"),
+    };
+    let material = format!(
+        "{status}\u{1}{old}\u{1}{added}\u{1}{removed}\u{1}{body}",
+        status = file.status.letter(),
+        old = file.old_path.as_deref().unwrap_or(""),
+        added = file.added,
+        removed = file.removed,
+        body = body,
+    );
+    short_code(&path_hash(&file.path, &material))
+}
+
+/// The same file over in the Code section — the way out of every section
+/// this screen deliberately does not render whole. Carries the page's own
+/// chrome query so a framed page (embed/panel) never walks its frame back
+/// to full chrome.
+fn code_view_link(project: &Project, rel_path: &str, open_q: &str) -> String {
+    format!(
+        "<a class=\"changeset__open\" href=\"/p/{pid}/_code/{path}{q}\">Open in Code view</a>",
+        pid = esc(&project.id),
+        path = esc(rel_path),
+        q = open_q,
+    )
+}
+
+/// One side's highlighted lines, addressed by the line NUMBER the patch
+/// gives them rather than by position: a reconstructed side can begin at
+/// line 1 (the ordinary case) or, in a file so large its first hunk starts
+/// later, at some other line. `base` is that first number, so a fragment is
+/// always looked up at `number - base` — and a lookup that falls outside
+/// renders the patch's own text instead, plain but never wrong.
+struct HighlightedSide<'a> {
+    lines: &'a [String],
+    base: usize,
+}
+
+impl HighlightedSide<'_> {
+    fn fragment(&self, line: &DiffLine, number: Option<usize>) -> String {
+        number
+            .and_then(|n| n.checked_sub(self.base))
+            .and_then(|i| self.lines.get(i))
+            .cloned()
+            .unwrap_or_else(|| esc(&line.text))
+    }
+}
+
+/// The side-by-side pairing: a run of removed lines sits beside the run of
+/// added lines that replaced it, row by row, and a context line fills both
+/// columns. The line numbers come from the patch itself, so neither column
+/// has to be counted here.
+///
+/// Each side is highlighted once, whole, before the walk — never per hunk:
+/// a block comment or a raw string opened above the first changed line only
+/// parses correctly when the parser has seen the file from its top.
+fn changes_rows(
+    file: &FileChange,
+    old_text: &str,
+    new_text: &str,
+    lines: &[DiffLine],
+    render: &RenderService,
+) -> String {
+    let old_name = file.old_path.as_deref().unwrap_or(&file.path);
+    let old_hl = render.highlight_source(std::path::Path::new(old_name), old_text);
+    let new_hl = render.highlight_source(std::path::Path::new(&file.path), new_text);
+    let old_side = HighlightedSide {
+        lines: &old_hl.lines,
+        base: lines.iter().find_map(|l| l.old_no).unwrap_or(1),
+    };
+    let new_side = HighlightedSide {
+        lines: &new_hl.lines,
+        base: lines.iter().find_map(|l| l.new_no).unwrap_or(1),
+    };
+
+    let mut out = String::new();
+    let mut removed: Vec<&DiffLine> = Vec::new();
+    let mut added: Vec<&DiffLine> = Vec::new();
+    for line in lines {
+        match line.kind {
+            LineKind::Removed => removed.push(line),
+            LineKind::Added => added.push(line),
+            LineKind::Context => {
+                flush_change_rows(&mut out, &mut removed, &mut added, &old_side, &new_side);
+                out.push_str(&changes_row(
+                    Some(line),
+                    Some(line),
+                    "ctx",
+                    &old_side,
+                    &new_side,
+                ));
+            }
+        }
+    }
+    flush_change_rows(&mut out, &mut removed, &mut added, &old_side, &new_side);
+    out
+}
+
+fn flush_change_rows(
+    out: &mut String,
+    removed: &mut Vec<&DiffLine>,
+    added: &mut Vec<&DiffLine>,
+    old_side: &HighlightedSide,
+    new_side: &HighlightedSide,
+) {
+    let pairs = removed.len().max(added.len());
+    for i in 0..pairs {
+        let left = removed.get(i).copied();
+        let right = added.get(i).copied();
+        let cls = match (left.is_some(), right.is_some()) {
+            (true, true) => "chg",
+            (true, false) => "del",
+            _ => "add",
+        };
+        out.push_str(&changes_row(left, right, cls, old_side, new_side));
+    }
+    removed.clear();
+    added.clear();
+}
+
+fn changes_row(
+    left: Option<&DiffLine>,
+    right: Option<&DiffLine>,
+    cls: &str,
+    old_side: &HighlightedSide,
+    new_side: &HighlightedSide,
+) -> String {
+    fn cell(
+        side: Option<&DiffLine>,
+        hl: &HighlightedSide,
+        number: fn(&DiffLine) -> Option<usize>,
+        gutter: &str,
+        pane: &str,
+    ) -> String {
+        match side {
+            Some(line) => format!(
+                "<td class=\"diffrow__num diffrow__num--{gutter}\">{n}</td>\
+                 <td class=\"diffrow__side diffrow__side--{pane}\"><code>{text}</code></td>",
+                gutter = gutter,
+                pane = pane,
+                n = number(line).map(|n| n.to_string()).unwrap_or_default(),
+                text = hl.fragment(line, number(line)),
+            ),
+            // The side this row has no line for: an empty gutter and an
+            // empty cell, so the two columns stay aligned row for row.
+            None => format!(
+                "<td class=\"diffrow__num diffrow__num--{gutter}\"></td>\
+                 <td class=\"diffrow__side diffrow__side--none\"></td>",
+                gutter = gutter,
+            ),
+        }
+    }
+    format!(
+        "<tr class=\"diffrow diffrow--{cls}\">{old}{new}</tr>",
+        cls = cls,
+        old = cell(left, old_side, |l| l.old_no, "old", "old"),
+        new = cell(right, new_side, |l| l.new_no, "new", "new"),
+    )
 }
 
 /// Sidebar for the Code section: always exactly one directory's contents
@@ -8742,16 +11005,29 @@ pub fn code_dir_page(project: &Project, listing: &DirListing) -> String {
 /// script in `app.js` wires the folder bar's click-to-toggle behavior once
 /// at load (this HTML needs no JS to render correctly, only to become
 /// interactive).
-fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>) -> String {
+fn code_tree(
+    project: &Project,
+    listing: &DirListing,
+    active_file: Option<&str>,
+    chrome: PageChrome,
+) -> String {
     let mut out = String::from(
         "<div class=\"fg-sidebar-search\">\
          <input class=\"fg-input\" placeholder=\"Search…\" autocomplete=\"off\" disabled></div>\
          <nav class=\"chapter\">",
     );
 
+    // D3: a folder or a crumb re-renders THIS frame (the sidebar navigating
+    // itself), so it keeps nav mode and steps out of the injected base
+    // target; only a FILE row carries the base target through to the panel,
+    // and it does that by having no target of its own.
+    let dir_q = chrome.self_link_query();
+    let dir_target = chrome.self_link_target();
     let mut crumbs = format!(
-        "<a class=\"chap-seg\" href=\"/p/{pid}/_code/\">{name}</a>",
+        "<a class=\"chap-seg\" href=\"/p/{pid}/_code/{q}\"{target}>{name}</a>",
         pid = esc(&project.id),
+        q = dir_q,
+        target = dir_target,
         name = esc(&project.name),
     );
     let mut acc = String::new();
@@ -8761,9 +11037,11 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
         }
         acc.push_str(seg);
         crumbs.push_str(&format!(
-            "<span class=\"chap-sep\">›</span><a class=\"chap-seg\" href=\"/p/{pid}/_code/{acc}\">{seg}</a>",
+            "<span class=\"chap-sep\">›</span><a class=\"chap-seg\" href=\"/p/{pid}/_code/{acc}{q}\"{target}>{seg}</a>",
             pid = esc(&project.id),
             acc = esc(&acc),
+            q = dir_q,
+            target = dir_target,
             seg = esc(seg),
         ));
     }
@@ -8777,9 +11055,11 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
         if entry.is_dir {
             dir_count += 1;
             dirs.push_str(&format!(
-                "<a class=\"chap-subfolder\" href=\"/p/{pid}/_code/{rel}\">{name}</a>",
+                "<a class=\"chap-subfolder\" href=\"/p/{pid}/_code/{rel}{q}\"{target}>{name}</a>",
                 pid = esc(&project.id),
                 rel = esc(&rel),
+                q = dir_q,
+                target = dir_target,
                 name = esc(&entry.name),
             ));
         } else {
@@ -8789,10 +11069,11 @@ fn code_tree(project: &Project, listing: &DirListing, active_file: Option<&str>)
                 "chap-file"
             };
             files.push_str(&format!(
-                "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}\">{name}</a>",
+                "<a class=\"{cls}\" href=\"/p/{pid}/_code/{rel}{q}\">{name}</a>",
                 cls = cls,
                 pid = esc(&project.id),
                 rel = esc(&rel),
+                q = chrome.link_query(),
                 name = esc(&entry.name),
             ));
         }
@@ -8947,8 +11228,8 @@ fn copy_md_button() -> &'static str {
 }
 
 /// Shared top bar for every page: brand, a page-specific center slot (crumb or
-/// empty), the Settings link, and the theme toggle. Keeps the Settings link on
-/// all pages and stops each view re-inventing its own header.
+/// empty), the Hướng dẫn and Settings links, and the theme toggle. Keeps both
+/// links on all pages and stops each view re-inventing its own header.
 fn topbar(center: &str) -> String {
     topbar_full("", center, "", "")
 }
@@ -8966,7 +11247,9 @@ fn topbar(center: &str) -> String {
 /// on these pages is "Waggle Dance" by a locked decision (`bee-cockpit.md`),
 /// never the identifier the command line uses.
 ///
-/// The nav slot and the Settings link share one menu. On a wide screen the
+/// The nav slot, the Hộp thư link (board-visibility bi-2), the Hướng dẫn link
+/// (guide-vi) and the Settings link share
+/// one menu. On a wide screen the
 /// stylesheet hides its control and lays the panel out inline, so the bar
 /// reads exactly as it did before this existed. On a narrow one the control
 /// becomes the only visible affordance and the panel drops full-width under
@@ -9011,6 +11294,8 @@ fn topbar_full(lead: &str, center: &str, actions: &str, nav: &str) -> String {
       <label class="topbar-menu__button" for="topbar-menu-toggle" title="Menu"><span class="menu-label">Menu</span><span aria-hidden="true">☰</span></label>
       <div class="topbar-menu__panel">
         {nav}
+        <a class="nav-link nav-link--icon" href="/inbox" title="Hộp thư"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"></rect><polyline points="3 7 12 13 21 7"></polyline></svg><span class="nav-link__txt">Hộp thư</span></a>
+        <a class="nav-link nav-link--icon" href="/guide" title="Hướng dẫn"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg><span class="nav-link__txt">Hướng dẫn</span></a>
         <a class="nav-link nav-link--icon" href="/settings" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg><span class="nav-link__txt">Settings</span></a>
       </div>
     </div>
@@ -9092,7 +11377,7 @@ pub fn settings_page(
     saved: bool,
     notify_credential_save_failed: bool,
     notify_credential_view: NotifyCredentialView,
-    projects: &[Project],
+    projects: &[(Project, Option<String>)],
 ) -> String {
     // agent-terminal-24: checked first, so a failed credential save is never
     // shadowed by `saved=1` also being set on the same redirect — a user
@@ -9111,27 +11396,28 @@ pub fn settings_page(
     let sel = |v: &str, opt: &str| if v == opt { "selected" } else { "" };
     let excludes = cfg.indexing.exclude_patterns.join("\n");
 
-    // D6: one row per registered project, each its own tiny form posting to
-    // that project's own toggle endpoint — a plain checkbox + Save, no
-    // JavaScript, the same no-script-required posture every other form on
-    // this page already keeps. `checked` here is the row's own boolean
-    // reflecting `Project::orchestration_enabled`, not the outer `checked`
-    // closure's `saved` flag.
     let orchestration_rows = if projects.is_empty() {
         r#"<p class="fg-empty">No projects registered yet.</p>"#.to_string()
     } else {
-        let mut out = String::new();
-        for p in projects {
+        let mut out = String::from(r#"<ul class="fg-orch-list">"#);
+        for (p, unreadable) in projects {
+            let state = match (p.orchestration_enabled, unreadable) {
+                (true, _) => "on".to_string(),
+                (false, Some(warning)) => {
+                    format!("off — .waggledance.toml could not be read: {warning}")
+                }
+                (false, None) => format!(
+                    "off — orchestration = false in {}",
+                    waggledance_core::project_settings::settings_path(&p.root_path).display()
+                ),
+            };
             out.push_str(&format!(
-                r#"<form class="fg-orch-row" method="post" action="/api/projects/{id}/orchestration">
-      <label class="fg-check"><input type="checkbox" name="enabled" {checked}><span class="fg-check__text">{name}</span></label>
-      <button type="submit" class="fg-btn fg-btn--ghost">Save</button>
-    </form>"#,
-                id = esc(&p.id),
-                checked = checked(p.orchestration_enabled),
+                r#"<li class="fg-orch-row"><span class="fg-check__text">{name}</span> <span class="fg-orch-state">{state}</span></li>"#,
                 name = esc(&p.name),
+                state = esc(&state),
             ));
         }
+        out.push_str("</ul>");
         out
     };
 
@@ -9232,6 +11518,9 @@ pub fn settings_page(
       <label class="fg-check"><input type="checkbox" name="notify_enabled" {term_notify}><span class="fg-check__text">Notify on agent status change</span></label>
       <label class="fg-check"><input type="checkbox" name="unassigned_enabled" {term_unassigned}><span class="fg-check__text">Show unassigned agent panes</span></label>
       <span class="fg-field__hint">Off by default. Turning this on makes every agent pane on this machine readable and writable through the browser, including ones outside any project waggledance knows about — unrelated repositories, root shells, other people's agents. It has no boundary check of its own.</span>
+      <label class="fg-check"><input type="checkbox" name="trigger_enabled" {term_trigger}><span class="fg-check__text">Wake a bee supervisor tick on fleet events</span></label>
+      <label class="fg-check"><input type="checkbox" name="trigger_dry_run" {term_trigger_dry_run}><span class="fg-check__text">Dry run: log what a tick would do, without waking one or calling an LLM</span></label>
+      <span class="fg-field__hint">Off by default. When on, a run capped, blocked, or overrun — or a new escalation row — wakes one cold `bee supervisor` observation tick in that project, spawning an LLM agent with no human in the loop. Dry run only takes effect while the switch above it is also on: it logs every detection and the tick it would have dispatched, but never spawns one — a way to watch real trigger volume before it costs an LLM call.</span>
     </fieldset>
     <fieldset><legend>Telegram notification</legend>
       <div class="fg-field">
@@ -9247,10 +11536,10 @@ pub fn settings_page(
     </fieldset>
     <button type="submit" class="fg-btn fg-btn--primary">Save terminal settings</button>
   </form>
-  <style>.fg-orch-row {{ display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }}</style>
+  <style>.fg-orch-list {{ list-style: none; padding: 0; margin: 0; }} .fg-orch-row {{ display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }}</style>
   <section class="fg-settings">
     <fieldset><legend>Orchestration</legend>
-      <span class="fg-field__hint">Per-project opt-in for orchestrator dispatch (the MCP dispatch/await tools). Flags below only take effect while Terminal, above, is enabled.</span>
+      <span class="fg-field__hint">Every project takes dispatched work unless its <code>.waggledance.toml</code> says <code>orchestration = false</code>. Edits apply on the next dispatch, no restart. Terminal, above, still gates pane dispatch. The observer trigger, when on, acts on every project that is on.</span>
       {orchestration_rows}
     </fieldset>
   </section>
@@ -9274,6 +11563,8 @@ pub fn settings_page(
         term_supervisor = checked(cfg.terminal.supervisor_enabled),
         term_notify = checked(cfg.terminal.notify_enabled),
         term_unassigned = checked(cfg.terminal.unassigned_enabled),
+        term_trigger = checked(cfg.terminal.trigger_enabled),
+        term_trigger_dry_run = checked(cfg.terminal.trigger_dry_run),
         notify_chat_id = esc(cfg.terminal.notify_chat_id.as_deref().unwrap_or("")),
         notify_credential_hint = notify_credential_hint,
         notify_credential_placeholder = esc(&notify_credential_placeholder),
@@ -9282,6 +11573,551 @@ pub fn settings_page(
         orchestration_rows = orchestration_rows,
     );
     layout_with_drawer("Settings", "", &body, false)
+}
+
+// ---------------------------------------------------------------------------
+// board-visibility bi-2 — the inbox: every project's filed letters, one list.
+// ---------------------------------------------------------------------------
+
+/// A letter's body, ALREADY through `waggledance-core`'s ordinary sanitizing
+/// markdown pipeline (`render::RenderService::render` — comrak, then the same
+/// ammonia sanitize every document page on this host goes through).
+///
+/// The newtype exists to make that non-negotiable at the type level, because
+/// the other prose surface in this file deliberately goes the opposite way:
+/// [`guide_chapter_page`] embeds `chapter.body` verbatim and UNSANITIZED, and
+/// it may — those fragments are authored by us and compiled into the binary
+/// with `include_str!` (decision d7efc6fe, and [`crate::guide`]'s own module
+/// docs). A letter is not ours. Another program composed it, in another
+/// project's checkout, out of that run's entries, and the file sits in a
+/// git-ignored runtime directory. So it takes the untrusted path, and the
+/// only constructor here takes a `RenderedPage` — a caller cannot hand
+/// [`inbox_letter_page`] a raw string even by accident, and no second
+/// pipeline is written for it.
+pub struct SanitizedLetterBody(String);
+
+impl SanitizedLetterBody {
+    /// The one door in. `RenderedPage::html` is the pipeline's sanitized
+    /// output, and nothing else can produce one.
+    pub fn from_rendered(page: &RenderedPage) -> Self {
+        Self(page.html.clone())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Which of the three things a row is, and the one fact only that kind has.
+///
+/// mi-2 made this explicit. Before it, "unreadable" was implied by a
+/// `reason: Some(..)` field, which worked while there were exactly two kinds
+/// and stopped working the moment bee's digest became a third
+/// (`BeeMailboxEntry::Digest`, mailbox-inbox D1). The reason now rides its own
+/// variant rather than a parallel `Option` beside the kind: two spellings of
+/// the same discriminator can disagree, and this one decides whether a row
+/// gets a link and a mark control at all.
+pub enum InboxRowKind {
+    /// One run's letter. `unfinished` is bee's own subject mark, transcribed —
+    /// mailbox-inbox D2: `UNFINISHED_SUBJECT_MARK` prefixes the subject
+    /// because human-mailbox D3 froze the letter's key set, so the badge is a
+    /// reading of the subject and never a status this view invented. The
+    /// subject itself is still shown exactly as filed, prefix included.
+    Letter { unfinished: bool },
+    /// A period's fold. `period` is bee's own word — `"day"` or `"week"`
+    /// today, carried as a plain string all the way from
+    /// `BeeDigest::period` so a widened bee reads as an unfamiliar period
+    /// rather than as an unreadable file.
+    ///
+    /// A digest holds NO read state (mailbox-inbox D1): no unread chip, no
+    /// mark control, and never a unit in any letter count.
+    Digest { period: String },
+    /// A file that parsed as neither, with bee's own one-line reason. Never
+    /// dropped — bee's reason, quoted at `waggledance_core::bee::mailbox`: a
+    /// silently missing letter reads to the human as a quiet night rather
+    /// than as a broken store.
+    Unreadable { reason: String },
+}
+
+/// One row of the inbox: something bee filed for the human, flattened for the
+/// view. Built in `server.rs` from `BeeSnapshot::mailbox` (bi-1's reader) —
+/// the view never touches disk.
+///
+/// Letters and digests share this one shape and one list on purpose
+/// (mailbox-inbox D1: the same `/inbox` section, never a second one). What
+/// differs between them lives in [`InboxRowKind`], which is the discriminator
+/// every branch below reads.
+pub struct InboxRow {
+    /// Where this row leads, or `None` for an unreadable entry, which has no
+    /// parsed entry behind it to open.
+    pub href: Option<String>,
+    /// The letter's or digest's one-line subject; empty for an unreadable
+    /// entry.
+    pub subject: String,
+    /// Which project this row is about. For a letter, the `project` field the
+    /// letter itself carries (bee's own word for it); for a digest — a fold
+    /// spanning a period, which names no single project — and for an
+    /// unreadable entry, which has no parsed fields at all, the registered
+    /// name of the checkout the file was found in.
+    pub project: String,
+    /// The `filed_at`, verbatim; empty for an unreadable entry.
+    pub filed_at: String,
+    /// The file name, which human-mailbox D11 makes the entry's only id.
+    pub file: String,
+    /// True only for a letter that parsed and is still unread. A digest is
+    /// never unread — it carries no read state at all — and an unreadable
+    /// entry is its own, louder signal instead.
+    pub unread: bool,
+    /// Letter, digest, or unreadable — and the one fact that kind carries.
+    pub kind: InboxRowKind,
+}
+
+/// What the inbox says when it holds nothing — and it holds nothing on this
+/// machine today, which is the normal state, not a broken one.
+///
+/// This is written for a reader who does not know bee's internals, because it
+/// is the whole page for them. Every clause behind it is a measured fact: bee
+/// files a letter only from an unattended run (its D9), and its `armed()`
+/// requires BOTH a `herding` block in `.bee/config.json` AND the owner's own
+/// marker file `<main-root>/.bee/tmp/bee-herding.enable`. The block is present
+/// in these checkouts; the marker is not, in any of them. So zero letters
+/// exist, and the honest thing to render is the reason — never a bare "0" and
+/// never an empty list frame, which would read as a store that is broken or as
+/// a page that has not finished loading.
+const INBOX_EMPTY: &str = r#"<div class="fg-card">
+  <div class="fg-card__head"><div class="fg-card__title">Chưa có lá thư nào</div></div>
+  <div class="fg-card__body fg-prose">
+    <p>Thư ở đây không phải do bạn hay tôi ngồi viết: mỗi lượt chạy <strong>không có người ngồi trực</strong> sẽ tự để lại đúng một lá thư khi nó xong việc — kể lại đã làm gì, đi chệch kế hoạch ở đâu, hỏng chỗ nào, và có câu nào chỉ bạn mới trả lời được.</p>
+    <p>Máy này chưa bật chế độ chạy không người trực, nên chưa lượt chạy nào tới lúc phải viết thư. Hộp thư trống vì vậy là <strong>bình thường</strong>, không phải hỏng hóc — khi nào bạn bật nó lên và một lượt chạy kết thúc, lá thư đầu tiên sẽ nằm ở đây.</p>
+  </div>
+</div>"#;
+
+/// `GET /inbox` — one cross-project list of every letter every registered
+/// project has filed, newest first.
+///
+/// **Where it is reached from, and why only there.** From the shared top bar
+/// menu ([`topbar_full`]), on every page, beside Hướng dẫn and Settings — the
+/// same slot and the same shape the guide already uses. Deliberately NOT from
+/// the handset tab bar ([`home_tabbar`]): decision dcfbda20 records that
+/// adding the guide there widened that bar from four columns to five, so
+/// there is no free slot left, and widening it a second time is a layout
+/// decision its owner already took once and would have to take again. The top
+/// bar menu has no such ceiling — it is a list that scrolls — so a phone still
+/// reaches the inbox in two presses, through the same menu it reaches
+/// everything else that leaves the page.
+///
+/// Rows arrive already ordered by the caller and are rendered in that order:
+/// sorting is over the file NAME, since human-mailbox D11 makes the name a UTC
+/// timestamp followed by a run slug precisely so that "a directory listing is
+/// the index" — which also gives an unreadable entry, with no parsed
+/// `filed_at` to sort on, its correct place in the sequence.
+pub fn inbox_page(rows: &[InboxRow]) -> String {
+    // Letters only, and only the unread ones (mailbox-inbox D1: a digest is
+    // never a unit in any letter count). The kind is tested rather than
+    // trusting `unread` to have been left false, so the rule holds here even
+    // if a future builder sets that flag by accident.
+    let unread = rows
+        .iter()
+        .filter(|r| matches!(r.kind, InboxRowKind::Letter { .. }) && r.unread)
+        .count();
+    // A summary of what is on THIS page, not the home page's own number (bi-4
+    // owns that one). It renders only when non-zero, for the same reason the
+    // board does: zero unread needs no pill to say so.
+    let aside = if unread > 0 {
+        format!(
+            r#"<div class="fg-pagehead__aside"><span class="fg-chip fg-chip--accent">{unread} chưa đọc</span></div>"#
+        )
+    } else {
+        String::new()
+    };
+    let list = if rows.is_empty() {
+        INBOX_EMPTY.to_string()
+    } else {
+        rows.iter().map(inbox_row_html).collect::<String>()
+    };
+    let body = format!(
+        r#"{topbar}
+<main class="fg-page">
+  <header class="fg-pagehead">
+    <div class="fg-pagehead__eyebrow">Hộp thư</div>
+    <h1 class="fg-pagehead__title">Thư từ các lượt chạy</h1>
+    {aside}
+  </header>
+  {list}
+</main>"#,
+        topbar = topbar("<span class=\"crumb\">Hộp thư</span>"),
+        aside = aside,
+        list = list,
+    );
+    layout_with_drawer("Hộp thư", "", &body, false)
+}
+
+/// One row: a link to the letter's own body, and the control that flips its
+/// read state ([`inbox_mark_form`]). An unreadable entry is a plain block
+/// naming the file and the reason — louder than an ordinary row on purpose,
+/// never a link, and with no flip control either, because there is no parsed
+/// letter on the other side of one and nothing whose status bee could move.
+///
+/// bi-3: the card is a `<div>` whose TITLE is the anchor, where bi-2 made the
+/// whole card one anchor. A form is interactive content and a browser may not
+/// nest it inside a link at all, so keeping the outer anchor would have meant
+/// keeping the flip control off the list — and the list is exactly where a
+/// human decides a letter is dealt with. The link itself is unchanged in
+/// target; only how much of the card is clickable.
+fn inbox_row_html(row: &InboxRow) -> String {
+    match &row.kind {
+        InboxRowKind::Unreadable { reason } => format!(
+            r#"<div class="fg-card fg-card--rule">
+  <div class="fg-card__head"><div class="fg-card__title">{file}</div><span class="fg-chip fg-chip--danger">Không đọc được</span></div>
+  <div class="fg-card__sub">{project}</div>
+  <div class="fg-card__body">{reason}</div>
+</div>"#,
+            file = esc(&row.file),
+            project = esc(&row.project),
+            reason = esc(reason),
+        ),
+        // mailbox-inbox D1, rendered: the same card, in the same list, in its
+        // place in the same ordering — but with the badge where the read chip
+        // would be and no flip control under it, because a digest has no read
+        // state for bee to move and a button whose only outcome is a refusal
+        // is not a control, it is a trap.
+        InboxRowKind::Digest { period } => format!(
+            r#"<div class="fg-card">
+  <div class="fg-card__head"><a class="fg-card__title" href="{href}">{subject}</a>{badge}</div>
+  <div class="fg-card__sub">{project} · {filed_at}</div>
+</div>"#,
+            href = esc(row.href.as_deref().unwrap_or("/inbox")),
+            subject = esc(&row.subject),
+            badge = digest_badge(period),
+            project = esc(&row.project),
+            filed_at = esc(&row.filed_at),
+        ),
+        InboxRowKind::Letter { unfinished } => format!(
+            r#"<div class="fg-card">
+  <div class="fg-card__head"><a class="fg-card__title" href="{href}">{subject}</a>{mark}{badge}</div>
+  <div class="fg-card__sub">{project} · {filed_at}</div>
+  {flip}
+</div>"#,
+            href = esc(row.href.as_deref().unwrap_or("/inbox")),
+            subject = esc(&row.subject),
+            mark = unread_mark(row.unread),
+            badge = unfinished_badge(*unfinished),
+            project = esc(&row.project),
+            filed_at = esc(&row.filed_at),
+            flip = inbox_mark_form(row, "/inbox"),
+        ),
+    }
+}
+
+/// The digest's badge: what this card is, and which period it folds.
+///
+/// The period is bee's own value translated for the reader — `day` and `week`
+/// are the two bee writes today. An unknown period prints VERBATIM rather
+/// than falling back to a guess or to an empty badge: `BeeDigest::period` is
+/// deliberately not an enum so a bee that grows a third period stays readable
+/// here, and the honest thing to show for a period we have no word for is
+/// bee's own word.
+fn digest_badge(period: &str) -> String {
+    let word = match period {
+        "day" => "ngày",
+        "week" => "tuần",
+        other => other,
+    };
+    format!(
+        r#"<span class="fg-chip fg-chip--neutral">Bản tổng hợp · {word}</span>"#,
+        word = esc(word),
+    )
+}
+
+/// The badge for a run that went silent (mailbox-inbox D2). It is a reading of
+/// bee's own subject prefix — `UNFINISHED_SUBJECT_MARK`, which rides the
+/// subject because human-mailbox D3 froze the letter's key set — so this view
+/// transcribes a mark bee wrote and invents no status of its own. The subject
+/// is still rendered exactly as filed, prefix and all.
+fn unfinished_badge(unfinished: bool) -> &'static str {
+    if unfinished {
+        r#"<span class="fg-chip fg-chip--warning">Lượt chạy chưa kết thúc</span>"#
+    } else {
+        ""
+    }
+}
+
+/// The read/unread marker. A word, never colour alone, so the state survives a
+/// greyscale screen and reaches a screen reader as text.
+fn unread_mark(unread: bool) -> &'static str {
+    if unread {
+        r#"<span class="fg-chip fg-chip--accent">Chưa đọc</span>"#
+    } else {
+        r#"<span class="fg-chip fg-chip--neutral">Đã đọc</span>"#
+    }
+}
+
+/// bi-3: the one control that flips a letter between read and unread.
+///
+/// It is a plain HTML `<form>` posting to `server.rs::inbox_mark_handler`, and
+/// that handler runs `bee mailbox mark` in the letter's own project. Nothing
+/// in this file, and nothing behind that route, opens the letter — human-mailbox
+/// D6 puts the field inside the letter and bee's own command is the only thing
+/// allowed to move it. So the state shown here is never flipped optimistically:
+/// the page that renders after the post is re-read from disk, which means what
+/// the chip says is what bee wrote, and a refused mark leaves the row exactly
+/// as it was.
+///
+/// A form, not `fetch` (the same reasoning `error_page_with_refresh`'s refresh
+/// button already took): the post works with the page's own scripts idle, and
+/// the button carries no state of its own that could disagree with the letter.
+///
+/// One button, whose direction is the letter's current state — an unread letter
+/// offers "read", a read one offers "unread" — because those are the only two
+/// values in bee's closed status set and offering both at once would render one
+/// button that is always a no-op.
+///
+/// `back` is where the reader should land afterwards: the list for a row, the
+/// letter's own page for the letter view. It is a same-site path built here,
+/// never user input, and `server.rs::safe_redirect_path` re-checks it anyway
+/// because the route is unauthenticated like every other route in this server.
+///
+/// An unreadable entry (`href: None`) gets no form: bee refuses a mark naming
+/// no filed letter, and a button whose only outcome is a refusal is not a
+/// control, it is a trap. mi-2: a DIGEST gets none for the same reason and a
+/// stronger one — mailbox-inbox D1 gives it no read state at all, so there is
+/// nothing to flip even in principle. The guard is here, at the one place that
+/// emits the control, rather than only at the two call sites, so no third
+/// caller can grow a mark button for a digest by forgetting to check.
+fn inbox_mark_form(row: &InboxRow, back: &str) -> String {
+    let InboxRowKind::Letter { .. } = row.kind else {
+        return String::new();
+    };
+    let Some(href) = row.href.as_deref() else {
+        return String::new();
+    };
+    let (status, label) = if row.unread {
+        ("read", "Đánh dấu đã đọc")
+    } else {
+        ("unread", "Đánh dấu chưa đọc")
+    };
+    format!(
+        r#"<form class="fg-card__foot" method="post" action="{action}">
+  <input type="hidden" name="status" value="{status}">
+  <input type="hidden" name="back" value="{back}">
+  <button type="submit" class="fg-btn fg-btn--secondary">{label}</button>
+</form>"#,
+        action = esc(&format!("{href}/mark")),
+        status = status,
+        back = esc(back),
+        label = label,
+    )
+}
+
+/// One letter, opened. The header is the typed frontmatter bi-1 parsed; the
+/// prose below it is the letter's own body, rendered through the sanitizing
+/// pipeline — see [`SanitizedLetterBody`] for why it can be nothing else.
+///
+/// bi-3: the header also carries the flip control ([`inbox_mark_form`]), beside
+/// the chip that states the letter's current state — the reader who just
+/// finished the letter is the one most likely to mark it read. The control is a
+/// form posting to a bee command; this page still opens no file, for reading or
+/// for writing, beyond the body it was handed.
+///
+/// mi-2: a DIGEST opens here too, through the same route and the same
+/// sanitized pipeline (mailbox-inbox D3) — one renderer, not two, because
+/// nothing about the page differs except what the header may honestly say. So
+/// this stays one function reading [`InboxRow::kind`] rather than a second
+/// spelling that would have to be kept in step with this one: a digest's
+/// header carries its badge and NO read chip and NO flip control, since D1
+/// gives it no read state to show or move.
+pub fn inbox_letter_page(row: &InboxRow, body: &SanitizedLetterBody) -> String {
+    let (mark, flip, badge) = match &row.kind {
+        InboxRowKind::Letter { unfinished } => (
+            unread_mark(row.unread).to_string(),
+            // Back to this letter's own page: a reader who marks it here stays
+            // here, and sees the chip beside the button carry bee's answer.
+            inbox_mark_form(row, row.href.as_deref().unwrap_or("/inbox")),
+            unfinished_badge(*unfinished).to_string(),
+        ),
+        InboxRowKind::Digest { period } => (String::new(), String::new(), digest_badge(period)),
+        // The list never links one and the route answers 404 for it, so this
+        // arm is unreachable in production — it renders the bare header rather
+        // than claiming a read state no parsed entry stands behind.
+        InboxRowKind::Unreadable { .. } => (String::new(), String::new(), String::new()),
+    };
+    // An entry whose run recorded nothing has an empty prose body (bee emits
+    // the frontmatter and stops). Saying so beats an unexplained blank — and
+    // it says it with the right noun, since a digest is not a letter.
+    let prose = if body.as_str().trim().is_empty() {
+        match row.kind {
+            InboxRowKind::Digest { .. } => r#"<p class="fg-empty">Bản tổng hợp này không có phần nội dung — tất cả những gì nó nói nằm ở dòng tiêu đề bên trên.</p>"#.to_string(),
+            _ => r#"<p class="fg-empty">Lá thư này không có phần nội dung — tất cả những gì nó nói nằm ở dòng tiêu đề bên trên.</p>"#.to_string(),
+        }
+    } else {
+        body.as_str().to_string()
+    };
+    let body_html = format!(
+        r#"{topbar}
+<main class="fg-page">
+  <header class="fg-pagehead">
+    <div class="fg-pagehead__eyebrow">{project} · {filed_at}</div>
+    <h1 class="fg-pagehead__title">{subject}</h1>
+    <div class="fg-pagehead__aside">{mark}{badge}{flip}</div>
+  </header>
+  <article class="fg-prose">{prose}</article>
+  <p class="fg-card__sub">{file}</p>
+</main>"#,
+        topbar = topbar(&format!(
+            "<span class=\"crumb\"><a href=\"/inbox\">Hộp thư</a> · {}</span>",
+            esc(&row.subject)
+        )),
+        project = esc(&row.project),
+        filed_at = esc(&row.filed_at),
+        subject = esc(&row.subject),
+        mark = mark,
+        badge = badge,
+        flip = flip,
+        prose = prose,
+        file = esc(&row.file),
+    );
+    layout_with_drawer(&format!("{} · Hộp thư", row.subject), "", &body_html, false)
+}
+
+/// guide-vi: the built-in guide's own chapter rail, on every guide page.
+///
+/// It reuses the file page's `.sidebar` shell (and so its handset drawer, its
+/// backdrop and the `#sidebar-toggle` in the top bar) rather than growing a
+/// second navigation column with its own breakpoint — a reader on a phone
+/// already knows how this one opens.
+///
+/// `current` is the slug being read, or the empty string on the index, where
+/// nothing is marked.
+fn guide_rail(current: &str) -> String {
+    let mut items = String::new();
+    items.push_str(&format!(
+        r#"<a class="guide-rail__item guide-rail__item--home{on}" href="/guide">Bức tranh lớn</a>"#,
+        on = if current.is_empty() {
+            " guide-rail__item--on"
+        } else {
+            ""
+        },
+    ));
+    for c in guide::CHAPTERS {
+        items.push_str(&format!(
+            r#"<a class="guide-rail__item{on}" href="/guide/{slug}"{aria}><span class="guide-rail__num">{num}</span><span class="guide-rail__title">{title}</span></a>"#,
+            on = if c.slug == current {
+                " guide-rail__item--on"
+            } else {
+                ""
+            },
+            aria = if c.slug == current {
+                r#" aria-current="page""#
+            } else {
+                ""
+            },
+            slug = c.slug,
+            num = c.number,
+            title = esc(c.title),
+        ));
+    }
+    format!(
+        r#"<nav class="guide-rail" aria-label="Chương">
+  <div class="guide-rail__head">Hướng dẫn bee</div>
+  {items}
+</nav>"#
+    )
+}
+
+/// The guide's landing page: the whole map in one diagram, then a card per
+/// chapter. `guide::OVERVIEW` is the authored fragment above the cards.
+pub fn guide_index_page() -> String {
+    let mut cards = String::new();
+    for c in guide::CHAPTERS {
+        cards.push_str(&format!(
+            r#"<a class="guide-card" href="/guide/{slug}">
+  <span class="guide-card__num">{num}</span>
+  <span class="guide-card__title">{title}</span>
+  <span class="guide-card__blurb">{blurb}</span>
+</a>"#,
+            slug = c.slug,
+            num = c.number,
+            title = esc(c.title),
+            blurb = esc(c.blurb),
+        ));
+    }
+    let body = format!(
+        r#"{topbar}
+<div class="layout layout--guide">
+  <aside id="sidebar" class="sidebar">{rail}</aside>
+  <div class="sidebar-backdrop"></div>
+  <main class="content">
+    <article class="fg-prose guide-prose">
+      {overview}
+      <div class="guide-cards">{cards}</div>
+    </article>
+  </main>
+</div>"#,
+        topbar = topbar_full(
+            sidebar_toggle(),
+            "<span class=\"crumb\">Hướng dẫn</span>",
+            "",
+            "",
+        ),
+        rail = guide_rail(""),
+        overview = guide::OVERVIEW,
+        cards = cards,
+    );
+    layout_with_drawer("Hướng dẫn bee", "", &body, false)
+}
+
+/// One chapter. The body is authored HTML embedded verbatim — see
+/// [`crate::guide`]'s module docs for why it is never sanitized and why
+/// nothing outside `assets/guide/` may ever reach here.
+pub fn guide_chapter_page(chapter: &guide::Chapter) -> String {
+    let (prev, next) = guide::neighbours(chapter.slug);
+    let step = |c: Option<&guide::Chapter>, rel: &str, label: &str| match c {
+        Some(c) => format!(
+            r#"<a class="guide-step guide-step--{rel}" href="/guide/{slug}"><span class="guide-step__rel">{label}</span><span class="guide-step__title">{num}. {title}</span></a>"#,
+            rel = rel,
+            slug = c.slug,
+            label = label,
+            num = c.number,
+            title = esc(c.title),
+        ),
+        None => String::new(),
+    };
+    let body = format!(
+        r#"{topbar}
+<div class="layout layout--guide">
+  <aside id="sidebar" class="sidebar">{rail}</aside>
+  <div class="sidebar-backdrop"></div>
+  <main class="content">
+    <article class="fg-prose guide-prose">
+      <header class="guide-head">
+        <div class="guide-head__eyebrow">Chương {num} / {total}</div>
+        <h1 class="guide-head__title">{title}</h1>
+        <p class="guide-head__blurb">{blurb}</p>
+      </header>
+      {chapter_body}
+      <nav class="guide-steps" aria-label="Chương trước và sau">{prev}{next}</nav>
+    </article>
+  </main>
+</div>"#,
+        topbar = topbar_full(
+            sidebar_toggle(),
+            &format!(
+                "<span class=\"crumb\"><a href=\"/guide\">Hướng dẫn</a> · {}</span>",
+                esc(chapter.title)
+            ),
+            "",
+            "",
+        ),
+        rail = guide_rail(chapter.slug),
+        num = chapter.number,
+        total = guide::CHAPTERS.len(),
+        title = esc(chapter.title),
+        blurb = esc(chapter.blurb),
+        chapter_body = chapter.body,
+        prev = step(prev, "prev", "Chương trước"),
+        next = step(next, "next", "Chương sau"),
+    );
+    layout_with_drawer(&format!("{} · Hướng dẫn", chapter.title), "", &body, false)
 }
 
 pub fn error_page(status: u16, msg: &str) -> String {
@@ -9432,6 +12268,9 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             !body.contains(r#"<nav class="fg-tabs" aria-label="Home sections">"#),
@@ -9461,6 +12300,9 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             terminals.contains(
@@ -9483,7 +12325,21 @@ mod tests {
     #[test]
     fn home_page_carries_the_new_task_button_on_both_tabs_over_a_hidden_overlay() {
         for tab in [HomeTab::Kanban, HomeTab::Terminals] {
-            let body = home_page(&[], false, &[], None, "", tab, &[], None, true, &[]);
+            let body = home_page(
+                &[],
+                false,
+                &[],
+                None,
+                "",
+                tab,
+                &[],
+                None,
+                true,
+                &[],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                "",
+            );
             assert!(
                 body.contains(
                     r#"<button type="button" class="fg-btn fg-btn--ghost topbar__new-task" data-new-task-open>+ New task</button>"#
@@ -9545,6 +12401,9 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
         let select = body
             .split(r#"<select class="fg-input" name="project" aria-label="Project">"#)
@@ -9584,7 +12443,7 @@ mod tests {
     fn the_new_task_button_leaves_the_handset_bar_with_the_orchestrator_button() {
         let css = include_str!("../assets/app.css");
         let query = css
-            .find("@media (max-width: 700px) {")
+            .find("@media (max-width: 900px) {")
             .expect("app.css declares no handset block for the home shell");
         let end = css[query + 1..]
             .find("@media")
@@ -9662,6 +12521,9 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
         for hook in [
             "data-new-task-open",
@@ -9709,6 +12571,9 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             home_html.contains("data-agent-drawer-homepage"),
@@ -9752,6 +12617,9 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             body.contains(
@@ -9905,6 +12773,9 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
 
         // The board itself is still here — the rail joined the Kanban tab,
@@ -10022,6 +12893,9 @@ mod tests {
             Some("w1:p2"),
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
 
         let shell_at = body
@@ -10070,7 +12944,16 @@ mod tests {
     /// view's own explanation with it.
     #[test]
     fn rail_with_no_live_panes_still_offers_the_way_to_the_terminals_view() {
-        let rail = project_sidebar(&[], false, &[], None, &[], None);
+        let rail = project_sidebar(
+            &[],
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
         assert!(
             rail.contains(
                 r#"<h2 class="home-sidebar__group home-sidebar__group--pinned"><a class="home-sidebar__group-link" href="/?tab=terminals"><svg class="home-sidebar__group-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6v6.5l2.5 3.5H6.5L9 9.5z"></path><line x1="12" y1="13" x2="12" y2="21"></line></svg>Agents</a></h2>"#
@@ -10087,6 +12970,452 @@ mod tests {
         );
     }
 
+    /// board-visibility bv-4: the rail is this page's per-project surface,
+    /// so a row says what its own project is working on and whether that
+    /// project wants the reader -- and a project with neither says nothing
+    /// at all rather than rendering an empty shell. The facts D3 refuses
+    /// (knowledge-debt) and the two recorded deletions (`gate_bypass`,
+    /// `running_workers`) are present in these fixtures on purpose: the
+    /// rail must stay silent about all three.
+    #[test]
+    fn a_project_row_names_its_live_feature_and_its_own_wait() {
+        let busy_root = std::env::temp_dir().join(format!(
+            "waggledance-views-rail-bee-busy-{}",
+            std::process::id()
+        ));
+        let idle_root = std::env::temp_dir().join(format!(
+            "waggledance-views-rail-bee-idle-{}",
+            std::process::id()
+        ));
+        for r in [&busy_root, &idle_root] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        let write = |root: &std::path::Path, rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+
+        // The busy project: an active feature on a phase, a live `gate`
+        // wait, and -- deliberately -- a knowledge-debt stub, a recorded
+        // `gate_bypass` and a named worker for the rail to stay quiet about.
+        write(
+            &busy_root,
+            ".bee/state.json",
+            r#"{
+                "feature": "board-visibility",
+                "phase": "executing",
+                "workers": [{"name": "rail-ghost-worker", "cell": "bv-4"}],
+                "waiting_on": {"kind": "gate", "subject": "Shape + execution approval"}
+            }"#,
+        );
+        write(&busy_root, ".bee/config.json", r#"{"gate_bypass": "full"}"#);
+        write(
+            &busy_root,
+            ".bee/capture-queue.jsonl",
+            "{\"kind\": \"stub\", \"id\": \"cap-1\"}\n",
+        );
+
+        // The idle project: no active feature, and the one mark AGENTS.md
+        // gives every ordinary turn end -- "control back with the human and
+        // nothing owed" (D4). Neither fact is a demand, so neither renders.
+        write(
+            &idle_root,
+            ".bee/state.json",
+            r#"{
+                "phase": "exploring",
+                "waiting_on": {"kind": "turn-end", "subject": "Không còn gì chờ bạn"}
+            }"#,
+        );
+
+        let mut busy = sample_project();
+        busy.id = "busy".into();
+        busy.name = "Busy".into();
+        busy.root_path = busy_root.clone();
+        let mut idle = sample_project();
+        idle.id = "idle".into();
+        idle.name = "Idle".into();
+        idle.root_path = idle_root.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(&[busy_root.clone(), idle_root.clone()]);
+        let bee_by_project: std::collections::HashMap<String, &BeeProjectRollup> = vec![
+            ("busy".to_string(), &rollups[0]),
+            ("idle".to_string(), &rollups[1]),
+        ]
+        .into_iter()
+        .collect();
+        let projects = vec![(busy, 3, Vec::new()), (idle, 0, Vec::new())];
+
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &bee_by_project,
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee">board-visibility · executing</span>"#
+            ),
+            "the busy row must name its active feature and that feature's phase: {rail}"
+        );
+        // (bv-6) The busy fixture's subject is a real sentence, so it wins
+        // the pill -- the pill still leads with its own word, and the wait
+        // is still one pill on one row.
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Shape + execution approval">Waiting on you<span class="proj-row__badge-title">— Shape + execution approval</span></span>"#
+            ),
+            "a live gate wait must read as a need on the project's own row, and name it: {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badges--bee").count(),
+            1,
+            "only the busy project has anything to say, so the idle row must render no bee \
+             block at all -- not an empty one: {rail}"
+        );
+        assert!(
+            !rail.contains("exploring"),
+            "the idle project's phase belongs to no active feature, so nothing of it renders: \
+             {rail}"
+        );
+        // Counted by the pill's own class, not by its words: since bv-6 the
+        // label appears twice inside ONE pill (its hover title repeats it
+        // ahead of the subject), so counting the phrase would count markup
+        // rather than rows.
+        assert_eq!(
+            rail.matches("proj-row__badge--bee-wait").count(),
+            1,
+            "the turn-end mark is the idle mark, not a demand -- exactly one row waits: {rail}"
+        );
+        // D3's refusal and the two recorded deletions, seen from the rail.
+        for absent in [
+            "knowledge-debt",
+            "gate_bypass",
+            "gate bypass",
+            "rail-ghost-worker",
+        ] {
+            assert!(
+                !rail.contains(absent),
+                "the rail must never carry {absent}: {rail}"
+            );
+        }
+        // One line per project: the bee block is a single flex row, never a
+        // list of its own.
+        assert!(
+            !rail.contains(r#"<ul class="proj-row__badges"#)
+                && !rail.contains("proj-row__bee-list"),
+            "the bee line must stay one row, never a nested list: {rail}"
+        );
+
+        // The whole path, not the helper alone: the same map threaded
+        // through `home_page` -- which is all `server.rs::index_page` does
+        // with it -- reaches the rendered board's own rail.
+        let page = home_page(
+            &projects,
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Kanban,
+            &[],
+            None,
+            true,
+            &[],
+            &bee_by_project,
+            &std::collections::HashMap::new(),
+            "",
+        );
+        assert!(
+            page.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee">board-visibility · executing</span>"#
+            ) && page.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Shape + execution approval">Waiting on you<span class="proj-row__badge-title">— Shape + execution approval</span></span>"#
+            ),
+            "the board page's own rail must carry both facts: {page}"
+        );
+
+        for r in [&busy_root, &idle_root] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// board-visibility bv-6: the rail's wait pill says WHAT the project is
+    /// waiting for, and only when the recorded subject beats the bare label
+    /// it would otherwise print. The three refusals are
+    /// [`bee_hub_subject_beats_derived`]'s, called here rather than
+    /// re-implemented, so a bare tool name and an echo of the label both keep
+    /// the plain pill -- and a project that is not waiting still renders no
+    /// pill at all.
+    #[test]
+    fn a_rail_wait_pill_names_the_subject_only_when_it_beats_the_bare_label() {
+        let root_for = |slug: &str| {
+            std::env::temp_dir().join(format!(
+                "waggledance-views-rail-wait-{slug}-{}",
+                std::process::id()
+            ))
+        };
+        // `named` carries the one subject that reaches this pill on the live
+        // store today (jarvis's, verbatim from `proof.md`) -- 56 characters,
+        // so it also exercises the clip.
+        let named_root = root_for("named");
+        let tool_root = root_for("tool");
+        let echo_root = root_for("echo");
+        let quiet_root = root_for("quiet");
+        let roots = [&named_root, &tool_root, &echo_root, &quiet_root];
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        let write = |root: &std::path::Path, body: &str| {
+            let p = root.join(".bee/state.json");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            &named_root,
+            r#"{"waiting_on": {"kind": "question",
+               "subject": "Chon muc do tich hop Jarvis vao Super+Space tren Omarchy"}}"#,
+        );
+        write(
+            &tool_root,
+            r#"{"waiting_on": {"kind": "gate", "subject": "AskUserQuestion"}}"#,
+        );
+        write(
+            &echo_root,
+            r#"{"waiting_on": {"kind": "gate", "subject": "Waiting on you"}}"#,
+        );
+        write(
+            &quiet_root,
+            r#"{"waiting_on": {"kind": "turn-end", "subject": "Nothing is owed"}}"#,
+        );
+
+        let mut projects = Vec::new();
+        for (id, root) in [
+            ("named", &named_root),
+            ("tool", &tool_root),
+            ("echo", &echo_root),
+            ("quiet", &quiet_root),
+        ] {
+            let mut p = sample_project();
+            p.id = id.into();
+            p.name = id.into();
+            p.root_path = root.clone();
+            projects.push((p, 0, Vec::new()));
+        }
+        let owned: Vec<std::path::PathBuf> = vec![
+            named_root.clone(),
+            tool_root.clone(),
+            echo_root.clone(),
+            quiet_root.clone(),
+        ];
+        let rollups = waggledance_core::bee::read_rollup(&owned);
+        let bee_by_project: std::collections::HashMap<String, &BeeProjectRollup> = projects
+            .iter()
+            .map(|(p, _, _)| p.id.clone())
+            .zip(rollups.iter())
+            .collect();
+
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &bee_by_project,
+            &std::collections::HashMap::new(),
+        );
+
+        // A sentence a human wrote wins the pill: the label still leads it,
+        // the clipped text follows in the row's own free-text span, and the
+        // whole subject survives in the hover title.
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait" title="Waiting on you — Chon muc do tich hop Jarvis vao Super+Space tren Omarchy">Waiting on you<span class="proj-row__badge-title">— Chon muc do tich hop Jarvis vao Super+Space…</span></span>"#
+            ),
+            "the recorded subject must name the wait on the rail, clipped for display with the \
+             whole of it kept in the title: {rail}"
+        );
+        // The two refused shapes keep the pill exactly as bv-4 wrote it --
+        // same markup, no title, nothing added.
+        assert_eq!(
+            rail.matches(
+                r#"<span class="proj-row__badge proj-row__badge--bee-wait">Waiting on you</span>"#
+            )
+            .count(),
+            2,
+            "a bare tool name and an echo of the label must both keep the plain pill: {rail}"
+        );
+        assert!(
+            !rail.contains("AskUserQuestion"),
+            "a one-word subject names a mechanism, never a decision, so it must not render: \
+             {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badge--bee-wait").count(),
+            3,
+            "the turn-end project is not waiting, so it renders no pill at all -- and no \
+             project ever renders two: {rail}"
+        );
+        assert!(
+            !rail.contains("Nothing is owed"),
+            "a turn-end mark's words must never reach the rail: {rail}"
+        );
+        // One line, still: the wait is one pill inside the row's own badge
+        // block, never a list and never a second block.
+        assert_eq!(
+            rail.matches("proj-row__badges--bee").count(),
+            3,
+            "each waiting row carries exactly one bee block and the quiet row none: {rail}"
+        );
+
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    #[test]
+    fn a_leader_wait_renders_one_pill_on_its_projects_rail_row() {
+        let project = |id: &str| {
+            let mut p = sample_project();
+            p.id = id.into();
+            p.name = id.into();
+            p
+        };
+        let projects = vec![
+            (project("blocked"), 0, Vec::new()),
+            (project("lost"), 0, Vec::new()),
+            (project("both"), 0, Vec::new()),
+            (project("quiet"), 0, Vec::new()),
+        ];
+        let mut leader_waits: LeaderWaitsByProject = std::collections::HashMap::new();
+        leader_waits.insert(
+            "blocked".into(),
+            vec![LeaderWait {
+                status: "blocked".into(),
+                since: "2026-10-16T10:00:00Z".into(),
+            }],
+        );
+        leader_waits.insert(
+            "lost".into(),
+            vec![LeaderWait {
+                status: "lost".into(),
+                since: "2026-10-16T10:30:00Z".into(),
+            }],
+        );
+        leader_waits.insert(
+            "both".into(),
+            vec![
+                LeaderWait {
+                    status: "lost".into(),
+                    since: "2026-10-16T10:30:00Z".into(),
+                },
+                LeaderWait {
+                    status: "blocked".into(),
+                    since: "2026-10-16T10:00:00Z".into(),
+                },
+            ],
+        );
+
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &leader_waits,
+        );
+
+        assert_eq!(
+            rail.matches(LEADER_WAIT_BLOCKED).count(),
+            2,
+            "the blocked project and the both-waits project each carry the permission pill, \
+             with no bee roll-up to lean on: {rail}"
+        );
+        assert_eq!(
+            rail.matches(LEADER_WAIT_LOST).count(),
+            1,
+            "the lost project carries the lost pill, and the both-waits project does not -- \
+             blocked wins: {rail}"
+        );
+        assert!(
+            rail.contains(
+                r#"<span class="proj-row__badge proj-row__badge--leader-wait" title="2026-10-16T10:00:00Z">Leader waiting — permission</span>"#
+            ),
+            "the pill wears the row's own badge vocabulary and keeps the run's own timestamp \
+             reachable: {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badge--leader-wait").count(),
+            3,
+            "one pill per project that has a leader wait, and none for the quiet project: {rail}"
+        );
+        assert_eq!(
+            rail.matches("proj-row__badges--bee").count(),
+            3,
+            "the quiet project renders no badge block at all, not an empty one: {rail}"
+        );
+
+        let page = home_page(
+            &projects,
+            false,
+            &[],
+            None,
+            "",
+            HomeTab::Kanban,
+            &[],
+            None,
+            true,
+            &[],
+            &std::collections::HashMap::new(),
+            &leader_waits,
+            "",
+        );
+        assert!(
+            page.contains(LEADER_WAIT_BLOCKED) && page.contains(LEADER_WAIT_LOST),
+            "the whole path, not the helper alone: the board's own rail must carry both pills: \
+             {page}"
+        );
+    }
+
+    /// board-visibility bv-6: the rail is a 259px column and its row stays
+    /// one line, so a free-text subject is clipped in Rust rather than left
+    /// to the layout -- on a word boundary where there is one, by characters
+    /// and never by bytes.
+    #[test]
+    fn a_long_wait_subject_is_clipped_on_a_word_boundary_never_mid_char() {
+        assert_eq!(
+            bee_rail_wait_clip("Shape + execution approval", 48),
+            "Shape + execution approval",
+            "a subject inside the budget is rendered whole"
+        );
+        assert_eq!(
+            bee_rail_wait_clip(
+                "Chon muc do tich hop Jarvis vao Super+Space tren Omarchy",
+                48
+            ),
+            "Chon muc do tich hop Jarvis vao Super+Space…",
+            "the live subject clips at its last space inside the budget"
+        );
+        assert_eq!(
+            bee_rail_wait_clip("Quyết định, mức độ tích hợp Jarvis vào Super+Space", 14),
+            "Quyết định…",
+            "diacritics count as characters, not bytes, and trailing punctuation goes before \
+             the ellipsis"
+        );
+        assert_eq!(
+            bee_rail_wait_clip("supercalifragilisticexpialidocious ok", 20),
+            "supercalifragilistic…",
+            "a first word longer than the budget is cut mid-word rather than dropped whole"
+        );
+    }
+
     /// rail-agents-compact: a live agent's row is at most two lines. Line
     /// one is the agent itself — dot, project name, the `· workspace · tab`
     /// address inline beside it, and the bee state word ending the line —
@@ -10099,7 +13428,16 @@ mod tests {
         let mut pane = menu_pane("w1:p1", Some("proj-1"), "Proj One");
         pane.view.bee_state = Some(BeeActivityState::Blocked);
         pane.view.bee_feature = Some("rail-agents-compact".into());
-        let rail = project_sidebar(&[], false, &[], None, &[pane], None);
+        let rail = project_sidebar(
+            &[],
+            false,
+            &[],
+            None,
+            &[pane],
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             rail.contains(
@@ -10130,7 +13468,16 @@ mod tests {
         // width on the first one.
         let mut plain = menu_pane("w1:p2", Some("proj-1"), "w1");
         plain.view.tab = "agent".into();
-        let quiet = project_sidebar(&[], false, &[], None, &[plain], None);
+        let quiet = project_sidebar(
+            &[],
+            false,
+            &[],
+            None,
+            &[plain],
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
         assert!(
             quiet.contains(r#"<span class="pinned-row__meta">· agent</span>"#),
             "a workspace that repeats the project name must drop out: {quiet}"
@@ -10160,6 +13507,9 @@ mod tests {
             Some("does-not-exist"),
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             body.contains(r#"<p class="fg-empty">This terminal is gone.</p>"#),
@@ -10220,7 +13570,16 @@ mod tests {
             (blocked, 1, vec![pane_with_status("blocked")]),
             (quiet, 1, Vec::new()),
         ];
-        let rail = project_sidebar(&projects, false, &[], None, &[], None);
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         assert!(
             rail.starts_with(r#"<nav class="home-sidebar" aria-label="Projects">"#),
@@ -10256,7 +13615,16 @@ mod tests {
             menu_pane("w1:p1", Some("proj-working"), "Proj Working"),
             menu_pane("w1:p2", Some("proj-blocked"), "Proj Blocked"),
         ];
-        let on_terminals = project_sidebar(&projects, false, &[], None, &pinned, Some("w1:p2"));
+        let on_terminals = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &pinned,
+            Some("w1:p2"),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             on_terminals.matches(r#"aria-current="page""#).count(),
             1,
@@ -10362,7 +13730,16 @@ mod tests {
             (branch, 1, Vec::new()),
             (lone, 0, Vec::new()),
         ];
-        let rail = project_sidebar(&projects, false, &[], None, &[], None);
+        let rail = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
 
         // One group per PROJECT, never per row: the branch is inside its
         // parent's group, so two groups is the whole rail here.
@@ -10530,7 +13907,16 @@ mod tests {
             (idle, 3, vec![shell_pane]),
             (active, 5, vec![pane_with_status("working")]),
         ];
-        let html = project_sidebar(&projects, false, &[], None, &[], None);
+        let html = project_sidebar(
+            &projects,
+            false,
+            &[],
+            None,
+            &[],
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
         assert!(
             !html.contains("fg-pagehead__title"),
             "the project rail must render no page heading: {html}"
@@ -10758,8 +14144,12 @@ mod tests {
         );
 
         let unassigned_html = unassigned_terminal_page(&panes);
+        // A bare "term-attach" substring now also matches the
+        // shared `.term-attach` card rule in `PROJECT_TAB_STYLE` (every page
+        // inlines that one stylesheet, attach-capable or not) — this checks
+        // the markup itself, the opening tag the attach-only div renders.
         assert!(
-            !unassigned_html.contains("term-attach"),
+            !unassigned_html.contains("class=\"term-attach\""),
             "the Unassigned page has no project-scoped attach route, so it must render no attach markup: {unassigned_html}"
         );
     }
@@ -10783,11 +14173,15 @@ mod tests {
             !html[bar_end..].contains("class=\"proj-tabs\""),
             "the section nav must not also open a band under the bar: {html}"
         );
+        // term-workspace-unify: the slice ends at the workspace's panel, the
+        // pane row's own next sibling. `.term-panes` is two elements deeper
+        // now (inside `.term-work__screen`), so slicing to it would let a
+        // "New shell" rendered INSIDE the panel pass as "on the row".
         let row_start = html.find("class=\"pane-bar\"").expect("no pane row");
         let row_end = html[row_start..]
-            .find("<div class=\"term-panes\">")
+            .find("<div class=\"term-work__panel\"")
             .map(|i| row_start + i)
-            .expect("no pane list after the pane row");
+            .expect("no panel after the pane row");
         assert!(
             html[row_start..row_end].contains("class=\"term-create__pane\""),
             "New shell must share the pane strip's row: {html}"
@@ -10818,6 +14212,77 @@ mod tests {
         assert!(
             html.contains(r#"href="/p/proj-1/_terminal/pane/w1:p1""#),
             "the pane's link must reproduce today's `/p/{{id}}/_terminal/pane/{{pane_id}}` shape: {html}"
+        );
+    }
+
+    /// changes-diff-screen D8/D9, re-pointed by term-workspace-unify: the
+    /// project terminal page offers Files and Diff, and offers them CLOSED.
+    /// Both buttons carry the exact nav-mode addresses the script is allowed
+    /// to load — built in [`term_work_sidebar`], never assembled from a
+    /// project id in `assets/app.js` — the panel ships hidden, and not one of
+    /// the three frames ships with a `src`, so a terminal page nobody touches
+    /// fetches nothing. The controls used to be two buttons of this page's
+    /// own above the terminal; they are the shared workspace's sidebar now,
+    /// which is the point of the feature — but what they PROMISE is
+    /// unchanged, so it stays pinned here, on this page, and not only on the
+    /// homepage tab.
+    #[test]
+    fn terminal_page_offers_files_and_diff_closed_with_no_frame_loaded() {
+        let project = sample_project();
+        let html = terminal_page(&project, &[], None, &[]);
+        assert!(
+            html.contains(
+                r#"<button type="button" class="term-work__tab" data-nav-tab="files" data-nav-src="/p/proj-1/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>"#
+            ),
+            "Files must carry the Code page's own nav-mode URL: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<button type="button" class="term-work__tab" data-nav-tab="diff" data-nav-src="/p/proj-1/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>"#
+            ),
+            "Diff must carry the Changes page's own nav-mode URL: {html}"
+        );
+        assert!(
+            html.contains(r#"<div class="term-work__panel" hidden>"#),
+            "the panel must exist and ship hidden: {html}"
+        );
+        assert_eq!(
+            html.matches("<iframe").count(),
+            3,
+            "the page must render exactly the two nav frames and the panel frame: {html}"
+        );
+        for (start, _) in html.match_indices("<iframe") {
+            let end = start + html[start..].find('>').expect("unclosed iframe tag");
+            assert!(
+                !html[start..end].contains("src="),
+                "an untouched terminal page must load no frame: {}",
+                &html[start..end]
+            );
+        }
+    }
+
+    /// The panel is the TOP half: it renders above the terminal, inside the
+    /// same content column, so opening it compresses the screen downward
+    /// rather than covering it. term-workspace-unify: that column is
+    /// `.term-work__col`, shared with the homepage tab — the order it puts
+    /// the panel and the screen in is what this pins, on the page that used
+    /// to compose the order itself.
+    #[test]
+    fn the_terminal_panel_renders_above_the_terminal() {
+        let project = sample_project();
+        let html = terminal_page(&project, &[], None, &[]);
+        let col = html
+            .find(r#"<div class="term-work__col">"#)
+            .expect("no workspace column");
+        let panel = html
+            .find(r#"<div class="term-work__panel" hidden>"#)
+            .expect("no panel");
+        let screen = html
+            .find(r#"<div class="term-work__screen">"#)
+            .expect("no terminal screen");
+        assert!(
+            col < panel && panel < screen,
+            "the panel must render above the terminal, inside the column: {html}"
         );
     }
 
@@ -10945,6 +14410,108 @@ mod tests {
             !html.contains("agent-drawer__tab"),
             "the floating agent-drawer pill is retired; the on-bar toggle is the only affordance now: {html}"
         );
+    }
+
+    /// guide-vi: the guide is a *menu* entry, which is only true if it rides
+    /// the shared bar rather than being linked from one page that happens to
+    /// know about it. `topbar_full` renders it beside Settings, so every page
+    /// built on the shared bar carries it — asserted here on three unrelated
+    /// pages so a future view that hand-rolls its own header is caught.
+    #[test]
+    fn every_page_offers_the_guide_from_the_shared_top_bar_menu() {
+        let project = sample_project();
+        let pages = [
+            (
+                "settings",
+                settings_page(
+                    &Config::default(),
+                    false,
+                    false,
+                    NotifyCredentialView::NotConfigured,
+                    &[],
+                ),
+            ),
+            ("terminal", terminal_page(&project, &[], None, &[])),
+            ("guide index", guide_index_page()),
+            ("guide chapter", guide_chapter_page(&guide::CHAPTERS[0])),
+        ];
+        for (what, html) in pages {
+            let menu_start = html
+                .find(r#"<div class="topbar-menu js-menu">"#)
+                .unwrap_or_else(|| panic!("{what} has no top bar menu: {html}"));
+            let menu_end = html[menu_start..]
+                .find("</header>")
+                .map(|i| menu_start + i)
+                .unwrap_or_else(|| panic!("{what} has an unclosed top bar"));
+            let menu = &html[menu_start..menu_end];
+            assert!(
+                menu.contains(r#"href="/guide""#),
+                "{what} must offer the guide from inside the bar's own menu: {menu}"
+            );
+        }
+    }
+
+    /// The chapter rail marks exactly the chapter being read, and never marks
+    /// one on the index — a rail that marks nothing on a chapter page leaves
+    /// the reader unable to see where they are in fourteen entries.
+    #[test]
+    fn the_guide_rail_marks_the_chapter_being_read_and_nothing_on_the_index() {
+        let index = guide_index_page();
+        assert_eq!(
+            index.matches(r#"aria-current="page""#).count(),
+            0,
+            "no chapter is current on the guide's own index: {index}"
+        );
+        for chapter in guide::CHAPTERS {
+            let html = guide_chapter_page(chapter);
+            assert_eq!(
+                html.matches(r#"aria-current="page""#).count(),
+                1,
+                "exactly one rail entry may be current on /guide/{}",
+                chapter.slug
+            );
+            assert!(
+                html.contains(&format!(
+                    r#"href="/guide/{}" aria-current="page""#,
+                    chapter.slug
+                )),
+                "the current entry must be this chapter's own: /guide/{}",
+                chapter.slug
+            );
+            // Every chapter is reachable from every other chapter's rail, so
+            // the reader never has to go back to the index to move sideways.
+            for other in guide::CHAPTERS {
+                assert!(
+                    html.contains(&format!(r#"href="/guide/{}""#, other.slug)),
+                    "/guide/{} must list /guide/{} in its rail",
+                    chapter.slug,
+                    other.slug
+                );
+            }
+        }
+    }
+
+    /// The index lists every chapter as a card — a chapter that exists in the
+    /// registry but never appears on the landing page is a chapter nobody
+    /// finds.
+    #[test]
+    fn the_guide_index_offers_a_card_for_every_chapter() {
+        let html = guide_index_page();
+        for chapter in guide::CHAPTERS {
+            assert!(
+                html.contains(&format!(
+                    r#"<a class="guide-card" href="/guide/{}">"#,
+                    chapter.slug
+                )),
+                "the guide index must card /guide/{}: {html}",
+                chapter.slug
+            );
+            assert!(
+                html.contains(&esc(chapter.title)),
+                "the card for /guide/{} must carry its title",
+                chapter.slug
+            );
+        }
     }
 
     /// Everything in the bar that navigates away from this page — the section
@@ -11140,7 +14707,7 @@ mod tests {
             .find(".home-rail__backdrop {\n  display: none;\n}")
             .expect("the drawer backdrop must be hidden by default (wide screens)");
         let query = css
-            .find("@media (max-width: 700px) {")
+            .find("@media (max-width: 900px) {")
             .expect("app.css declares no handset block for the home shell");
         assert!(
             bar_hidden < query && backdrop_hidden < query,
@@ -11268,88 +14835,70 @@ mod tests {
     /// module follows.
     #[test]
     fn terminal_create_controls_escapes_preset_labels() {
-        let html =
-            terminal_create_controls("proj-1", &["<script>alert(1)</script>".to_string()], true);
+        let html = terminal_create_controls("proj-1", &["<script>alert(1)</script>".to_string()]);
         assert!(!html.contains("<script>alert(1)</script>"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
-    /// home-terminal-header: `plain_shell` is the whole difference between
-    /// the two callers. `true` (the project terminal page) keeps the
-    /// always-offered plain-shell button; `false` (the homepage Terminals
-    /// tab) drops it and leaves the configured agent presets standing. With
-    /// `false` and nothing configured, no `.term-create` box renders at all
-    /// rather than an empty one — the same silence a pane outside every
-    /// registered project already gets.
+    /// home-terminal-new-shell: "New shell" is what every caller of this
+    /// function offers, with or without configured presets — the
+    /// `plain_shell` flag that used to withhold it from one caller is gone,
+    /// and this test is what stops it coming back under another name. The
+    /// box is therefore never empty, so there is no longer any input that
+    /// makes this function return nothing; the one surface that renders no
+    /// controls decides that for itself by never calling in
+    /// (`terminals_tab`'s `project_id: None` case, pinned separately).
     #[test]
-    fn terminal_create_controls_offer_the_plain_shell_button_only_when_asked() {
-        let presets = vec!["Claude".to_string()];
-
-        let with_shell = terminal_create_controls("proj-1", &presets, true);
+    fn terminal_create_controls_always_offer_the_plain_shell_button() {
+        let with_presets = terminal_create_controls("proj-1", &["Claude".to_string()]);
         assert!(
-            with_shell.contains("class=\"term-create__pane\""),
-            "{with_shell}"
+            with_presets.contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "{with_presets}"
         );
         assert!(
-            with_shell.contains(r#"data-preset="Claude""#),
-            "{with_shell}"
+            with_presets.contains(r#"data-preset="Claude""#),
+            "{with_presets}"
         );
 
-        let without_shell = terminal_create_controls("proj-1", &presets, false);
+        let no_presets = terminal_create_controls("proj-1", &[]);
         assert!(
-            !without_shell.contains("class=\"term-create__pane\"")
-                && !without_shell.contains(">New shell<"),
-            "the plain-shell button must not render when it was not asked for: {without_shell}"
+            no_presets.contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "no configured preset must still leave the shell button standing: {no_presets}"
         );
         assert!(
-            without_shell.contains(r#"data-preset="Claude""#)
-                && without_shell.contains(r#"class="term-create" data-project-id="proj-1""#),
-            "the agent presets must still render, still targeting the project: {without_shell}"
-        );
-
-        let nothing = terminal_create_controls("proj-1", &[], false);
-        assert!(
-            nothing.is_empty(),
-            "no button to offer must render no box at all: {nothing}"
-        );
-        assert!(
-            terminal_create_controls("proj-1", &[], true).contains("class=\"term-create__pane\""),
-            "a plain-shell caller with no presets still gets its button"
+            no_presets.contains(r#"class="term-create" data-project-id="proj-1""#),
+            "the box must still name the project it creates into: {no_presets}"
         );
     }
 
-    /// D5 (terminal-pane-scope), amended 2026-08-08 (term-key-height):
-    /// every key in the row — Enter, Esc, Tab and the arrows — stands 44px
-    /// tall, so the row reads as one band. The arrows alone keep the 44px
-    /// minimum WIDTH and the body-size glyph (pressed repeatedly, often
-    /// with a thumb); they are picked out by their own `.term-keys--move`
-    /// modifier rather than by being a direct child of `.term-controls`,
-    /// which since the merge reaches the named keys too. The scroll pair
+    /// D5 (terminal-pane-scope), amended 2026-08-08 (term-key-height),
+    /// amended again by tkg-1 for the 2×6 grid (D1): every key in the grid
+    /// stands 44px tall AND floors at 44px wide via the grid's own
+    /// `grid-template-columns: repeat(6, minmax(44px, 1fr))` — one rule now
+    /// covers the width floor every key used to need its own
+    /// `.term-keys--move`-only modifier for, because the merge makes every
+    /// key equally "the direct child of `.term-controls`". The scroll pair
     /// (`.term-scroll`) and the reply buttons
     /// (`.term-reply__send`/`.term-reply__stage`) carry no such rule.
     #[test]
-    fn terminal_key_rows_share_one_height_and_arrows_keep_the_wider_box() {
+    fn terminal_key_rows_share_one_height_and_are_never_narrower_than_44px() {
         let project = sample_project();
         let html = terminal_page(&project, &[], None, &[]);
         assert!(
             html.contains(
                 ".term-keys button { padding: var(--space-1) var(--space-2); min-height: 44px;"
             ),
-            "the whole key row must stand 44px tall: {html}"
+            "the whole key grid must stand 44px tall: {html}"
         );
         assert!(
             html.contains(
-                ".term-keys--move button { min-width: 44px; font-size: var(--type-body-size); }"
+                ".term-keys { display: grid; grid-template-columns: repeat(6, minmax(44px, 1fr)); gap: var(--space-1); }"
             ),
-            "the arrow group must keep its 44px minimum width at body-size type: {html}"
+            "every column in the grid must floor at 44px wide: {html}"
         );
-        // The markup carrying that modifier is pinned by the route test
-        // `terminal_page_renders_the_reply_bar_and_key_buttons`; this fixture
-        // has no panes, so only the stylesheet is in reach here.
         assert!(
-            !html.contains(".term-controls > .term-keys button { min-width: 44px")
-                && !html.contains(".term-controls .term-keys button { min-width: 44px"),
-            "a positional rule would reach the named keys too, so it must not exist: {html}"
+            !html.contains(".term-keys--move"),
+            "the arrows-only modifier is gone now that one grid replaces both key groups: {html}"
         );
         assert!(
             !html.contains(".term-scroll button { min-width: 44px")
@@ -11363,14 +14912,146 @@ mod tests {
         );
     }
 
-    /// D1 (terminal-approve-button): Approve leads the row — Approve,
-    /// Stage, Send — so a one-tap send never sits shoulder to shoulder with
-    /// Send, and Stage/Send keep their existing relative order.
+    /// term-keys-nav-tint D1 (`334b8353`): the four arrows carry their own
+    /// colour so the navigation cluster reads apart from the action keys
+    /// beside it. Three things are pinned, and each would be a real
+    /// regression on its own: every one of the four arrows is selected (a
+    /// rule that named three would leave one odd key behind), the tint is
+    /// the INFO accent rather than `--color-action` (which Send and a
+    /// latched modifier own — see the rule right below it), and the colour
+    /// arrives through tokens so both themes stay correct. Needles are
+    /// single selectors, never a span of adjacent declarations — the pitfall
+    /// in `docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`.
+    #[test]
+    fn the_arrow_keys_are_tinted_apart_from_the_action_keys() {
+        // The markup half needs a pane actually rendered, so it comes from
+        // `pane_controls` (the idiom the other grid-markup tests use); the
+        // stylesheet half comes from the page that ships it.
+        let html = pane_controls("pane-1", "Agent One", false, None, None);
+        let project = sample_project();
+        let css = terminal_page(&project, &[], None, &[]);
+        for key in ["up", "down", "left", "right"] {
+            assert!(
+                html.contains(&format!(
+                    "<button type=\"button\" class=\"term-keys__nav\" data-key=\"{key}\">"
+                )),
+                "the {key} arrow must carry the navigation class: {html}"
+            );
+        }
+        // Nothing else in the grid wears the class — leaked onto another key
+        // it would silently join the cluster.
+        assert_eq!(
+            html.matches("class=\"term-keys__nav\"").count(),
+            4,
+            "exactly the four arrows may carry the navigation class: {html}"
+        );
+        // The other half of the handshake: the class the markup wears is the
+        // one the stylesheet actually paints.
+        assert!(
+            css.contains(".term-keys button.term-keys__nav {"),
+            "the navigation tint must select the arrows by that class: {css}"
+        );
+        assert!(
+            css.contains("color: var(--color-info); }"),
+            "the arrows must take the info token as their glyph colour: {css}"
+        );
+        assert!(
+            css.contains("color-mix(in srgb, var(--color-info) 22%, var(--color-surface-raised))"),
+            "the arrow ground must be the info token mixed over the shared surface token: {css}"
+        );
+        // D1b (`816f4993`): the accent-alt slots are BOARD LANE IDENTITY in
+        // the live console theme (alt-2 is the orange for "needs you"), so a
+        // key must never wear one — the mistake D1 shipped.
+        assert!(
+            !css.contains(".term-keys button.term-keys__nav { background: color-mix(in srgb, var(--color-accent-alt"),
+            "the arrows must not borrow a board lane-identity colour: {css}"
+        );
+        // The action colour stays what it was: Send's and a latched
+        // modifier's, never the arrows'.
+        assert!(
+            css.contains(
+                ".term-keys button[aria-pressed=\"true\"] { background: var(--color-action);"
+            ),
+            "the latch rule must still own the action colour: {css}"
+        );
+    }
+
+    /// term-reply-composer (D1): the actions row is the
+    /// card's own last child, not a sibling block rendered below it —
+    /// proven by literal nesting, not left-to-right ordering (which the old
+    /// split layout satisfied too): the `</div>` closing
+    /// `.term-reply__actions` is immediately followed by the `</div>`
+    /// closing the card, and only then does the form itself close. True for
+    /// both the attach-capable card (`.term-attach`) and the no-attach card
+    /// (`.term-reply__field`).
+    #[test]
+    fn pane_controls_actions_row_closes_inside_the_card() {
+        let with_attach = pane_controls("pane-1", "Agent One", true, None, None);
+        assert!(
+            with_attach.contains("      </div>\n    </div>\n  </form>"),
+            "the actions row must close inside the attach card, before the form closes: {with_attach}"
+        );
+        let without_attach = pane_controls("pane-1", "Agent One", false, None, None);
+        assert!(
+            without_attach.contains("      </div>\n    </div>\n  </form>"),
+            "the actions row must close inside the field card, before the form closes: {without_attach}"
+        );
+    }
+
+    /// term-reply-composer (D1): the restructure must not have cost
+    /// `assets/app.js` a single selector — every class name the old split
+    /// layout rendered still renders somewhere in the new single-card
+    /// composer (markup for the attach-capable variant, CSS for
+    /// `.term-reply__field`, which only the no-attach variant's markup
+    /// uses).
+    #[test]
+    fn pane_controls_keeps_every_pre_existing_class_name() {
+        let project = sample_project();
+        let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
+            pane_id: "w1:p1".into(),
+            kind: "claude".into(),
+            name: "one".into(),
+            status: "working".into(),
+            cwd: String::new(),
+            workspace: "w1".into(),
+            tab: "t1".into(),
+            title: String::new(),
+        }];
+        let html = terminal_page(&project, &panes, Some("w1:p1"), &[]);
+        for class in [
+            "term-reply__field",
+            "term-reply__text",
+            "term-reply__actions",
+            "term-reply__approve",
+            "term-reply__stage",
+            "term-reply__send",
+            "term-attach",
+            "term-attach__input",
+            "term-attach__chips",
+            "term-attach__btn",
+            "term-attach__error",
+        ] {
+            assert!(
+                html.contains(class),
+                "the composer must still carry {class}: {html}"
+            );
+        }
+    }
+
+    /// D1 (terminal-approve-button), amended by trc-2: Approve leads Stage
+    /// in the key grid's row 1 — a one-tap send never sits shoulder to
+    /// shoulder with Send — and both render before Send, which now trails
+    /// alone in the composer's actions row.
     #[test]
     fn pane_controls_renders_approve_before_stage_and_send() {
         let html = pane_controls("pane-1", "Agent One", false, None, None);
         assert!(
-            html.contains(r#"<button type="button" class="term-reply__approve">Approve</button>"#),
+            html.contains(
+                r#"<button type="button" class="term-reply__approve" data-pane-id="pane-1">Approve</button>"#
+            ),
             "the Approve button must render: {html}"
         );
         let approve_at = html
@@ -11384,7 +15065,7 @@ mod tests {
             .expect("Send button must render");
         assert!(
             approve_at < stage_at && stage_at < send_at,
-            "the row must read Approve, Stage, Send: {html}"
+            "the key grid must read Approve then Stage, before Send trails in the composer: {html}"
         );
         assert!(
             !html.contains("data-agent-state"),
@@ -11407,8 +15088,9 @@ mod tests {
             Some(&BeeActivityState::Blocked),
         );
         assert!(
-            blocked
-                .contains(r#"<button type="button" class="term-reply__approve">Approve</button>"#),
+            blocked.contains(
+                r#"<button type="button" class="term-reply__approve" data-pane-id="pane-1">Approve</button>"#
+            ),
             "a blocked pane keeps the plain, enabled Approve button: {blocked}"
         );
         assert!(
@@ -11425,7 +15107,7 @@ mod tests {
         );
         assert!(
             waiting.contains(
-                r#"<button type="button" class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is needs an answer">Approve</button>"#
+                r#"<button type="button" class="term-reply__approve" data-pane-id="pane-1" disabled title="Approve answers a permission prompt; this agent is needs an answer">Approve</button>"#
             ),
             "a pane waiting on a typed answer must render Approve disabled, with the reason: {waiting}"
         );
@@ -11434,8 +15116,8 @@ mod tests {
             "the reply form must carry that pane's state word too: {waiting}"
         );
         for enabled in [
-            r#"<button type="button" class="term-reply__stage">Stage</button>"#,
-            r#"<button type="submit" class="term-reply__send">Send</button>"#,
+            r#"<button type="button" class="term-reply__stage" data-pane-id="pane-1">Stage</button>"#,
+            r#"<button type="submit" class="term-reply__send" aria-label="Send">↑</button>"#,
         ] {
             assert!(
                 waiting.contains(enabled),
@@ -11452,7 +15134,7 @@ mod tests {
         );
         assert!(
             working.contains(
-                r#"class="term-reply__approve" disabled title="Approve answers a permission prompt; this agent is working">Approve</button>"#
+                r#"class="term-reply__approve" data-pane-id="pane-1" disabled title="Approve answers a permission prompt; this agent is working">Approve</button>"#
             ),
             "a working pane must render Approve disabled too: {working}"
         );
@@ -11483,70 +15165,61 @@ mod tests {
         );
     }
 
-    /// D1: the new button sizes exactly like its siblings — no new colours,
-    /// no new tokens — so it joins both the shared reply-button rule and the
-    /// mobile sizing tweak alongside term-reply__send/term-reply__stage.
+    /// trc-2: Approve and Stage now render inside `.term-keys`, so they take
+    /// their box shape from the grid's own `.term-keys button` rule — no
+    /// dedicated reply-button rule lists them any more, on the base
+    /// stylesheet or the mobile tweak. Send stays outside the grid, in the
+    /// composer's own actions row, with its own distinct round-button rule
+    /// (a fixed-size circle must never join a shared padding/stretch rule).
     #[test]
-    fn term_reply_approve_shares_the_stage_send_css_rule() {
+    fn term_reply_approve_and_stage_share_the_key_grid_css_rule() {
         let project = sample_project();
         let html = terminal_page(&project, &[], None, &[]);
         assert!(
-            html.contains(".term-reply__send, .term-reply__stage, .term-reply__approve {"),
-            "the shared reply-button rule must include term-reply__approve: {html}"
+            !html.contains(".term-reply__send, .term-reply__stage, .term-reply__approve {"),
+            "Approve/Stage/Send must no longer share one box-shape rule: {html}"
         );
         assert!(
-            html.contains(
+            !html.contains(
                 ".term-keys button, .term-reply__send, .term-reply__stage, .term-reply__approve {"
             ),
-            "the mobile sizing tweak must include term-reply__approve: {html}"
+            "the mobile sizing tweak must no longer list the reply buttons by name: {html}"
+        );
+        assert!(
+            html.contains(".term-keys button { padding: var(--space-2) var(--space-3); }"),
+            "the mobile tweak must still size every key-grid button, Approve/Stage included since they render inside it now: {html}"
         );
     }
 
-    /// term-keys-one-row: on a handset the arrows and the named keys share
-    /// one line — both groups stop wrapping and every key takes an equal
-    /// share, inside the tab's own narrow block and nowhere else.
+    /// term-keys-grid (D1): the 2×6 grid is a base rule, not a narrow-only
+    /// override — it holds six columns, two rows, at every width, so a
+    /// handset never collapses it into a single overflowing line the way
+    /// the old flex row (term-keys-one-row) used to force.
     #[test]
-    fn term_keys_share_one_row_only_inside_the_narrow_media_query() {
+    fn term_keys_grid_holds_its_shape_at_every_width() {
         let html = PROJECT_TAB_STYLE;
+        assert!(
+            html.contains(
+                ".term-keys { display: grid; grid-template-columns: repeat(6, minmax(44px, 1fr)); gap: var(--space-1); }"
+            ),
+            "the 2x6 grid rule must ship as a base rule: {html}"
+        );
         let start = html
             .find("@media (max-width: 720px) {")
             .expect("the narrow block must exist");
         let tail = &html[start..];
         let end = tail.find("\n}\n").expect("the narrow block must close");
         let narrow = &tail[..end];
-        for rule in [
-            ".term-controls { flex-wrap: nowrap;",
-            ".term-keys { flex: 1 1 0; flex-wrap: nowrap; min-width: 0; }",
-            ".term-keys button { flex: 1 1 0; min-width: 0;",
-            ".term-controls .term-keys--move button { min-width: 0; }",
-        ] {
-            assert!(
-                narrow.contains(rule),
-                "narrow block must carry `{rule}`: {narrow}"
-            );
-        }
-        let outside = format!("{}{}", &html[..start], &tail[end..]);
         assert!(
-            !outside.contains("flex-wrap: nowrap"),
-            "the one-row rule is a handset rule only: {outside}"
+            !narrow.contains("grid-template-columns"),
+            "the grid shape must not be re-declared inside the narrow block — it already holds at every width: {narrow}"
+        );
+        assert!(
+            !html.contains("term-keys--move"),
+            "the arrows-only modifier is gone now that one grid replaces both key groups: {html}"
         );
     }
 
-    /// (board-action-dupes) The board's action pair and run button render as
-    /// SIBLINGS of their row inside `.bee-hub__cards`, carrying no
-    /// `data-hub-key` of their own — deliberately, since a `<button>` inside
-    /// an `<a>` is invalid markup ([`bee_hub_ready_to_merge_row`]). That puts
-    /// them out of reach of the leaves pass in `assets/app.js`, which only
-    /// ever removes keyed nodes, so `hubReconcileCards` has to remove its own
-    /// unkeyed leftovers or every board patch imports one more copy beside
-    /// the last. It must also withhold the enter fade from them:
-    /// board-live-morph D2 spends motion on the card/row itself and nothing
-    /// else, and an unkeyed sibling arrives with the row it belongs to.
-    ///
-    /// Both halves are pinned here rather than in the reconcile's own
-    /// neighbourhood because the duplication is invisible to every
-    /// render-side assertion in this file — the server's markup was never
-    /// wrong.
     #[test]
     fn app_js_reconcile_drops_its_unkeyed_leftovers() {
         let script = include_str!("../assets/app.js");
@@ -11569,16 +15242,21 @@ mod tests {
         );
     }
 
-    /// D2/D4: `assets/app.js` wires the Approve button the same way it
-    /// wires Stage — posting through the existing `postJson`/`inputUrl`
-    /// helpers, never a new fetch — so the project page and the homepage
-    /// Terminals tab both get a working button for free.
+    /// D2/D4, amended by trc-2: `assets/app.js` wires the Approve button the
+    /// same way it wires Stage — posting through the existing
+    /// `postJson`/`inputUrl` helpers, never a new fetch — so the project
+    /// page and the homepage Terminals tab both get a working button for
+    /// free. Approve now renders in the key grid rather than inside the
+    /// `.term-reply` form, so it is read off the shared `.term-pane` card
+    /// ancestor instead of the form itself.
     #[test]
     fn app_js_wires_the_approve_button() {
         let script = include_str!("../assets/app.js");
         assert!(
-            script.contains(r#"var approveBtn = form.querySelector(".term-reply__approve");"#),
-            "app.js must read the Approve button: {script}"
+            script.contains(
+                r#"var approveBtn = card && card.querySelector(".term-reply__approve");"#
+            ),
+            "app.js must read the Approve button from the pane's card: {script}"
         );
         assert!(
             script
@@ -11604,8 +15282,10 @@ mod tests {
         });
         let section = &script[start..];
         assert!(
-            section.contains(r#"var approveBtn = form.querySelector(".term-reply__approve");"#),
-            "the Unassigned page's own wiring in app.js must read the Approve button: {section}"
+            section.contains(
+                r#"var approveBtn = card && card.querySelector(".term-reply__approve");"#
+            ),
+            "the Unassigned page's own wiring in app.js must read the Approve button from the pane's card: {section}"
         );
         assert!(
             section.contains(r#"postJson(inputUrl(paneId), { text: "Approve", submit: true })"#),
@@ -11693,6 +15373,9 @@ mod tests {
             None,
             true,
             &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "",
         );
         assert!(
             page_html.contains(r#"<main class="fg-page fg-page--tight">"#),
@@ -11789,8 +15472,8 @@ mod tests {
             "the Older/Newer/Live history controls must render: {html}"
         );
         assert!(
-            html.contains("term-keys--move") && html.contains(r#"class="term-reply""#),
-            "the movement keys and reply form must render: {html}"
+            html.contains(r#"class="term-keys""#) && html.contains(r#"class="term-reply""#),
+            "the key grid and reply form must render: {html}"
         );
 
         // agents-drawer-global: no drawer here — `home_page` (this tab's
@@ -11807,6 +15490,15 @@ mod tests {
     /// reply/keys group [`pane_controls`] renders — carries that pane's own
     /// `data-term-base` rather than falling back to a page-root
     /// `data-project-id` this page does not have.
+    ///
+    /// home-terminal-new-shell: that used to be pinned as "the string
+    /// `data-project-id` appears nowhere", which held only because this
+    /// case configures no presets and the create box therefore did not
+    /// render at all. It renders now (New shell alone), and it has always
+    /// carried its own `data-project-id` whenever a preset was configured —
+    /// that attribute is how `app.js` builds `/p/:id/_terminal/create/…`,
+    /// and D5 never forbade it. So the pin is narrowed to what D5 actually
+    /// says: the only one on the page is `.term-create`'s own.
     #[test]
     fn terminals_tab_controls_carry_the_selected_panes_own_base() {
         let pane = menu_pane("w1:p1", Some("proj-1"), "Proj One");
@@ -11820,9 +15512,14 @@ mod tests {
             html.matches(base_attr.as_str()).count() >= 4,
             "every pane control must carry data-term-base=\"{base}\": {html}"
         );
+        assert_eq!(
+            html.matches("data-project-id").count(),
+            1,
+            "the tab must carry no project id beyond the create box's own: {html}"
+        );
         assert!(
-            !html.contains("data-project-id"),
-            "the tab must never fall back to a page-root data-project-id: {html}"
+            html.contains(r#"class="term-create" data-project-id="proj-1""#),
+            "and that one must be the create box's: {html}"
         );
     }
 
@@ -11855,6 +15552,14 @@ mod tests {
         assert!(
             with_project[bar_start..bar_end].contains(r#"data-preset="Claude""#),
             "the creation controls must live inside the pane_bar switcher: {with_project}"
+        );
+        // home-terminal-new-shell: parity with the project terminal page's
+        // own switcher — this tab offers the plain shell button too, in the
+        // same place, targeting the selected pane's project.
+        assert!(
+            with_project[bar_start..bar_end]
+                .contains(r#"<button type="button" class="term-create__pane">New shell"#),
+            "the tab must offer New shell inside the switcher: {with_project}"
         );
 
         let unassigned_pane = menu_pane("w1:p2", None, "Unassigned");
@@ -12027,6 +15732,387 @@ mod tests {
         );
     }
 
+    /// home-terminal-panel D1/D2: a projected pane's tab renders the whole
+    /// mechanism and loads none of it. Every address the sidebar and the
+    /// panel can ever hold is HERE, in the markup — `assets/app.js` is only
+    /// ever allowed to copy one of these attributes onto a frame, so a
+    /// project id is never assembled in script (D2).
+    #[test]
+    fn terminals_tab_projected_pane_renders_the_files_and_diff_sidebar() {
+        let panes = vec![menu_pane("w1:p1", Some("proj-1"), "Proj One")];
+        let html = terminals_tab(&panes, Some("w1:p1"), true, &[]);
+        assert!(
+            html.contains(
+                r#"<button type="button" class="term-work__tab" data-nav-tab="files" data-nav-src="/p/proj-1/_code/?embed=1&amp;nav=1" aria-pressed="false">Files</button>"#
+            ),
+            "Files must carry the Code page's own nav-mode URL: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<button type="button" class="term-work__tab" data-nav-tab="diff" data-nav-src="/p/proj-1/_changes?embed=1&amp;nav=1" aria-pressed="false">Diff</button>"#
+            ),
+            "Diff must carry the Changes page's own nav-mode URL: {html}"
+        );
+        assert!(
+            html.contains(r#"data-panel-src="/p/proj-1/_changes?embed=1&amp;panel=1""#),
+            "the sidebar must carry the embedded Changes page the Diff tab drops into the panel (D1), sidebar-less because this sidebar is it: {html}"
+        );
+        assert!(
+            html.contains(r#"<div class="term-work__panel" hidden>"#),
+            "the panel must exist and ship hidden: {html}"
+        );
+        assert!(
+            html.contains("data-panel-close"),
+            "the panel must ship with the control that closes the split: {html}"
+        );
+        // Lazy in the markup, not in the script: three frames (two nav, one
+        // panel) and not one `src` between them, so a tab nobody opens
+        // anything from fetches nothing.
+        assert_eq!(
+            html.matches("<iframe").count(),
+            3,
+            "the tab must render exactly the two nav frames and the panel frame: {html}"
+        );
+        for (start, _) in html.match_indices("<iframe") {
+            let end = start + html[start..].find('>').expect("unclosed iframe tag");
+            assert!(
+                !html[start..end].contains("src="),
+                "no frame may ship loaded: {}",
+                &html[start..end]
+            );
+        }
+    }
+
+    /// home-terminal-panel D1: a pane outside every registered project has
+    /// no `:id` for `/p/:id/_code` or `/p/:id/_changes` to embed, so the
+    /// sidebar says why instead of offering controls that would point at
+    /// nothing — and nothing else on the tab moves for it: no tabs, no
+    /// panel, no frames.
+    #[test]
+    fn terminals_tab_pane_with_no_project_gets_an_explained_sidebar_and_no_frames() {
+        let panes = vec![menu_pane("w1:u1", None, "Unassigned")];
+        let html = terminals_tab(&panes, Some("w1:u1"), true, &[]);
+        assert!(
+            html.contains(r#"class="term-work__side term-work__side--empty""#)
+                && html.contains("not inside a registered project"),
+            "the sidebar must explain why it is empty: {html}"
+        );
+        assert!(
+            !html.contains("<iframe"),
+            "a pane with no project must render no frames at all: {html}"
+        );
+        assert!(
+            !html.contains("term-work__tab") && !html.contains("term-work__panel"),
+            "a pane with no project must render neither tab buttons nor a panel: {html}"
+        );
+    }
+
+    /// home-terminal-panel D2's cross-file link, pinned from both ends: the
+    /// nav pages put [`PANEL_FRAME_NAME`] in a `<base target>` and the
+    /// terminals tab names its panel frame with it. A typo on either end
+    /// would open a new browser tab instead of the panel, silently — so
+    /// neither end spells the name out, and this test asserts through the
+    /// constant rather than the literal it happens to hold.
+    #[test]
+    fn the_workspace_panel_frame_and_the_nav_base_target_share_one_name() {
+        let panes = vec![menu_pane("w1:p1", Some("proj-1"), "Proj One")];
+        let html = terminals_tab(&panes, Some("w1:p1"), true, &[]);
+        assert!(
+            html.contains(&format!(r#"name="{PANEL_FRAME_NAME}""#)),
+            "the panel frame must be named from the shared constant: {html}"
+        );
+        assert_eq!(
+            panel_base_tag(),
+            format!(r#"<base target="{PANEL_FRAME_NAME}">"#),
+            "the nav pages must target that same frame"
+        );
+    }
+
+    /// The workspace's JS half, for BOTH pages. term-workspace-unify folded
+    /// two tests into this one — the homepage's sidebar block and the project
+    /// page's panel block — because it folded two script blocks into one:
+    /// `assets/app.js` roots at `.term-work` and serves whichever page
+    /// rendered it, so asserting the same block twice would pay two
+    /// maintenance bills for one behavior.
+    ///
+    /// What is pinned is what could go quietly wrong: a frame's URL is only
+    /// ever the server's own attribute (never a string built here from a
+    /// project id, never a value read out of storage); a nav frame is loaded
+    /// once and left loaded, while the panel frame is re-pointed only when
+    /// the address actually changed; choosing Diff fills the panel as well as
+    /// the sidebar; the open tab is remembered per PROJECT under one key that
+    /// both pages share; every storage touch is wrapped; and the split is one
+    /// class on `<main>`, the same one on either page.
+    #[test]
+    fn app_js_wires_the_one_terminal_workspace_from_the_servers_own_urls() {
+        let script = include_str!("../assets/app.js");
+        assert!(
+            script.contains(r#"var root = document.querySelector(".term-work");"#),
+            "one block must root at the shared workspace, whichever page rendered it: {script}"
+        );
+        assert!(
+            script.contains(r#"var src = btn.getAttribute("data-nav-src") || "";"#),
+            "a nav frame's src must be copied from its own tab button's attribute: {script}"
+        );
+        assert!(
+            script.contains(r#"if (!frame.getAttribute("src")) frame.setAttribute("src", src);"#),
+            "a nav frame is loaded once and then left loaded: {script}"
+        );
+        assert!(
+            script.contains(r#"var src = side.getAttribute("data-panel-src") || "";"#)
+                && script.contains(r#"if (name === "diff") fillPanelWithDiff();"#),
+            "choosing Diff must also fill the panel, from the sidebar's own attribute (D1): {script}"
+        );
+        assert!(
+            script.contains(r#"if (panelFrame.getAttribute("src") !== src) {"#),
+            "the panel frame must be re-pointed only when the address changed: {script}"
+        );
+        assert!(
+            script.contains(
+                r#""waggledance-term-panel:" + (root.getAttribute("data-panel-project") || "");"#
+            ),
+            "the open tab must be remembered per project under the one shared key: {script}"
+        );
+        assert!(
+            !script.contains("waggledance-home-panel:"),
+            "the homepage's own key is retired — one key means the choice follows the project across both pages: {script}"
+        );
+        assert!(
+            script.contains(
+                r#"try { storedTab = sessionStorage.getItem(KEY); } catch (e) { storedTab = null; }"#
+            ),
+            "a throwing sessionStorage must read as no tab open: {script}"
+        );
+        assert!(
+            script.contains(r#"var closer = root.querySelector("[data-panel-close]");"#)
+                && script.contains(r#"if (main) main.classList.toggle("term-split", split);"#),
+            "the close control and the split must drive the one split class: {script}"
+        );
+        assert!(
+            !script.contains("term-embed"),
+            "the project page's deleted variant must have no wiring left: {script}"
+        );
+    }
+
+    /// The workspace's CSS half, for BOTH pages — half and half, and only
+    /// while the panel is open. term-workspace-unify folded the project
+    /// page's own copy of this test into this one: there is a single set of
+    /// rules now, hanging off the same `main.fg-page.term-split` both pages
+    /// put on their `<main>`, so there is ONE definition of what "split"
+    /// means and one test of it. The panel's `display` is set only when it is
+    /// not `hidden`, so a closed panel leaves either page laid out exactly as
+    /// it was before this feature existed.
+    #[test]
+    fn the_workspace_panel_splits_the_content_area_in_half_only_while_open() {
+        let css = include_str!("../assets/app.css");
+        assert!(
+            css.contains(
+                "main.fg-page.term-split { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }"
+            ),
+            "the split must give the content area one fixed frame: {css}"
+        );
+        let closed_costs_nothing =
+            ".term-work__panel:not([hidden]) { display: flex; flex-direction: column; }";
+        assert!(
+            css.contains(closed_costs_nothing),
+            "the panel must take its display only when it is not hidden: {css}"
+        );
+        assert!(
+            !css.contains(".term-work__panel { display:"),
+            "the panel must take no unconditional display rule, or `hidden` would stop hiding it: {css}"
+        );
+        assert!(
+            css.contains("main.fg-page.term-split .term-work__panel { flex: 1 1 50%; }"),
+            "the open panel must take the top half: {css}"
+        );
+        assert!(
+            css.contains(
+                "main.fg-page.term-split .term-work__screen { flex: 1 1 50%; min-height: 0; overflow-y: auto; border-top:"
+            ),
+            "the terminal must take the other half and scroll inside itself: {css}"
+        );
+        assert!(
+            !css.contains("term-embed"),
+            "the project page's deleted variant must have no rules left: {css}"
+        );
+    }
+
+    /// term-workspace-unify: the unification itself, pinned from both ends.
+    /// The project terminal page and the homepage Terminals tab render ONE
+    /// workspace — the same frame, column, screen wrapper, panel and
+    /// Files | Diff sidebar — and each names its OWN project in every address
+    /// it hands the script. A page growing a variant of its own again fails
+    /// here first, which is what makes the shared layout stay shared.
+    #[test]
+    fn both_terminal_surfaces_render_the_one_shared_workspace() {
+        let project = sample_project();
+        let panes = vec![menu_pane("w1:p1", Some("proj-2"), "Proj Two")];
+        for (page, html, pid) in [
+            (
+                "the project terminal page",
+                terminal_page(&project, &[], None, &[]),
+                "proj-1",
+            ),
+            (
+                "the homepage Terminals tab",
+                terminals_tab(&panes, Some("w1:p1"), true, &[]),
+                "proj-2",
+            ),
+        ] {
+            for part in [
+                r#"<div class="term-work""#,
+                r#"<div class="term-work__col">"#,
+                r#"<div class="term-work__screen">"#,
+                r#"<aside class="term-work__side""#,
+                r#"<div class="term-work__panel" hidden>"#,
+                r#"<div class="term-work__tabs""#,
+            ] {
+                assert!(
+                    html.contains(part),
+                    "{page} must render `{part}` of the shared workspace: {html}"
+                );
+            }
+            assert!(
+                html.contains(&format!(
+                    r#"data-nav-tab="files" data-nav-src="/p/{pid}/_code/?embed=1&amp;nav=1""#
+                )) && html.contains(&format!(
+                    r#"data-nav-tab="diff" data-nav-src="/p/{pid}/_changes?embed=1&amp;nav=1""#
+                )),
+                "{page}'s sidebar must offer Files and Diff over {pid}'s own nav pages: {html}"
+            );
+            assert!(
+                html.contains(&format!(
+                    r#"data-panel-src="/p/{pid}/_changes?embed=1&amp;panel=1""#
+                )) && html.contains(&format!(r#"data-panel-project="{pid}""#)),
+                "{page}'s panel address and storage key must name {pid}: {html}"
+            );
+            assert!(
+                !html.contains("term-embed"),
+                "{page} must render nothing of the deleted per-page variant: {html}"
+            );
+        }
+    }
+
+    /// The workspace's rules belong to BOTH pages, so not one of them may be
+    /// scoped to `.home-shell` — that wrapper exists only on the homepage.
+    /// The rule this matters most for is the 700px breakpoint that undoes the
+    /// fixed-height split: left homepage-scoped (which is how it was written),
+    /// a handset on the project page keeps a `100dvh`, `overflow: hidden`
+    /// frame while the columns stack inside it — a terminal you cannot scroll
+    /// to. Comments are stripped first: the block above these rules explains
+    /// the scoping in prose that names both selectors.
+    #[test]
+    fn no_terminal_workspace_rule_is_scoped_to_the_homepage_shell() {
+        let css = css_without_comments(include_str!("../assets/app.css"));
+        for rule in css.lines() {
+            if !(rule.contains(".term-work") || rule.contains("main.fg-page.term-split")) {
+                continue;
+            }
+            assert!(
+                !rule.contains(".home-shell"),
+                "a shared workspace rule must not be scoped to the homepage shell: {rule}"
+            );
+        }
+        assert!(
+            css.contains("main.fg-page.term-split { height: auto; overflow: visible; }"),
+            "the narrow breakpoint must undo the split — for both pages: {css}"
+        );
+    }
+
+    /// CSS with every `/* … */` comment removed, so a rule test reads rules
+    /// and a comment that quotes a selector cannot fail it.
+    fn css_without_comments(css: &str) -> String {
+        let mut out = String::new();
+        let mut rest = css;
+        while let Some(open) = rest.find("/*") {
+            out.push_str(&rest[..open]);
+            match rest[open..].find("*/") {
+                Some(close) => rest = &rest[open + close + 2..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Every occurrence of the retired workspace class in `text`, with the
+    /// 40 characters that follow it for the failure message.
+    ///
+    /// The needle is assembled at runtime, for two reasons. This file is one
+    /// of the three the guard reads, so a literal would trip the guard on its
+    /// own source — and, the trap that makes a bare `rg` count a FALSE red,
+    /// the locked decision ids `home-terminal-panel`,
+    /// `home-terminal-parity-2` and `home-terminal-header-2` are cited in
+    /// comments in all three files and must STAY. So what is matched is the
+    /// class token alone: the old prefix with the word ending right there —
+    /// a `_`, a `-`, a quote, a dot, a space — never a letter or a digit
+    /// carrying it on into one of those ids.
+    fn retired_workspace_class_hits(text: &str) -> Vec<String> {
+        let needle = concat!("home", "-term");
+        let mut hits = Vec::new();
+        for (at, _) in text.match_indices(needle) {
+            let rest = &text[at + needle.len()..];
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            hits.push(text[at..].chars().take(40).collect::<String>());
+        }
+        hits
+    }
+
+    /// term-workspace-unify's whole point, guarded across all three files
+    /// that rendered the old name: a page that is not the homepage must not
+    /// render a homepage-named class. Every one of those names is a rename
+    /// with a mechanical counterpart in another file, and a missed one shows
+    /// up as an unstyled or dead control rather than a crash — silent, unless
+    /// something fails here.
+    #[test]
+    fn no_file_renders_the_retired_homepage_named_workspace_class() {
+        for (file, text) in [
+            ("src/views.rs", include_str!("views.rs")),
+            ("assets/app.css", include_str!("../assets/app.css")),
+            ("assets/app.js", include_str!("../assets/app.js")),
+        ] {
+            let hits = retired_workspace_class_hits(text);
+            assert!(
+                hits.is_empty(),
+                "{file} still carries the retired homepage-named class: {hits:?}"
+            );
+        }
+    }
+
+    /// The guard above, proved in both directions — a guard that cannot fail
+    /// is not a guard, and this one has to walk past three locked decision
+    /// ids that begin with the very letters it hunts.
+    #[test]
+    fn the_class_guard_walks_past_the_decision_ids_and_still_catches_a_class() {
+        let ids = "home-terminal-panel D1/D2, home-terminal-parity-2, home-terminal-header-2";
+        assert!(
+            retired_workspace_class_hits(ids).is_empty(),
+            "a cited decision id must not read as a class: {ids}"
+        );
+        let old = concat!("home", "-term");
+        for reintroduced in [
+            format!(r#"<div class="{old}__col">"#),
+            format!(r#"<div class="{old}">"#),
+            format!(".{old}__panel {{ display: flex; }}"),
+            format!(r#"root.classList.toggle("{old}--split", split);"#),
+        ] {
+            assert_eq!(
+                retired_workspace_class_hits(&reintroduced).len(),
+                1,
+                "a reintroduced class must fail the guard: {reintroduced}"
+            );
+        }
+    }
+
     /// The Older/Newer/Live column is bounded by the screen it moves: the
     /// rail it lives in is positioned against `.term-screen-wrap`, which is
     /// the only ancestor that establishes a containing block, so every one of
@@ -12132,58 +16218,59 @@ mod tests {
         );
     }
 
-    /// D6: the settings page's Orchestration section renders one row per
-    /// registered project, each posting to that project's own toggle
-    /// endpoint, checked exactly when `Project::orchestration_enabled` is
-    /// true — never the other project's value.
     #[test]
-    fn settings_page_orchestration_section_reflects_each_projects_own_flag() {
+    fn settings_page_orchestration_section_lists_each_projects_effective_state() {
         let mut on = sample_project();
-        on.id = "proj-on".into();
         on.name = "Proj On".into();
         on.orchestration_enabled = true;
         let mut off = sample_project();
-        off.id = "proj-off".into();
         off.name = "Proj Off".into();
+        off.root_path = std::path::PathBuf::from("/srv/off");
         off.orchestration_enabled = false;
+        let mut broken = sample_project();
+        broken.name = "Proj Broken".into();
+        broken.orchestration_enabled = false;
 
         let html = settings_page(
             &Config::default(),
             false,
             false,
             NotifyCredentialView::NotConfigured,
-            &[on, off],
+            &[
+                (on, None),
+                (off, None),
+                (
+                    broken,
+                    Some("/srv/b/.waggledance.toml failed to parse: x".into()),
+                ),
+            ],
         );
         assert!(
-            html.contains("Orchestration"),
-            "the settings page must carry an Orchestration section: {html}"
+            html.contains(r#"Proj On</span> <span class="fg-orch-state">on</span>"#),
+            "{html}"
         );
         assert!(
-            html.contains(r#"action="/api/projects/proj-on/orchestration""#),
-            "each project row must post to its own toggle endpoint: {html}"
+            html.contains(
+                r#"Proj Off</span> <span class="fg-orch-state">off — orchestration = false in /srv/off/.waggledance.toml</span>"#
+            ),
+            "{html}"
         );
         assert!(
-            html.contains(r#"action="/api/projects/proj-off/orchestration""#),
-            "each project row must post to its own toggle endpoint: {html}"
+            html.contains(
+                r#"Proj Broken</span> <span class="fg-orch-state">off — .waggledance.toml could not be read: /srv/b/.waggledance.toml failed to parse: x</span>"#
+            ),
+            "{html}"
         );
-
-        let on_row_start = html
-            .find(r#"action="/api/projects/proj-on/orchestration""#)
-            .expect("the on project's row must exist");
-        let on_row = &html[on_row_start..on_row_start + 200];
-        assert!(
-            on_row.contains(r#"name="enabled" checked"#),
-            "the opted-in project's checkbox must render checked: {on_row}"
-        );
-
-        let off_row_start = html
-            .find(r#"action="/api/projects/proj-off/orchestration""#)
-            .expect("the off project's row must exist");
-        let off_row = &html[off_row_start..off_row_start + 200];
-        assert!(
-            !off_row.contains(r#"name="enabled" checked"#),
-            "the opted-out project's checkbox must render unchecked: {off_row}"
-        );
+        for hint in [
+            "Every project takes dispatched work unless its <code>.waggledance.toml</code> says <code>orchestration = false</code>.",
+            "Edits apply on the next dispatch, no restart.",
+            "Terminal, above, still gates pane dispatch.",
+            "The observer trigger, when on, acts on every project that is on.",
+        ] {
+            assert!(html.contains(hint), "{hint}: {html}");
+        }
+        assert!(!html.contains("/orchestration\""), "{html}");
+        assert!(!html.contains("fg-orch-row\" method"), "{html}");
     }
 
     /// D8: with no projects registered the Orchestration section renders an
@@ -12873,6 +16960,291 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// (board-visibility bv-3) The half the widening exists for: when the
+    /// project recorded what it is actually waiting for — a sentence a
+    /// human wrote, not a tool name — that sentence takes the card's
+    /// waiting line, in place of the derived wording and never beside it.
+    /// The board's answer to "what does this project need from me?" is the
+    /// subject itself; `Shape gate awaiting your decision` was only ever
+    /// the best guess available without one.
+    #[test]
+    fn hub_renders_the_recorded_waiting_subject_when_it_beats_the_derived_sentence() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-hub-subject-informative-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            ".bee/state.json",
+            r#"{"feature": "subject-feat", "phase": "executing", "waiting_on": {"kind": "gate", "subject": "Agent logo marks — shape + execution approval"}}"#,
+        );
+        write(
+            ".bee/lanes/subject-feat.json",
+            r#"{
+                "feature": "subject-feat",
+                "phase": "executing",
+                "mode": "standard",
+                "next_action": "keep going",
+                "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+            }"#,
+        );
+
+        let snapshot = waggledance_core::bee::read_snapshot(&root);
+        let mut project = sample_project();
+        project.root_path = root.clone();
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
+        );
+
+        assert!(
+            html.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Agent logo marks — shape + execution approval</p>"#
+            ),
+            "a real recorded subject must become the card's waiting sentence: {html}"
+        );
+        assert!(
+            !html.contains("Shape gate awaiting your decision"),
+            "the recorded subject replaces the derived sentence, it never joins it: {html}"
+        );
+        assert_eq!(
+            html.matches("bee-hub__reason").count(),
+            1,
+            "one waiting line, not a second surface beside it: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (board-visibility bv-3) The recorded `waiting_on.subject` replaces
+    /// the card's own derived sentence ONLY when it says more to a human
+    /// than that sentence already does. A bare one-word subject never
+    /// does: four lanes in this repo's own store record the literal
+    /// subject `"AskUserQuestion"` — the name of the tool that asked,
+    /// which says nothing about what is being asked — and rendering it
+    /// would replace a good sentence with a worse one. Written before the
+    /// widening in [`bee_classify_features`] that renders a good subject,
+    /// because the fallback is the half of that rule the board can be hurt
+    /// by.
+    #[test]
+    fn hub_keeps_the_derived_waiting_sentence_when_the_recorded_subject_is_a_bare_tool_name() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-hub-subject-tool-name-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            ".bee/state.json",
+            r#"{"feature": "subject-feat", "phase": "executing", "waiting_on": {"kind": "gate", "subject": "AskUserQuestion"}}"#,
+        );
+        write(
+            ".bee/lanes/subject-feat.json",
+            r#"{
+                "feature": "subject-feat",
+                "phase": "executing",
+                "mode": "standard",
+                "next_action": "keep going",
+                "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+            }"#,
+        );
+
+        let snapshot = waggledance_core::bee::read_snapshot(&root);
+        let mut project = sample_project();
+        project.root_path = root.clone();
+        let html = bee_feature_hub_section(
+            &project,
+            &snapshot,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &BeeHubLiveRuns::new(),
+        );
+
+        assert!(
+            html.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#
+            ),
+            "a bare tool name must leave the card's own derived sentence standing: {html}"
+        );
+        assert!(
+            !html.contains("AskUserQuestion"),
+            "the name of the tool that asked must never reach the card: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (board-visibility bv-3) The other two ways a recorded subject earns
+    /// nothing: it is blank, or it only echoes the sentence the card
+    /// derives anyway. The echo case is spelled in a different case from
+    /// the derived wording precisely so the assertion can tell the two
+    /// apart — if the subject won, the card would say `shape gate`
+    /// lowercase.
+    #[test]
+    fn hub_keeps_the_derived_waiting_sentence_for_a_blank_or_echoing_recorded_subject() {
+        let render = |suffix: &str, waiting_on: &str| -> String {
+            let root = std::env::temp_dir().join(format!(
+                "waggledance-views-hub-subject-{suffix}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |rel: &str, body: &str| {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            };
+            write(
+                ".bee/state.json",
+                &format!(
+                    r#"{{"feature": "subject-feat", "phase": "executing", "waiting_on": {waiting_on}}}"#
+                ),
+            );
+            write(
+                ".bee/lanes/subject-feat.json",
+                r#"{
+                    "feature": "subject-feat",
+                    "phase": "executing",
+                    "mode": "standard",
+                    "next_action": "keep going",
+                    "approved_gates": {"context": true, "shape": false, "execution": false, "review": false}
+                }"#,
+            );
+            let snapshot = waggledance_core::bee::read_snapshot(&root);
+            let mut project = sample_project();
+            project.root_path = root.clone();
+            let html = bee_feature_hub_section(
+                &project,
+                &snapshot,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &BeeHubLiveRuns::new(),
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            html
+        };
+
+        let derived = r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#;
+
+        let blank = render("blank", r#"{"kind": "gate", "subject": "   "}"#);
+        assert!(
+            blank.contains(derived),
+            "a blank subject must leave the derived sentence standing: {blank}"
+        );
+
+        let echo = render(
+            "echo",
+            r#"{"kind": "gate", "subject": "shape gate awaiting your decision"}"#,
+        );
+        assert!(
+            echo.contains(derived),
+            "a subject that only echoes the derived sentence must leave it standing: {echo}"
+        );
+        assert!(
+            !echo.contains("Waiting on you — shape gate"),
+            "the echoing subject must not be rendered in place of the sentence it echoes: {echo}"
+        );
+    }
+
+    /// (board-visibility bv-3, D4 seen from the view) A `turn-end` mark is
+    /// AGENTS.md's "control back with the human and nothing owed" — the
+    /// idle mark, not a demand — so bv-1 already made it read not-live.
+    /// From the board that has to be visible twice over: a project whose
+    /// ONLY wait is `turn-end` gets no waiting line at all, and a project
+    /// that really is gate-stopped never borrows a `turn-end` subject for
+    /// the sentence it does draw. The subject used here is a live lane's
+    /// own, and it means "nothing is waiting on you" — the exact string
+    /// that must never be rendered as a demand.
+    #[test]
+    fn hub_draws_no_waiting_line_for_a_turn_end_mark_and_never_borrows_its_subject() {
+        let render = |suffix: &str, gates: &str| -> String {
+            let root = std::env::temp_dir().join(format!(
+                "waggledance-views-hub-turn-end-{suffix}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |rel: &str, body: &str| {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            };
+            write(
+                ".bee/state.json",
+                r#"{"feature": "quiet-feat", "phase": "executing", "waiting_on": {"kind": "turn-end", "subject": "Không còn gì chờ bạn"}}"#,
+            );
+            write(
+                ".bee/lanes/quiet-feat.json",
+                &format!(
+                    r#"{{
+                        "feature": "quiet-feat",
+                        "phase": "executing",
+                        "mode": "standard",
+                        "next_action": "keep going",
+                        "approved_gates": {gates}
+                    }}"#
+                ),
+            );
+            let snapshot = waggledance_core::bee::read_snapshot(&root);
+            let mut project = sample_project();
+            project.root_path = root.clone();
+            let html = bee_feature_hub_section(
+                &project,
+                &snapshot,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &BeeHubLiveRuns::new(),
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            html
+        };
+
+        // Every gate that can be a stop is approved, so nothing else is
+        // pulling a waiting line onto this card: the `turn-end` mark is
+        // the only wait this project records.
+        let only_turn_end = render(
+            "alone",
+            r#"{"context": true, "shape": true, "execution": true, "review": false}"#,
+        );
+        assert!(
+            only_turn_end.contains(r#"href="/p/proj-1/_bee/feature/quiet-feat""#),
+            "the feature is still active work, so its card must render: {only_turn_end}"
+        );
+        assert!(
+            !only_turn_end.contains("bee-hub__reason"),
+            "a finished turn is nothing owed: the card must carry no waiting line: {only_turn_end}"
+        );
+        assert!(
+            !only_turn_end.contains("Không còn gì chờ bạn"),
+            "a not-live mark's subject must not reach the card at all: {only_turn_end}"
+        );
+
+        let gate_stopped = render(
+            "with-gate",
+            r#"{"context": true, "shape": false, "execution": false, "review": false}"#,
+        );
+        assert!(
+            gate_stopped.contains(
+                r#"<p class="bee-cell__meta bee-hub__reason">Waiting on you — Shape gate awaiting your decision</p>"#
+            ),
+            "a real gate stop still draws its own sentence: {gate_stopped}"
+        );
+        assert!(
+            !gate_stopped.contains("Không còn gì chờ bạn"),
+            "a not-live subject must never be borrowed for the sentence a real stop draws: {gate_stopped}"
+        );
+    }
+
     /// (waiting-means-stopped-1) A pause handoff naming the active feature,
     /// with nobody's session bound to its lane at all, must still put the
     /// Waiting on you line on its In Progress card — the `working_now` gate
@@ -13119,7 +17491,10 @@ mod tests {
         let html = bee_live_strip_section(&waggledance_core::bee::read_snapshot(&root));
 
         assert!(!html.contains("<img"), "the tag must not survive: {html}");
-        assert!(!html.contains("<script"), "nor the one in the acceptance: {html}");
+        assert!(
+            !html.contains("<script"),
+            "nor the one in the acceptance: {html}"
+        );
         assert!(html.contains("&lt;img"), "it must arrive escaped: {html}");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -13159,7 +17534,12 @@ mod tests {
             .split('}')
             .next()
             .unwrap();
-        for needed in ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap", "min-width: 0"] {
+        for needed in [
+            "overflow: hidden",
+            "text-overflow: ellipsis",
+            "white-space: nowrap",
+            "min-width: 0",
+        ] {
             assert!(rule.contains(needed), "the work span must {needed}: {rule}");
         }
     }
@@ -14566,6 +18946,416 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // -- board-visibility bi-4: the home page's one unread number ----------
+    //
+    // These go through `read_rollup` from a real letter file on disk rather
+    // than hand-building a `BeeSnapshot`, for the reason
+    // `docs/knowledge/patterns/prove-the-whole-path.md` names: the promise is
+    // user-visible ("I can see there is something to read"), and the seam
+    // between bi-1's mailbox reader, the cross-project roll-up and this strip
+    // belongs to no single unit test. The bytes below are bee's own emitter
+    // shape (`verbs/mailbox.rs::render_letter`); there are zero real letters
+    // on this machine, since bee files one only from an unattended run and no
+    // checkout has armed one.
+
+    /// One letter file on disk, in the bytes bee's emitter writes.
+    fn home_letter_file(root: &std::path::Path, name: &str, subject: &str, status: &str) {
+        let p = root.join(".bee/human-mailbox").join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            p,
+            format!(
+                "---\nsubject: {subject:?}\nrun: \"2026-08-30-run\"\nproject: \"demo\"\nfiled_at: \"2026-08-30T09:00:00Z\"\nstatus: {status:?}\nitems: []\nneeds_you: []\n---\n\nBody of the letter.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The one thing bi-4 puts on the home page: how many letters nobody has
+    /// read yet, summed across EVERY registered project, linking to `/inbox`.
+    /// Two projects contribute here and a read letter sits beside an unread
+    /// one, so a per-project count, a count of all letters, or a count taken
+    /// from the first project alone all read as a different number than 3.
+    #[test]
+    fn the_home_board_shows_one_unread_letter_count_summed_across_every_project() {
+        let root_a =
+            std::env::temp_dir().join(format!("waggledance-views-unread-a-{}", std::process::id()));
+        let root_b =
+            std::env::temp_dir().join(format!("waggledance-views-unread-b-{}", std::process::id()));
+        for r in [&root_a, &root_b] {
+            let _ = std::fs::remove_dir_all(r);
+            std::fs::create_dir_all(r.join(".bee")).unwrap();
+        }
+        home_letter_file(
+            &root_a,
+            "2026-08-30T09-00-00Z-one.md",
+            "Letter one",
+            "unread",
+        );
+        home_letter_file(
+            &root_a,
+            "2026-08-30T10-00-00Z-two.md",
+            "Letter two",
+            "unread",
+        );
+        home_letter_file(
+            &root_a,
+            "2026-08-30T11-00-00Z-old.md",
+            "Already seen",
+            "read",
+        );
+        home_letter_file(
+            &root_b,
+            "2026-08-30T12-00-00Z-far.md",
+            "Letter from the other project",
+            "unread",
+        );
+
+        let mut project_a = sample_project();
+        project_a.id = "proj-unread-a".into();
+        project_a.root_path = root_a.clone();
+        let mut project_b = sample_project();
+        project_b.id = "proj-unread-b".into();
+        project_b.root_path = root_b.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(&[root_a.clone(), root_b.clone()]);
+        let pairs: Vec<(&Project, &BeeProjectRollup)> =
+            vec![(&project_a, &rollups[0]), (&project_b, &rollups[1])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            html.contains(r#"data-bee-unread="3""#),
+            "the count must be 3 -- every project's unread letters and only the unread ones: {html}"
+        );
+        assert!(
+            html.contains("3 lá thư chưa đọc"),
+            "the number must be readable as words, not only as an attribute: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/inbox""#),
+            "the count must lead to the inbox, where the reading that lowers it happens: {html}"
+        );
+        // D3's second clause is what forbids the letters themselves here.
+        for subject in [
+            "Letter one",
+            "Letter two",
+            "Already seen",
+            "Letter from the other project",
+        ] {
+            assert!(
+                !html.contains(subject),
+                "no letter subject may reach the home board -- only the number does: {html}"
+            );
+        }
+        assert!(
+            !html.contains("/inbox/p/"),
+            "no per-letter link may reach the home board either: {html}"
+        );
+
+        for r in [&root_a, &root_b] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// The mirror, and the harder half of the rule: at zero unread the home
+    /// board renders NOTHING -- no strip, no placeholder, no "0 chưa đọc".
+    /// Zero is the ordinary state on this machine, so a permanent zero would
+    /// be furniture. A project with letters that have all been read is the
+    /// case that separates "nothing to show" from "no mailbox at all", so
+    /// this one has a read letter on disk rather than an empty directory.
+    #[test]
+    fn the_home_board_shows_nothing_at_all_when_no_letter_is_unread() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-zero-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(
+            &root,
+            "2026-08-30T09-00-00Z-seen.md",
+            "Already seen",
+            "read",
+        );
+
+        let mut project = sample_project();
+        project.id = "proj-unread-zero".into();
+        project.root_path = root.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            !html.contains("data-bee-unread"),
+            "zero unread renders no strip at all, not an empty one: {html}"
+        );
+        assert!(
+            !html.contains("chưa đọc") && !html.contains("bee-hub__inbox"),
+            "zero unread must not leave a placeholder or a bare 0 behind: {html}"
+        );
+        assert!(
+            !html.contains(r#"href="/inbox""#),
+            "with nothing to read there is nothing on the board to lead to it: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One digest on disk, in the bytes bee's `render_digest` emits
+    /// (beehive `verbs/mailbox_digest.rs`) -- `type: "digest"` is the contract
+    /// that makes it one (mailbox-inbox D1), never the file name.
+    fn home_digest_file(root: &std::path::Path, name: &str, period: &str, period_id: &str) {
+        let p = root.join(".bee/human-mailbox").join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            p,
+            format!(
+                "---\nsubject: \"What happened on {period_id}.\"\ntype: \"digest\"\nperiod: {period:?}\nperiod_id: {period_id:?}\nfiled_at: \"2026-08-31T00:04:00Z\"\nletters:\n  - \"2026-08-30T09-00-00Z-one.md\"\nunreadable: []\n---\n\n## demo\n\n- Run finished\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// mailbox-inbox D1's hardest clause, pinned where it would be broken
+    /// silently: a digest is NEVER counted as a letter. The home board's strip
+    /// counts through `BeeMailboxEntry::is_unread`, which is false for a
+    /// digest, so this asserts the number the reader sees stays the number of
+    /// unread LETTERS with two digests sitting in the same mailbox.
+    #[test]
+    fn the_home_board_never_counts_a_digest_as_a_letter() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-digest-count-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-one.md", "Letter one", "unread");
+        home_digest_file(&root, "digest-2026-08-30.md", "day", "2026-08-30");
+        home_digest_file(&root, "digest-2026-W35.md", "week", "2026-W35");
+
+        let mut project = sample_project();
+        project.id = "proj-digest-count".into();
+        project.root_path = root.clone();
+
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        // The reader really did see all three files -- otherwise a count of 1
+        // would prove nothing about digests at all.
+        assert_eq!(rollups[0].snapshot.mailbox.len(), 3);
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(
+            html.contains(r#"data-bee-unread="1""#),
+            "one unread letter beside two digests is still one: {html}"
+        );
+        assert!(
+            html.contains("1 lá thư chưa đọc"),
+            "and reads as one in words too: {html}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// board-live-morph D1 (decision 5dce3301): the home board does NOT
+    /// full-page reload -- it refetches its own HTML and patches
+    /// `[data-feature-hub]` in place. This asserts the whole path rather
+    /// than assuming it:
+    ///
+    /// 1. the strip is INSIDE the patched section, and a direct child of it,
+    ///    sitting before `.bee-hub__groups`;
+    /// 2. `app.js`'s `hubPatchWholesale` -- the function that actually runs
+    ///    on every patch -- removes every direct child except
+    ///    `.bee-hub__groups`/`.bee-hub__archive` and re-inserts the fetched
+    ///    section's own, which is exactly what makes (1) mean "replaced",
+    ///    never "appended twice";
+    /// 3. a second render with a different number carries the new count and
+    ///    only the new count, and still exactly one strip.
+    #[test]
+    fn the_home_unread_count_rides_the_patched_fragment_and_is_replaced_not_duplicated() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-patch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "unread");
+        home_letter_file(&root, "2026-08-30T10-00-00Z-b.md", "B", "unread");
+
+        let mut project = sample_project();
+        project.id = "proj-unread-patch".into();
+        project.root_path = root.clone();
+
+        let render = |root: &std::path::PathBuf, project: &Project| -> String {
+            let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(root));
+            let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(project, &rollups[0])];
+            bee_cross_project_features_section(
+                &pairs,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            )
+        };
+
+        let html = render(&root, &project);
+
+        // (1) Inside the refetched fragment, and outside the two containers
+        // the patch keeps -- i.e. a direct child of the section.
+        let section_at = html
+            .find(r#"data-feature-hub="cross-project""#)
+            .expect("the cross-project board renders the patched section");
+        let strip_at = html
+            .find(r#"data-bee-unread="2""#)
+            .expect("two unread letters render the strip");
+        let groups_at = html
+            .find(r#"<div class="bee-hub__groups">"#)
+            .expect("the board renders its groups container");
+        assert!(
+            section_at < strip_at && strip_at < groups_at,
+            "the strip must sit inside [data-feature-hub] and before .bee-hub__groups, \
+             so the patch replaces it wholesale: {html}"
+        );
+        assert_eq!(
+            html.matches("data-bee-unread").count(),
+            1,
+            "exactly one strip is rendered, so a patch has exactly one node to replace: {html}"
+        );
+
+        // (2) The patch function itself, pinned: what it spares, and what it
+        // therefore replaces. A future edit that started sparing more, or
+        // stopped re-inserting, would strand this number stale.
+        let js = APP_JS;
+        let start = js
+            .find("function hubPatchWholesale(oldSection, newSection) {")
+            .expect("hubPatchWholesale must exist");
+        let end = js[start..]
+            .find("\n  function ")
+            .map(|i| start + i)
+            .expect("hubPatchWholesale is followed by another function");
+        let block = &js[start..end];
+        assert!(
+            block.contains(
+                "if (child !== oldGroups && child !== oldArchive) oldSection.removeChild(child);"
+            ),
+            "every direct child but the groups and archive containers is removed on a patch: {block}"
+        );
+        assert!(
+            block.contains(
+                "oldSection.insertBefore(document.importNode(before[i], true), oldGroups)"
+            ),
+            "and the fetched section's own pre-groups children are inserted back: {block}"
+        );
+
+        // (3) One letter read: the number moves, and only one strip survives.
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "read");
+        let next = render(&root, &project);
+        assert!(
+            next.contains(r#"data-bee-unread="1""#) && !next.contains(r#"data-bee-unread="2""#),
+            "the refetched fragment carries the NEW count, never the stale one: {next}"
+        );
+        assert_eq!(
+            next.matches("data-bee-unread").count(),
+            1,
+            "and still exactly one strip, never a second appended beside it: {next}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// board-live-morph D2 (decision 7871e652): motion is spent on the card
+    /// as a whole -- "Text, badges and counts inside a card" do not animate.
+    /// This count is exactly such a number, so it must not animate when it
+    /// changes. Two things make that true and both are pinned here: it is
+    /// none of the elements `app.js` moves or fades (it carries no
+    /// `data-hub-key`, and neither of the two keyed classes the board's own
+    /// transition rule names), and `bee_hub_style` gives `.bee-hub__inbox`
+    /// no transition or animation of its own.
+    #[test]
+    fn the_home_unread_count_does_not_animate_when_it_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "waggledance-views-unread-still-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        home_letter_file(&root, "2026-08-30T09-00-00Z-a.md", "A", "unread");
+
+        let mut project = sample_project();
+        project.id = "proj-unread-still".into();
+        project.root_path = root.clone();
+        let rollups = waggledance_core::bee::read_rollup(std::slice::from_ref(&root));
+        let pairs: Vec<(&Project, &BeeProjectRollup)> = vec![(&project, &rollups[0])];
+        let html = bee_cross_project_features_section(
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        let strip_at = html
+            .find(r#"class="fg-banner fg-banner--info bee-hub__inbox""#)
+            .expect("one unread letter renders the strip");
+        let strip_end = html[strip_at..]
+            .find("</a>")
+            .map(|i| strip_at + i)
+            .expect("the strip closes");
+        let strip = &html[strip_at..strip_end];
+        assert!(
+            !strip.contains("data-hub-key"),
+            "the strip must not be a keyed element -- those are what the patch moves and fades: {strip}"
+        );
+        assert!(
+            !strip.contains("bee-hub__shell") && !strip.contains("bee-hub__row"),
+            "nor may it wear either class the board's own transition rule names: {strip}"
+        );
+
+        // The comments in this stylesheet talk ABOUT motion (including the
+        // one beside this very rule, explaining why it has none), so they are
+        // stripped before the declarations are read -- otherwise the scan
+        // below would be matching prose, not CSS.
+        let style = bee_hub_style();
+        let mut css = String::with_capacity(style.len());
+        let mut rest = style.as_str();
+        while let Some(open) = rest.find("/*") {
+            css.push_str(&rest[..open]);
+            rest = match rest[open..].find("*/") {
+                Some(close) => &rest[open + close + 2..],
+                None => "",
+            };
+        }
+        css.push_str(rest);
+        for rule in css.split('}') {
+            if !rule.contains("bee-hub__inbox") {
+                continue;
+            }
+            assert!(
+                !rule.contains("transition") && !rule.contains("animation"),
+                "D2: a count that changed earns no motion -- {rule}"
+            );
+        }
+        assert!(
+            css.contains(".bee-hub__inbox"),
+            "the scan above must actually have a rule to read: {css}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// inprogress-priority-order-2 (D4/D6/D7): two projects, each
     /// contributing one In Progress feature and one Todo feature. The In
     /// Progress column must merge into ONE list ordered by the shared D7
@@ -15151,12 +19941,10 @@ mod tests {
         );
 
         let card_slot = (1..=10)
-            .find(|n| {
-                html.contains(&format!(
-                    "bee-hub__shell--p{n}\" data-hub-key=\""
-                ))
-            })
-            .unwrap_or_else(|| panic!("proj-a's own In Progress card must carry a colour modifier: {html}"));
+            .find(|n| html.contains(&format!("bee-hub__shell--p{n}\" data-hub-key=\"")))
+            .unwrap_or_else(|| {
+                panic!("proj-a's own In Progress card must carry a colour modifier: {html}")
+            });
         let row_slot = (1..=10)
             .find(|n| html.contains(&format!("bee-hub__row-project--p{n}\">Project A</span>")))
             .unwrap_or_else(|| {
@@ -15349,11 +20137,16 @@ mod tests {
         for mark in AGENT_MARKS {
             assert!(
                 sprite.contains(&format!(
-                    r#"<symbol id="agent-mark-{id}" viewBox="{vb}">"#,
+                    r#"<symbol id="agent-mark-{id}" viewBox="{vb}" {paint}>"#,
                     id = mark.id,
-                    vb = mark.view_box
+                    vb = mark.view_box,
+                    paint = agent_mark_paint(mark)
                 )),
-                "mark `{}` must reach the sprite carrying its own viewBox: {sprite}",
+                "mark `{}` must reach the sprite carrying its own viewBox AND the same \
+                 fill/stroke paint bee_hub_agent_mark_svg_sized uses -- a symbol with no \
+                 paint attribute clones as an unpainted <path>, whose fill inherits the \
+                 SVG default of black rather than currentColor, so status tinting (e.g. \
+                 .pane-mark--working's warning color) never reaches the drawer: {sprite}",
                 mark.id
             );
             assert!(
@@ -17252,18 +22045,18 @@ mod tests {
     }
 
     /// inprogress-priority-order-2 (D1, must-have): the In Progress
-    /// ordering rule lives INSIDE the existing `@media (max-width: 700px)`
+    /// ordering rule lives INSIDE the existing `@media (max-width: 900px)`
     /// block, reuses that same breakpoint (no new one), and never leaks
     /// outside it -- a wide-screen render must carry no `order` rule at
     /// all.
     #[test]
     fn bee_hub_style_puts_in_progress_order_rule_only_inside_the_narrow_media_query() {
         let css = bee_hub_style();
-        let media_at = css.find("@media (max-width: 700px)").unwrap_or_else(|| {
+        let media_at = css.find("@media (max-width: 900px)").unwrap_or_else(|| {
             panic!("the existing narrow-screen breakpoint must still exist: {css}")
         });
         assert!(
-            css.matches("@media (max-width: 700px)").count() == 1,
+            css.matches("@media (max-width: 900px)").count() == 1,
             "D1 must reuse the existing breakpoint, never add a second one: {css}"
         );
         let media_end = css[media_at..]
@@ -17279,7 +22072,7 @@ mod tests {
         let after_media = &css[media_end..];
         assert!(
             !before_media.contains("order: -1;") && !after_media.contains("order: -1;"),
-            "the order rule must never appear outside the max-width: 700px block, so wide-screen rendering is unchanged: {css}"
+            "the order rule must never appear outside the max-width: 900px block, so wide-screen rendering is unchanged: {css}"
         );
     }
 
@@ -17790,7 +22583,7 @@ mod tests {
     /// since a project the board cannot start a run on has no board run to
     /// report.
     #[test]
-    fn bee_hub_run_row_renders_nothing_to_press_without_the_project_opt_in() {
+    fn bee_hub_run_row_renders_nothing_to_press_when_the_project_turned_orchestration_off() {
         let project = sample_project();
         assert!(!project.orchestration_enabled);
         let data = BeeHubFinishedData {
@@ -17809,7 +22602,7 @@ mod tests {
             let row = bee_hub_run_row(&project, group, &data, None, None, &live_runs);
             assert!(
                 !row.contains("bee-hub__actions") && !row.contains("bee-hub__running"),
-                "a project without the opt-in renders the bare {group} row: {row}"
+                "a project that turned orchestration off renders the bare {group} row: {row}"
             );
         }
     }
@@ -17883,7 +22676,7 @@ mod tests {
     /// alike render exactly as they did before this feature — the
     /// waiting-on reading, and nothing to press.
     #[test]
-    fn bee_hub_renders_no_action_pair_without_the_project_opt_in() {
+    fn bee_hub_renders_no_action_pair_when_the_project_turned_orchestration_off() {
         let project = sample_project();
         assert!(!project.orchestration_enabled);
         let data = BeeHubFinishedData {
@@ -17898,7 +22691,7 @@ mod tests {
         let row = bee_hub_ready_to_merge_row(&project, &data, &merge, None, None);
         assert!(
             !row.contains("bee-hub__actions"),
-            "a project without the opt-in never renders a button: {row}"
+            "a project that turned orchestration off never renders a button: {row}"
         );
 
         // The card side of the same rule, with a stop on every input that
@@ -17927,7 +22720,7 @@ mod tests {
         });
         assert!(
             !card_html.contains("bee-hub__actions"),
-            "a card on a project without the opt-in never renders a button: {card_html}"
+            "a card on a project that turned orchestration off never renders a button: {card_html}"
         );
     }
 
@@ -18213,11 +23006,11 @@ mod tests {
     fn bee_hub_style_keeps_every_phone_board_rule_inside_the_one_narrow_media_query() {
         let css = bee_hub_style();
         assert_eq!(
-            css.matches("@media (max-width: 700px)").count(),
+            css.matches("@media (max-width: 900px)").count(),
             1,
             "the board must still declare exactly one narrow block: {css}"
         );
-        let media_at = css.find("@media (max-width: 700px)").expect("narrow block");
+        let media_at = css.find("@media (max-width: 900px)").expect("narrow block");
         let media_end = css[media_at..]
             .find("</style>")
             .map(|i| media_at + i)
@@ -19125,6 +23918,50 @@ mod tests {
         );
     }
 
+    /// The sibling check for the stylesheets this FILE ships inline, which
+    /// the `APP_CSS` test above never sees. Same failure, one layer over:
+    /// a `*/` typed one line early ends the comment there, and the prose
+    /// after it becomes CSS the parser chokes on — swallowing the rules that
+    /// follow while every `contains(...)` assertion still passes, because
+    /// the literal it greps for is present, just no longer inside a comment.
+    /// That shipped here once (term-keys-nav-tint), and the arrow tint below
+    /// it is what went missing on the live page.
+    #[test]
+    fn inline_style_blocks_have_balanced_comments_and_braces() {
+        let project = sample_project();
+        let pages: [(&str, String); 2] = [
+            ("terminal page", terminal_page(&project, &[], None, &[])),
+            ("project tab style", PROJECT_TAB_STYLE.to_string()),
+        ];
+        for (name, html) in pages {
+            let mut rest = html.as_str();
+            let mut blocks = 0;
+            while let Some(start) = rest.find("<style>") {
+                let after = &rest[start + "<style>".len()..];
+                let end = after
+                    .find("</style>")
+                    .unwrap_or_else(|| panic!("{name}: a <style> block is never closed"));
+                let css = &after[..end];
+                blocks += 1;
+                let opened = css.matches("/*").count();
+                let closed = css.matches("*/").count();
+                assert_eq!(
+                    opened, closed,
+                    "{name}: comment delimiters are unbalanced ({opened} `/*` vs {closed} `*/`) — \
+                     prose left outside a comment is parsed as CSS and takes the rules after it down"
+                );
+                let open = css.matches('{').count();
+                let close = css.matches('}').count();
+                assert_eq!(
+                    open, close,
+                    "{name}: braces are unbalanced ({open} open vs {close} close)"
+                );
+                rest = &after[end..];
+            }
+            assert!(blocks > 0, "{name}: expected at least one <style> block");
+        }
+    }
+
     /// waggledance-rename W5: `mdview:mermaid-done` was renamed on both the
     /// dispatch side (`file_page`'s embedded script) and the listener side
     /// (`assets/app.js`). Comparing the two sides to each other — instead of
@@ -19179,5 +24016,2199 @@ mod tests {
             dispatch_event, listen_event,
             "the mermaid-done event name must be identical on both sides of the handshake"
         );
+    }
+
+    /// csl-2 (D1 `a4d73a4f`, D2 `ae531e75`): the slash-suggest menu is
+    /// created entirely by `assets/app.js`, so nothing in the served markup
+    /// mentions it — the only handshake left to pin is the pair the JS
+    /// reaches for: the textarea class it binds to, and the endpoint it
+    /// fetches its entries from. Same two-sided idiom as
+    /// `agent_page_composer_class_matches_what_app_js_finds_it_by` above:
+    /// one side is `APP_JS`, the other is the rendered composer, and a
+    /// rename on either side goes red. Needles are single tokens, never
+    /// spans of adjacent statements — the pitfall in
+    /// `docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`.
+    #[test]
+    fn slash_suggest_binds_to_the_composer_class_the_pages_actually_render() {
+        assert!(
+            APP_JS.contains("wireSlashSuggest"),
+            "app.js must still carry the shared slash-suggest wiring"
+        );
+        assert!(
+            APP_JS.contains(".term-reply__text"),
+            "app.js must still find the composer textarea by .term-reply__text"
+        );
+        assert!(
+            APP_JS.contains("/_slash"),
+            "app.js must still fetch its suggestions from the _slash endpoint"
+        );
+        // csl-3: on the shared pane-form loop the project id comes from the
+        // form's own `data-term-base` (`/p/<id>/_terminal/<pane>`), so the
+        // home page's Terminals tab — which renders these forms with no
+        // page-level `data-project-id` — still asks that pane's project
+        // endpoint instead of falling back to the user-level list.
+        assert!(
+            APP_JS.contains(r#"base.split("/")[2]"#),
+            "app.js must still derive the pane's project id from data-term-base for the _slash fetch"
+        );
+
+        // The markup side of the same handshake, for the pane reply box D1
+        // names.
+        let project = sample_project();
+        let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
+            pane_id: "w1:p1".into(),
+            kind: "claude".into(),
+            name: "one".into(),
+            status: "working".into(),
+            cwd: String::new(),
+            workspace: "w1".into(),
+            tab: "t1".into(),
+            title: String::new(),
+        }];
+        let pane_html = terminal_page(&project, &panes, Some("w1:p1"), &[]);
+        assert!(
+            pane_html.contains("term-reply__text"),
+            "the pane composer must still carry the class app.js binds to: {pane_html}"
+        );
+    }
+
+    /// pane-kick-refresh (D1 `ac627264`, D2 `5f697a7c`): a key or reply that
+    /// lands used to stay invisible until the next fixed 1500 ms screen tick.
+    /// The fix is entirely inside `assets/app.js` — a successful send
+    /// dispatches a window event carrying its pane id, and each screen poller
+    /// listens for it and refetches that one pane at once. The event name is
+    /// the whole seam: it is written twice, once on each side of a boundary
+    /// no compiler checks, so renaming one side alone silently restores the
+    /// old lag. Same two-sided idiom as
+    /// `slash_suggest_binds_to_the_composer_class_the_pages_actually_render`
+    /// above, and the same needle discipline — each assertion names one thing
+    /// the behaviour promises, never the statements it sits between
+    /// (`docs/knowledge/patterns/assertions-that-pin-literal-adjacency.md`).
+    #[test]
+    fn a_landed_send_kicks_the_screen_poller_through_the_event_both_sides_name() {
+        assert!(
+            APP_JS.contains(r#"new CustomEvent("waggledance:pane-dirty""#),
+            "app.js must still DISPATCH the pane-dirty event when a send lands"
+        );
+        assert!(
+            APP_JS.contains(r#"addEventListener("waggledance:pane-dirty""#),
+            "app.js must still LISTEN for the pane-dirty event in its screen pollers"
+        );
+        assert!(
+            APP_JS.contains("markPaneDirty"),
+            "app.js must still route every sender through the markPaneDirty helper"
+        );
+
+        // D1 leaves the steady-state poll rate alone: the kick removes the
+        // wait, it does not poll harder. The follow-ups that cover a kick
+        // landing mid-flight are bounded one-shot timers, never a new
+        // interval.
+        assert!(
+            APP_JS.contains("var POLL_MS = 1500;"),
+            "the screen pollers must still tick at 1500 ms — the kick is additive"
+        );
+        assert!(
+            APP_JS.contains("PANE_DIRTY_FOLLOW_UP_MS"),
+            "app.js must still schedule the pane-dirty follow-ups from one place"
+        );
+
+        // The markup side of the same handshake: the listener finds its pane
+        // by the `data-pane-id` the screen frame actually renders.
+        let project = sample_project();
+        let panes = vec![TerminalPaneView {
+            bee_state: None,
+            bee_feature: None,
+            bee_no_signal: false,
+            pane_id: "w1:p1".into(),
+            kind: "claude".into(),
+            name: "one".into(),
+            status: "working".into(),
+            cwd: String::new(),
+            workspace: "w1".into(),
+            tab: "t1".into(),
+            title: String::new(),
+        }];
+        let pane_html = terminal_page(&project, &panes, Some("w1:p1"), &[]);
+        assert!(
+            pane_html.contains(r#"data-pane-id="w1:p1""#),
+            "the rendered screen must still carry the data-pane-id the kick matches on: {pane_html}"
+        );
+    }
+
+    /// csl-2: the menu app.js builds is invisible without its rules — the
+    /// class name is the seam between the two files, so it is asserted from
+    /// both ends, the way the test above pins the JS↔markup seam. `APP_CSS`
+    /// is the concatenated stylesheet the page actually serves (the same
+    /// constant `served_html_and_js_never_mention_mdview_outside_the_storage_fallback`
+    /// reads), so this also proves the rules survive that concat.
+    #[test]
+    fn slash_menu_class_is_styled_in_the_stylesheet_that_ships() {
+        assert!(
+            APP_JS.contains("slash-menu"),
+            "app.js must still build the menu with the .slash-menu class"
+        );
+        assert!(
+            APP_CSS.contains(".slash-menu"),
+            "the served stylesheet must still style .slash-menu"
+        );
+        assert!(
+            APP_CSS.contains(".slash-item"),
+            "the served stylesheet must still style .slash-item rows"
+        );
+    }
+
+    // -- board-visibility bi-2: the inbox ---------------------------------
+
+    fn letter_row(subject: &str, project: &str, filed_at: &str, unread: bool) -> InboxRow {
+        InboxRow {
+            href: Some(format!("/inbox/p/{filed_at}-run.md")),
+            subject: subject.into(),
+            project: project.into(),
+            filed_at: filed_at.into(),
+            file: format!("{filed_at}-run.md"),
+            unread,
+            // The ordinary letter: bee left no unfinished-run mark on it.
+            kind: InboxRowKind::Letter { unfinished: false },
+        }
+    }
+
+    /// mi-2: the same row for a run bee marked as having gone silent. The
+    /// subject carries bee's own prefix verbatim, exactly as it arrives from
+    /// the reader — the badge is read off it, never off a field.
+    fn unfinished_letter_row(subject: &str, filed_at: &str) -> InboxRow {
+        InboxRow {
+            kind: InboxRowKind::Letter { unfinished: true },
+            ..letter_row(subject, "waggledance", filed_at, true)
+        }
+    }
+
+    /// mi-2: one digest row, in the shape `server.rs::inbox_row` builds from
+    /// `BeeMailboxEntry::Digest` — no read state, and the checkout's own name,
+    /// because a fold spans every project of its period.
+    fn digest_row(subject: &str, filed_at: &str, period: &str) -> InboxRow {
+        InboxRow {
+            href: Some(format!("/inbox/p/digest-{filed_at}.md")),
+            subject: subject.into(),
+            project: "waggledance".into(),
+            filed_at: filed_at.into(),
+            file: format!("digest-{filed_at}.md"),
+            unread: false,
+            kind: InboxRowKind::Digest {
+                period: period.into(),
+            },
+        }
+    }
+
+    /// A row has to answer four things at a glance, or the list is a list of
+    /// nothing: what the letter says, which project it is about, when it was
+    /// filed, and whether it has been read.
+    #[test]
+    fn an_inbox_row_names_subject_project_filed_at_and_read_state() {
+        let html = inbox_page(&[letter_row(
+            "Fixed the rail pill",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            true,
+        )]);
+        for needle in [
+            "Fixed the rail pill",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            "Chưa đọc",
+            r#"href="/inbox/p/2026-08-30T09:00:00Z-run.md""#,
+        ] {
+            assert!(html.contains(needle), "the row must carry {needle}: {html}");
+        }
+        // Read state is a word, not a colour: the read row says so too.
+        let read = inbox_page(&[letter_row(
+            "Already seen",
+            "beehive",
+            "2026-08-29T09:00:00Z",
+            false,
+        )]);
+        assert!(
+            read.contains("Đã đọc") && !read.contains("Chưa đọc"),
+            "{read}"
+        );
+    }
+
+    /// bee's own rule, quoted at the reader this list reads from: a silently
+    /// missing letter reads to the human as a quiet night rather than as a
+    /// broken store. So a letter that could not be parsed is ON the page, by
+    /// name, with its reason — and it is not a link, because there is no
+    /// parsed letter behind it to open.
+    #[test]
+    fn an_unreadable_letter_is_named_on_the_inbox_and_never_linked() {
+        let html = inbox_page(&[InboxRow {
+            href: None,
+            subject: String::new(),
+            project: "waggledance".into(),
+            filed_at: String::new(),
+            file: "2026-08-30T10-00-00Z-broken.md".into(),
+            unread: false,
+            kind: InboxRowKind::Unreadable {
+                reason: "missing required field `filed_at`".into(),
+            },
+        }]);
+        assert!(
+            html.contains("2026-08-30T10-00-00Z-broken.md"),
+            "the unreadable letter must name its file: {html}"
+        );
+        assert!(
+            html.contains("missing required field `filed_at`"),
+            "and why it could not be read: {html}"
+        );
+        assert!(
+            html.contains("Không đọc được"),
+            "and say plainly that it could not be: {html}"
+        );
+        assert!(
+            !html.contains(r#"<a class="fg-card" href="/inbox/"#),
+            "an unreadable entry has no letter to open, so it is no link: {html}"
+        );
+        // bi-3: nor anything to flip. bee refuses a mark naming no filed
+        // letter, and a button whose only outcome is a refusal is a trap.
+        assert!(
+            !html.contains("/mark"),
+            "an unreadable entry offers no read/unread control: {html}"
+        );
+    }
+
+    /// bi-3: the flip control, on the row and on the letter's own page. It is
+    /// a form posting to the route that calls `bee mailbox mark` — never a
+    /// link, never a script — and it offers exactly the one direction the
+    /// letter is not already in, because `read|unread` is bee's whole set.
+    #[test]
+    fn the_flip_control_offers_the_one_direction_the_letter_is_not_in() {
+        let unread = inbox_page(&[letter_row(
+            "Đêm qua",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            true,
+        )]);
+        assert!(
+            unread.contains(r#"method="post" action="/inbox/p/2026-08-30T09:00:00Z-run.md/mark""#),
+            "the control posts to that letter's own mark route: {unread}"
+        );
+        assert!(
+            unread.contains(r#"name="status" value="read""#)
+                && unread.contains("Đánh dấu đã đọc")
+                && !unread.contains(r#"name="status" value="unread""#),
+            "an unread letter is offered the flip to read, and only that: {unread}"
+        );
+        assert!(
+            unread.contains(r#"name="back" value="/inbox""#),
+            "and lands the reader back on the list they clicked from: {unread}"
+        );
+
+        let read = inbox_page(&[letter_row(
+            "Đã xem",
+            "waggledance",
+            "2026-08-29T09:00:00Z",
+            false,
+        )]);
+        assert!(
+            read.contains(r#"name="status" value="unread""#) && read.contains("Đánh dấu chưa đọc"),
+            "a read letter is offered the way back: {read}"
+        );
+    }
+
+    /// The letter's own page carries the same control, beside the chip that
+    /// states where the letter stands — and comes back to this letter, not to
+    /// the list, so the reader sees bee's answer on the page they are on.
+    #[test]
+    fn an_opened_letter_carries_the_flip_control_back_to_itself() {
+        let row = letter_row("Đêm qua", "waggledance", "2026-08-30T09:00:00Z", true);
+        let index: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        let page = waggledance_core::render::RenderService::new().render(
+            "một việc\n",
+            &std::env::temp_dir().join("waggledance-bi3-letter.md"),
+            "p",
+            std::path::Path::new("/nonexistent"),
+            &index,
+        );
+        let html = inbox_letter_page(&row, &SanitizedLetterBody::from_rendered(&page));
+        assert!(
+            html.contains(r#"action="/inbox/p/2026-08-30T09:00:00Z-run.md/mark""#)
+                && html.contains(r#"name="status" value="read""#),
+            "the opened letter offers the same one flip: {html}"
+        );
+        assert!(
+            html.contains(r#"name="back" value="/inbox/p/2026-08-30T09:00:00Z-run.md""#),
+            "and returns to this letter rather than to the list: {html}"
+        );
+    }
+
+    /// Zero letters is this machine's normal state, not a fault — bee files a
+    /// letter only from an unattended run, and no checkout here has armed one.
+    /// The page has to SAY that. A bare count, or an empty list frame, would
+    /// read as a broken store or as a page that never loaded.
+    #[test]
+    fn an_empty_inbox_explains_the_unattended_run_instead_of_showing_a_zero() {
+        let html = inbox_page(&[]);
+        assert!(
+            html.contains("Chưa có lá thư nào"),
+            "the empty inbox must say it is empty in words: {html}"
+        );
+        assert!(
+            html.contains("không có người ngồi trực"),
+            "and name the one condition that files a letter: {html}"
+        );
+        assert!(
+            html.contains("Máy này chưa bật chế độ chạy không người trực"),
+            "and say that this machine has not armed it: {html}"
+        );
+        assert!(
+            !html.contains("fg-pagehead__aside"),
+            "no unread pill when there is nothing to have read: {html}"
+        );
+    }
+
+    /// Where the inbox is reached from (bi-2's own decision): the shared top
+    /// bar menu, on every page, beside Hướng dẫn and Settings.
+    #[test]
+    fn the_inbox_is_reached_from_the_top_bar_menu_on_every_page() {
+        for (page, html) in [
+            ("error", error_page(404, "nope")),
+            ("guide", guide_index_page()),
+            ("inbox", inbox_page(&[])),
+        ] {
+            let start = html
+                .find(r#"<div class="topbar-menu js-menu">"#)
+                .unwrap_or_else(|| panic!("{page} has no top bar menu"));
+            let end = start + html[start..].find("</header>").expect("unclosed top bar");
+            let menu = &html[start..end];
+            assert!(
+                menu.contains(r#"href="/inbox""#) && menu.contains("Hộp thư"),
+                "the {page} page's menu must reach the inbox beside the guide and Settings: {menu}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_handset_tab_bar_keeps_the_seven_destinations_it_was_widened_to() {
+        let bar = home_tabbar(HomeTab::Kanban);
+        let items =
+            bar.matches("home-tabbar__item").count() - bar.matches("home-tabbar__item--on").count();
+        assert_eq!(
+            items, 7,
+            "the tab bar's seven columns are a recorded layout decision (dcfbda20, usage-dashboard D2, bee-bulk-upgrade D1): {bar}"
+        );
+        assert!(
+            !bar.contains("/inbox"),
+            "the inbox lives in the top bar menu, not as a column: {bar}"
+        );
+    }
+
+    fn upgrade_report(applied: bool, outcomes: Vec<(&str, Outcome)>) -> UpgradeReport {
+        UpgradeReport {
+            source_root: std::path::PathBuf::from("/src/<bee>"),
+            source_head: Some("abc1234".into()),
+            source_branch: Some("main".into()),
+            source_dirty: true,
+            target_version: Some("9.9.9".into()),
+            applied,
+            projects: outcomes
+                .into_iter()
+                .map(|(id, outcome)| waggledance_core::bee_upgrade::ProjectUpgrade {
+                    id: id.into(),
+                    name: format!("name-{id}"),
+                    root: std::path::PathBuf::from(format!("/p/{id}")),
+                    branch: Some("main".into()),
+                    from_version: Some("1.0.0".into()),
+                    to_version: Some("9.9.9".into()),
+                    notices: vec!["n1".into()],
+                    outside_repo: Vec::new(),
+                    outcome,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bee_tab_pending_row_carries_an_upgrade_form_for_its_own_id() {
+        let report = upgrade_report(
+            false,
+            vec![(
+                "p&1",
+                Outcome::Pending {
+                    files: vec!["AGENTS.md".into()],
+                },
+            )],
+        );
+        let html = bee_tab(Some(&report), None);
+        assert!(html.contains(r#"action="/api/bee/upgrade""#), "{html}");
+        assert!(
+            html.contains(r#"<input type="hidden" name="project" value="p&amp;1">"#),
+            "{html}"
+        );
+        assert!(html.contains(">Upgrade</button>"), "{html}");
+        assert!(html.contains(r#"<input type="hidden" name="all" value="1">"#), "{html}");
+        assert!(html.contains("Upgrade all pending"), "{html}");
+        assert!(html.contains("/src/&lt;bee&gt;"), "{html}");
+        assert!(html.contains("abc1234"), "{html}");
+        assert!(html.contains("9.9.9"), "{html}");
+        assert!(html.contains("uncommitted"), "{html}");
+    }
+
+    #[test]
+    fn bee_tab_skipped_row_shows_its_reason_and_no_form() {
+        let report = upgrade_report(
+            false,
+            vec![(
+                "s1",
+                Outcome::Skipped {
+                    reason: "live bee session".into(),
+                    files: Vec::new(),
+                },
+            )],
+        );
+        let html = bee_tab(Some(&report), None);
+        assert!(html.contains("live bee session"), "{html}");
+        assert!(html.contains("skipped"), "{html}");
+        assert!(!html.contains("<form"), "{html}");
+    }
+
+    #[test]
+    fn bee_tab_applied_report_renders_no_forms_and_shows_the_commit() {
+        let report = upgrade_report(
+            true,
+            vec![
+                (
+                    "u1",
+                    Outcome::Upgraded {
+                        commit: "def5678".into(),
+                        files: vec!["AGENTS.md".into()],
+                    },
+                ),
+                (
+                    "p1",
+                    Outcome::Pending {
+                        files: vec!["AGENTS.md".into()],
+                    },
+                ),
+            ],
+        );
+        let html = bee_tab(Some(&report), None);
+        assert!(html.contains("def5678"), "{html}");
+        assert!(!html.contains("<form"), "{html}");
+    }
+
+    #[test]
+    fn bee_tab_error_renders_the_error_instead_of_the_table() {
+        let html = bee_tab(None, Some("no <source>"));
+        assert!(html.contains("no &lt;source&gt;"), "{html}");
+        assert!(!html.contains("<table"), "{html}");
+    }
+
+    fn usage_summary_with(models: Vec<ModelSpend>) -> UsageSummary {
+        use waggledance_core::usage::{SpendSplit, Tokens};
+        let main = Tokens {
+            new: 1_200_000,
+            cached: 34_500,
+        };
+        let subagents = Tokens {
+            new: 700,
+            cached: 0,
+        };
+        let mut all = main;
+        all.new += subagents.new;
+        UsageSummary {
+            days: 7,
+            since_ms: 0,
+            now_ms: 0,
+            totals: SpendSplit {
+                main,
+                subagents,
+                all,
+            },
+            projects: Vec::new(),
+            models,
+            per_day: Vec::new(),
+            features: Vec::new(),
+            runs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn usage_tab_shows_the_empty_state_when_no_agent_ran_in_the_window() {
+        let mut summary = usage_summary_with(Vec::new());
+        summary.totals = Default::default();
+        let html = usage_tab(&summary, 14, Some("p&1"), &[("p&1".into(), "<One>".into())]);
+        assert!(html.contains("No agent activity in this window."), "{html}");
+        assert!(
+            html.contains(
+                r#"href="/?tab=usage&amp;days=14&amp;project=p%261" aria-current="true">14d</a>"#
+            ),
+            "the current window chip keeps the project filter: {html}"
+        );
+        assert!(
+            html.contains("&lt;One&gt;") && !html.contains("<One>"),
+            "{html}"
+        );
+        assert!(!html.contains("usage__table"), "{html}");
+    }
+
+    #[test]
+    fn usage_tab_folds_subagents_into_their_parent_run_grouped_by_project() {
+        use waggledance_core::usage::Tokens;
+        let run = |key: &str, title: &str, parent: Option<&str>, started_ms: i64| RunRow {
+            key: key.into(),
+            project_id: if key.contains("other") { "" } else { "p1" }.into(),
+            project_name: if key.contains("other") {
+                "Other"
+            } else {
+                "Hive"
+            }
+            .into(),
+            provider: key.split(':').next().unwrap().into(),
+            title: title.into(),
+            model: "claude-opus-5-5".into(),
+            parent_key: parent.map(Into::into),
+            subagent: parent.is_some(),
+            started_ms,
+            duration_ms: 90 * 60_000,
+            spend: Tokens {
+                new: 1_500,
+                cached: 20_000,
+            },
+        };
+        let mut summary = usage_summary_with(Vec::new());
+        let mut other = run("claude:other", "Elsewhere", None, 6);
+        other.spend.new = 9_000_000;
+        summary.runs = vec![
+            other,
+            run("pi:grand", "Nested", Some("pi:child"), 5),
+            run("pi:child", "ud-<6>", Some("claude:lead"), 4),
+            run("claude:orphan", "", Some("claude:gone"), 2),
+            run("claude:lead", "Lead task", None, 1),
+        ];
+        let html = usage_tab(&summary, 7, None, &[]);
+        let hive = html
+            .find(r#"<h3 class="usage__group"><span>Hive</span><span class="usage__group-total">86.0k</span></h3>"#)
+            .expect(&html);
+        let elsewhere = html
+            .find(r#"<h3 class="usage__group"><span>Other</span>"#)
+            .expect(&html);
+        assert!(
+            hive < elsewhere,
+            "Other sorts last whatever its size: {html}"
+        );
+        assert!(
+            html.contains(r#"<details class="usage__run"><summary class="usage__run-row"><span class="usage__task">Lead task <span class="usage__sub">2 subagents</span></span><span>claude</span><span>claude-opus-5-5</span>"#),
+            "a parent folds its subagents, closed by default: {html}"
+        );
+        assert!(
+            html.contains("<span>1h 30m</span><span>4.5k</span><span>60.0k</span></summary>"),
+            "the parent's tokens include every descendant's: {html}"
+        );
+        let child = html
+            .find(r#"<li class="usage__subagent"><span class="usage__subagent-title">ud-&lt;6&gt;</span><span class="usage__subagent-meta">pi · claude-opus-5-5 · 1h 30m · 1.5k new · 20.0k cache</span></li>"#)
+            .expect(&html);
+        let grand = html.find(">Nested</span>").expect(&html);
+        assert!(child < grand, "nested subagents flatten by start: {html}");
+        assert!(
+            html.contains(r#"<div class="usage__run usage__run-row"><span class="usage__task">orphan <span class="usage__sub">subagent</span></span>"#),
+            "a subagent whose parent is absent is a tagged top-level row: {html}"
+        );
+        assert!(
+            html.contains("<span>Task</span><span>Provider</span>")
+                && !html.contains("<span>Project</span>")
+                && !html.contains("subagent of"),
+            "{html}"
+        );
+        assert!(!html.contains("usage__more"), "{html}");
+        let filtered = usage_tab(&summary, 7, Some("p1"), &[]);
+        assert!(
+            !filtered.contains("usage__group") && filtered.contains("Lead task"),
+            "a project filter drops the headings: {filtered}"
+        );
+        summary.runs = (0..302)
+            .map(|i| run(&format!("pi:r{i}"), "t", None, i))
+            .collect();
+        summary.runs.push(run("pi:sub", "s", Some("pi:r0"), 0));
+        let html = usage_tab(&summary, 7, None, &[]);
+        assert!(html.contains("2 more runs not shown."), "{html}");
+        assert_eq!(
+            html.matches(r#"<span class="usage__task">"#).count(),
+            300,
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn usage_tab_splits_main_and_subagent_tokens_per_model() {
+        use waggledance_core::usage::Tokens;
+        let html = usage_tab(
+            &usage_summary_with(vec![ModelSpend {
+                model: "claude-opus-5-5".into(),
+                main: Tokens {
+                    new: 1_200_000,
+                    cached: 34_500,
+                },
+                subagents: Tokens {
+                    new: 700,
+                    cached: 0,
+                },
+            }]),
+            7,
+            None,
+            &[],
+        );
+        assert!(
+            html.contains("<th>Main new</th><th>Main cache-read</th><th>Subagent new</th><th>Subagent cache-read</th>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<tr><td>claude-opus-5-5</td><td>1.2M</td><td>34.5k</td><td>700</td><td>0</td></tr>"),
+            "{html}"
+        );
+    }
+
+    /// The letter body takes the UNTRUSTED path — `waggledance-core`'s
+    /// ordinary sanitizing markdown pipeline, the same one every document page
+    /// uses — and never the guide's authored-fragment path (d7efc6fe), because
+    /// another program in another checkout composed the file.
+    ///
+    /// The proof runs the real pipeline over hostile markdown and reads the
+    /// finished page: a `<script>` in a letter must not reach the browser as
+    /// one, while the letter's ordinary prose must survive.
+    #[test]
+    fn a_letters_body_is_rendered_through_the_sanitizing_pipeline() {
+        let source = "## Đã làm\n\n- một việc\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n";
+        let path = std::env::temp_dir().join("waggledance-bi2-letter.md");
+        let index: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        let page = waggledance_core::render::RenderService::new().render(
+            source,
+            &path,
+            "p",
+            std::path::Path::new("/nonexistent"),
+            &index,
+        );
+        let html = inbox_letter_page(
+            &letter_row("Một lượt chạy", "waggledance", "2026-08-30T09:00:00Z", true),
+            &SanitizedLetterBody::from_rendered(&page),
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "a letter's script tag must not survive into the page: {html}"
+        );
+        assert!(
+            !html.contains("onerror"),
+            "nor an inline event handler: {html}"
+        );
+        assert!(
+            html.contains("Đã làm") && html.contains("một việc"),
+            "the letter's own prose must still render: {html}"
+        );
+        assert!(
+            html.contains("Một lượt chạy") && html.contains("2026-08-30T09:00:00Z"),
+            "and the header keeps the letter's own frontmatter: {html}"
+        );
+    }
+
+    // -- mailbox-inbox mi-2: digests and the unfinished-run mark -----------
+
+    /// mailbox-inbox D1, on a row: a digest is a card in the SAME list, it
+    /// says what it is and which period it folds, and it carries no read
+    /// state at all — no unread chip, no read chip, and nothing to flip.
+    /// bee holds the read field inside a letter and a digest has none, so a
+    /// mark button here could only ever be refused.
+    #[test]
+    fn a_digest_row_names_its_period_and_offers_no_read_state_to_flip() {
+        let html = inbox_page(&[digest_row(
+            "What happened on 2026-08-30.",
+            "2026-08-31T00:04:00Z",
+            "day",
+        )]);
+        assert!(
+            html.contains("What happened on 2026-08-30."),
+            "the digest's own subject is what the row says: {html}"
+        );
+        assert!(
+            html.contains("Bản tổng hợp · ngày"),
+            "and the badge names what it is and the period it folds: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/inbox/p/digest-2026-08-31T00:04:00Z.md""#),
+            "it opens through the same letter route (D3): {html}"
+        );
+        assert!(
+            !html.contains("/mark") && !html.contains("Đánh dấu"),
+            "a digest has no read state, so it offers no control to flip one: {html}"
+        );
+        assert!(
+            !html.contains("Chưa đọc") && !html.contains("Đã đọc"),
+            "nor any chip claiming it has been read or not: {html}"
+        );
+    }
+
+    /// `BeeDigest::period` is deliberately not an enum: bee may widen the set,
+    /// and an unknown period must stay readable rather than render an empty
+    /// badge or a guess. `week` has our word; anything else prints bee's.
+    #[test]
+    fn a_digests_period_is_translated_when_known_and_printed_verbatim_when_not() {
+        let week = inbox_page(&[digest_row("Tuần này", "2026-08-31T00:04:00Z", "week")]);
+        assert!(week.contains("Bản tổng hợp · tuần"), "{week}");
+        let unknown = inbox_page(&[digest_row("Quý này", "2026-09-30T00:04:00Z", "quarter")]);
+        assert!(
+            unknown.contains("Bản tổng hợp · quarter"),
+            "an unfamiliar period reads as bee's own word, never as a blank: {unknown}"
+        );
+    }
+
+    /// mailbox-inbox D2: the badge is a transcription of the mark bee wrote
+    /// into the subject (human-mailbox D3 froze the letter's key set, so the
+    /// mark rides there by design). The subject is still shown exactly as
+    /// filed — prefix included — and no status is invented beside it: the row
+    /// still says plainly whether the letter has been read.
+    #[test]
+    fn an_unfinished_letter_row_badges_the_mark_and_still_shows_the_subject_whole() {
+        let html = inbox_page(&[unfinished_letter_row(
+            "Unfinished run: nightly on waggledance",
+            "2026-08-30T09:00:00Z",
+        )]);
+        assert!(
+            html.contains("Lượt chạy chưa kết thúc"),
+            "the badge names the state bee marked: {html}"
+        );
+        assert!(
+            html.contains("Unfinished run: nightly on waggledance"),
+            "and the subject is still rendered as bee filed it: {html}"
+        );
+        assert!(
+            html.contains("Chưa đọc") && html.contains("/mark"),
+            "an unfinished letter is still a letter: read state and all: {html}"
+        );
+        // The mirror: an ordinary letter grows no badge from nowhere.
+        let ordinary = inbox_page(&[letter_row(
+            "Đêm qua",
+            "waggledance",
+            "2026-08-30T09:00:00Z",
+            true,
+        )]);
+        assert!(
+            !ordinary.contains("Lượt chạy chưa kết thúc"),
+            "a letter bee did not mark carries no badge: {ordinary}"
+        );
+    }
+
+    /// The whole of mailbox-inbox D1's first clause: ONE section. Letters and
+    /// digests interleave in the caller's order inside the same list, under
+    /// the same one page header — never a second section, never a digest
+    /// block below the letters. And the page's unread pill counts letters
+    /// only: the digest between them adds nothing to it.
+    #[test]
+    fn letters_and_digests_render_as_one_interleaved_list_and_only_letters_are_counted() {
+        let html = inbox_page(&[
+            letter_row("Đêm qua", "waggledance", "2026-08-31T09:00:00Z", true),
+            digest_row(
+                "What happened on 2026-08-30.",
+                "2026-08-31T00:04:00Z",
+                "day",
+            ),
+            letter_row("Hôm kia", "beehive", "2026-08-29T09:00:00Z", false),
+        ]);
+        let at = |needle: &str| {
+            html.find(needle)
+                .unwrap_or_else(|| panic!("the inbox must carry {needle}: {html}"))
+        };
+        assert!(
+            at("Đêm qua") < at("What happened on 2026-08-30.")
+                && at("What happened on 2026-08-30.") < at("Hôm kia"),
+            "the digest sits where the caller's ordering put it, between the letters: {html}"
+        );
+        assert_eq!(
+            html.matches(r#"<main class="fg-page">"#).count(),
+            1,
+            "one page, one section — a digest never opens a second one: {html}"
+        );
+        assert_eq!(
+            html.matches("fg-pagehead__title").count(),
+            1,
+            "and no second heading introducing the digests: {html}"
+        );
+        assert!(
+            html.contains("1 chưa đọc"),
+            "the pill counts the one unread LETTER, never the digest: {html}"
+        );
+    }
+
+    /// mailbox-inbox D3 at the page: a digest opens through the same renderer
+    /// and the same sanitizing pipeline, read-only. The header carries its
+    /// badge instead of a read chip, and there is nothing on the page to flip.
+    #[test]
+    fn an_opened_digest_renders_its_body_and_offers_nothing_to_flip() {
+        let index: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        let page = waggledance_core::render::RenderService::new().render(
+            "## waggledance\n\n- Run finished: 3 cells capped\n\n<script>alert(1)</script>\n",
+            &std::env::temp_dir().join("waggledance-mi2-digest.md"),
+            "p",
+            std::path::Path::new("/nonexistent"),
+            &index,
+        );
+        let html = inbox_letter_page(
+            &digest_row(
+                "What happened on 2026-08-30.",
+                "2026-08-31T00:04:00Z",
+                "day",
+            ),
+            &SanitizedLetterBody::from_rendered(&page),
+        );
+        assert!(
+            html.contains("Run finished: 3 cells capped"),
+            "the digest's own prose renders: {html}"
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "through the same SANITIZING pipeline a letter takes: {html}"
+        );
+        assert!(
+            html.contains("Bản tổng hợp · ngày"),
+            "the header says what this page is: {html}"
+        );
+        assert!(
+            !html.contains("/mark") && !html.contains("Đánh dấu"),
+            "and offers no flip control, because there is no read state: {html}"
+        );
+        assert!(
+            !html.contains("Chưa đọc") && !html.contains("Đã đọc"),
+            "nor a chip claiming one: {html}"
+        );
+    }
+
+    /// cds-2: the Changes screen's own markup. `changes_page` renders from
+    /// a `WorkingTreeDiff` alone, so these build the diff by hand — no git,
+    /// no repository, no route — and assert on what the reader sees.
+    fn changes_fixture() -> WorkingTreeDiff {
+        WorkingTreeDiff {
+            files: vec![
+                FileChange {
+                    path: "src/app/main.rs".into(),
+                    old_path: None,
+                    status: ChangeStatus::Modified,
+                    note: None,
+                    added: 2,
+                    removed: 2,
+                    body: ChangeBody::Text {
+                        old_text:
+                            "fn main() {\n    let old = 1;\n    // keep\n    let gone = 0;\n}\n"
+                                .into(),
+                        new_text:
+                            "fn main() {\n    let new = 2;\n    let extra = 3;\n    // keep\n}\n"
+                                .into(),
+                        lines: vec![
+                            DiffLine {
+                                kind: LineKind::Context,
+                                old_no: Some(1),
+                                new_no: Some(1),
+                                text: "fn main() {".into(),
+                            },
+                            // A removal and an addition standing together pair
+                            // into ONE row (`chg`); the second addition has no
+                            // counterpart and takes an `add` row of its own.
+                            DiffLine {
+                                kind: LineKind::Removed,
+                                old_no: Some(2),
+                                new_no: None,
+                                text: "    let old = 1;".into(),
+                            },
+                            DiffLine {
+                                kind: LineKind::Added,
+                                old_no: None,
+                                new_no: Some(2),
+                                text: "    let new = 2;".into(),
+                            },
+                            DiffLine {
+                                kind: LineKind::Added,
+                                old_no: None,
+                                new_no: Some(3),
+                                text: "    let extra = 3;".into(),
+                            },
+                            DiffLine {
+                                kind: LineKind::Context,
+                                old_no: Some(3),
+                                new_no: Some(4),
+                                text: "    // keep".into(),
+                            },
+                            // A removal with nothing beside it: a `del` row.
+                            DiffLine {
+                                kind: LineKind::Removed,
+                                old_no: Some(4),
+                                new_no: None,
+                                text: "    let gone = 0;".into(),
+                            },
+                            DiffLine {
+                                kind: LineKind::Context,
+                                old_no: Some(5),
+                                new_no: Some(5),
+                                text: "}".into(),
+                            },
+                        ],
+                        truncated: false,
+                    },
+                },
+                FileChange {
+                    path: "notes/logo.png".into(),
+                    old_path: None,
+                    status: ChangeStatus::Added,
+                    note: Some("untracked".into()),
+                    added: 0,
+                    removed: 0,
+                    body: ChangeBody::Binary,
+                },
+            ],
+            hidden: 2,
+            stdout_truncated: false,
+            sections_capped: false,
+            base: ActiveBase::WorkingTree,
+        }
+    }
+
+    /// The page with its tags stripped — what a reader actually reads. A
+    /// highlighted line is chopped into spans token by token, so the source
+    /// it renders is a claim about the text, not about the markup between
+    /// the words (which the highlighting assertions cover separately).
+    fn text_of(html: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A page built from one diff and nothing else: the base the view
+    /// reports mirrors the diff's own, exactly as `Engine::changes` builds
+    /// it, so these fixtures cannot drift from the real pairing.
+    fn changes_view(diff: WorkingTreeDiff) -> ChangesView {
+        ChangesView {
+            base: diff.base.clone(),
+            content: ChangesContent::Diff(diff),
+            commits: Vec::new(),
+        }
+    }
+
+    fn changes_html(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &changes_view(diff),
+            &RenderService::new(),
+            PageChrome::Full,
+        )
+    }
+
+    /// The same page under D9's `embed=1`, so an embed test differs from its
+    /// full-chrome twin by exactly one argument.
+    fn changes_html_embedded(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &changes_view(diff),
+            &RenderService::new(),
+            PageChrome::Embed,
+        )
+    }
+
+    /// The screenshot's own promise: both panes of a modified file carry
+    /// syntax-highlighted, line-numbered content, and the row that changed
+    /// is tinted per side. The tint itself is CSS, so what the markup owes
+    /// is the class the palette hangs on — one per side, on the right row.
+    #[test]
+    fn both_panes_of_a_modified_file_are_highlighted_and_side_tinted() {
+        let html = changes_html(changes_fixture());
+
+        let text = text_of(&html);
+        assert!(
+            text.contains("let old = 1;") && text.contains("let new = 2;"),
+            "both reconstructed sides render: {html}"
+        );
+        // syntect's class-based output; a pane rendering raw text would
+        // carry the words above but none of these.
+        assert!(
+            html.matches("<span class=\"source").count() >= 2,
+            "each side is highlighted by highlight_source, not dumped as text: {html}"
+        );
+        assert!(
+            html.contains("<tr class=\"diffrow diffrow--chg\">"),
+            "a removal and the addition replacing it share one row: {html}"
+        );
+        assert!(
+            html.contains("<tr class=\"diffrow diffrow--del\">"),
+            "a removal with no counterpart owns a row of its own: {html}"
+        );
+        assert!(
+            html.contains("<tr class=\"diffrow diffrow--add\">"),
+            "and so does an addition with none: {html}"
+        );
+        assert!(
+            html.contains("diffrow__side--none"),
+            "the empty side of a one-sided row keeps the columns aligned: {html}"
+        );
+        assert!(
+            html.contains("diffrow__side--old") && html.contains("diffrow__side--new"),
+            "each pane is addressable, which is what the red/green palette needs: {html}"
+        );
+        assert!(
+            html.contains("<td class=\"diffrow__num diffrow__num--old\">2</td>"),
+            "the old side keeps the patch's own line number: {html}"
+        );
+    }
+
+    /// Every sidebar row points at a section that exists on the page, and
+    /// carries the file's status badge and its own counts. The pairing is
+    /// the whole click-scrolls-to-the-file behaviour (the anchor does the
+    /// scrolling; app.js only adds the in-view highlight).
+    #[test]
+    fn sidebar_rows_anchor_to_the_sections_they_name() {
+        let html = changes_html(changes_fixture());
+
+        assert!(
+            html.contains("<div class=\"chap-sec\">src/app</div>"),
+            "files are grouped under their directory: {html}"
+        );
+        assert!(
+            html.contains("class=\"chap-file chg-row\" href=\"#f0\""),
+            "the row reuses the Code sidebar's own row class and links to its section: {html}"
+        );
+        assert!(
+            html.contains("<section class=\"changeset\" id=\"f0\"")
+                && html.contains("<section class=\"changeset\" id=\"f1\""),
+            "every anchor a row points at exists: {html}"
+        );
+        assert!(
+            html.contains("chg-badge--m") && html.contains("chg-badge--a"),
+            "M and A badges, one per status: {html}"
+        );
+        assert!(
+            html.contains("+2") && html.contains("&minus;2"),
+            "per-file counts ride the row: {html}"
+        );
+    }
+
+    /// The mobile drawer is not re-implemented here: the page hands app.js
+    /// the same `#sidebar` / `.layout` / `.sidebar-backdrop` shell and the
+    /// same toggle button the Code section does, so the drawer script binds
+    /// to this screen unmodified.
+    #[test]
+    fn changes_page_reuses_the_code_drawer_markup() {
+        let html = changes_html(changes_fixture());
+        for needle in [
+            "<div class=\"layout\">",
+            "<aside id=\"sidebar\" class=\"sidebar\">",
+            "<div class=\"sidebar-backdrop\"></div>",
+            "id=\"sidebar-toggle\"",
+        ] {
+            assert!(html.contains(needle), "missing {needle}: {html}");
+        }
+    }
+
+    /// The header states what is compared and how much of it is not shown —
+    /// the hidden count as an aggregate, never a name (D5).
+    #[test]
+    fn changes_header_counts_files_and_names_no_hidden_path() {
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains("2 files changed") && html.contains("working tree"),
+            "the header says what it is: {html}"
+        );
+        assert!(
+            html.contains("2 files hidden by this project's exclude rules"),
+            "the aggregate hidden count is shown: {html}"
+        );
+    }
+
+    /// cds-6 / D6: a commit as the picker lists it.
+    fn sample_commit(sha: &str, subject: &str) -> CommitEntry {
+        CommitEntry {
+            sha: sha.into(),
+            short: sha[..7].into(),
+            date: "2026-08-30".into(),
+            subject: subject.into(),
+        }
+    }
+
+    /// The page as the route builds it: a diff, the picker's commit list,
+    /// and the base the diff itself reports.
+    fn changes_html_with_commits(diff: WorkingTreeDiff, commits: Vec<CommitEntry>) -> String {
+        changes_page(
+            &sample_project(),
+            &ChangesView {
+                base: diff.base.clone(),
+                content: ChangesContent::Diff(diff),
+                commits,
+            },
+            &RenderService::new(),
+            PageChrome::Full,
+        )
+    }
+
+    /// D6: the header offers the working tree and the recent commits, and
+    /// exactly one of them — the one the page is showing — is selected.
+    #[test]
+    fn the_base_picker_lists_the_working_tree_and_the_recent_commits() {
+        let older = sample_commit(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "an older commit",
+        );
+        let newest = sample_commit(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "the newest commit",
+        );
+        let commits = vec![newest.clone(), older.clone()];
+
+        let html = changes_html_with_commits(changes_fixture(), commits.clone());
+        assert!(
+            html.contains("<option value=\"\" selected>Working tree</option>"),
+            "the default page has the working tree picked: {html}"
+        );
+        assert!(
+            html.contains(&format!("<option value=\"{}\">", newest.sha))
+                && html.contains("the newest commit")
+                && html.contains("an older commit"),
+            "both commits are offered, neither picked: {html}"
+        );
+        assert_eq!(
+            html.matches(" selected>").count(),
+            1,
+            "exactly one option is selected: {html}"
+        );
+
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(older.clone());
+        let html = changes_html_with_commits(diff, commits);
+        assert!(
+            html.contains(&format!(
+                "<option value=\"{}\" selected>{} — an older commit · 2026-08-30</option>",
+                older.sha, older.short
+            )),
+            "the commit being shown is the picked one: {html}"
+        );
+        assert!(
+            html.contains("<option value=\"\">Working tree</option>"),
+            "and the way back to the working tree is still offered: {html}"
+        );
+        assert_eq!(
+            html.matches(" selected>").count(),
+            1,
+            "exactly one option is selected: {html}"
+        );
+    }
+
+    /// A commit older than the listed window is still what the page shows,
+    /// so the picker shows it too rather than presenting a list none of
+    /// whose entries is the current one.
+    #[test]
+    fn a_base_outside_the_listed_window_still_appears_picked() {
+        let listed = sample_commit("cccccccccccccccccccccccccccccccccccccccc", "listed");
+        let ancient = sample_commit("dddddddddddddddddddddddddddddddddddddddd", "ancient");
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(ancient.clone());
+
+        let html = changes_html_with_commits(diff, vec![listed]);
+        assert!(
+            html.contains(&format!("<option value=\"{}\" selected>", ancient.sha)),
+            "the shown commit leads the list: {html}"
+        );
+        assert_eq!(html.matches(" selected>").count(), 1, "{html}");
+    }
+
+    /// A commit subject is whatever its author typed. It reaches the picker
+    /// as text and nothing else — the value beside it is the sha alone, so
+    /// no part of a subject ever reaches a URL either.
+    #[test]
+    fn a_commit_subject_with_markup_in_it_is_escaped_in_the_picker() {
+        let nasty = sample_commit(
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "fix <script>alert(1)</script> & \"quotes\"",
+        );
+
+        let html = changes_html_with_commits(changes_fixture(), vec![nasty]);
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "the subject never renders as markup: {html}"
+        );
+        assert!(
+            html.contains("fix &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;"),
+            "it renders as the text it is: {html}"
+        );
+    }
+
+    /// commit-label-condense D1: bee's machine commits name one feature
+    /// three ways — slug, `<project>--wt--<slug>`, `wt/<slug>` — and each
+    /// machine shape condenses to the one slug form in the picker, while a
+    /// subject a human typed renders exactly as typed.
+    #[test]
+    fn bee_machine_subjects_condense_to_one_slug_form() {
+        let merge = sample_commit(
+            "1111111111111111111111111111111111111111",
+            "Merge worktree beehive--wt--letter-digest (branch wt/letter-digest) via bee worktree merge",
+        );
+        let auto = sample_commit(
+            "2222222222222222222222222222222222222222",
+            "Auto-commit .bee, docs/decisions, letter-digest's recorded docs/knowledge, and docs/history/letter-digest bookkeeping before merging worktree beehive--wt--letter-digest",
+        );
+        let lane = sample_commit(
+            "3333333333333333333333333333333333333333",
+            "Commit letter-digest's lane rewrite after merging worktree beehive--wt--letter-digest",
+        );
+        let human = sample_commit(
+            "4444444444444444444444444444444444444444",
+            "Merge worktree cleanup notes",
+        );
+
+        let html =
+            changes_html_with_commits(changes_fixture(), vec![merge.clone(), auto, lane, human]);
+        assert!(
+            html.contains("1111111 — letter-digest · worktree merge · 2026-08-30"),
+            "the merge subject condenses to the slug form: {html}"
+        );
+        assert!(
+            html.contains("2222222 — letter-digest · pre-merge bookkeeping · 2026-08-30"),
+            "the auto-commit subject condenses to the slug form: {html}"
+        );
+        assert!(
+            html.contains("3333333 — letter-digest · lane bookkeeping · 2026-08-30"),
+            "the lane-rewrite subject condenses to the slug form: {html}"
+        );
+        assert!(
+            html.contains("4444444 — Merge worktree cleanup notes · 2026-08-30"),
+            "a human subject that merely resembles the shape renders verbatim: {html}"
+        );
+
+        // The header names its base by the same condensed form.
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(merge.clone());
+        let html = changes_html_with_commits(diff, vec![merge]);
+        assert!(
+            html.contains("1111111 — letter-digest · worktree merge"),
+            "the header claim condenses too: {html}"
+        );
+    }
+
+    /// D4 under D6: the reviewed layer is the same layer in commit mode —
+    /// same per-section attributes, same counter — and the base it is keyed
+    /// by rides the screen root, empty for the working tree so marks made
+    /// before the picker existed keep the key they were written under.
+    #[test]
+    fn commit_mode_keeps_the_reviewed_markup_and_names_its_base() {
+        let commit = sample_commit("ffffffffffffffffffffffffffffffffffffffff", "a commit");
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains("data-base=\"\""),
+            "the working tree is the empty base: {html}"
+        );
+
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(commit.clone());
+        let html = changes_html_with_commits(diff, vec![commit.clone()]);
+        assert!(
+            html.contains(&format!("data-base=\"{}\"", commit.sha)),
+            "a commit view is keyed by its own sha: {html}"
+        );
+        for needle in [
+            "class=\"changes__reviewed\"",
+            "changeset__review",
+            "data-path=",
+            "data-key=",
+        ] {
+            assert!(
+                html.contains(needle),
+                "the reviewed layer is unchanged in commit mode, missing {needle}: {html}"
+            );
+        }
+    }
+
+    /// Every `data-key` on the page, in section order — the content keys a
+    /// reviewed mark is stored against.
+    fn data_keys(html: &str) -> Vec<String> {
+        html.match_indices("data-key=\"")
+            .map(|(i, m)| {
+                let rest = &html[i + m.len()..];
+                rest[..rest.find('"').expect("attribute is closed")].to_string()
+            })
+            .collect()
+    }
+
+    /// cds-3 / D4: the ground the client-side reviewed layer stands on. The
+    /// marks themselves live in the reader's browser, so what the SERVER
+    /// owes is the addressing — the project the marks are scoped to, a path
+    /// and a content key per section, a checkbox to tick and a tick on the
+    /// sidebar row that mirrors it, and the counter's own element.
+    #[test]
+    fn the_page_carries_everything_a_reviewed_mark_hangs_on() {
+        let html = changes_html(changes_fixture());
+
+        assert!(
+            // cds-6 extended this: a mark is scoped per project AND per
+            // base (D6), so the root names both. The empty base is the
+            // working tree, which keeps the key it always had.
+            html.contains("<div class=\"changes\" data-project-id=\"proj-1\" data-base=\"\">"),
+            "marks are scoped per project and base, so both are on the screen root: {html}"
+        );
+        assert!(
+            html.contains(
+                "<section class=\"changeset\" id=\"f0\" data-path=\"src/app/main.rs\" data-key=\""
+            ),
+            "each section names its file and its content key: {html}"
+        );
+        assert_eq!(
+            data_keys(&html).len(),
+            2,
+            "one key per changed file: {html}"
+        );
+        assert!(
+            html.contains("<label class=\"changeset__review\" hidden>")
+                && html.contains("<input type=\"checkbox\" class=\"changeset__review-box\">"),
+            "the checkbox is in the sticky header, shipped hidden for no-script: {html}"
+        );
+        assert_eq!(
+            html.matches("class=\"chg-row__check\"").count(),
+            2,
+            "every sidebar row carries the mirrored tick: {html}"
+        );
+        assert!(
+            html.contains("<span class=\"changes__reviewed\" hidden>0/2 reviewed</span>"),
+            "the N/M counter ships with the file total and stays hidden until app.js counts: {html}"
+        );
+    }
+
+    /// The rule that keeps a tick honest: the key is derived from the
+    /// section's CONTENT, so editing a marked file moves it and the mark
+    /// stored under the old key stops matching (app.js drops it on load).
+    /// Re-rendering the same diff must move nothing, or every mark would
+    /// evaporate on the next reload.
+    #[test]
+    fn editing_a_file_moves_its_content_key_and_leaves_the_others_alone() {
+        let before = data_keys(&changes_html(changes_fixture()));
+        let again = data_keys(&changes_html(changes_fixture()));
+        assert_eq!(
+            before, again,
+            "the same diff renders the same keys, or no mark would ever survive a reload"
+        );
+
+        let mut edited = changes_fixture();
+        if let ChangeBody::Text { new_text, .. } = &mut edited.files[0].body {
+            *new_text = new_text.replace("let new = 2;", "let new = 42;");
+        }
+        let after = data_keys(&changes_html(edited));
+        assert_ne!(
+            before[0], after[0],
+            "an edit to the file's new side moves its key: {before:?} vs {after:?}"
+        );
+        assert_eq!(
+            before[1], after[1],
+            "and moves no other file's: {before:?} vs {after:?}"
+        );
+
+        // A rename with byte-identical content is still a different thing to
+        // have reviewed, so the status is part of the key too.
+        let mut renamed = changes_fixture();
+        renamed.files[0].status = ChangeStatus::Renamed;
+        assert_ne!(before[0], data_keys(&changes_html(renamed))[0]);
+    }
+
+    /// Nothing changed: no sections, so no counter — "0/0 reviewed" beside
+    /// "nothing has changed" would be a number about nothing.
+    #[test]
+    fn an_empty_diff_offers_no_reviewed_counter() {
+        let html = changes_html(WorkingTreeDiff::default());
+        assert!(
+            html.contains("Nothing has changed in the working tree."),
+            "{html}"
+        );
+        assert!(!html.contains("changes__reviewed"), "{html}");
+        assert!(!html.contains("changeset__review"), "{html}");
+    }
+
+    /// diff-file-collapse D1: the ground the two-way fold stands on. Every
+    /// section ships its own button, first in the sticky header, wired by
+    /// `aria-controls` to the body it folds and starting out expanded — and
+    /// `hidden`, because it remembers nothing and app.js is what makes it
+    /// real (the contract `.changeset__review` beside it already follows).
+    #[test]
+    fn every_section_ships_a_hidden_fold_button_over_its_own_body() {
+        let html = changes_html(changes_fixture());
+
+        assert!(
+            html.contains(
+                "<h2 class=\"changeset__head\"><button type=\"button\" \
+                 class=\"changeset__fold\" aria-expanded=\"true\" \
+                 aria-controls=\"f0-body\" aria-label=\"Fold src/app/main.rs\" hidden>"
+            ),
+            "the fold button is the header's first child, expanded, named for its file: {html}"
+        );
+        assert!(
+            html.contains("<div class=\"changeset__body\" id=\"f0-body\">"),
+            "and `aria-controls` points at a body that actually carries that id: {html}"
+        );
+        assert_eq!(
+            html.matches("class=\"changeset__fold\"").count(),
+            2,
+            "one fold button per changed file: {html}"
+        );
+        assert_eq!(
+            html.matches("id=\"f1-body\"").count(),
+            1,
+            "every section's body id is its own: {html}"
+        );
+    }
+
+    /// diff-file-collapse D3: ONE whole-screen control, in the head beside
+    /// the reviewed counter. It ships saying "Collapse all" — the state
+    /// every screen opens in — and `hidden`, for the same reason as above.
+    #[test]
+    fn the_head_carries_one_hidden_collapse_all_button() {
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains(
+                "<button type=\"button\" class=\"changes__fold-all\" hidden>Collapse all</button>"
+            ),
+            "the head offers Collapse all, hidden until app.js takes it: {html}"
+        );
+        assert_eq!(
+            html.matches("changes__fold-all").count(),
+            1,
+            "one control, not one per file: {html}"
+        );
+        // Scoped to the CHANGES head — the page's own topbar closes a
+        // `</header>` long before this one does.
+        let head_start = html
+            .find("<header class=\"changes__head\">")
+            .expect("the changes head is rendered");
+        let head_end = head_start
+            + html[head_start..]
+                .find("</header>")
+                .expect("the changes head is closed");
+        assert!(
+            html[head_start..head_end].contains("changes__fold-all"),
+            "and it sits inside the head, beside the counter: {html}"
+        );
+    }
+
+    /// Nothing changed: nothing to fold. Neither control is rendered, the
+    /// same rule the reviewed counter follows one test up — a Collapse all
+    /// over an empty screen is a button about nothing.
+    #[test]
+    fn an_empty_diff_offers_no_fold_controls() {
+        let html = changes_html(WorkingTreeDiff::default());
+        assert!(!html.contains("changes__fold-all"), "{html}");
+        assert!(!html.contains("changeset__fold"), "{html}");
+    }
+
+    /// A binary file says so instead of rendering bytes; a truncated one
+    /// says so and offers the file whole in the Code section.
+    #[test]
+    fn binary_and_truncated_sections_explain_themselves() {
+        let html = changes_html(changes_fixture());
+        assert!(
+            html.contains("Binary file changed"),
+            "a binary file gets a row, not a diff: {html}"
+        );
+
+        let mut diff = changes_fixture();
+        if let ChangeBody::Text { truncated, .. } = &mut diff.files[0].body {
+            *truncated = true;
+        }
+        let html = changes_html(diff);
+        assert!(
+            html.contains("Truncated") && html.contains("/p/proj-1/_code/src/app/main.rs"),
+            "a truncated section links the file whole in Code view: {html}"
+        );
+    }
+
+    /// D3: git missing or no repository still renders the screen — sidebar
+    /// shell, topbar and all — with the reason in the reader's terms and
+    /// never git's own words (which could name a path).
+    #[test]
+    fn the_unavailable_state_is_a_page_not_a_stack_trace() {
+        let html = changes_page(
+            &sample_project(),
+            &ChangesView {
+                content: ChangesContent::Unavailable(GitDiffError::GitUnavailable(
+                    "/secret/path/git: No such file".into(),
+                )),
+                commits: Vec::new(),
+                base: ActiveBase::WorkingTree,
+            },
+            &RenderService::new(),
+            PageChrome::Full,
+        );
+        assert!(
+            html.contains("git command line"),
+            "the reason is explained: {html}"
+        );
+        assert!(
+            !html.contains("/secret/path/git"),
+            "git's own message never reaches the page: {html}"
+        );
+        assert!(
+            html.contains("<aside id=\"sidebar\" class=\"sidebar\">"),
+            "the layout is the same one a diff renders in: {html}"
+        );
+    }
+
+    /// The covered-contract surface the plan's risk map names: the third
+    /// link ships on Docs and Code pages too, and exactly one link at a
+    /// time is marked current.
+    #[test]
+    fn section_switch_offers_all_three_sections_on_every_section() {
+        let project = sample_project();
+        for (active, current_href) in [
+            (Section::Docs, "/p/proj-1/"),
+            (Section::Code, "/p/proj-1/_code/"),
+            (Section::Changes, "/p/proj-1/_changes"),
+        ] {
+            let nav = section_switch(&project, active);
+            assert!(nav.contains(">Docs</a>"), "{nav}");
+            assert!(nav.contains(">Code</a>"), "{nav}");
+            assert!(nav.contains(">Changes</a>"), "{nav}");
+            assert_eq!(
+                nav.matches("aria-current=\"page\"").count(),
+                1,
+                "exactly one section is current: {nav}"
+            );
+            assert!(
+                nav.contains(&format!("href=\"{current_href}\" aria-current=\"page\"")),
+                "the active section is the marked one: {nav}"
+            );
+        }
+    }
+
+    /// A directory a Code page can be rendered from: one subfolder and one
+    /// file, so both kinds of sidebar link are on the page at once.
+    fn code_listing() -> DirListing {
+        DirListing {
+            rel_path: "src".into(),
+            entries: vec![
+                waggledance_core::code_source::DirEntry {
+                    name: "app".into(),
+                    is_dir: true,
+                    size: 0,
+                },
+                waggledance_core::code_source::DirEntry {
+                    name: "main.rs".into(),
+                    is_dir: false,
+                    size: 42,
+                },
+            ],
+        }
+    }
+
+    /// D9: `embed=1` takes the topbar off the Changes screen and nothing
+    /// else. What the screen is FOR — the changed-file sidebar, the base
+    /// picker, the reviewed marks — is still every bit of it there, and the
+    /// layout says it is embedded so app.css can drop the 53px offset its
+    /// sticky elements were measured against.
+    #[test]
+    fn an_embedded_changes_page_drops_the_topbar_and_keeps_the_screen() {
+        let html = changes_html_embedded(changes_fixture());
+
+        assert!(
+            !html.contains("<header class=\"topbar\">"),
+            "no topbar inside the frame: {html}"
+        );
+        assert!(
+            !html.contains("section-switch"),
+            "and none of the chrome that lived on it: {html}"
+        );
+        assert!(
+            !html.contains("id=\"sidebar-toggle\""),
+            "including the drawer toggle: {html}"
+        );
+
+        assert!(
+            html.contains("class=\"layout layout--embed\""),
+            "the layout marks itself embedded: {html}"
+        );
+        assert!(
+            html.contains("changes-nav"),
+            "the changed-file sidebar stays: {html}"
+        );
+        assert!(
+            html.contains("changes__base-select"),
+            "the base picker stays: {html}"
+        );
+        assert!(
+            html.contains("changeset__review"),
+            "the reviewed marks stay: {html}"
+        );
+    }
+
+    /// D9: navigating inside the frame must stay inside it. The picker is the
+    /// one control on this screen that navigates, and it has two paths — the
+    /// plain GET form (which drops any query already in its `action`, so the
+    /// flag rides as a field) and `app.js` (which reads `data-embed`).
+    #[test]
+    fn an_embedded_changes_page_carries_embed_through_its_base_picker() {
+        let html = changes_html_embedded(changes_fixture());
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"embed\" value=\"1\">"),
+            "the scripting-off form submits the flag: {html}"
+        );
+        assert!(
+            html.contains("data-embed=\"1\""),
+            "and the scripted path is told about it: {html}"
+        );
+    }
+
+    /// D9 on the Code section: same page, no bar, and every link the tree
+    /// offers keeps the reader in the frame — the crumbs up, the subfolders
+    /// down, and the files themselves.
+    #[test]
+    fn an_embedded_code_page_carries_embed_through_its_sidebar_links() {
+        for html in [
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Embed),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Embed,
+            ),
+        ] {
+            assert!(
+                !html.contains("<header class=\"topbar\">"),
+                "no topbar inside the frame: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout layout--embed\""),
+                "the layout marks itself embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/?embed=1\""),
+                "the root crumb stays embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/src/app?embed=1\""),
+                "a subfolder link stays embedded: {html}"
+            );
+            assert!(
+                html.contains("href=\"/p/proj-1/_code/src/main.rs?embed=1\""),
+                "a file link stays embedded: {html}"
+            );
+        }
+    }
+
+    /// The other half of D9: without the flag these pages are the pages they
+    /// have always been — the bar is there, no link carries a query it never
+    /// carried, and nothing claims to be embedded.
+    #[test]
+    fn without_the_embed_flag_the_pages_keep_their_chrome() {
+        for html in [
+            changes_html(changes_fixture()),
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Full),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Full,
+            ),
+        ] {
+            assert!(
+                html.contains("<header class=\"topbar\">"),
+                "the topbar is where it was: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout\""),
+                "and the layout carries no embed modifier: {html}"
+            );
+            assert!(
+                !html.contains("embed=1"),
+                "no link and no field mentions embedding: {html}"
+            );
+        }
+    }
+
+    /// home-terminal-panel D2: a Changes page in nav mode, so the nav tests
+    /// below differ from their embed twins by exactly one argument.
+    fn changes_html_nav(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &changes_view(diff),
+            &RenderService::new(),
+            PageChrome::Nav,
+        )
+    }
+
+    /// D2: `embed=1&nav=1` on the Changes screen is the changed-file list and
+    /// the picker that governs it, and NOTHING else — no topbar (embed
+    /// already took that), no diff sections, no `.layout` columns. A sidebar
+    /// 240px wide that quietly rendered every changed file's two highlighted
+    /// panes would cost the whole screen to show a list.
+    #[test]
+    fn a_nav_changes_page_is_the_file_list_and_nothing_beside_it() {
+        let html = changes_html_nav(changes_fixture());
+
+        assert!(
+            html.contains("<base target=\"wd-term-panel\">"),
+            "the head names the panel frame every file row loads into: {html}"
+        );
+        assert_eq!(
+            PANEL_FRAME_NAME, "wd-term-panel",
+            "and the terminals tab names its iframe from the same constant"
+        );
+        assert!(
+            html.contains("class=\"nav-only nav-only--changes\""),
+            "the body is the nav and its own wrapper: {html}"
+        );
+        assert!(
+            html.contains("changes-nav") && html.contains("chg-badge"),
+            "the list keeps its grouping and status badges: {html}"
+        );
+        assert!(
+            html.contains("changes__base-select"),
+            "the base picker rides along so the nav can switch base: {html}"
+        );
+
+        assert!(
+            !html.contains("<header class=\"topbar\">"),
+            "no topbar: {html}"
+        );
+        assert!(
+            !html.contains("changeset__head"),
+            "and not one diff section beside the list: {html}"
+        );
+        assert!(
+            !html.contains("class=\"layout"),
+            "the two-column page shell is gone with them: {html}"
+        );
+        assert!(
+            !html.contains("agent-drawer"),
+            "and a 240px frame carries no agent drawer: {html}"
+        );
+    }
+
+    /// D3: a row in the Diff nav opens the file's diff in the PANEL, so its
+    /// href cannot be the bare `#f<i>` the full screen uses — there is no
+    /// section in this frame for that fragment to reach. It is the embedded
+    /// Changes page's own absolute URL with the anchor on the end.
+    #[test]
+    fn nav_changes_rows_deep_link_into_the_embedded_page() {
+        let html = changes_html_nav(changes_fixture());
+        assert!(
+            html.contains("href=\"/p/proj-1/_changes?embed=1&amp;panel=1#f0\""),
+            "the first row deep-links the embedded page at its section, and asks \
+             for it without the in-page sidebar this nav already is: {html}"
+        );
+        assert!(
+            !html.contains("href=\"#f0\""),
+            "and no row is left as a fragment that scrolls this frame to nowhere: {html}"
+        );
+    }
+
+    /// D3, second half: a nav loaded against a commit hands that commit on to
+    /// every row it renders. Opening a file from a commit's list must show
+    /// that commit's diff, not silently the working tree's.
+    #[test]
+    fn a_nav_changes_page_carries_its_commit_into_every_row() {
+        let mut diff = changes_fixture();
+        diff.base = ActiveBase::Commit(CommitEntry {
+            sha: "abc123def456".into(),
+            short: "abc123d".into(),
+            date: "2026-08-30".into(),
+            subject: "Name the wait".into(),
+        });
+        let html = changes_html_nav(diff);
+        assert!(
+            html.contains(
+                "href=\"/p/proj-1/_changes?embed=1&amp;panel=1&amp;commit=abc123def456#f0\""
+            ),
+            "the row carries the nav's own base, panel mode and all: {html}"
+        );
+    }
+
+    /// D2/D3: the picker changes what the SIDEBAR is comparing, so it
+    /// navigates this frame — past the injected base target — and keeps nav
+    /// mode on the way. It also gives up `data-base-url`, the hook `app.js`
+    /// binds its scripted `change` handler to: that handler rebuilds the URL
+    /// from `data-embed` alone and would drop `nav=1`, swapping the sidebar
+    /// for a full diff page. Without the hook the plain GET form navigates.
+    #[test]
+    fn the_nav_base_picker_navigates_the_nav_itself() {
+        let html = changes_html_nav(changes_fixture());
+        assert!(
+            html.contains("action=\"/p/proj-1/_changes\" target=\"_self\""),
+            "the picker's form targets this frame, not the panel: {html}"
+        );
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"embed\" value=\"1\">")
+                && html.contains("<input type=\"hidden\" name=\"nav\" value=\"1\">"),
+            "and submits both flags, so the nav comes back as a nav: {html}"
+        );
+        assert!(
+            !html.contains("data-base-url="),
+            "the scripted handler, which cannot carry nav=1, never binds: {html}"
+        );
+        assert!(
+            html.contains("changes__base-go"),
+            "so the form's own Show button stays the way it navigates: {html}"
+        );
+    }
+
+    /// The empty case: a project with nothing changed still renders a nav —
+    /// the frame says so in the reader's words instead of coming back blank.
+    #[test]
+    fn a_nav_changes_page_with_no_changes_says_so() {
+        let mut diff = changes_fixture();
+        diff.files.clear();
+        let html = changes_html_nav(diff);
+        assert!(
+            html.contains("<base target=\"wd-term-panel\">"),
+            "the base target is there either way: {html}"
+        );
+        assert!(
+            html.contains("changes-nav__empty") && html.contains("No changed files."),
+            "and the list states its own emptiness: {html}"
+        );
+    }
+
+    /// D2 on the Code section: nav mode is the tree, in a document that is
+    /// nothing but the tree.
+    #[test]
+    fn a_nav_code_page_is_the_tree_and_nothing_beside_it() {
+        for html in [
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Nav),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Nav,
+            ),
+        ] {
+            assert!(
+                html.contains("<base target=\"wd-term-panel\">"),
+                "the head names the panel frame: {html}"
+            );
+            assert!(
+                html.contains("class=\"nav-only nav-only--code\"") && html.contains("chap-crumbs"),
+                "the body is the tree and its wrapper: {html}"
+            );
+            assert!(
+                !html.contains("<header class=\"topbar\">") && !html.contains("class=\"layout"),
+                "no bar and no page shell: {html}"
+            );
+            assert!(
+                !html.contains("codeview__") && !html.contains("codelist__"),
+                "and neither of the main panes this page would otherwise build: {html}"
+            );
+        }
+    }
+
+    /// D3: inside the Files nav, a folder or a crumb re-renders the NAV — it
+    /// keeps nav mode and steps out of the injected base target with its own
+    /// `target="_self"`. A file row does the opposite: it carries the panel's
+    /// embed URL and no target at all, so the base sends it to the panel.
+    #[test]
+    fn nav_code_folders_navigate_themselves_and_files_fill_the_panel() {
+        let html = code_dir_page(&sample_project(), &code_listing(), PageChrome::Nav);
+
+        assert!(
+            html.contains(
+                "<a class=\"chap-seg\" href=\"/p/proj-1/_code/?embed=1&amp;nav=1\" target=\"_self\">"
+            ),
+            "the root crumb re-renders the nav: {html}"
+        );
+        assert!(
+            html.contains(
+                "<a class=\"chap-subfolder\" href=\"/p/proj-1/_code/src/app?embed=1&amp;nav=1\" target=\"_self\">"
+            ),
+            "and so does a subfolder: {html}"
+        );
+        assert!(
+            html.contains(
+                "<a class=\"chap-file\" href=\"/p/proj-1/_code/src/main.rs?embed=1&amp;panel=1\">"
+            ),
+            "a file row is an absolute panel link with no nav and no target: {html}"
+        );
+        assert!(
+            !html.contains("/p/proj-1/_code/src/main.rs?embed=1&amp;nav=1"),
+            "a file must never re-render the sidebar as the whole file page: {html}"
+        );
+    }
+
+    /// The pages nav mode does not touch. `PageChrome::Embed` still renders
+    /// the whole embedded page, base-target-free and self-target-free — nav
+    /// mode is a narrowing of embed, never a change to it.
+    #[test]
+    fn embed_mode_is_untouched_by_nav_mode() {
+        for html in [
+            changes_html_embedded(changes_fixture()),
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Embed),
+        ] {
+            assert!(
+                !html.contains("<base target=") && !html.contains("target=\"_self\""),
+                "an embedded page names no frame and overrides no base: {html}"
+            );
+            assert!(
+                !html.contains("nav=1") && !html.contains("nav-only"),
+                "and carries nothing of nav mode: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout layout--embed\""),
+                "it is the same embedded page it was: {html}"
+            );
+        }
+    }
+
+    /// UAT: a Changes page in panel mode, so the panel tests below differ
+    /// from their embed twins by exactly one argument.
+    fn changes_html_panel(diff: WorkingTreeDiff) -> String {
+        changes_page(
+            &sample_project(),
+            &changes_view(diff),
+            &RenderService::new(),
+            PageChrome::Panel,
+        )
+    }
+
+    /// A framed page must never hand its frame a way back to full chrome:
+    /// the changeset "Open in Code view" link carries the page's own chrome
+    /// query — nothing on a full page, `?embed=1` under embed, and
+    /// `?embed=1&panel=1` inside the homepage panel.
+    #[test]
+    fn the_open_in_code_view_link_carries_the_pages_own_chrome() {
+        let project = sample_project();
+        assert_eq!(
+            code_view_link(&project, "src/main.rs", PageChrome::Full.link_query()),
+            format!(
+                "<a class=\"changeset__open\" href=\"/p/{}/_code/src/main.rs\">Open in Code view</a>",
+                project.id
+            ),
+        );
+        assert!(
+            code_view_link(&project, "src/main.rs", PageChrome::Embed.link_query())
+                .contains("/_code/src/main.rs?embed=1\""),
+            "embed keeps the frame embedded"
+        );
+        assert!(
+            code_view_link(&project, "src/main.rs", PageChrome::Panel.link_query())
+                .contains("/_code/src/main.rs?embed=1&amp;panel=1\""),
+            "panel keeps the frame sidebar-less"
+        );
+    }
+
+    /// UAT, the whole of it: inside the homepage panel the page keeps every
+    /// part of itself EXCEPT the changed-file column, because that column is
+    /// already on screen as the sidebar the frame was opened from. The
+    /// header the user pointed at — count, base picker, reviewed counter —
+    /// and the diff sections themselves are untouched, now across the whole
+    /// frame.
+    #[test]
+    fn a_panel_changes_page_drops_the_duplicate_sidebar_and_keeps_the_screen() {
+        let html = changes_html_panel(changes_fixture());
+
+        assert!(
+            !html.contains("<aside id=\"sidebar\""),
+            "the in-page sidebar is the duplicate this mode exists to remove: {html}"
+        );
+        assert!(
+            !html.contains("changes-nav") && !html.contains("sidebar-backdrop"),
+            "and neither the list inside it nor the drawer backdrop under it \
+             is left behind: {html}"
+        );
+        assert!(
+            html.contains("class=\"layout layout--embed layout--panel\""),
+            "the layout marks itself panel BESIDE embed, so every sticky offset \
+             embed mode zeroes stays zeroed: {html}"
+        );
+
+        assert!(
+            html.contains("<span class=\"changes__count\">2 files changed</span>"),
+            "the header's file count stays: {html}"
+        );
+        assert!(
+            html.contains("changes__base-select"),
+            "the base picker stays: {html}"
+        );
+        assert!(
+            html.contains("changes__reviewed"),
+            "the reviewed counter stays: {html}"
+        );
+        assert!(
+            html.contains("changeset__head") && html.contains("changeset__review"),
+            "and every diff section, with its own reviewed mark: {html}"
+        );
+        assert!(
+            !html.contains("<header class=\"topbar\">"),
+            "panel mode is still an embed: no outer bar: {html}"
+        );
+    }
+
+    /// UAT: navigating inside the panel must come back as a panel page — a
+    /// picked base that returned the ordinary embed would put the duplicate
+    /// column straight back. Both of the picker's paths carry the flag, the
+    /// scripting-off form as a field and `app.js` as an attribute, exactly
+    /// as they already carry `embed`.
+    #[test]
+    fn a_panel_changes_page_carries_panel_through_its_base_picker() {
+        let html = changes_html_panel(changes_fixture());
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"embed\" value=\"1\">")
+                && html.contains("<input type=\"hidden\" name=\"panel\" value=\"1\">"),
+            "the scripting-off form submits both flags: {html}"
+        );
+        assert!(
+            html.contains("data-embed=\"1\" data-panel=\"1\""),
+            "and the scripted path is told about both: {html}"
+        );
+        assert!(
+            html.contains("data-base-url=\"/p/proj-1/_changes\""),
+            "the scripted handler still binds here — unlike nav mode, this \
+             page's picker navigates the frame it is in: {html}"
+        );
+    }
+
+    /// The JS half of the line above: the handler that rebuilds the picker's
+    /// URL reads the panel flag and puts it back on. Without this the panel
+    /// silently falls out of panel mode on the first base change.
+    #[test]
+    fn app_js_keeps_panel_on_the_base_pickers_own_navigation() {
+        let script = include_str!("../assets/app.js");
+        assert!(
+            script.contains(r#"var panel = sel.getAttribute("data-panel") === "1";"#)
+                && script.contains(r#"if (panel) q.push("panel=1");"#),
+            "the scripted base change must carry panel=1 the way it carries embed=1: {script}"
+        );
+    }
+
+    /// UAT on the Code section: the tree is the duplicate there — the Files
+    /// sidebar beside the frame is the same tree — so the panel gets the
+    /// file and nothing else. A directory keeps its own main-pane listing,
+    /// which is not a duplicate of anything.
+    #[test]
+    fn a_panel_code_page_drops_the_tree_and_keeps_the_file() {
+        let file = code_page(
+            &sample_project(),
+            "src/main.rs",
+            CodeBody::Binary { size: 42 },
+            &code_listing(),
+            PageChrome::Panel,
+        );
+        assert!(
+            !file.contains("<aside id=\"sidebar\"")
+                && !file.contains("chap-crumbs")
+                && !file.contains("sidebar-backdrop"),
+            "no tree column, and no drawer parts belonging to it: {file}"
+        );
+        assert!(
+            file.contains("class=\"codeview\"") && file.contains("Binary file"),
+            "the file itself is the whole point of the frame: {file}"
+        );
+        assert!(
+            file.contains("class=\"layout layout--embed layout--panel\""),
+            "panel rides beside embed here too: {file}"
+        );
+
+        let dir = code_dir_page(&sample_project(), &code_listing(), PageChrome::Panel);
+        assert!(
+            !dir.contains("<aside id=\"sidebar\"") && !dir.contains("chap-crumbs"),
+            "a directory drops the same column: {dir}"
+        );
+        assert!(
+            dir.contains("class=\"codelist\"") && dir.contains("codelist__row"),
+            "and keeps its own listing, which duplicates nothing: {dir}"
+        );
+    }
+
+    /// UAT: a link followed inside the panel must land back in the panel.
+    /// Every URL these pages build for themselves carries both flags, so
+    /// walking the breadcrumb or a folder row can never grow the duplicate
+    /// column back mid-session.
+    #[test]
+    fn panel_pages_carry_panel_through_their_own_links() {
+        let dir = code_dir_page(&sample_project(), &code_listing(), PageChrome::Panel);
+        assert!(
+            dir.contains("<a href=\"/p/proj-1/_code/?embed=1&amp;panel=1\">"),
+            "the breadcrumb root stays in the panel: {dir}"
+        );
+        assert!(
+            dir.contains("href=\"/p/proj-1/_code/src/app?embed=1&amp;panel=1\""),
+            "and so does a row of the listing: {dir}"
+        );
+        assert!(
+            !dir.contains("nav=1"),
+            "panel mode borrows nothing from nav mode: {dir}"
+        );
+    }
+
+    /// The other half, the one the prohibition names: `Embed` is untouched.
+    /// The project terminal page's own panel (cds-8) embeds these pages with
+    /// their sidebars intact, because there it is the only navigation in the
+    /// frame — so plain embed must keep rendering exactly what it did.
+    #[test]
+    fn embed_mode_is_untouched_by_panel_mode() {
+        for html in [
+            changes_html_embedded(changes_fixture()),
+            code_dir_page(&sample_project(), &code_listing(), PageChrome::Embed),
+            code_page(
+                &sample_project(),
+                "src/main.rs",
+                CodeBody::Binary { size: 42 },
+                &code_listing(),
+                PageChrome::Embed,
+            ),
+        ] {
+            assert!(
+                html.contains("<aside id=\"sidebar\" class=\"sidebar\">")
+                    && html.contains("<div class=\"sidebar-backdrop\"></div>"),
+                "an embedded page keeps its own sidebar and backdrop: {html}"
+            );
+            assert!(
+                html.contains("class=\"layout layout--embed\""),
+                "and its own layout class, with no panel modifier: {html}"
+            );
+            assert!(
+                !html.contains("panel=1") && !html.contains("data-panel"),
+                "and mentions the panel narrowing nowhere: {html}"
+            );
+        }
+    }
+
+    /// cds-8's panel, re-pointed by term-workspace-unify. This slot held
+    /// `the_project_terminal_panel_stays_on_plain_embed_urls`: the project
+    /// page had a panel of its own that dropped a WHOLE embedded page into
+    /// the frame, sidebar included, so it asked for plain `?embed=1` and
+    /// never for the sidebar-less `panel=1` — that embedded sidebar was the
+    /// only navigation the panel had. The variant is deleted. Both pages now
+    /// render the shared workspace, which carries a sidebar of its OWN beside
+    /// the terminal, so the narrowed rendering is right on both: the old
+    /// assertion would today pin a duplicated sidebar as correct, which is
+    /// why it is stated as retired here rather than quietly dropped. What
+    /// survives is the claim that still means something — the two pages
+    /// agree on what the panel holds, and neither carries a control of the
+    /// deleted variant's own.
+    #[test]
+    fn both_terminal_workspaces_ask_for_the_sidebar_less_panel() {
+        let project = sample_project();
+        let panes = vec![menu_pane("w1:p1", Some("proj-2"), "Proj Two")];
+        for (page, html) in [
+            (
+                "the project terminal page",
+                terminal_page(&project, &[], None, &[]),
+            ),
+            (
+                "the homepage Terminals tab",
+                terminals_tab(&panes, Some("w1:p1"), true, &[]),
+            ),
+        ] {
+            assert!(
+                html.contains("?embed=1&amp;panel=1"),
+                "{page} must drop the narrowed Changes page into the panel: {html}"
+            );
+            assert!(
+                !html.contains("data-embed-src"),
+                "{page} must carry none of the deleted variant's own controls: {html}"
+            );
+        }
     }
 }

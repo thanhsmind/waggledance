@@ -49,3 +49,24 @@ area branding:
 None: no capped cell trace carries a deviation or a failure signature.
 
 knowledge promote: 1 capped cell(s) mined, 1 delivery draft, 1 area bullet(s), 0 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, the spec already records this feature
+
+Reviewed in the sweep of the unapplied-proposal backlog.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/bee-artifact-rename/delivery.md`
+  already exists as a curated record.
+- **(b) Area updates** — not applied. `docs/specs/bee-cockpit.md` names `bee-artifact-rename` in its own
+  `sources`, which is the receipt that this feature's behaviour was merged into
+  the spec when it closed. The generated bullets restate the same work in
+  implementation vocabulary — function and type names — which a spec carries only
+  in its Pointers, so applying them would add nothing the spec does not say and
+  would break its vocabulary rule. This resolution rests on that receipt and on
+  the spec owning the area, not on a line-by-line re-reading of every bullet.
+- **(c) Pattern candidates** — none promoted from here.
+
+<!-- /bee:not-a-deferral -->

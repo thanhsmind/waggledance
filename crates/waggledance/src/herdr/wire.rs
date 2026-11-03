@@ -5,7 +5,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Pinned wire protocol number — exact-match (bumps per herdr release).
-pub const HERDR_PROTOCOL: u32 = 16;
+pub const HERDR_PROTOCOL: u32 = 20;
 
 /// A socket request: `{ "id", "method", "params" }`, newline-terminated.
 #[derive(Debug, Serialize)]
@@ -916,8 +916,8 @@ mod tests {
     #[test]
     fn protocol_pin_exact() {
         assert!(ProtocolInfo {
-            protocol: 16,
-            server_version: "0.7.4".into()
+            protocol: 20,
+            server_version: "0.8.0".into()
         }
         .is_compatible());
         assert!(!ProtocolInfo {

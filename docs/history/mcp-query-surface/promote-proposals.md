@@ -87,3 +87,32 @@ handle_search now reports refresh outcome (refreshed/failed) in structuredConten
 Candidate only. `bee knowledge promote` proposes; naming the pattern, generalizing it beyond this cell, and moving `bee.lifecycle` to `active` are a human or agent decision.
 
 knowledge promote: 5 capped cell(s) mined, 1 delivery draft, 4 area bullet(s), 1 pattern candidate(s), 0 file(s) written.
+
+---
+
+<!-- bee:not-a-deferral: this section records a completed review with no outstanding action. -->
+
+## Resolution — 2026-08-25, the area had no spec; one was written
+
+Reviewed in a sweep of the unapplied-proposal backlog. This feature was the only
+one in that backlog whose area was genuinely undocumented: `mcp-surface` had no
+spec, so its four candidate bullets had nowhere to be merged *into*.
+
+- **(a) Delivery draft** — not applied. `docs/knowledge/work/mcp-query-surface/delivery.md`
+  already exists as a curated record.
+- **(b) Area updates** — not applied as written; the bullets name handlers and
+  types, which a spec carries only in its Pointers. Instead the area was
+  inventoried from the shipped surface and written up as
+  `docs/specs/mcp-surface.md` (`coverage: partial`), covering all seven tools,
+  the two switches that gate dispatch, label-only publication of agent kinds, the
+  containment filter on the pane inventory, the 60-second clamp on waiting, and
+  the refusal order. It cites eight locked decisions and states four Open Gaps
+  rather than inventing answers for them. `docs/specs/reading-map.md` gained its
+  row.
+- **(c) Pattern candidates** — one proposed, not promoted. Its cell carries a bare
+  failure signature and no recorded deviation, so there is no stated trap to
+  generalize from; what the cell did — replace an unconditional freshness promise
+  with a reported refresh outcome — is now stated as behaviour in the new spec's
+  "On partial failure", which is where it belongs.
+
+<!-- /bee:not-a-deferral -->

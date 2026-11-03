@@ -1,0 +1,62 @@
+[
+  {
+    "workspaceId": "wks_fixture_a",
+    "projectId": "prj_fixture",
+    "cwd": "/srv/fixture/repo",
+    "kind": "local_checkout",
+    "displayName": "repo",
+    "isPaseoOwnedWorktree": false,
+    "createdAt": "2026-09-02T10:00:00.000Z",
+    "updatedAt": "2026-10-01T10:00:00.000Z",
+    "archivedAt": null,
+    "pinnedAt": null
+  },
+  {
+    "workspaceId": "wks_fixture_b",
+    "projectId": "prj_fixture",
+    "cwd": "/srv/fixture/repo",
+    "kind": "local_checkout",
+    "displayName": "repo",
+    "isPaseoOwnedWorktree": false,
+    "createdAt": "2026-08-26T08:50:45.841Z",
+    "updatedAt": "2026-10-01T10:00:00.000Z",
+    "archivedAt": null,
+    "pinnedAt": null
+  },
+  {
+    "workspaceId": "wks_fixture_c",
+    "projectId": "prj_fixture",
+    "cwd": "/srv/fixture/repo",
+    "kind": "local_checkout",
+    "displayName": "repo",
+    "isPaseoOwnedWorktree": false,
+    "createdAt": "2026-09-30T05:50:56.392Z",
+    "updatedAt": "2026-10-01T10:00:00.000Z",
+    "archivedAt": null,
+    "pinnedAt": null
+  },
+  {
+    "workspaceId": "wks_fixture_archived",
+    "projectId": "prj_fixture_old",
+    "cwd": "/srv/fixture/old",
+    "kind": "local_checkout",
+    "displayName": "old",
+    "isPaseoOwnedWorktree": false,
+    "createdAt": "2026-08-01T08:00:00.000Z",
+    "updatedAt": "2026-08-20T08:00:00.000Z",
+    "archivedAt": "2026-08-20T08:00:00.000Z",
+    "pinnedAt": null
+  },
+  {
+    "workspaceId": "wks_fixture_owned",
+    "projectId": "prj_fixture",
+    "cwd": "/srv/fixture/repo-worktrees/feature",
+    "kind": "worktree",
+    "displayName": "feature",
+    "isPaseoOwnedWorktree": true,
+    "createdAt": "2026-08-15T08:00:00.000Z",
+    "updatedAt": "2026-10-01T10:00:00.000Z",
+    "archivedAt": null,
+    "pinnedAt": null
+  }
+]

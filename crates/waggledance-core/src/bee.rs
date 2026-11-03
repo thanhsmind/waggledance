@@ -85,6 +85,18 @@
 //!   later event (an unrecognized future kind included) resolves it — see
 //!   [`BeeDeferredQueue`].
 //!
+//! board-visibility (slice 2) adds the human mailbox: `.bee/human-mailbox/*.md`,
+//! each letter's frozen YAML frontmatter parsed into a typed record by
+//! [`mailbox`], surfaced on [`BeeSnapshot::mailbox`]. A letter that cannot be
+//! read comes back as [`BeeMailboxEntry::Unreadable`] rather than vanishing —
+//! bee's own rule, and the reasoning lives in that module's doc comment. The
+//! letter files are opened for reading only, like every other path here (D4);
+//! read/unread is flipped by calling bee, never by writing the file. The same
+//! directory also holds bee's period digests, told apart by their frontmatter
+//! `type: "digest"` and never by their file name: they come back as
+//! [`BeeMailboxEntry::Digest`] beside the letters and are counted as none of
+//! them (mailbox-inbox D1).
+//!
 //! Every path-shaped value that crosses into a public field is rendered
 //! relative to the project root (or reduced to a bare filename when it
 //! falls outside the root) — no absolute path may survive into a
@@ -96,6 +108,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+mod mailbox;
+
+pub use mailbox::{
+    mailbox_dir, BeeDigest, BeeLetter, BeeLetterDeparture, BeeLetterItem, BeeLetterNeedsYou,
+    BeeLetterStatus, BeeMailboxEntry,
+};
 
 /// One live cell, trimmed to what the cockpit board needs. Any path-shaped
 /// field (`files`, `worker`) is relativized against the project root before
@@ -205,15 +224,57 @@ pub struct BeeState {
     /// `waiting_on_is_live`: `true` only when `waiting_on` is a JSON object
     /// carrying a non-empty (after trim) string `kind` AND a non-empty
     /// (after trim) string `subject`; `null`, an absent key, a non-object
-    /// value, or an empty field all read `false`. Deliberately carries no
-    /// whitelist of `kind` values, so a `kind` bee introduces later still
-    /// reads live here. Badge semantics: a live mark means "a human is
+    /// value, or an empty field all read `false`. Exactly one `kind` is
+    /// excluded by name (board-visibility D4): `turn-end`, which AGENTS.md
+    /// gives the Stop hook for every ordinary turn end — "control back with
+    /// the human and nothing owed" — is the idle mark, not a demand, and
+    /// reads `false`. There is deliberately no whitelist in the other
+    /// direction: a `kind` bee introduces later still reads live here, so an
+    /// unrecognised demand surfaces instead of disappearing.
+    /// Badge semantics: a live mark means "a human is
     /// being waited on right now" — `run_state == "awaiting-approval"`
     /// alone must not earn the danger badge, because bee derives that
     /// run_state whenever any gate is pending with none later approved,
     /// and the user-invoked review gate routinely sits pending with nobody
     /// actually waiting.
     pub waiting_on_live: bool,
+    /// `state.json`'s `waiting_on` carried whole — its `kind` and `subject`
+    /// (board-visibility bv-2) — *beside* [`BeeState::waiting_on_live`],
+    /// never instead of it. `Some` exactly when the mark is well formed (a
+    /// JSON object with a non-empty-after-trim string `kind` AND `subject`);
+    /// an absent key, `null`, a non-object, or either field empty all read
+    /// `None` rather than an empty struct of empty strings.
+    ///
+    /// Two things this field deliberately does NOT do, because they belong
+    /// to its consumer and not to a reader:
+    ///
+    /// - It applies **no quality judgment to `subject`**. Four lanes in this
+    ///   repo's own store record the literal subject `"AskUserQuestion"` — a
+    ///   tool name, useless to a human — and that string arrives here
+    ///   unchanged. A surface that would rather show its own derived
+    ///   sentence than a bare tool name decides that at render time; the
+    ///   reader's whole job is to carry what was recorded faithfully. The
+    ///   one transformation applied is the crate-wide absolute-path scrub
+    ///   every free-text field gets (see [`scrub_paths`]).
+    /// - It says **nothing about liveness**. `kind == "turn-end"` is carried
+    ///   here like any other, while `waiting_on_live` excludes it by name
+    ///   (board-visibility D4). So `waiting_on_live` implies
+    ///   `waiting_on.is_some()`, but never the reverse: a consumer that
+    ///   wants "is a human being waited on" must read the flag, and one that
+    ///   wants "what did this project record" reads this.
+    pub waiting_on: Option<BeeWaitingOn>,
+}
+
+/// `.bee/state.json`'s `waiting_on` object as recorded — the wait's `kind`
+/// (`gate`, `question`, `turn-end`, or any kind bee introduces later) and
+/// its `subject`, both already trimmed and known non-empty by construction:
+/// this struct only ever exists for a well-formed mark, so a caller never
+/// has to re-check for blanks. See [`BeeState::waiting_on`] for what the
+/// reader deliberately refuses to decide about either field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BeeWaitingOn {
+    pub kind: String,
+    pub subject: String,
 }
 
 /// `.bee/state.json`'s or a `.bee/lanes/<feature>.json`'s
@@ -1173,6 +1234,13 @@ pub struct BeeSnapshot {
     /// `.bee/deferred-queue.jsonl` debt (kanban-live-signals D3) — see
     /// [`read_deferred_queue`].
     pub deferred_queue: BeeDeferredQueue,
+    /// `.bee/human-mailbox/*.md` — every letter bee has filed for the human
+    /// in this project, sorted by file name (which is its id, and which
+    /// human-mailbox D11 makes chronological). Empty is the normal shape for
+    /// a checkout whose unattended loop has never run; an unreadable letter
+    /// is present as [`BeeMailboxEntry::Unreadable`], never dropped. See
+    /// [`mailbox`].
+    pub mailbox: Vec<BeeMailboxEntry>,
     /// Human-readable notes naming what could not be read. Every path
     /// mentioned here is relative to the project root.
     pub read_errors: Vec<String>,
@@ -1208,6 +1276,7 @@ impl BeeSnapshot {
             tier_mix: None,
             last_tool_call: None,
             deferred_queue: BeeDeferredQueue::default(),
+            mailbox: Vec::new(),
             read_errors: Vec::new(),
         }
     }
@@ -1380,6 +1449,11 @@ pub fn read_snapshot(root: &Path) -> BeeSnapshot {
     let last_tool_call = read_last_tool_call(&bee_dir);
     let deferred_queue = read_deferred_queue(&bee_dir, root, &mut read_errors);
 
+    // board-visibility: the letters bee filed for the human. Read-only, and
+    // never a `read_errors` entry — a letter that cannot be parsed carries its
+    // own reason to the board instead (see `mailbox`).
+    let mailbox = mailbox::read_mailbox(&bee_dir);
+
     let attention = compute_attention_items(
         &buckets.stuck,
         &read_errors,
@@ -1418,6 +1492,7 @@ pub fn read_snapshot(root: &Path) -> BeeSnapshot {
         tier_mix,
         last_tool_call,
         deferred_queue,
+        mailbox,
         read_errors,
     }
 }
@@ -1898,6 +1973,7 @@ fn read_state(bee_dir: &Path, root: &Path, read_errors: &mut Vec<String>) -> Opt
                 .map(String::from),
             run_state: v.get("run_state").and_then(Value::as_str).map(String::from),
             waiting_on_live: waiting_on_is_live(&v),
+            waiting_on: parse_waiting_on(&v, root),
         }),
         Err(e) => {
             read_errors.push(format!("{}: could not parse ({e})", rel_str(&path, root)));
@@ -1923,19 +1999,59 @@ fn parse_approved_gates(v: &Value) -> Option<BeeApprovedGates> {
         })
 }
 
+/// The well-formed core of `state.json`'s `waiting_on` — its trimmed,
+/// non-empty `kind` and `subject` — or `None` when the key is absent,
+/// `null`, not an object, or missing either string. Factored out (the same
+/// precedent [`parse_approved_gates`] and [`parse_route`] set for their own
+/// shared shapes) so the reduced flag [`waiting_on_is_live`] and the carried
+/// record [`parse_waiting_on`] can never drift apart on what counts as a
+/// mark at all. The one thing those two disagree on — `turn-end` — lives in
+/// `waiting_on_is_live` alone, where board-visibility D4 put it.
+fn waiting_on_fields(v: &Value) -> Option<(&str, &str)> {
+    let w = v.get("waiting_on").and_then(Value::as_object)?;
+    let non_empty = |key: &str| {
+        w.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    Some((non_empty("kind")?, non_empty("subject")?))
+}
+
+/// Carry `state.json`'s `waiting_on` into [`BeeState::waiting_on`] — the
+/// recorded `kind` and `subject`, with no judgment passed on either; see
+/// that field's doc comment for what this reader refuses to decide.
+fn parse_waiting_on(v: &Value, root: &Path) -> Option<BeeWaitingOn> {
+    waiting_on_fields(v).map(|(kind, subject)| BeeWaitingOn {
+        kind: kind.to_string(),
+        // Free text bound for a rendered surface, so it takes the same
+        // absolute-path scrub every other free-text field in this snapshot
+        // takes (`next_action`, `route.rationale`, cell titles). Scrubbing a
+        // path is not a quality judgment on the sentence: the words survive.
+        subject: scrub_paths(subject, root),
+    })
+}
+
 /// Reduce `state.json`'s `waiting_on` to the live/not-live flag stored on
 /// [`BeeState::waiting_on_live`] — see that field's doc comment for the
 /// exact predicate this mirrors from bee's own `waiting_on_is_live`.
 fn waiting_on_is_live(v: &Value) -> bool {
-    v.get("waiting_on")
-        .and_then(Value::as_object)
-        .map(|w| {
-            let non_empty = |key: &str| {
-                w.get(key)
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.trim().is_empty())
-            };
-            non_empty("kind") && non_empty("subject")
+    waiting_on_fields(v)
+        .map(|(kind, _subject)| {
+            // board-visibility D4: `turn-end` is the one kind that is not a
+            // demand. AGENTS.md defines it as the mark the Stop hook sets on
+            // every ordinary turn end — "control back with the human and
+            // nothing owed" — so it records that a session went idle, not
+            // that anyone is being waited on. Matched literally (trimmed,
+            // case-sensitive) against the string bee itself writes.
+            //
+            // Every other kind — including one bee introduces after this was
+            // written — stays live, and that default is deliberate: an
+            // unrecognised kind that really is a demand must show on the
+            // board and be argued with, never be silently swallowed by a
+            // reader that has not heard of it. This exclusion grows only on
+            // evidence, one named kind at a time.
+            kind != "turn-end"
         })
         .unwrap_or(false)
 }
@@ -2108,24 +2224,124 @@ fn herding_agent_argv_from_config(config: &Value) -> Option<Vec<String>> {
 /// it, which is worse than either answer alone.
 ///
 /// `None` covers every way a label yields no command: no `herding` block, no
-/// `agents` map, no entry under that label, an entry in a shape this reader
-/// does not understand (bee's own `{argv, workspace_trust}` object form), or
-/// an argv that is empty or holds a non-string token. The caller refuses —
-/// resolving a label to the label itself would run `claude-sonnet` as a
-/// command.
+/// `agents` map, no entry under that label, or an argv that is empty or holds
+/// a non-string token. The caller refuses — resolving a label to the label
+/// itself would run `claude-sonnet` as a command.
 pub fn herding_argv_for_label(root: &Path, label: &str) -> Option<Vec<String>> {
-    let raw = fs::read_to_string(root.join(".bee").join("config.json")).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    herding_argv_for_label_from_config(&value, label)
+    herding_entry_for_label(root, label).map(|e| e.argv)
 }
 
-/// [`herding_argv_for_label`]'s pure half, over an already-parsed
-/// `.bee/config.json`.
-fn herding_argv_for_label_from_config(config: &Value, label: &str) -> Option<Vec<String>> {
-    match config.get("herding")?.get("agents")?.get(label)? {
-        Value::Array(tokens) => argv_tokens(tokens),
+/// The whole entry a project's `herding.agent_command` names — the board's
+/// resolver, and the entry-shaped sibling of [`herding_agent_argv`]
+/// (board-entry-conditions D1).
+///
+/// An **array** `agent_command` is an inline command: it names no label, so it
+/// declares nothing around itself and yields an entry with no conditions (D2).
+/// A **string** resolves through [`herding_entry_for_label`] and keeps whatever
+/// that entry declares — an `env` map, a trust store, or neither.
+///
+/// This exists because the board and the dispatch path must honour the same
+/// declaration. Resolving only the argv here, as the board used to, meant one
+/// `herding.agents` entry behaved differently depending on which button
+/// started it: `env` unset and a trust prompt waiting, on a path where nobody
+/// asked for anything different.
+pub fn herding_default_entry(root: &Path) -> Option<BeeHerdingEntry> {
+    let raw = fs::read_to_string(root.join(".bee").join("config.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let herding = value.get("herding")?;
+    match herding.get("agent_command")? {
+        Value::Array(tokens) => Some(BeeHerdingEntry {
+            argv: argv_tokens(tokens)?,
+            env: Vec::new(),
+            workspace_trust: None,
+        }),
+        Value::String(label) => herding_entry_for_label_from_config(&value, label),
         _ => None,
     }
+}
+
+/// Everything a project declares about ONE agent kind: the command, and the
+/// conditions bee applies around it (herding-entry-conditions D1).
+///
+/// bee documents **two** entry shapes, not one — a bare argv array, and an
+/// object `{"argv": […], "env": {…}}` with an optional `workspace_trust`
+/// (`bee-herding/agent-resolution-and-spawn-commands.md`,
+/// `defaults-and-agent-env` D4). Reading only the array was the bug that made
+/// beehive's own `agy-flash` look unusable.
+///
+/// The conditions travel to the **spawn path only**. They are deliberately
+/// absent from [`BeeHerdingRegistry`], which keeps publishing labels and
+/// nothing else: an `env` map holds values a project chose not to put in its
+/// argv, and a trust path names a file outside the repo — neither belongs in
+/// an answer a caller reads (`ask-state-fleet-read` D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeeHerdingEntry {
+    /// The command to run. Never empty — an entry that cannot produce one
+    /// resolves to `None` instead.
+    pub argv: Vec<String>,
+    /// Exported into the pane before the agent starts, when declared.
+    pub env: Vec<(String, String)>,
+    /// The foreign tool's own trust store, when the entry gates on one.
+    pub workspace_trust: Option<BeeWorkspaceTrust>,
+}
+
+/// An entry's declaration that its tool keeps a per-workspace trust list:
+/// which file, and which key inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeeWorkspaceTrust {
+    pub file: String,
+    pub key: String,
+}
+
+/// Read one label's whole entry — argv plus conditions.
+pub fn herding_entry_for_label(root: &Path, label: &str) -> Option<BeeHerdingEntry> {
+    let raw = fs::read_to_string(root.join(".bee").join("config.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    herding_entry_for_label_from_config(&value, label)
+}
+
+/// [`herding_entry_for_label`]'s pure half, over an already-parsed
+/// `.bee/config.json`.
+fn herding_entry_for_label_from_config(config: &Value, label: &str) -> Option<BeeHerdingEntry> {
+    let entry = config.get("herding")?.get("agents")?.get(label)?;
+    match entry {
+        // The bare form: the entry IS the command, and declares no conditions.
+        Value::Array(tokens) => Some(BeeHerdingEntry {
+            argv: argv_tokens(tokens)?,
+            env: Vec::new(),
+            workspace_trust: None,
+        }),
+        Value::Object(_) => Some(BeeHerdingEntry {
+            // Still `None` when the object carries no usable command — an
+            // object is not a command just because it is well-formed.
+            argv: match entry.get("argv")? {
+                Value::Array(tokens) => argv_tokens(tokens)?,
+                _ => return None,
+            },
+            env: entry
+                .get("env")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            workspace_trust: entry.get("workspace_trust").and_then(|t| {
+                Some(BeeWorkspaceTrust {
+                    file: t.get("file")?.as_str()?.to_string(),
+                    key: t.get("key")?.as_str()?.to_string(),
+                })
+            }),
+        }),
+        _ => None,
+    }
+}
+
+/// [`herding_argv_for_label`]'s pure half — the predicate `resolvable` and the
+/// dispatch resolver share (D7), now covering both entry shapes.
+fn herding_argv_for_label_from_config(config: &Value, label: &str) -> Option<Vec<String>> {
+    herding_entry_for_label_from_config(config, label).map(|e| e.argv)
 }
 
 /// [`BeeHerdingRegistry`]'s pure reader, over an already-parsed
@@ -4502,6 +4718,153 @@ fn compute_tier_mix(all_cells: &[BeeCell]) -> Option<BeeTierMix> {
     })
 }
 
+/// The two `kind` values [`read_escalations`] answers for, and the whole set
+/// (observer-tick-trigger D4d, verbatim: "`kind` = `escalation` or
+/// `urgent`").
+///
+/// `intervention` — the third mailbox kind — is deliberately absent. It is an
+/// ordinary supervisor question subject to bee's own frequency cap; only the
+/// two kinds here mean "this needs attention now", and only they are a
+/// transition worth waking an observer for.
+const ESCALATION_KINDS: [&str; 2] = ["escalation", "urgent"];
+
+/// One `escalation`/`urgent` row from a project's own
+/// `.bee/supervisor/interventions.jsonl` mailbox — see [`read_escalations`].
+///
+/// The field set is locked against a real row generated by
+/// `bee supervisor record --kind escalation …` against a disposable scratch
+/// store (2026-08-31, bee schema_version 1.0), not against CLI help text:
+///
+/// ```text
+/// {"ts":"2026-08-31T10:17:47.459Z","event":"record","id":"8b84e1f4",
+///  "kind":"escalation","signal":"none","point_key":"ott4-scratch-point",
+///  "question":"Is the row shape stable?","target_session":"ott4-scratch-session",
+///  "tick":null,"queued":false}
+/// ```
+///
+/// Two things that sample settled, both of which a help-text reading would
+/// have missed. First, the file is a mailbox EVENT log, not a row log: a
+/// `bee supervisor mark-delivered` stamp appends
+/// `{"ts":…,"event":"delivered","id":"8b84e1f4","delivered_at":…}` to the same
+/// file, and it carries no `kind` at all — so `event == "record"` is the
+/// filter that finds rows, and every other event shape is a normal, expected
+/// line rather than a malformed one. Second, `tick` is nullable and `signal`
+/// defaults to the literal string `"none"`, so neither can be typed as a
+/// required `String`.
+///
+/// Only the fields a caller can act on are kept. `signal`, `tick` and
+/// `queued` are read past deliberately: the trigger that consumes this
+/// judges nothing about a row's content (observer-tick-trigger D5), it only
+/// needs to know one appeared and to point at it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeeEscalation {
+    /// The row's own stable id, as `bee supervisor pending` prints it.
+    pub id: String,
+    /// `escalation` or `urgent` — never anything else (see
+    /// [`ESCALATION_KINDS`]).
+    pub kind: String,
+    /// RFC3339, as written.
+    pub ts: String,
+    /// The slug the supervisor filed this row under. Empty when the row
+    /// carried none.
+    pub point_key: String,
+    /// The session the row is addressed to. Empty when the row carried none.
+    pub target_session: String,
+}
+
+/// Read the `escalation`/`urgent` rows out of `<root>/.bee/supervisor/interventions.jsonl`,
+/// oldest first (observer-tick-trigger D4d).
+///
+/// **Read-only, and the only read this repo ever makes against a project's
+/// `.bee/supervisor/` store** (observer-tick-trigger D5). It opens one file
+/// for reading and writes nothing anywhere — not the store, not a cache, not
+/// a copy of any row.
+///
+/// Fail-soft in the same shape every other reader in this module uses: a
+/// missing `.bee/`, a missing store and an unreadable file all read as an
+/// empty list, never an error — a project that has never run a supervisor
+/// tick simply has nothing to say.
+///
+/// One deliberate departure from this module's precedent: **a malformed line
+/// is warned about, by its 1-indexed line number, before it is skipped.**
+/// Every other reader here degrades silently or into
+/// [`BeeSnapshot::read_errors`], which is right for a passive UI read — a
+/// dropped row costs a rendered cell. This read feeds an autonomous dispatch
+/// decision instead, where a silently dropped row is a transition nobody is
+/// ever told about, so it takes bee's own `unreadable_lines` posture
+/// (`bee supervisor pending`: "one unparseable line warns and is skipped with
+/// its line number") rather than this module's. There is no `read_errors`
+/// channel to carry it into here, so the warning is the channel.
+///
+/// A malformed line never aborts the file: each line is parsed on its own and
+/// the rows around a bad one still surface.
+pub fn read_escalations(root: &Path) -> Vec<BeeEscalation> {
+    let path = root
+        .join(".bee")
+        .join("supervisor")
+        .join("interventions.jsonl");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    line = i + 1,
+                    "{}: skipping an unreadable interventions.jsonl line ({e})",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        // Not a record event (a `delivered` stamp, a release, anything bee
+        // adds later): a normal line of this append-only log, carrying no
+        // row of its own. Skipped silently — it is not malformed.
+        if v.get("event").and_then(Value::as_str) != Some("record") {
+            continue;
+        }
+        let Some(kind) = v.get("kind").and_then(Value::as_str) else {
+            continue;
+        };
+        if !ESCALATION_KINDS.contains(&kind) {
+            continue;
+        }
+        let Some(id) = v.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        out.push(BeeEscalation {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            ts: v
+                .get("ts")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            point_key: v
+                .get("point_key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            target_session: v
+                .get("target_session")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5483,7 +5846,11 @@ mod tests {
             "source": "startup",
             "work": work,
         });
-        write(root, &format!(".bee/sessions/{id}.json"), &record.to_string());
+        write(
+            root,
+            &format!(".bee/sessions/{id}.json"),
+            &record.to_string(),
+        );
     }
 
     fn only_session(root: &std::path::Path) -> BeeSession {
@@ -5513,7 +5880,10 @@ mod tests {
         assert_eq!(work.title, "make the board name the work");
         assert_eq!(work.status, "active");
         assert_eq!(work.turns, 2);
-        assert_eq!(work.acceptance.as_deref(), Some("Every live session names its ask"));
+        assert_eq!(
+            work.acceptance.as_deref(),
+            Some("Every live session names its ask")
+        );
         assert_eq!(work.updated_at.as_deref(), Some("2026-08-25T08:30:00.000Z"));
 
         std::fs::remove_dir_all(&root).ok();
@@ -5525,14 +5895,20 @@ mod tests {
         // parses, so one bad record must not be able to hide behind a good one.
         for (name, work) in [
             ("not-an-object", serde_json::json!("just a string")),
-            ("no-title", serde_json::json!({ "status": "open", "turns": 1 })),
+            (
+                "no-title",
+                serde_json::json!({ "status": "open", "turns": 1 }),
+            ),
             ("title-not-a-string", serde_json::json!({ "title": 42 })),
             ("null", Value::Null),
         ] {
             let root = fresh_root(&format!("work-bad-{name}"));
             write_session_with_work(&root, "w1", work);
             let session = only_session(&root);
-            assert!(session.work.is_none(), "{name}: a bad work block reads as None");
+            assert!(
+                session.work.is_none(),
+                "{name}: a bad work block reads as None"
+            );
             assert_eq!(session.id, "w1", "{name}: the session itself still parses");
             std::fs::remove_dir_all(&root).ok();
         }
@@ -5571,7 +5947,11 @@ mod tests {
             !rendered.contains("SENTINEL"),
             "W2: the record's text must not survive into the snapshot: {rendered}"
         );
-        assert_eq!(session.work.unwrap().turns, 7, "the turn count still comes through");
+        assert_eq!(
+            session.work.unwrap().turns,
+            7,
+            "the turn count still comes through"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -5601,7 +5981,11 @@ mod tests {
     #[test]
     fn an_absolute_path_in_the_title_or_the_acceptance_is_scrubbed() {
         let root = fresh_root("work-scrub");
-        let inside = root.join("crates").join("bee.rs").to_string_lossy().into_owned();
+        let inside = root
+            .join("crates")
+            .join("bee.rs")
+            .to_string_lossy()
+            .into_owned();
         write_session_with_work(
             &root,
             "w1",
@@ -5616,7 +6000,11 @@ mod tests {
         let work = only_session(&root).work.unwrap();
         let root_str = root.to_string_lossy().into_owned();
         assert!(!work.title.contains(&root_str), "W4: {}", work.title);
-        assert!(work.title.contains("bee.rs"), "the file is still named: {}", work.title);
+        assert!(
+            work.title.contains("bee.rs"),
+            "the file is still named: {}",
+            work.title
+        );
         let acceptance = work.acceptance.unwrap();
         assert!(!acceptance.contains(&root_str), "W4: {acceptance}");
 
@@ -8225,10 +8613,15 @@ mod tests {
     /// ask-state-fleet-read D2: the registry names every label a caller may
     /// ask for, marks the ones that actually resolve, and carries no argv
     /// anywhere. beehive's own store is the shape under test — three array
-    /// entries beside `agy-flash`, which bee writes as an OBJECT this reader
-    /// does not understand. That label must still be listed (it exists, and
-    /// a consumer that cannot see it cannot ask why it fails) while staying
-    /// out of `resolvable` (it does not work today).
+    /// entries beside `agy-flash`, which bee writes as an OBJECT.
+    ///
+    /// *Updated by herding-entry-conditions D1:* that object form is a
+    /// documented bee shape, not a malformed entry, so `agy-flash` now
+    /// resolves and appears in `resolvable`. The earlier version of this test
+    /// asserted the opposite and said "it does not work today" — the reader
+    /// was incomplete, and today has arrived. What has NOT changed is the rule
+    /// underneath: `resolvable` means "this label can start", whatever the
+    /// shape it was declared in.
     #[test]
     fn the_herding_registry_lists_every_label_and_marks_only_the_resolvable_ones() {
         let root = fresh_root("herding-registry-labels");
@@ -8263,8 +8656,8 @@ mod tests {
         );
         assert_eq!(
             registry.resolvable,
-            vec!["claude-sonnet", "pi-agy-flash-3.7"],
-            "bee's object form does not resolve today and must not claim to"
+            vec!["claude-sonnet", "pi-agy-flash-3.7", "agy-flash"],
+            "the object form is a bee shape, so a label declared in it resolves"
         );
 
         // D2 is a property of the type, so prove it the way a consumer would
@@ -8348,13 +8741,15 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// dispatch-project-presets D2/D6: the by-label resolver is the one
-    /// answer to "can this label start?". It resolves an array entry, and
-    /// refuses every other shape — including bee's own object form, which is
-    /// the case that matters, because a label that EXISTS but cannot start is
-    /// the one a caller would otherwise be told is a typo.
+    /// dispatch-project-presets D2/D6, as amended by herding-entry-conditions
+    /// D1: the by-label resolver is the one answer to "can this label start?",
+    /// and it now understands both shapes bee declares — a bare argv array and
+    /// an object carrying `argv`. What still resolves to nothing is an entry
+    /// that yields no usable command, in either shape: an empty argv, an argv
+    /// with a hole in it, an object with no `argv` at all, or a label nobody
+    /// declared.
     #[test]
-    fn a_label_resolves_only_when_its_entry_is_an_argv_this_reader_understands() {
+    fn a_label_resolves_when_either_declared_shape_yields_a_command() {
         let root = fresh_root("herding-by-label");
         write(
             &root,
@@ -8366,8 +8761,9 @@ mod tests {
                         "claude-sonnet": ["claude", "--model", "sonnet"],
                         "agy-flash": {
                             "argv": ["agy", "--dangerously-skip-permissions"],
-                            "workspace_trust": {"file": "~/.gemini/settings.json"}
+                            "workspace_trust": {"file": "~/.gemini/settings.json", "key": "trustedWorkspaces"}
                         },
+                        "no-argv": {"env": {"K": "v"}},
                         "empty": [],
                         "holed": ["claude", 7]
                     }
@@ -8383,8 +8779,16 @@ mod tests {
                 "sonnet".to_string()
             ])
         );
+        assert_eq!(
+            herding_argv_for_label(&root, "agy-flash"),
+            Some(vec![
+                "agy".to_string(),
+                "--dangerously-skip-permissions".to_string()
+            ]),
+            "the object form is a bee shape and must resolve to its argv"
+        );
         for (case, label) in [
-            ("bee's object form", "agy-flash"),
+            ("an object with no argv", "no-argv"),
             ("an empty argv", "empty"),
             ("an argv with a non-string token", "holed"),
             ("a label absent from the map", "no-such-agent"),
@@ -8403,7 +8807,7 @@ mod tests {
             .config
             .and_then(|c| c.herding)
             .expect("a herding block yields a registry");
-        assert_eq!(registry.resolvable, vec!["claude-sonnet"]);
+        assert_eq!(registry.resolvable, vec!["claude-sonnet", "agy-flash"]);
         for label in &registry.agents {
             assert_eq!(
                 herding_argv_for_label(&root, label).is_some(),
@@ -8430,6 +8834,184 @@ mod tests {
         ] {
             write(&root, ".bee/config.json", body);
             assert_eq!(herding_argv_for_label(&root, "claude-sonnet"), None);
+        }
+
+        std::fs::remove_dir_all(&bare).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// herding-entry-conditions D1: an entry carries its CONDITIONS as well as
+    /// its command, in the shape bee declares them — and the object form of
+    /// `agy-flash` is exactly how beehive writes it.
+    #[test]
+    fn an_object_entry_carries_its_env_and_trust_store_alongside_its_argv() {
+        let root = fresh_root("herding-entry-conditions");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agents": {
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "env": {"AGY_MODE": "flash"},
+                            "workspace_trust": {
+                                "file": "~/.gemini/antigravity-cli/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        },
+                        "plain": ["claude", "--model", "sonnet"]
+                    }
+                }
+            }"#,
+        );
+
+        let entry = herding_entry_for_label(&root, "agy-flash").expect("a declared entry");
+        assert_eq!(entry.argv, vec!["agy", "--dangerously-skip-permissions"]);
+        assert_eq!(
+            entry.env,
+            vec![("AGY_MODE".to_string(), "flash".to_string())]
+        );
+        let trust = entry
+            .workspace_trust
+            .expect("the entry gates on a trust store");
+        assert_eq!(trust.file, "~/.gemini/antigravity-cli/settings.json");
+        assert_eq!(trust.key, "trustedWorkspaces");
+
+        // The bare form is the same entry with no conditions — not a second
+        // code path, and not a reason for a caller to branch on shape.
+        let plain = herding_entry_for_label(&root, "plain").expect("a declared entry");
+        assert_eq!(plain.argv, vec!["claude", "--model", "sonnet"]);
+        assert!(plain.env.is_empty());
+        assert!(plain.workspace_trust.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The conditions reach the spawn path and stop there. `env` values are
+    /// what a project chose to keep OUT of its argv, and a trust path names a
+    /// file outside the repo — neither may travel in an answer a caller reads
+    /// (ask-state-fleet-read D2, still binding).
+    #[test]
+    fn the_published_registry_still_carries_labels_and_nothing_else() {
+        let root = fresh_root("herding-entry-conditions-noleak");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agents": {
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "env": {"AGY_SECRET_MODE": "please-do-not-publish"},
+                            "workspace_trust": {
+                                "file": "~/.gemini/antigravity-cli/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let registry = read_snapshot(&root)
+            .config
+            .and_then(|c| c.herding)
+            .expect("a herding block yields a registry");
+        assert_eq!(registry.agents, vec!["agy-flash"]);
+        assert_eq!(registry.resolvable, vec!["agy-flash"]);
+
+        let published = serde_json::to_string(&registry).expect("registry serializes");
+        for leaked in [
+            "AGY_SECRET_MODE",
+            "please-do-not-publish",
+            "--dangerously-skip-permissions",
+            "trustedWorkspaces",
+            ".gemini",
+        ] {
+            assert!(
+                !published.contains(leaked),
+                "{leaked:?} is a condition, not a label, and must not be published: {published}"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// board-entry-conditions D1: the board's own resolver reads the whole
+    /// declaration, so an `agent_command` naming a conditioned label carries
+    /// those conditions to the spawn. Before this, one entry behaved
+    /// differently depending on which button started it — `env` unset and a
+    /// trust prompt waiting, on a path where nobody asked for anything else.
+    #[test]
+    fn the_default_entry_keeps_the_conditions_of_the_label_it_names() {
+        let root = fresh_root("board-default-entry");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{
+                "herding": {
+                    "agent_command": "agy-flash",
+                    "agents": {
+                        "agy-flash": {
+                            "argv": ["agy", "--dangerously-skip-permissions"],
+                            "env": {"AGY_MODE": "flash"},
+                            "workspace_trust": {
+                                "file": "~/.gemini/antigravity-cli/settings.json",
+                                "key": "trustedWorkspaces"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let entry = herding_default_entry(&root).expect("a named label resolves");
+        assert_eq!(entry.argv, vec!["agy", "--dangerously-skip-permissions"]);
+        assert_eq!(
+            entry.env,
+            vec![("AGY_MODE".to_string(), "flash".to_string())]
+        );
+        assert!(entry.workspace_trust.is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D2: an inline command names no label, so it declares nothing around
+    /// itself — and that path must stay exactly as cheap as it was.
+    #[test]
+    fn an_inline_default_command_carries_no_conditions() {
+        let root = fresh_root("board-default-inline");
+        write(
+            &root,
+            ".bee/config.json",
+            r#"{"herding": {"agent_command": ["codex", "--full-auto"]}}"#,
+        );
+
+        let entry = herding_default_entry(&root).expect("an inline command resolves");
+        assert_eq!(entry.argv, vec!["codex", "--full-auto"]);
+        assert!(entry.env.is_empty());
+        assert!(entry.workspace_trust.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every way a project declares no default answers the same `None`, so the
+    /// board keeps its one named refusal instead of guessing at a command.
+    #[test]
+    fn a_project_with_no_declared_default_yields_no_entry() {
+        let bare = fresh_root("board-default-none");
+        assert!(herding_default_entry(&bare).is_none(), "no config.json");
+
+        let root = fresh_root("board-default-empty");
+        for body in [
+            r#"{"gate_bypass": false}"#,
+            r#"{"herding": {"agents": {"a": ["x"]}}}"#,
+            r#"{"herding": {"agent_command": "missing", "agents": {"a": ["x"]}}}"#,
+            r#"{"herding": {"agent_command": []}}"#,
+        ] {
+            write(&root, ".bee/config.json", body);
+            assert!(herding_default_entry(&root).is_none(), "{body}");
         }
 
         std::fs::remove_dir_all(&bare).ok();
@@ -10838,6 +11420,241 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // board-visibility D4: a finished turn is not a wait on the human.
+
+    /// The `turn-end` mark AGENTS.md gives the Stop hook means "control back
+    /// with the human and nothing owed" — the store's own live lanes carry
+    /// subjects like "Không còn gì chờ bạn" ("nothing is waiting on you")
+    /// under it — so it must never light a needs-you surface, however
+    /// well-formed its `subject` is.
+    #[test]
+    fn state_json_waiting_on_turn_end_reads_not_live() {
+        for subject in ["Không còn gì chờ bạn", "board is green"] {
+            let root = fresh_root("state-waiting-on-turn-end");
+            write(
+                &root,
+                ".bee/state.json",
+                &format!(
+                    r#"{{"phase":"swarming","waiting_on":{{"kind":"turn-end","subject":"{subject}"}}}}"#
+                ),
+            );
+            let snap = read_snapshot(&root);
+            assert!(
+                !snap.state.as_ref().unwrap().waiting_on_live,
+                "a turn-end mark is the idle mark, never a wait on the human \
+                 (subject {subject:?})"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // Only the exact string bee writes is excluded — a kind that merely
+        // contains or resembles it is still a demand.
+        let root = fresh_root("state-waiting-on-turn-end-lookalike");
+        write(
+            &root,
+            ".bee/state.json",
+            r#"{"phase":"swarming","waiting_on":{"kind":"turn-ended","subject":"still owed"}}"#,
+        );
+        let snap = read_snapshot(&root);
+        assert!(
+            snap.state.as_ref().unwrap().waiting_on_live,
+            "only the literal kind \"turn-end\" is excluded"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The two kinds an agent may set itself stay live, and so does a kind
+    /// this reader has never heard of: the exclusion is one named kind, not
+    /// a whitelist, so a future demand surfaces rather than disappearing.
+    #[test]
+    fn state_json_waiting_on_gate_question_and_unknown_kinds_read_live() {
+        for kind in ["gate", "question", "some-kind-bee-adds-later"] {
+            let root = fresh_root("state-waiting-on-live-kinds");
+            write(
+                &root,
+                ".bee/state.json",
+                &format!(
+                    r#"{{"phase":"swarming","waiting_on":{{"kind":"{kind}","subject":"shape gate"}}}}"#
+                ),
+            );
+            let snap = read_snapshot(&root);
+            assert!(
+                snap.state.as_ref().unwrap().waiting_on_live,
+                "kind {kind:?} must read as a live wait on the human"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// The kind field carries the same emptiness rule the subject already
+    /// had: a blank kind is not a demand either, and never was.
+    #[test]
+    fn state_json_waiting_on_blank_kind_reads_not_live() {
+        let root = fresh_root("state-waiting-on-blank-kind");
+        write(
+            &root,
+            ".bee/state.json",
+            r#"{"phase":"swarming","waiting_on":{"kind":"   ","subject":"shape gate"}}"#,
+        );
+        let snap = read_snapshot(&root);
+        assert!(
+            !snap.state.as_ref().unwrap().waiting_on_live,
+            "a whitespace-only kind must never read as live"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // board-visibility bv-2: the wait's kind and subject carried whole,
+    // beside the reduced flag rather than instead of it.
+
+    #[test]
+    fn state_json_waiting_on_carries_kind_and_subject_beside_the_flag() {
+        let root = fresh_root("state-waiting-on-carried");
+        write(
+            &root,
+            ".bee/state.json",
+            r#"{"phase":"swarming","waiting_on":{"kind":"gate","subject":"Agent logo marks — shape + execution approval","session":"s1"}}"#,
+        );
+
+        let snap = read_snapshot(&root);
+        let state = snap.state.as_ref().expect("state.json must parse");
+        let waiting = state
+            .waiting_on
+            .as_ref()
+            .expect("a well-formed waiting_on must be carried");
+        assert_eq!(waiting.kind, "gate");
+        assert_eq!(
+            waiting.subject,
+            "Agent logo marks — shape + execution approval"
+        );
+        assert!(
+            state.waiting_on_live,
+            "the flag beside the record must be untouched by carrying it"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Four lanes in this repo's own store record the literal subject
+    /// `"AskUserQuestion"` — a tool name, useless to a human. The reader
+    /// carries it anyway: judging a subject good enough to show is the
+    /// rendering surface's call, never the reader's.
+    #[test]
+    fn state_json_waiting_on_carries_an_unusable_subject_unjudged() {
+        let root = fresh_root("state-waiting-on-unusable-subject");
+        write(
+            &root,
+            ".bee/state.json",
+            r#"{"phase":"swarming","waiting_on":{"kind":"question","subject":"AskUserQuestion"}}"#,
+        );
+
+        let snap = read_snapshot(&root);
+        let waiting = snap
+            .state
+            .as_ref()
+            .unwrap()
+            .waiting_on
+            .as_ref()
+            .expect("an unusable subject is still a recorded subject");
+        assert_eq!(waiting.subject, "AskUserQuestion");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `turn-end` is not live (D4) but it *is* recorded, so the record keeps
+    /// it: `waiting_on_live` implies `waiting_on.is_some()`, never the
+    /// reverse. A consumer asking "is a human waited on" reads the flag.
+    #[test]
+    fn state_json_waiting_on_turn_end_is_carried_though_it_is_not_live() {
+        let root = fresh_root("state-waiting-on-turn-end-carried");
+        write(
+            &root,
+            ".bee/state.json",
+            r#"{"phase":"swarming","waiting_on":{"kind":"turn-end","subject":"Không còn gì chờ bạn"}}"#,
+        );
+
+        let snap = read_snapshot(&root);
+        let state = snap.state.as_ref().unwrap();
+        let waiting = state
+            .waiting_on
+            .as_ref()
+            .expect("a turn-end mark is still a recorded mark");
+        assert_eq!(waiting.kind, "turn-end");
+        assert_eq!(waiting.subject, "Không còn gì chờ bạn");
+        assert!(
+            !state.waiting_on_live,
+            "carrying the record must not resurrect the D4 exclusion"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn state_json_without_a_usable_waiting_on_carries_no_record_at_all() {
+        for (label, json) in [
+            ("absent", r#"{"phase":"swarming"}"#),
+            ("null", r#"{"phase":"swarming","waiting_on":null}"#),
+            ("non-object", r#"{"phase":"swarming","waiting_on":"gate"}"#),
+            (
+                "blank subject",
+                r#"{"phase":"swarming","waiting_on":{"kind":"gate","subject":"  "}}"#,
+            ),
+            (
+                "blank kind",
+                r#"{"phase":"swarming","waiting_on":{"kind":"","subject":"shape gate"}}"#,
+            ),
+        ] {
+            let root = fresh_root("state-waiting-on-absent-record");
+            write(&root, ".bee/state.json", json);
+
+            let snap = read_snapshot(&root);
+            assert!(
+                snap.state.as_ref().unwrap().waiting_on.is_none(),
+                "a {label} waiting_on must read None, never an empty struct"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A subject is free text bound for a rendered page, so it takes the
+    /// same absolute-path scrub `next_action` and `route.rationale` take —
+    /// the words survive, the machine's home directory does not.
+    #[test]
+    fn state_json_waiting_on_subject_is_scrubbed_of_absolute_paths() {
+        let root = fresh_root("state-waiting-on-scrub");
+        let file = root.join("docs").join("plan.md");
+        let file = file.to_string_lossy().into_owned();
+        write(
+            &root,
+            ".bee/state.json",
+            &format!(
+                r#"{{"phase":"swarming","waiting_on":{{"kind":"gate","subject":"Approve {file} before merge"}}}}"#
+            ),
+        );
+
+        let snap = read_snapshot(&root);
+        let subject = snap
+            .state
+            .as_ref()
+            .unwrap()
+            .waiting_on
+            .as_ref()
+            .expect("a well-formed waiting_on must be carried")
+            .subject
+            .clone();
+        assert!(
+            !subject.contains(&file),
+            "an absolute path survived into the subject: {subject}"
+        );
+        assert!(
+            subject.starts_with("Approve ") && subject.ends_with(" before merge"),
+            "scrubbing a path must leave the sentence intact: {subject}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     // kanban-live-signals D1: the tools.jsonl bounded-tail reader.
 
     #[test]
@@ -11006,6 +11823,101 @@ mod tests {
             snap.read_errors.is_empty(),
             "an absent deferred-queue.jsonl must never be a read error: {:?}",
             snap.read_errors
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- observer-tick-trigger D4d: the interventions mailbox reader ---
+
+    /// The four real lines below are verbatim bytes from a scratch
+    /// `.bee/supervisor/interventions.jsonl`, produced by running
+    /// `bee supervisor record` (escalation, urgent, intervention) and
+    /// `bee supervisor mark-delivered` against a disposable store on
+    /// 2026-08-31. They are the shape [`BeeEscalation`] is locked against —
+    /// re-generate them, never hand-edit them, if bee's writer changes.
+    const REAL_MAILBOX: &str = concat!(
+        r#"{"ts":"2026-08-31T10:17:47.459Z","event":"record","id":"8b84e1f4","kind":"escalation","signal":"none","point_key":"ott4-scratch-point","question":"Is the row shape stable?","target_session":"ott4-scratch-session","tick":null,"queued":false}"#,
+        "\n",
+        r#"{"ts":"2026-08-31T10:18:02.897Z","event":"record","id":"d8f70921","kind":"urgent","signal":"none","point_key":"p-three","question":"Urgent one?","target_session":"s3","tick":null,"queued":false}"#,
+        "\n",
+        r#"{"ts":"2026-08-31T10:18:05.986Z","event":"record","id":"747d30a3","kind":"intervention","signal":"none","point_key":"p-two","question":"Plain intervention?","target_session":"s2","tick":null,"queued":false}"#,
+        "\n",
+        r#"{"ts":"2026-08-31T10:18:08.924Z","event":"delivered","id":"8b84e1f4","delivered_at":"2026-08-31T10:18:08.924Z"}"#,
+        "\n",
+    );
+
+    #[test]
+    fn real_mailbox_rows_read_back_as_escalations_and_urgents_only() {
+        let root = fresh_root("escalations-real");
+        write(&root, ".bee/supervisor/interventions.jsonl", REAL_MAILBOX);
+
+        let rows = read_escalations(&root);
+
+        // The intervention row and the `delivered` event are both dropped:
+        // one is the wrong kind, the other is not a row at all.
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["8b84e1f4", "d8f70921"],
+            "only escalation/urgent record events are rows, oldest first"
+        );
+        assert_eq!(rows[0].kind, "escalation");
+        assert_eq!(rows[0].ts, "2026-08-31T10:17:47.459Z");
+        assert_eq!(rows[0].point_key, "ott4-scratch-point");
+        assert_eq!(rows[0].target_session, "ott4-scratch-session");
+        assert_eq!(rows[1].kind, "urgent");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_missing_supervisor_store_reads_as_empty_not_an_error() {
+        let root = fresh_root("escalations-missing");
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+
+        assert!(read_escalations(&root).is_empty());
+        // And a root with no `.bee/` at all is the same answer.
+        let bare = fresh_root("escalations-bare");
+        assert!(read_escalations(&bare).is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn a_malformed_line_is_skipped_and_the_rows_around_it_still_read() {
+        let root = fresh_root("escalations-malformed");
+        let body = format!(
+            "{}\n{}\n{}\n",
+            r#"{"ts":"2026-08-31T10:00:00.000Z","event":"record","id":"first","kind":"escalation","point_key":"a","target_session":"s1"}"#,
+            "{not json at all",
+            r#"{"ts":"2026-08-31T10:02:00.000Z","event":"record","id":"third","kind":"urgent","point_key":"c","target_session":"s3"}"#,
+        );
+        write(&root, ".bee/supervisor/interventions.jsonl", &body);
+
+        let rows = read_escalations(&root);
+
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["first", "third"],
+            "line 2 is unreadable; it must not abort the rows around it"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reading_the_mailbox_writes_nothing_anywhere() {
+        let root = fresh_root("escalations-readonly");
+        write(&root, ".bee/supervisor/interventions.jsonl", REAL_MAILBOX);
+        let before = snapshot_tree(&root);
+
+        let _ = read_escalations(&root);
+
+        assert_eq!(
+            before,
+            snapshot_tree(&root),
+            "observer-tick-trigger D5: this read never writes to a project's supervisor store"
         );
 
         std::fs::remove_dir_all(&root).ok();
