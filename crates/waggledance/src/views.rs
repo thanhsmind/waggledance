@@ -15220,6 +15220,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn app_js_reconcile_drops_its_unkeyed_leftovers() {
+        let script = include_str!("../assets/app.js");
+        let start = script
+            .find("function hubReconcileCards(")
+            .expect("app.js must still define hubReconcileCards");
+        let end = script[start..]
+            .find("function hubPatchGroup(")
+            .expect("hubPatchGroup must still follow hubReconcileCards")
+            + start;
+        let reconcile = &script[start..end];
+        assert!(
+            reconcile.contains(r#"if (leftover.nodeType !== 1 || !leftover.getAttribute("data-hub-key")) {"#)
+                && reconcile.contains("container.removeChild(leftover);"),
+            "hubReconcileCards must remove every unkeyed leftover trailing the placed prefix, or the action pair piles up one copy per patch: {reconcile}"
+        );
+        assert!(
+            reconcile.contains("if (key) {\n          freshEl.classList.add(\"bee-hub__enter\");"),
+            "only a keyed fresh insert may take the enter fade (board-live-morph D2): {reconcile}"
+        );
+    }
+
     /// D2/D4, amended by trc-2: `assets/app.js` wires the Approve button the
     /// same way it wires Stage — posting through the existing
     /// `postJson`/`inputUrl` helpers, never a new fetch — so the project
