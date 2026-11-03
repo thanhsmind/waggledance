@@ -237,7 +237,9 @@ the task to the project's leader, and the leader answers with `waggledance mail 
 The daemon keeps those answers in an inbox and wakes wd's main session once per message.
 It also nudges a silent leader, sends wd a board of open tasks, and relays each
 permission request for wd to allow or deny. `waggledance setup openclaw` installs wd's
-side, and `waggledance_ask_state` lists each project's `leaders`. The inbox, the wake,
+side, and also installs the bee skill set from the bee-onboarded repo it runs in into
+OpenClaw's global skills dir (`~/.openclaw/skills`), so every OpenClaw agent can run the
+bee workflow; `waggledance_ask_state` lists each project's `leaders`. The inbox, the wake,
 the follow-up commands and the known gaps are in
 [wd hands a task straight to a project's leader](docs/knowledge/patterns/wd-direct-leader.md).
 
