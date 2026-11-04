@@ -1,13 +1,13 @@
 ---
 type: bee.area
 title: homepage-tabs — the Usage tab
-description: "The home page's third tab: token spend per project, per model (main vs subagents), per agent run and per closed feature over a 1, 7, 14 or 30-day window, read from the Claude Code, pi and Codex session logs joined with Paseo agent records; .bee/usage files feed only the finished-features list."
-timestamp: 2026-10-23
+description: "The home page's third tab: token spend per project, per model (main vs subagents), per agent run and per closed feature over a 1, 7, 14 or 30-day window, read from the Claude Code, pi and Codex session logs and the opencode store joined with Paseo agent records; .bee/usage files feed only the finished-features list. The same events feed the /api/usage/rows feed agent-works reads."
+timestamp: 2026-11-04
 bee:
   id: homepage-tabs-usage-tab
   lifecycle: active
   areas: [bee-cockpit, web-interface]
-  sources: [docs/history/usage-dashboard/CONTEXT.md, docs/history/usage-dashboard/plan.md]
+  sources: [docs/history/usage-dashboard/CONTEXT.md, docs/history/usage-dashboard/plan.md, docs/history/usage-rows/CONTEXT.md]
 ---
 
 # homepage-tabs — the Usage tab
@@ -47,7 +47,21 @@ them or to a project.
 | Claude Code | `~/.claude/projects/<dir>/<session>.jsonl`, plus native subagent transcripts at `<dir>/<session>/subagents/agent-*.jsonl` with their `agent-*.meta.json` | `input_tokens` + `output_tokens` + `cache_creation_input_tokens` | `cache_read_input_tokens` |
 | pi | `~/.pi/agent/sessions/<dir>/*.jsonl` | `input` + `output` + `cacheWrite` | `cacheRead` |
 | Codex | `~/.codex/sessions/**/*.jsonl`, minus sessions imported from another agent | `last_token_usage`: `input_tokens` − `cached_input_tokens` + `output_tokens` + `cache_write_input_tokens` | `last_token_usage.cached_input_tokens` |
+| opencode | `$XDG_DATA_HOME/opencode/opencode.db` (default `~/.local/share`), opened read-only: `session`, `message.data`, `part.data` | `tokens.input` + `tokens.output` + `tokens.reasoning` + `tokens.cache.write` | `tokens.cache.read` |
 | Paseo | `$PASEO_HOME/agents/<dir>/*.json` (default `~/.paseo`) | names runs only, no tokens | — |
+
+Each event keeps the four token kinds apart — `input`, `output`,
+`cache_read`, `cache_write` — and the tab's **new** and **cache-read** are
+derived from them (`new = input + output + cache_write`). An event also
+carries its model's provider (`anthropic` for Claude Code, `openai` for
+Codex, the transcript's own for pi and opencode), the cost the transcript
+recorded (pi: `usage.cost` split by kind plus `total`; opencode: one `cost`
+total with no split; Claude Code and Codex: none), its tool calls (Claude
+`tool_use` items, pi `toolCall` items, Codex `function_call` /
+`custom_tool_call` / `local_shell_call` lines hung on the next turn,
+opencode `tool` parts) and whether it ended in an error (Claude
+`isApiErrorMessage`, pi `stopReason: "error"`, a Codex `error` event,
+opencode `error`). An event is kept when it has tokens or is an error.
 
 - **Claude Code** repeats one message across several log lines; the parser
   keeps the last line per message id and request id. A subagent's events
@@ -151,25 +165,77 @@ by task (decision 4ddb1112):
   session start to close. The row carries the feature's whole spend,
   including sessions that ended before the window opened.
 
+## The rows feed — `/api/usage/rows` (usage-rows D1-D10)
+
+agent-works reads waggledance spend from `GET /api/usage/rows?from=YYYY-MM-DD&to=YYYY-MM-DD`
+to split it per project on its two-team Usage page. Its field names are a
+contract agent-works builds against; change none without telling it.
+
+- **Window.** Days are Asia/Saigon calendar days (fixed UTC+7), `from` and
+  `to` inclusive. Neither given is the 30 days ending today; only `from`
+  runs through today; only `to` is the 30 days ending `to`. A malformed
+  date, `from` after `to`, or a span over 366 days answers
+  `400 {"error": "<why>"}`.
+- **Response.** `{from, to, generatedAt, projects: [{id, name}], rows}`.
+  `projects` is every registered project plus `{id: "other", name: "Other"}`
+  — all registered projects, not only the Paseo-managed ones the tab shows.
+- **One row** per (day, project, agent, provider, model, session), numbers
+  summed: `day, team ("waggledance"), project, agent, provider, model,
+  session, preset, runTitle, parent, subagent, input, output, cacheRead,
+  cacheWrite, tokens, cost, costInput, costOutput, costCacheRead,
+  costCacheWrite, costSource, messages, toolCalls, errors`.
+
+| Field | Source |
+|---|---|
+| `project` | the registered project whose root holds the cwd (a `--wt--` worktree folds into its root), else `other` |
+| `agent` | the preset label of the waggledance run whose `runs.session_id` matches the transcript session, else the agent kind (`claude`, `pi`, `codex`, `opencode`) |
+| `provider`, `model` | the event's provider; the model id with any `<provider>/` prefix removed |
+| `session` | the transcript session id; `<session>/agent-<id>` for a Claude Code native subagent |
+| `parent`, `subagent` | the parent run's `session` (Paseo parent label, Claude subagent, opencode child session) or null |
+| `preset`, `runTitle` | the matched run's preset label or null; the transcript or Paseo title, else the first line of the matched run's task, else null |
+| `tokens` | `input + output + cacheRead + cacheWrite` |
+| `cost*`, `costSource` | sums of the costs the transcript recorded; all null with `costSource` null when no message in the row recorded one, else `costSource: "transcript"`. A part stays null when no message recorded it (opencode's total-only cost). Never estimated (decision be26628f) |
+| `messages`, `toolCalls`, `errors` | kept events, their tool calls, and those that ended in an error |
+
+pi writes `cost` zeros for a model it holds no price for; the feed passes
+those zeros through as recorded, with `costSource: "transcript"`.
+
+**Session ids on runs.** `runs.session_id` (schema v9) holds the agent's
+transcript session for a herdr-dispatched run: `dispatch_run` takes it from
+herdr's `agent_session` for the run's pane right after the send, and the
+await poll fills it when herdr reports it later. Paseo-delivered runs have
+no preset label and leave it null. `Engine::run_sessions` maps each stored
+session to its run's preset label and task.
+
 ## Cache and warm-up
 
 `AgentLogCache` keeps each parsed file keyed by path and re-parses a file
 only when its mtime or length changes. A request skips session logs last
 modified before `days + 1` days ago; Paseo records are always read. At
 startup the daemon warms the cache in the background over the last 30 days,
-so the first open of the tab does not parse every log.
+so the first open of the tab does not parse every log. The opencode store is
+re-read only when `opencode.db` or its `-wal` file changes size or mtime, or a
+request reaches further back than the cached read.
 
 ## Pointers
 
 - `crates/waggledance-core/src/agent_usage.rs` — `parse_claude`,
   `parse_claude_subagent`, `parse_pi`, `parse_codex`, `parse_paseo`,
   `apply_paseo` (titles and parents), `project_for` (canonical roots,
-  worktree folding), `AgentLogCache` and its `runs`, `AgentHomes` (the four
-  home directories, `PASEO_HOME`)
+  worktree folding), `read_opencode`, `AgentLogCache` and its `runs`,
+  `AgentHomes` (the five homes, `PASEO_HOME`, `XDG_DATA_HOME`), `UsageEvent`
+  and `Cost`
+- `crates/waggledance-core/src/usage_rows.rs` — `build`, `UsageRow`,
+  `RunMeta`, `day_of` / `day_start_ms` (UTC+7)
+- `crates/waggledance-core/src/repository.rs` — `migration_9_runs_session`,
+  `set_run_session`, `run_sessions`
+- `crates/waggledance/src/orchestrate.rs` — `record_session` at dispatch and
+  in the await poll
 - `crates/waggledance-core/src/usage.rs` — `read_usage` (parses
   `.bee/usage/`), `summarize_runs` (window, event buckets, Other, run rows,
   feature rows), `set_local_offset_secs`
-- `crates/waggledance/src/server.rs` — the `/api/usage` route, `api_usage`,
+- `crates/waggledance/src/server.rs` — `api_usage_rows` and
+  `usage_rows_window` (the rows feed); the `/api/usage` route, `api_usage`,
   `usage_summary` (project mapping, `other` filter, `spawn_blocking` read),
   the startup warm-up, and the `days` / `project` parsing in `RegisterFlag`
 - `crates/waggledance/src/views.rs` — `usage_tab`, `usage_runs_table`,
@@ -178,3 +244,4 @@ so the first open of the tab does not parse every log.
   `.usage__group` headings and the `.usage__subagents` list; a grid
   `<summary>` drops the native marker, so `.usage__task::before` draws it
 - `docs/history/usage-dashboard/CONTEXT.md` — decisions D1 to D7
+- `docs/history/usage-rows/CONTEXT.md` — the rows feed, D1 to D10
