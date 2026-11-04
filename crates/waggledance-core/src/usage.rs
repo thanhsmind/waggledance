@@ -409,8 +409,8 @@ fn summarize_with(
         let mut by_model: BTreeMap<&str, u64> = BTreeMap::new();
         for e in events {
             let t = Tokens {
-                new: e.new,
-                cached: e.cached,
+                new: e.new_tokens(),
+                cached: e.cached_tokens(),
             };
             spend.add(&t);
             *by_model.entry(&e.model).or_default() += t.total();
@@ -799,8 +799,9 @@ mod tests {
             .map(|(ts, model, new, cached)| crate::agent_usage::UsageEvent {
                 ts_ms: ms(ts),
                 model: (*model).into(),
-                new: *new,
-                cached: *cached,
+                input: *new,
+                cache_read: *cached,
+                ..Default::default()
             })
             .collect();
         Arc::new(AgentRun {

@@ -7876,7 +7876,8 @@ mod bee_route_tests {
             claude: none.clone(),
             pi: none.clone(),
             codex: none.clone(),
-            paseo: none,
+            paseo: none.clone(),
+            opencode: none,
         }
     }
 
@@ -7974,6 +7975,7 @@ mod bee_route_tests {
             pi: dir.join("pi"),
             codex: dir.join("codex"),
             paseo: dir.join("paseo"),
+            opencode: dir.join("opencode"),
         }
     }
 
