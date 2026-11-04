@@ -425,6 +425,17 @@ impl FakeHerdr {
     /// D1 cases -- a pane whose two directories diverge, or where either is
     /// absent entirely. This is the only seam that can, since nothing else
     /// ever writes to either field after a pane is created.
+    pub async fn set_session(&self, pane_id: &str, session_id: Option<&str>) -> Result<()> {
+        let mut snap = self.inner.snapshot.lock().await;
+        for a in &mut snap.agents {
+            if a.pane_id == pane_id {
+                a.session_id = session_id.map(str::to_string);
+                return Ok(());
+            }
+        }
+        Err(HerdrError::NoSuchPane(pane_id.to_string()))
+    }
+
     pub async fn set_pane_dirs(
         &self,
         pane_id: &str,
