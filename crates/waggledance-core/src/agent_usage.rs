@@ -15,15 +15,44 @@ const HEAD_BYTES: usize = 1024;
 const DAY_MS: i64 = 86_400_000;
 const KEEP_DAYS: i64 = 31;
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-pub struct UsageEvent {
-    pub ts_ms: i64,
-    pub model: String,
-    pub new: u64,
-    pub cached: u64,
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Cost {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub total: f64,
 }
 
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct UsageEvent {
+    pub ts_ms: i64,
+    pub provider: String,
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost: Option<Cost>,
+    pub tool_calls: u64,
+    pub error: bool,
+}
+
+impl UsageEvent {
+    pub fn new_tokens(&self) -> u64 {
+        self.input + self.output + self.cache_write
+    }
+
+    pub fn cached_tokens(&self) -> u64 {
+        self.cache_read
+    }
+
+    pub fn tokens(&self) -> u64 {
+        self.new_tokens() + self.cache_read
+    }
+}
+
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
 pub struct AgentRun {
     pub key: String,
     pub provider: String,
@@ -58,6 +87,7 @@ pub struct AgentHomes {
     pub pi: PathBuf,
     pub codex: PathBuf,
     pub paseo: PathBuf,
+    pub opencode: PathBuf,
 }
 
 impl Default for AgentHomes {
@@ -67,11 +97,16 @@ impl Default for AgentHomes {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".paseo"));
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local").join("share"));
         Self {
             claude: home.join(".claude"),
             pi: home.join(".pi"),
             codex: home.join(".codex"),
             paseo,
+            opencode: data.join("opencode"),
         }
     }
 }
@@ -106,8 +141,21 @@ fn ts_ms(v: &Value) -> Option<i64> {
     Some((dt.unix_timestamp_nanos() / 1_000_000) as i64)
 }
 
+fn num_f(v: &Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(Value::as_f64)
+}
+
+fn count_items(content: Option<&Value>, kind: &str) -> u64 {
+    content.and_then(Value::as_array).map_or(0, |items| {
+        items
+            .iter()
+            .filter(|c| str_of(c, "type") == Some(kind))
+            .count() as u64
+    })
+}
+
 fn finish(mut run: AgentRun) -> AgentRun {
-    run.events.retain(|e| e.new > 0 || e.cached > 0);
+    run.events.retain(|e| e.tokens() > 0 || e.error);
     run.started_ms = run.events.iter().map(|e| e.ts_ms).min().unwrap_or(0);
     run.ended_ms = run.events.iter().map(|e| e.ts_ms).max().unwrap_or(0);
     run
@@ -119,6 +167,7 @@ struct LogState {
     seen: HashMap<(String, String), usize>,
     model: Option<(u8, String)>,
     imported: bool,
+    pending_tools: u64,
 }
 
 impl LogState {
@@ -151,16 +200,26 @@ impl LogState {
         let Some(msg) = v.get("message") else {
             return;
         };
-        let (Some(u), Some(ts)) = (msg.get("usage"), ts_ms(v)) else {
+        let error = v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
+        let Some(ts) = ts_ms(v) else {
             return;
         };
-        let event = UsageEvent {
+        let u = match msg.get("usage") {
+            Some(u) => u,
+            None if error => &Value::Null,
+            None => return,
+        };
+        let mut event = UsageEvent {
             ts_ms: ts,
+            provider: "anthropic".into(),
             model: str_of(msg, "model").unwrap_or_default().into(),
-            new: num(u, "input_tokens")
-                + num(u, "output_tokens")
-                + num(u, "cache_creation_input_tokens"),
-            cached: num(u, "cache_read_input_tokens"),
+            input: num(u, "input_tokens"),
+            output: num(u, "output_tokens"),
+            cache_read: num(u, "cache_read_input_tokens"),
+            cache_write: num(u, "cache_creation_input_tokens"),
+            cost: None,
+            tool_calls: count_items(msg.get("content"), "tool_use"),
+            error,
         };
         let Some(id) = str_of(msg, "id") else {
             run.events.push(event);
@@ -168,7 +227,12 @@ impl LogState {
         };
         let request = str_of(v, "requestId").unwrap_or_default();
         match self.seen.entry((id.into(), request.into())) {
-            MapEntry::Occupied(at) => run.events[*at.get()] = event,
+            MapEntry::Occupied(at) => {
+                let prior = &run.events[*at.get()];
+                event.tool_calls += prior.tool_calls;
+                event.error |= prior.error;
+                run.events[*at.get()] = event;
+            }
             MapEntry::Vacant(slot) => {
                 slot.insert(run.events.len());
                 run.events.push(event);
@@ -196,11 +260,29 @@ impl LogState {
             (None, Some(m)) => m.into(),
             _ => String::new(),
         };
+        let cost = u.get("cost").filter(|c| c.is_object()).map(|c| Cost {
+            input: num_f(c, "input"),
+            output: num_f(c, "output"),
+            cache_read: num_f(c, "cacheRead"),
+            cache_write: num_f(c, "cacheWrite"),
+            total: num_f(c, "total").unwrap_or_else(|| {
+                ["input", "output", "cacheRead", "cacheWrite"]
+                    .iter()
+                    .filter_map(|k| num_f(c, k))
+                    .sum()
+            }),
+        });
         run.events.push(UsageEvent {
             ts_ms: ts,
+            provider: str_of(msg, "provider").unwrap_or_default().into(),
             model,
-            new: num(u, "input") + num(u, "output") + num(u, "cacheWrite"),
-            cached: num(u, "cacheRead"),
+            input: num(u, "input"),
+            output: num(u, "output"),
+            cache_read: num(u, "cacheRead"),
+            cache_write: num(u, "cacheWrite"),
+            cost,
+            tool_calls: count_items(msg.get("content"), "toolCall"),
+            error: str_of(msg, "stopReason") == Some("error"),
         });
     }
 
@@ -234,7 +316,28 @@ impl LogState {
             .any(|t| {
                 t.contains("[external_agent_tool_call") || t.contains("[external_agent_tool_result")
             });
-        if kind != Some("event_msg") || str_of(p, "type") != Some("token_count") {
+        let item = str_of(p, "type");
+        if kind == Some("response_item")
+            && matches!(
+                item,
+                Some("function_call" | "custom_tool_call" | "local_shell_call")
+            )
+        {
+            self.pending_tools += 1;
+            return;
+        }
+        if kind == Some("event_msg") && item == Some("error") {
+            if let Some(ts) = ts_ms(v) {
+                self.run.events.push(UsageEvent {
+                    ts_ms: ts,
+                    provider: "openai".into(),
+                    error: true,
+                    ..UsageEvent::default()
+                });
+            }
+            return;
+        }
+        if kind != Some("event_msg") || item != Some("token_count") {
             return;
         }
         let Some(u) = p.get("info").and_then(|i| i.get("last_token_usage")) else {
@@ -247,9 +350,15 @@ impl LogState {
         let cached = num(u, "cached_input_tokens");
         self.run.events.push(UsageEvent {
             ts_ms: ts,
+            provider: "openai".into(),
             model: String::new(),
-            new: input.saturating_sub(cached) + output + num(u, "cache_write_input_tokens"),
-            cached,
+            input: input.saturating_sub(cached),
+            output,
+            cache_read: cached,
+            cache_write: num(u, "cache_write_input_tokens"),
+            cost: None,
+            tool_calls: std::mem::take(&mut self.pending_tools),
+            error: false,
         });
     }
 }
@@ -333,6 +442,129 @@ pub fn parse_pi(text: &str) -> Option<AgentRun> {
 
 pub fn parse_codex(text: &str) -> Option<AgentRun> {
     codex_run(&fed(Kind::Codex, text))
+}
+
+fn open_readonly(db: &Path) -> Option<rusqlite::Connection> {
+    use rusqlite::OpenFlags;
+    if !db.is_file() {
+        return None;
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(db, flags).ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(500))
+        .ok()?;
+    Some(conn)
+}
+
+pub fn read_opencode(db: &Path, since_ms: i64) -> Vec<AgentRun> {
+    let Some(conn) = open_readonly(db) else {
+        return Vec::new();
+    };
+    read_opencode_conn(&conn, since_ms).unwrap_or_default()
+}
+
+fn read_opencode_conn(
+    conn: &rusqlite::Connection,
+    since_ms: i64,
+) -> rusqlite::Result<Vec<AgentRun>> {
+    let mut tools: HashMap<String, u64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT message_id, count(*) FROM part \
+             WHERE time_created >= ?1 AND json_extract(data, '$.type') = 'tool' \
+             GROUP BY message_id",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows.flatten() {
+            tools.insert(row.0, row.1.max(0) as u64);
+        }
+    }
+    let mut runs: HashMap<String, AgentRun> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.directory, s.title, s.parent_id, m.id, m.time_created, m.data \
+             FROM message m JOIN session s ON s.id = m.session_id \
+             WHERE m.time_created >= ?1 ORDER BY m.time_created, m.id",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (session, dir, title, parent, msg_id, created, data) = row;
+            let Ok(v) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if str_of(&v, "role") != Some("assistant") {
+                continue;
+            }
+            let run = runs.entry(session.clone()).or_insert_with(|| AgentRun {
+                key: format!("opencode:{session}"),
+                provider: "opencode".into(),
+                session_id: session.clone(),
+                cwd: dir.clone(),
+                title: title.clone(),
+                parent_key: parent
+                    .as_ref()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| format!("opencode:{p}")),
+                subagent: parent.as_ref().is_some_and(|p| !p.is_empty()),
+                ..AgentRun::default()
+            });
+            if let Some(cwd) = v.get("path").and_then(|p| str_of(p, "cwd")) {
+                if run.cwd.is_empty() {
+                    run.cwd = cwd.into();
+                }
+            }
+            let t = v.get("tokens").unwrap_or(&Value::Null);
+            let cache = t.get("cache").unwrap_or(&Value::Null);
+            let ts = v
+                .get("time")
+                .and_then(|tm| tm.get("created"))
+                .and_then(Value::as_i64)
+                .unwrap_or(created);
+            let cost = num_f(&v, "cost").map(|total| Cost {
+                total,
+                ..Cost::default()
+            });
+            run.events.push(UsageEvent {
+                ts_ms: ts,
+                provider: str_of(&v, "providerID").unwrap_or_default().into(),
+                model: str_of(&v, "modelID").unwrap_or_default().into(),
+                input: num(t, "input"),
+                output: num(t, "output") + num(t, "reasoning"),
+                cache_read: num(cache, "read"),
+                cache_write: num(cache, "write"),
+                cost,
+                tool_calls: tools.get(&msg_id).copied().unwrap_or(0),
+                error: v.get("error").is_some_and(|e| !e.is_null()),
+            });
+        }
+    }
+    Ok(runs
+        .into_values()
+        .map(finish)
+        .filter(|r| !r.events.is_empty())
+        .collect())
+}
+
+fn opencode_stamp(dir: &Path) -> Option<Vec<(SystemTime, u64)>> {
+    let db = dir.join("opencode.db");
+    let md = fs::metadata(&db).ok()?;
+    let mut stamp = vec![(md.modified().unwrap_or(UNIX_EPOCH), md.len())];
+    if let Ok(wal) = fs::metadata(dir.join("opencode.db-wal")) {
+        stamp.push((wal.modified().unwrap_or(UNIX_EPOCH), wal.len()));
+    }
+    Some(stamp)
 }
 
 pub fn parse_paseo(text: &str) -> Option<PaseoAgent> {
@@ -446,10 +678,13 @@ struct CacheEntry {
     parsed: Parsed,
 }
 
+type OpencodeCache = (Vec<(SystemTime, u64)>, i64, Vec<Arc<AgentRun>>);
+
 #[derive(Default)]
 pub struct AgentLogCache {
     files: Mutex<HashMap<PathBuf, CacheEntry>>,
     parsed_bytes: AtomicU64,
+    opencode: Mutex<Option<OpencodeCache>>,
     #[cfg(test)]
     read_hook: Option<fn(&AgentLogCache)>,
 }
@@ -599,6 +834,27 @@ impl AgentLogCache {
         Some(Parsed::Log(Arc::new(log)))
     }
 
+    fn opencode_runs(&self, dir: &Path, horizon: i64) -> Vec<Arc<AgentRun>> {
+        let Some(stamp) = opencode_stamp(dir) else {
+            return Vec::new();
+        };
+        {
+            let cache = self.opencode.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((s, since, runs)) = cache.as_ref() {
+                if *s == stamp && *since <= horizon {
+                    return runs.clone();
+                }
+            }
+        }
+        let runs: Vec<Arc<AgentRun>> = read_opencode(&dir.join("opencode.db"), horizon)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        *self.opencode.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((stamp, horizon, runs.clone()));
+        runs
+    }
+
     pub fn runs(&self, homes: &AgentHomes, since_ms: i64) -> Vec<Arc<AgentRun>> {
         let horizon = since_ms.min(millis(SystemTime::now()) - KEEP_DAYS * DAY_MS);
         let mut keep = HashSet::new();
@@ -659,6 +915,7 @@ impl AgentLogCache {
                 Parsed::Paseo(None) => {}
             }
         }
+        runs.extend(self.opencode_runs(&homes.opencode, horizon));
         apply_paseo(&mut runs, &agents);
         runs
     }
@@ -702,13 +959,15 @@ mod tests {
             / 1_000_000) as i64
     }
 
-    fn ev(ts: &str, model: &str, new: u64, cached: u64) -> UsageEvent {
-        UsageEvent {
-            ts_ms: ms(ts),
-            model: model.into(),
-            new,
-            cached,
-        }
+    fn ev(ts: &str, model: &str, new: u64, cached: u64) -> (i64, String, u64, u64) {
+        (ms(ts), model.into(), new, cached)
+    }
+
+    fn flat(events: &[UsageEvent]) -> Vec<(i64, String, u64, u64)> {
+        events
+            .iter()
+            .map(|e| (e.ts_ms, e.model.clone(), e.new_tokens(), e.cached_tokens()))
+            .collect()
     }
 
     #[test]
@@ -721,7 +980,7 @@ mod tests {
         assert!(!run.subagent);
         assert_eq!(run.parent_key, None);
         assert_eq!(
-            run.events,
+            flat(&run.events),
             vec![
                 ev("2026-10-23T01:00:02Z", "claude-opus-5-5", 60, 40),
                 ev("2026-10-23T02:00:00Z", "claude-sonnet-5-5", 5, 7),
@@ -739,7 +998,10 @@ mod tests {
         assert_eq!(run.parent_key.as_deref(), Some("claude:s1"));
         assert!(run.subagent);
         assert_eq!(run.title, "review (opus)");
-        assert_eq!(run.events, vec![ev("2026-10-23T03:00:00Z", "opus", 5, 11)]);
+        assert_eq!(
+            flat(&run.events),
+            vec![ev("2026-10-23T03:00:00Z", "opus", 5, 11)]
+        );
         let bare = parse_claude_subagent("s1", "agent-a1", CLAUDE_SUB, None);
         assert_eq!(bare.title, "");
     }
@@ -750,7 +1012,7 @@ mod tests {
         assert_eq!(run.key, "pi:p1");
         assert_eq!(run.cwd, "/work/proj");
         assert_eq!(
-            run.events,
+            flat(&run.events),
             vec![ev(
                 "2026-10-23T02:58:38.668Z",
                 "hive/deepseek-flash",
@@ -767,7 +1029,7 @@ mod tests {
         assert_eq!(run.key, "codex:c1");
         assert_eq!(run.cwd, "/work/proj");
         assert_eq!(
-            run.events,
+            flat(&run.events),
             vec![
                 ev("2026-10-23T01:00:03Z", "gpt-5.5", 650, 400),
                 ev("2026-10-23T01:00:06Z", "gpt-5.5", 115, 100),
@@ -785,6 +1047,142 @@ mod tests {
         assert_eq!(parse_codex(&format!("{CODEX}{IMPORT_MARK}")), None);
         let result = r#"{"type":"response_item","payload":{"type":"message","content":[{"type":"input_text","text":"[external_agent_tool_result: ok]"}]}}"#;
         assert_eq!(parse_codex(&format!("{CODEX}{result}")), None);
+    }
+
+    fn split(e: &UsageEvent) -> (u64, u64, u64, u64, u64, bool) {
+        (
+            e.input,
+            e.output,
+            e.cache_read,
+            e.cache_write,
+            e.tool_calls,
+            e.error,
+        )
+    }
+
+    #[test]
+    fn claude_keeps_each_token_kind_and_counts_tools_and_errors() {
+        let text = r#"{"type":"assistant","requestId":"r1","timestamp":"2026-10-23T01:00:01Z","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":4}}}
+{"type":"assistant","requestId":"r1","timestamp":"2026-10-23T01:00:02Z","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"t1"},{"type":"tool_use","id":"t2"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":30,"cache_read_input_tokens":40}}}
+{"type":"assistant","isApiErrorMessage":true,"requestId":"r2","timestamp":"2026-10-23T01:00:03Z","message":{"id":"m2","model":"<synthetic>","content":[{"type":"text","text":"API Error"}],"usage":{"input_tokens":0,"output_tokens":0}}}
+"#;
+        let run = parse_claude("s1", text);
+        assert_eq!(run.events.len(), 2);
+        assert_eq!(split(&run.events[0]), (10, 20, 40, 30, 2, false));
+        assert_eq!(run.events[0].provider, "anthropic");
+        assert_eq!(run.events[0].cost, None);
+        assert_eq!(split(&run.events[1]), (0, 0, 0, 0, 0, true));
+    }
+
+    #[test]
+    fn pi_keeps_the_transcript_cost_parts_tools_and_errors() {
+        let text = r#"{"type":"session","id":"p1","timestamp":"2026-10-23T02:58:34Z","cwd":"/work/proj"}
+{"type":"message","timestamp":"2026-10-23T02:58:38Z","message":{"role":"assistant","provider":"hive","model":"flash","content":[{"type":"toolCall","id":"c1"},{"type":"thinking"}],"stopReason":"toolUse","usage":{"input":100,"output":5,"cacheRead":50,"cacheWrite":7,"cost":{"input":0.1,"output":0.02,"cacheRead":0.005,"cacheWrite":0,"total":0.125}}}}
+{"type":"message","timestamp":"2026-10-23T02:59:00Z","message":{"role":"assistant","provider":"hive","model":"flash","content":[],"stopReason":"error","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}}
+"#;
+        let run = parse_pi(text).unwrap();
+        assert_eq!(run.events.len(), 2);
+        let e = &run.events[0];
+        assert_eq!(split(e), (100, 5, 50, 7, 1, false));
+        assert_eq!(
+            (e.provider.as_str(), e.model.as_str()),
+            ("hive", "hive/flash")
+        );
+        assert_eq!(
+            e.cost,
+            Some(Cost {
+                input: Some(0.1),
+                output: Some(0.02),
+                cache_read: Some(0.005),
+                cache_write: Some(0.0),
+                total: 0.125,
+            })
+        );
+        assert_eq!(split(&run.events[1]), (0, 0, 0, 0, 0, true));
+        assert_eq!(run.events[1].cost, None);
+    }
+
+    #[test]
+    fn codex_splits_cached_input_and_hangs_tool_calls_on_the_next_turn() {
+        let tools = r#"{"type":"response_item","timestamp":"2026-10-23T01:00:02Z","payload":{"type":"function_call","name":"shell"}}
+{"type":"response_item","timestamp":"2026-10-23T01:00:02Z","payload":{"type":"custom_tool_call","name":"apply_patch"}}
+"#;
+        let error = r#"{"type":"event_msg","timestamp":"2026-10-23T01:00:07Z","payload":{"type":"error","message":"stream disconnected"}}
+"#;
+        let run = parse_codex(&format!("{tools}{CODEX}{error}")).unwrap();
+        assert_eq!(run.events.len(), 3);
+        assert_eq!(split(&run.events[0]), (600, 50, 400, 0, 2, false));
+        assert_eq!(split(&run.events[1]), (100, 10, 100, 5, 0, false));
+        assert_eq!(split(&run.events[2]), (0, 0, 0, 0, 0, true));
+        assert!(run
+            .events
+            .iter()
+            .all(|e| e.provider == "openai" && e.model == "gpt-5.5"));
+    }
+
+    fn opencode_fixture(dir: &Path) -> PathBuf {
+        let db = dir.join("opencode.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE session (id text PRIMARY KEY, project_id text, parent_id text, directory text NOT NULL, title text NOT NULL, time_created integer, time_updated integer);
+CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer, data text NOT NULL);
+CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer, data text NOT NULL);
+INSERT INTO session VALUES ('ses_a','prj',NULL,'/work/proj--wt--feat','Build rows',0,0);
+INSERT INTO session VALUES ('ses_b','prj','ses_a','/work/proj','explore',0,0);
+INSERT INTO message VALUES ('msg_u','ses_a',1792800000000,0,'{"role":"user"}');
+INSERT INTO message VALUES ('msg_1','ses_a',1792800001000,0,'{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet-5-5","cost":0.25,"tokens":{"input":100,"output":40,"reasoning":10,"cache":{"read":500,"write":60}},"time":{"created":1792800001000}}');
+INSERT INTO message VALUES ('msg_2','ses_a',1792800002000,0,'{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet-5-5","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"error":{"name":"APIError"},"time":{"created":1792800002000}}');
+INSERT INTO message VALUES ('msg_3','ses_b',1792800003000,0,'{"role":"assistant","providerID":"openrouter","modelID":"glm","cost":0,"tokens":{"input":5,"output":1,"cache":{"read":0,"write":0}},"time":{"created":1792800003000}}');
+INSERT INTO message VALUES ('msg_old','ses_b',1000,0,'{"role":"assistant","providerID":"x","modelID":"y","tokens":{"input":9}}');
+INSERT INTO part VALUES ('p1','msg_1','ses_a',1792800001000,0,'{"type":"tool","tool":"bash","state":{"input":{"type":"text"}}}');
+INSERT INTO part VALUES ('p2','msg_1','ses_a',1792800001000,0,'{"type":"tool","tool":"read"}');
+INSERT INTO part VALUES ('p3','msg_1','ses_a',1792800001000,0,'{"type":"text","text":"{\"type\":\"tool\"}"}');"#,
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn opencode_store_reads_tokens_cost_tools_errors_and_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = opencode_fixture(dir.path());
+        let mut runs = read_opencode(&db, 1_792_000_000_000);
+        runs.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(runs.len(), 2);
+        let a = &runs[0];
+        assert_eq!(
+            (a.key.as_str(), a.provider.as_str(), a.cwd.as_str()),
+            ("opencode:ses_a", "opencode", "/work/proj--wt--feat")
+        );
+        assert_eq!(a.title, "Build rows");
+        assert!(!a.subagent);
+        assert_eq!(a.events.len(), 2);
+        assert_eq!(split(&a.events[0]), (100, 50, 500, 60, 2, false));
+        assert_eq!(a.events[0].model, "claude-sonnet-5-5");
+        assert_eq!(
+            a.events[0].cost.map(|c| (c.total, c.input)),
+            Some((0.25, None))
+        );
+        assert!(a.events[1].error);
+        let b = &runs[1];
+        assert!(b.subagent);
+        assert_eq!(b.parent_key.as_deref(), Some("opencode:ses_a"));
+        assert_eq!(b.events.len(), 1);
+        assert_eq!(read_opencode(&dir.path().join("missing.db"), 0), Vec::new());
+    }
+
+    #[test]
+    fn the_cache_reads_the_opencode_store_beside_the_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let homes = homes_in(dir.path());
+        fs::create_dir_all(&homes.opencode).unwrap();
+        opencode_fixture(&homes.opencode);
+        let cache = AgentLogCache::new();
+        let runs = cache.runs(&homes, 1_792_000_000_000);
+        let mut keys: Vec<&str> = runs.iter().map(|r| r.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["opencode:ses_a", "opencode:ses_b"]);
+        assert_eq!(cache.runs(&homes, 1_792_000_000_000).len(), 2);
     }
 
     fn paseo(id: &str, provider: &str, session: &str, title: &str, labels: &str) -> String {
@@ -881,6 +1279,7 @@ mod tests {
             pi: dir.join("pi"),
             codex: dir.join("codex"),
             paseo: dir.join("paseo"),
+            opencode: dir.join("opencode"),
         }
     }
 
@@ -940,10 +1339,10 @@ mod tests {
         assert_eq!(cache.parsed_bytes.load(Ordering::Relaxed), first + grown);
         let claude = run_of(&runs, "claude:s1");
         assert_eq!(claude.events.len(), 2);
-        assert_eq!(claude.events[1].new, 100);
+        assert_eq!(claude.events[1].new_tokens(), 100);
         let codex = run_of(&runs, "codex:c1");
         assert_eq!(
-            codex.events.last(),
+            flat(&codex.events).last(),
             Some(&ev("2026-10-23T01:00:07Z", "gpt-5.5", 150, 0))
         );
         assert_eq!(codex.events.len(), 3);
@@ -952,7 +1351,7 @@ mod tests {
         let runs = cache.runs(&homes, since);
         let claude = run_of(&runs, "claude:s1");
         assert_eq!(claude.events.len(), 2);
-        assert_eq!(claude.events[1].new, 200);
+        assert_eq!(claude.events[1].new_tokens(), 200);
         assert_eq!(
             *claude,
             parse_claude("s1", &fs::read_to_string(&main).unwrap())
@@ -1021,7 +1420,7 @@ mod tests {
             before + short.len() as u64
         );
         assert_eq!(
-            run_of(&runs, "codex:c1").events,
+            flat(&run_of(&runs, "codex:c1").events),
             vec![ev("2026-10-23T01:00:03Z", "gpt-5.5", 650, 400)]
         );
     }
@@ -1165,10 +1564,10 @@ mod tests {
 
         let again = cache.runs(&homes, since);
         let find = |k: &str| again.iter().find(|r| r.key == k).unwrap().clone();
-        assert_eq!(find("claude:s1").events[0].new, 60);
-        assert_eq!(find("pi:p1").events[0].new, 1012);
+        assert_eq!(find("claude:s1").events[0].new_tokens(), 60);
+        assert_eq!(find("pi:p1").events[0].new_tokens(), 1012);
         assert_eq!(
-            parse_claude("s1", &fs::read_to_string(&main).unwrap()).events[0].new,
+            parse_claude("s1", &fs::read_to_string(&main).unwrap()).events[0].new_tokens(),
             69
         );
     }

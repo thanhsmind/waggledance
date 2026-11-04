@@ -439,6 +439,7 @@ fn router(state: AppState) -> Router {
         .route("/api/projects", get(api_projects))
         .route("/api/board", get(api_board))
         .route("/api/usage", get(api_usage))
+        .route("/api/usage/rows", get(api_usage_rows))
         // agent-switch-drawer: the cross-project pane switcher's own feed —
         // every agent-backed pane on the host, from every registered
         // project plus the Unassigned group, gated the same as the rest of
@@ -1514,6 +1515,115 @@ async fn api_usage(
             .await
             .0,
     )
+}
+
+const USAGE_ROWS_MAX_DAYS: i64 = 366;
+
+fn usage_rows_window(
+    from: Option<&str>,
+    to: Option<&str>,
+    today: time::Date,
+) -> Result<(time::Date, time::Date), String> {
+    let parse = |name: &str, v: &str| {
+        let bad = || format!("{name} must be a date written YYYY-MM-DD, got {v:?}");
+        if !v.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+            return Err(bad());
+        }
+        let parts: Vec<&str> = v.split('-').collect();
+        let [y, m, d] = parts.as_slice() else {
+            return Err(bad());
+        };
+        if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+            return Err(bad());
+        }
+        let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i32>(), m.parse::<u8>(), d.parse::<u8>()) else {
+            return Err(bad());
+        };
+        time::Month::try_from(m)
+            .ok()
+            .and_then(|m| time::Date::from_calendar_date(y, m, d).ok())
+            .ok_or_else(bad)
+    };
+    let from = from
+        .filter(|v| !v.is_empty())
+        .map(|v| parse("from", v))
+        .transpose()?;
+    let to = to
+        .filter(|v| !v.is_empty())
+        .map(|v| parse("to", v))
+        .transpose()?;
+    let span = time::Duration::days(29);
+    let (from, to) = match (from, to) {
+        (Some(f), Some(t)) => (f, t),
+        (Some(f), None) => (f, today.max(f)),
+        (None, Some(t)) => (t - span, t),
+        (None, None) => (today - span, today),
+    };
+    if from > to {
+        return Err(format!("from {from} is after to {to}"));
+    }
+    if (to - from).whole_days() >= USAGE_ROWS_MAX_DAYS {
+        return Err(format!(
+            "the window from {from} to {to} spans more than {USAGE_ROWS_MAX_DAYS} days"
+        ));
+    }
+    Ok((from, to))
+}
+
+async fn api_usage_rows(
+    State(st): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    use waggledance_core::{agent_usage, usage_rows};
+    let today = usage_rows::today();
+    let (from, to) = match usage_rows_window(
+        q.get("from").map(String::as_str),
+        q.get("to").map(String::as_str),
+        today,
+    ) {
+        Ok(w) => w,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+        }
+    };
+    let projects = st.engine.list_projects().unwrap_or_default();
+    let presets = st.engine.run_sessions().unwrap_or_default();
+    let since = usage_rows::day_start_ms(from);
+    let (logs, homes) = (st.agent_logs.clone(), st.agent_homes.clone());
+    let roots: Vec<_> = projects
+        .iter()
+        .map(|p| (p.id.clone(), p.name.clone(), p.root_path.clone()))
+        .collect();
+    let rows = tokio::task::spawn_blocking(move || {
+        let runs: Vec<_> = logs
+            .runs(&homes, since)
+            .into_iter()
+            .map(|r| {
+                let id = agent_usage::project_for(std::path::Path::new(&r.cwd), &roots)
+                    .map(String::from);
+                (id, r)
+            })
+            .collect();
+        usage_rows::build(&runs, &presets, from, to)
+    })
+    .await
+    .unwrap_or_default();
+    let mut listed: Vec<_> = projects
+        .iter()
+        .map(|p| json!({ "id": p.id, "name": p.name }))
+        .collect();
+    listed.push(json!({ "id": "other", "name": "Other" }));
+    let generated = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    Json(json!({
+        "from": from.to_string(),
+        "to": to.to_string(),
+        "generatedAt": generated,
+        "projects": listed,
+        "rows": rows,
+    }))
+    .into_response()
 }
 
 async fn api_board(State(st): State<AppState>) -> impl IntoResponse {
@@ -7876,7 +7986,8 @@ mod bee_route_tests {
             claude: none.clone(),
             pi: none.clone(),
             codex: none.clone(),
-            paseo: none,
+            paseo: none.clone(),
+            opencode: none,
         }
     }
 
@@ -7974,6 +8085,134 @@ mod bee_route_tests {
             pi: dir.join("pi"),
             codex: dir.join("codex"),
             paseo: dir.join("paseo"),
+            opencode: dir.join("opencode"),
+        }
+    }
+
+    fn rows_fixture(name: &str) -> (AppState, Project) {
+        let root = fresh_root(name);
+        let mut st = build_state();
+        let homes = agent_homes_fixture(name, &root);
+        let ts = (time::OffsetDateTime::now_utc() - time::Duration::minutes(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let cwd = serde_json::to_string(&root.to_string_lossy()).unwrap();
+        write(
+            &homes.pi,
+            "agent/sessions/-work/priced.jsonl",
+            &format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"type":"session","id":"pi-priced","cwd":{cwd},"timestamp":"{ts}"}}"#
+                ),
+                format_args!(
+                    r#"{{"type":"message","timestamp":"{ts}","message":{{"provider":"hive","model":"flash","content":[{{"type":"toolCall"}}],"stopReason":"toolUse","usage":{{"input":30,"output":5,"cacheRead":7,"cacheWrite":2,"cost":{{"input":0.3,"output":0.05,"cacheRead":0.007,"cacheWrite":0.002,"total":0.359}}}}}}}}"#
+                ),
+            ),
+        );
+        st.agent_homes = Arc::new(homes);
+        let project = register(&st, &root, name);
+        (st, project)
+    }
+
+    async fn rows_json(st: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let resp = get(router(st), uri).await;
+        let status = resp.status();
+        (
+            status,
+            serde_json::from_str(&body_string(resp).await).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn api_usage_rows_defaults_to_the_thirty_saigon_days_ending_today() {
+        let (st, project) = rows_fixture("usage-rows-default");
+        let (status, v) = rows_json(st, "/api/usage/rows").await;
+        assert_eq!(status, StatusCode::OK);
+        let today = waggledance_core::usage_rows::today();
+        assert_eq!(v["to"], today.to_string());
+        assert_eq!(v["from"], (today - time::Duration::days(29)).to_string());
+        assert!(v["generatedAt"].as_str().unwrap().ends_with('Z'));
+        let projects = v["projects"].as_array().unwrap();
+        assert!(projects.iter().any(|p| p["id"] == project.id.as_str()));
+        assert_eq!(projects.last().unwrap()["id"], "other");
+        let rows = v["rows"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert!(rows
+            .iter()
+            .all(|r| r["team"] == "waggledance" && r["project"] == project.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn api_usage_rows_carry_every_field_and_the_transcript_cost() {
+        let (st, project) = rows_fixture("usage-rows-fields");
+        let today = waggledance_core::usage_rows::today();
+        let uri = format!("/api/usage/rows?from={today}&to={today}");
+        let (status, v) = rows_json(st, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = v["rows"].as_array().unwrap();
+        let priced = rows.iter().find(|r| r["session"] == "pi-priced").unwrap();
+        let want = serde_json::json!({
+            "day": today.to_string(), "team": "waggledance", "project": project.id,
+            "agent": "pi", "provider": "hive", "model": "flash", "session": "pi-priced",
+            "preset": null, "runTitle": null, "parent": null, "subagent": false,
+            "input": 30, "output": 5, "cacheRead": 7, "cacheWrite": 2, "tokens": 44,
+            "cost": 0.359, "costInput": 0.3, "costOutput": 0.05, "costCacheRead": 0.007,
+            "costCacheWrite": 0.002, "costSource": "transcript",
+            "messages": 1, "toolCalls": 1, "errors": 0
+        });
+        assert_eq!(priced, &want);
+        let claude = rows.iter().find(|r| r["session"] == "sess-main").unwrap();
+        assert_eq!(claude["provider"], "anthropic");
+        assert_eq!(claude["runTitle"], "Lead task");
+        assert!(claude["cost"].is_null() && claude["costSource"].is_null());
+        let child = rows.iter().find(|r| r["session"] == "pi-sess").unwrap();
+        assert_eq!(child["subagent"], true);
+        assert_eq!(child["parent"], "sess-main");
+    }
+
+    #[tokio::test]
+    async fn api_usage_rows_name_the_preset_of_a_dispatched_session() {
+        let (st, project) = rows_fixture("usage-rows-preset");
+        let run = waggledance_core::domain::Run {
+            id: "run-usage-rows".into(),
+            project_id: project.id.clone(),
+            pane_id: "w1:p1".into(),
+            preset_label: Some("claude-sonnet".into()),
+            task: "Ship the rows feed".into(),
+            baseline: String::new(),
+            marker: "m".into(),
+            status: "working".into(),
+            created_at: "2026-11-04T00:00:00Z".into(),
+            updated_at: "2026-11-04T00:00:00Z".into(),
+        };
+        st.engine.insert_run(&run, None).unwrap();
+        st.engine.set_run_session(&run.id, "sess-main").unwrap();
+        let (_, v) = rows_json(st, "/api/usage/rows").await;
+        let claude = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["session"] == "sess-main")
+            .unwrap()
+            .clone();
+        assert_eq!(claude["agent"], "claude-sonnet");
+        assert_eq!(claude["preset"], "claude-sonnet");
+    }
+
+    #[tokio::test]
+    async fn api_usage_rows_refuse_a_bad_window_with_an_error() {
+        for uri in [
+            "/api/usage/rows?from=2026-13-01",
+            "/api/usage/rows?to=yesterday",
+            "/api/usage/rows?from=2026-11-04&to=2026-11-01",
+            "/api/usage/rows?from=2024-01-01&to=2026-01-01",
+            "/api/usage/rows?from=+026-01-01",
+        ] {
+            let (st, _) = rows_fixture("usage-rows-bad");
+            let (status, v) = rows_json(st, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(v["error"].as_str().is_some_and(|e| !e.is_empty()), "{uri}");
         }
     }
 

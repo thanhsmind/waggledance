@@ -6,8 +6,8 @@ use crate::domain::{
 };
 use crate::error::Result;
 use crate::short_link;
-use rusqlite::{params, Connection};
-use std::collections::HashSet;
+use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -244,6 +244,45 @@ impl SqliteStore {
             params![id, request_id],
         )?;
         Ok(())
+    }
+
+    pub fn set_run_session(&self, id: &str, session_id: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let changed = c.execute(
+            "UPDATE runs SET session_id=?2 WHERE id=?1 AND session_id IS NULL",
+            params![id, session_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn run_session(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let found = c
+            .query_row(
+                "SELECT session_id FROM runs WHERE id=?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(found.flatten())
+    }
+
+    pub fn run_sessions(&self) -> Result<HashMap<String, crate::usage_rows::RunMeta>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT session_id, preset_label, task FROM runs
+             WHERE session_id IS NOT NULL ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                crate::usage_rows::RunMeta {
+                    preset_label: row.get(1)?,
+                    task: row.get(2)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn set_run_pane(&self, id: &str, pane_id: &str) -> Result<()> {
@@ -1010,10 +1049,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (6, migration_6_runs_notice),
     (7, migration_7_inbox),
     (8, migration_8_tasks),
+    (9, migration_9_runs_session),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -1144,6 +1184,18 @@ fn migration_7_inbox(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(recipient, acked_at, dead_at, seq);",
     )?;
+    Ok(())
+}
+
+fn migration_9_runs_session(conn: &Connection) -> Result<()> {
+    let runs: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='runs'",
+        [],
+        |r| r.get(0),
+    )?;
+    if runs == 1 && !has_column(conn, "runs", "session_id")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN session_id TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -2546,7 +2598,7 @@ mod tests {
             assert_eq!(
                 c.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
                     .unwrap(),
-                8
+                SCHEMA_VERSION
             );
             super::migrate(&c).unwrap();
             super::migration_8_tasks(&c).unwrap();

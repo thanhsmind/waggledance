@@ -30,6 +30,7 @@ use waggledance_core::notify_store::NotifyStore;
 use waggledance_core::paths_boundary::Boundary;
 use waggledance_core::Engine;
 
+use crate::herdr::wire::Agent;
 use crate::herdr::{self, AgentStatus, Herdr, HerdrError, ReadSource};
 use crate::notify;
 
@@ -422,7 +423,27 @@ pub async fn dispatch_run(
     engine
         .insert_run(&run, feature)
         .map_err(|e| DispatchRefusal::PersistenceFailed(e.to_string()))?;
+    if let Ok(snapshot) = herdr.snapshot().await {
+        record_session(engine, &run.id, &run.pane_id, &snapshot.agents);
+    }
     Ok(Dispatched { run, warnings })
+}
+
+fn record_session(engine: &Engine, run_id: &str, pane_id: &str, agents: &[Agent]) -> bool {
+    let Some(session) = agents
+        .iter()
+        .find(|a| a.pane_id == pane_id)
+        .and_then(|a| a.session_id.as_deref())
+    else {
+        return false;
+    };
+    match engine.set_run_session(run_id, session) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("could not record session {session} for run {run_id}: {e}");
+            false
+        }
+    }
 }
 
 /// What a dispatch produced: the durable run, plus anything that went wrong
@@ -728,8 +749,13 @@ async fn await_run_with_poll_interval(
     let mut stable_reads: u32 = 0;
     let mut last_revision: Option<u64> = None;
 
+    let mut session_known = engine.run_session(&run.id).ok().flatten().is_some();
+
     loop {
         let snapshot = herdr.snapshot().await?;
+        if !session_known {
+            session_known = record_session(engine, &run.id, &run.pane_id, &snapshot.agents);
+        }
         let status = snapshot
             .agents
             .iter()
@@ -1414,6 +1440,66 @@ mod tests {
             store.undelivered().unwrap().is_empty(),
             "Done never notifies (D1)"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_run_stores_the_session_herdr_reports_for_the_pane() {
+        let herdr = ScriptedSubmit::new(SubmitOutcome::Accepted);
+        herdr
+            .inner
+            .set_session("w2:p4", Some("sess-42"))
+            .await
+            .unwrap();
+        let engine = test_engine();
+        let root = temp_root("dispatch-session");
+        let project = test_project(&root);
+        let dispatched = dispatch_run(
+            &herdr,
+            &engine,
+            &project,
+            DispatchTarget::Pane("w2:p4".to_string()),
+            "do the thing",
+            None,
+            Some("claude-sonnet".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.run_session(&dispatched.run.id).unwrap().as_deref(),
+            Some("sess-42")
+        );
+        let sessions = engine.run_sessions().unwrap();
+        assert_eq!(
+            sessions["sess-42"].preset_label.as_deref(),
+            Some("claude-sonnet")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn await_run_fills_a_session_herdr_reports_only_after_dispatch() {
+        let herdr = FakeHerdr::new();
+        let engine = test_engine();
+        let pane = "w2:p4";
+        let baseline = capture_baseline(&herdr, pane).await.unwrap();
+        let marker = mint_marker();
+        let run = build_run("run-late-session", pane, &baseline, &marker.joined());
+        engine.insert_run(&run, None).unwrap();
+        assert_eq!(engine.run_session(&run.id).unwrap(), None);
+        herdr.set_session(pane, Some("sess-late")).await.unwrap();
+        send_task(&herdr, pane, &run.task, &marker).await.unwrap();
+        herdr
+            .send_input(pane, &marker.joined(), false)
+            .await
+            .unwrap();
+        await_run(&herdr, &engine, &run, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.run_session(&run.id).unwrap().as_deref(),
+            Some("sess-late")
+        );
+        assert!(!engine.set_run_session(&run.id, "other").unwrap());
     }
 
     #[tokio::test]

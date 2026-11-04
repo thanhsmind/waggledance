@@ -628,6 +628,20 @@ impl Engine {
         self.store.set_run_pane(id, pane_id)
     }
 
+    pub fn set_run_session(&self, id: &str, session_id: &str) -> Result<bool> {
+        self.store.set_run_session(id, session_id)
+    }
+
+    pub fn run_session(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_session(id)
+    }
+
+    pub fn run_sessions(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::usage_rows::RunMeta>> {
+        self.store.run_sessions()
+    }
+
     pub fn requeue_run(&self, id: &str) -> Result<bool> {
         self.store.requeue_run(id)
     }
