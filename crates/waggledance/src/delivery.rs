@@ -56,8 +56,35 @@ struct Notice {
 }
 
 struct Follow {
-    leader: String,
-    original: Run,
+    leader: Option<String>,
+    prior: String,
+    of: Option<String>,
+}
+
+enum Route {
+    Wait,
+    Follow(Follow),
+}
+
+const FAMILY_OPEN: [&str; 3] = ["queued", "working", "blocked"];
+
+fn started_leader(run: &Run) -> Option<&str> {
+    run.pane_id
+        .strip_prefix(PASEO_PANE_PREFIX)
+        .filter(|a| *a != "pending")
+}
+
+fn gone_note(of: &str, leader: Option<&str>) -> String {
+    match leader {
+        Some(leader) => format!(
+            "[waggledance] follow-up of run {of}: its leader {leader} was gone (archived or \
+             unreadable), so a new leader carries the original task"
+        ),
+        None => format!(
+            "[waggledance] follow-up of run {of}: no leader was ever started for it, so a new \
+             leader carries the original task"
+        ),
+    }
 }
 
 fn notice_until() -> String {
@@ -343,19 +370,44 @@ impl Delivery {
         }
         let wd = matches!(self.engine.run_caller(&run.id), Ok(Some(c)) if c == paseo::WD_CALLER);
         let mode = paseo::leader_mode(config, &settings.paseo);
-        let prompt = match wd.then(|| self.follow_up(run)).flatten() {
-            Some(follow) => match self.paseo.inspect(&follow.leader).await {
-                Ok(state) if !state.archived && LEADER_RUNNING.contains(&state.status.as_str()) => {
-                    self.set_status(&run.id, "queued");
-                    return;
+        let route = match self.engine.run_follow_up_of(&run.id) {
+            Ok(Some(of)) => self.follow_up_of(run, &of),
+            Ok(None) => wd.then(|| self.follow_up(run)).flatten().map(Route::Follow),
+            Err(e) => {
+                tracing::warn!(
+                    "delivery could not read run {}'s follow-up link: {e}",
+                    run.id
+                );
+                wd.then(|| self.follow_up(run)).flatten().map(Route::Follow)
+            }
+        };
+        let mut note = None;
+        let prompt = match route {
+            Some(Route::Wait) => {
+                self.set_status(&run.id, "queued");
+                return;
+            }
+            Some(Route::Follow(follow)) => {
+                let state = match follow.leader.as_deref() {
+                    Some(leader) => Some(self.paseo.inspect(leader).await),
+                    None => None,
+                };
+                match (follow.leader.as_deref(), state) {
+                    (Some(_), Some(Ok(state)))
+                        if !state.archived && LEADER_RUNNING.contains(&state.status.as_str()) =>
+                    {
+                        self.set_status(&run.id, "queued");
+                        return;
+                    }
+                    (Some(leader), Some(Ok(state))) if !state.archived => {
+                        return self.follow_on(&name, run, leader, &mode, timeout, wd).await;
+                    }
+                    (leader, _) => {
+                        note = follow.of.as_deref().map(|of| gone_note(of, leader));
+                        format!("{}\n\n{}", follow.prior, run.task)
+                    }
                 }
-                Ok(state) if !state.archived => {
-                    return self
-                        .follow_on(&name, run, &follow.leader, &mode, timeout)
-                        .await;
-                }
-                _ => format!("{}\n\n{}", follow.original.task, run.task),
-            },
+            }
             None => run.task.clone(),
         };
         let start = match paseo::resolve_leader(
@@ -378,13 +430,19 @@ impl Delivery {
             reason = start.reason,
             "delivery starts the {name} leader"
         );
-        self.state.lock().unwrap().headers.insert(
-            run.id.clone(),
-            format!(
-                "[waggledance] leader started in Paseo workspace {} ({})",
-                start.workspace, start.reason
-            ),
+        let mut header = format!(
+            "[waggledance] leader started in Paseo workspace {} ({})",
+            start.workspace, start.reason
         );
+        if let Some(note) = note {
+            header.push('\n');
+            header.push_str(&note);
+        }
+        self.state
+            .lock()
+            .unwrap()
+            .headers
+            .insert(run.id.clone(), header);
         let spec = start.spec(&prompt);
         let started = self.paseo.run_and_wait(&spec, timeout);
         let finder = async {
@@ -419,12 +477,9 @@ impl Delivery {
                 self.presend_failed(&name, &run, &e.to_string())
             }
             Err(e) => self.lose(&name, &run, agent, &e.to_string()),
-            Ok(TurnEnd::Completed) => self.done(&name, &run, agent, wd).await,
+            Ok(TurnEnd::Completed) => self.done(&name, &run, agent).await,
             Ok(TurnEnd::Permission) => match agent {
-                Some(agent) => {
-                    self.blocked_then_done(&name, &run, agent, deadline, wd)
-                        .await
-                }
+                Some(agent) => self.blocked_then_done(&name, &run, agent, deadline).await,
                 None => self.lose(&name, &run, None, "permission requested"),
             },
             Ok(TurnEnd::Other { status, message }) => self.lose(
@@ -447,12 +502,56 @@ impl Delivery {
             return None;
         }
         let leader = self.engine.get_task(corr).ok().flatten()?.leader_id?;
-        Some(Follow { leader, original })
+        Some(Follow {
+            leader: Some(leader),
+            prior: original.task,
+            of: None,
+        })
     }
 
-    async fn follow_on(&self, name: &str, run: &Run, leader: &str, mode: &str, timeout: Duration) {
+    fn follow_up_of(&self, run: &Run, of: &str) -> Option<Route> {
+        let chain = self
+            .engine
+            .follow_up_chain(of)
+            .map_err(|e| tracing::warn!("delivery could not read run {of}'s chain: {e}"))
+            .ok()
+            .filter(|chain| !chain.is_empty())?;
+        let family = self
+            .engine
+            .follow_up_family(&chain[0].id)
+            .map_err(|e| tracing::warn!("delivery could not read run {of}'s family: {e}"))
+            .ok()?;
+        let earlier: Vec<&Run> = family.iter().take_while(|r| r.id != run.id).collect();
+        if earlier
+            .iter()
+            .any(|r| FAMILY_OPEN.contains(&r.status.as_str()))
+        {
+            return Some(Route::Wait);
+        }
+        let leader = earlier.iter().rev().find_map(|r| started_leader(r));
+        let prior = chain
+            .iter()
+            .map(|r| r.task.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Some(Route::Follow(Follow {
+            leader: leader.map(str::to_string),
+            prior,
+            of: Some(of.to_string()),
+        }))
+    }
+
+    async fn follow_on(
+        &self,
+        name: &str,
+        run: &Run,
+        leader: &str,
+        mode: &str,
+        timeout: Duration,
+        wd: bool,
+    ) {
         self.check_mode(run, leader, mode).await;
-        self.sent(run, leader, true, &now_rfc3339());
+        self.sent(run, leader, wd, &now_rfc3339());
         let run = Run {
             pane_id: pane(Some(leader)),
             ..run.clone()
@@ -464,11 +563,8 @@ impl Delivery {
                 self.presend_failed(name, &run, &e.to_string())
             }
             Err(e) => self.lose(name, &run, agent, &e.to_string()),
-            Ok(TurnEnd::Completed) => self.done(name, &run, agent, true).await,
-            Ok(TurnEnd::Permission) => {
-                self.blocked_then_done(name, &run, leader, deadline, true)
-                    .await
-            }
+            Ok(TurnEnd::Completed) => self.done(name, &run, agent).await,
+            Ok(TurnEnd::Permission) => self.blocked_then_done(name, &run, leader, deadline).await,
             Ok(TurnEnd::Other { status, message }) => self.lose(
                 name,
                 &run,
@@ -518,14 +614,7 @@ impl Delivery {
         }
     }
 
-    async fn blocked_then_done(
-        &self,
-        name: &str,
-        run: &Run,
-        agent: &str,
-        deadline: Instant,
-        wd: bool,
-    ) {
+    async fn blocked_then_done(&self, name: &str, run: &Run, agent: &str, deadline: Instant) {
         loop {
             self.end(name, run, "blocked", None, Some(agent));
             loop {
@@ -541,9 +630,9 @@ impl Delivery {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.paseo.wait(agent, remaining).await {
-                Ok(TurnEnd::Completed) => return self.done(name, run, Some(agent), wd).await,
+                Ok(TurnEnd::Completed) => return self.done(name, run, Some(agent)).await,
                 Ok(TurnEnd::Other { status, .. }) if status == "idle" => {
-                    return self.done(name, run, Some(agent), wd).await
+                    return self.done(name, run, Some(agent)).await
                 }
                 Ok(TurnEnd::Permission) => {}
                 Ok(TurnEnd::Other { status, message }) => {
@@ -566,7 +655,7 @@ impl Delivery {
         }
     }
 
-    async fn done(&self, name: &str, run: &Run, agent: Option<&str>, wd: bool) {
+    async fn done(&self, name: &str, run: &Run, agent: Option<&str>) {
         let logs = match agent {
             Some(agent) => self
                 .paseo
@@ -580,15 +669,6 @@ impl Delivery {
         };
         let reply = leader_reply(&logs, &run.task);
         self.end(name, run, "done", Some(&reply), agent);
-        if let (false, Some(agent)) = (wd, agent) {
-            self.archive(agent).await;
-        }
-    }
-
-    async fn archive(&self, agent: &str) {
-        if let Err(e) = self.paseo.archive(agent).await {
-            tracing::warn!("delivery could not archive leader {agent}: {e}");
-        }
     }
 
     fn lose(&self, name: &str, run: &Run, agent: Option<&str>, why: &str) {
@@ -959,7 +1039,10 @@ mod tests {
             .calls()
             .iter()
             .all(|c| !matches!(c, Call::Inspect(_))));
-        assert!(r.fake.archived(agent_of(&run)));
+        assert!(
+            !r.fake.archived(agent_of(&run)),
+            "a done run keeps its leader"
+        );
     }
 
     #[tokio::test]
@@ -1106,7 +1189,7 @@ mod tests {
         assert!(!calls.contains(&Call::RuntimeMode("idle-lead".into())));
         assert!(set_modes(&r).is_empty());
         assert_eq!(r.status("run-1"), "done");
-        assert!(r.fake.archived(&agent));
+        assert!(!r.fake.archived(&agent), "a done run keeps its leader");
     }
 
     #[tokio::test]
@@ -1204,7 +1287,7 @@ mod tests {
             r.transcript("run-1")
         );
         assert!(r.fake.calls().contains(&Call::Wait(agent.clone())));
-        assert!(r.fake.archived(&agent), "a done run archives its leader");
+        assert!(!r.fake.archived(&agent), "a done run keeps its leader");
         r.tick().await;
         let notices = r.notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
@@ -1237,7 +1320,7 @@ mod tests {
         assert_eq!(r.status("run-2"), "done");
         let done = agent_of(&r.engine.get_run("run-2").unwrap().unwrap()).to_string();
         assert_ne!(lost, done, "each run has its own leader");
-        assert!(r.fake.archived(&done), "a done run archives its leader");
+        assert!(!r.fake.archived(&done), "a done run keeps its leader");
     }
 
     #[tokio::test]
@@ -1533,6 +1616,170 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn queue_follow(r: &Rig, id: &str, of: &str, text: &str, at: &str) {
+        let run = Run {
+            id: id.into(),
+            project_id: "proj-1".into(),
+            pane_id: "paseo:pending".into(),
+            preset_label: None,
+            task: text.into(),
+            baseline: at.into(),
+            marker: String::new(),
+            status: "queued".into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+        };
+        r.engine
+            .insert_follow_up_run(&run, None, Some("caller-1"), Some(of))
+            .unwrap();
+    }
+
+    fn leader_of(r: &Rig, id: &str) -> String {
+        agent_of(&r.engine.get_run(id).unwrap().unwrap()).to_string()
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_of_goes_to_the_idle_leader_of_the_run_it_names() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let leader = leader_of(&r, "run-1");
+        r.fake.set_status(&leader, "idle");
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        assert_eq!(r.started_tasks(), vec!["build it".to_string()]);
+        assert_eq!(
+            send_waits(&r),
+            vec![(leader.clone(), "add a test".to_string())]
+        );
+        assert_eq!(r.status("run-2"), "done");
+        assert_eq!(leader_of(&r, "run-2"), leader);
+        assert!(!r.fake.archived(&leader));
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_of_a_running_leader_waits_queued_and_sends_once_idle() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let leader = leader_of(&r, "run-1");
+        r.fake.set_status(&leader, "running");
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        assert!(send_waits(&r).is_empty(), "no send into a running turn");
+        assert_eq!(r.status("run-2"), "queued");
+        assert_eq!(r.started_tasks().len(), 1, "no second leader");
+        r.fake.set_status(&leader, "idle");
+        r.tick().await;
+        assert_eq!(send_waits(&r).len(), 1);
+        assert_eq!(r.status("run-2"), "done");
+        assert_eq!(r.started_tasks().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_of_an_archived_leader_starts_one_carrying_the_original_task() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let old = leader_of(&r, "run-1");
+        r.fake.archive(&old).await.unwrap();
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        let started = r.started_tasks();
+        assert_eq!(started, vec!["build it", "build it\n\nadd a test"]);
+        assert!(send_waits(&r).is_empty());
+        let fresh = leader_of(&r, "run-2");
+        assert_ne!(fresh, old);
+        assert_eq!(r.status("run-2"), "done");
+        let transcript = r.transcript("run-2");
+        assert!(
+            transcript.contains(&format!(
+                "follow-up of run run-1: its leader {old} was gone"
+            )),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_of_follow_ups_follows_the_newest_leader() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let first = leader_of(&r, "run-1");
+        r.fake.archive(&first).await.unwrap();
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        let second = leader_of(&r, "run-2");
+        assert_ne!(second, first);
+        r.fake.set_status(&second, "idle");
+        queue_follow(&r, "run-3", "run-1", "and a doc", "2026-10-14T14:00:09Z");
+        r.tick().await;
+        assert_eq!(r.status("run-3"), "done");
+        r.fake.set_status(&second, "idle");
+        queue_follow(
+            &r,
+            "run-4",
+            "run-2",
+            "and a changelog",
+            "2026-10-14T14:00:10Z",
+        );
+        r.tick().await;
+        assert_eq!(r.status("run-4"), "done");
+        assert_eq!(
+            send_waits(&r),
+            vec![
+                (second.clone(), "and a doc".to_string()),
+                (second.clone(), "and a changelog".to_string())
+            ]
+        );
+        assert_eq!(r.started_tasks().len(), 2);
+        assert_eq!(leader_of(&r, "run-4"), second);
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_waits_while_an_earlier_run_of_its_family_is_still_open() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let leader = leader_of(&r, "run-1");
+        r.fake.set_status(&leader, "idle");
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.engine
+            .update_run_status("run-2", "working", &now_rfc3339(), None, None)
+            .unwrap();
+        queue_follow(&r, "run-3", "run-2", "and a doc", "2026-10-14T14:00:09Z");
+        r.tick().await;
+        assert_eq!(r.status("run-3"), "queued");
+        assert!(send_waits(&r).is_empty(), "no send while run-2 is open");
+        r.engine
+            .finish_run("run-2", "done", &now_rfc3339(), Some("ok"), None)
+            .unwrap();
+        r.tick().await;
+        assert_eq!(r.status("run-3"), "done");
+        assert_eq!(send_waits(&r), vec![(leader, "and a doc".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_of_a_run_whose_leader_never_started_starts_one_with_both_tasks() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.engine
+            .finish_run("run-1", "lost", &now_rfc3339(), Some("never sent"), None)
+            .unwrap();
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        assert_eq!(r.started_tasks(), vec!["build it\n\nadd a test"]);
+        assert!(r
+            .transcript("run-2")
+            .contains("no leader was ever started for it"));
     }
 
     #[tokio::test]
