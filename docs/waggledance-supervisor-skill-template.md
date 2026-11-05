@@ -160,14 +160,29 @@ below, and never search for the leader yourself — do not list Paseo agents, pa
 workspaces to find it. The mode gate still decides scope: a routing phrase with no
 completion verb is relay mode.
 
-The daemon starts a new Paseo leader for each task and never reuses or waits on an
-existing one, so tasks for one project run in parallel. Hand the task to it:
+The daemon starts a new Paseo leader for each new task, so tasks for one project run in
+parallel. A follow-up is the one exception: it goes to the leader that already carries
+the work. Decide which one this request is before you dispatch:
+
+1. Call `waggledance_ask_state` for the project and read `leaders[].runs` — each entry
+   names a `run_id`, its `request_id`, its `status` and a `task_summary`.
+2. When the new spec extends work a live leader carries — the same feature, the same
+   files, the same output — it is a follow-up. Dispatch it with `follow_up_of` set to
+   that `run_id`, and mint no fresh correlation id for it: the provenance line keeps the
+   original corr.
+3. Otherwise it is new work: mint a new correlation id and dispatch without
+   `follow_up_of`, which opens a new leader.
+
+Hand the task over through one of the two doors:
 
 - From aicoworker, run `wd-bridge.py handoff --project <project> --task "<task>"`.
-  Keep the `corr` it prints; `reply`, `redo` and `accept` carry it.
+  Keep the `corr` it prints; `reply`, `redo` and `accept` carry it, and those are its
+  follow-ups.
 - From any other session, call `waggledance_dispatch` with `{project, task, leader:
   true, request_id}`, where `request_id` is the correlation id minted for this hand-off,
-  so a retry never sends twice.
+  so a retry never sends twice. For a follow-up, add `follow_up_of: <run_id>`; the
+  daemon waits while that leader is mid-turn, sends to it once it is idle, and starts a
+  new leader carrying the earlier task text when the old one is gone.
 
 The mode gate, the provenance line as line 1, the spec body, and the file-and-stop or
 execute-to-completion contract hold unchanged inside the task text. Never name a
