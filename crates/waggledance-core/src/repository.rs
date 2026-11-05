@@ -2,7 +2,7 @@
 //! Behind a `Mutex<Connection>` so it is Send+Sync for the async daemon.
 
 use crate::domain::{
-    InboxMessage, IndexedFile, PermissionRequest, Project, Run, SearchResult, WdTask,
+    InboxMessage, IndexedFile, LeaderRun, PermissionRequest, Project, Run, SearchResult, WdTask,
 };
 use crate::error::Result;
 use crate::short_link;
@@ -138,10 +138,21 @@ impl SqliteStore {
         request_id: Option<&str>,
         caller: Option<&str>,
     ) -> Result<String> {
+        self.insert_follow_up_run(r, feature, request_id, caller, None)
+    }
+
+    pub fn insert_follow_up_run(
+        &self,
+        r: &Run,
+        feature: Option<&str>,
+        request_id: Option<&str>,
+        caller: Option<&str>,
+        follow_up_of: Option<&str>,
+    ) -> Result<String> {
         let c = self.conn.lock().unwrap();
         let inserted = c.execute(
-            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature,request_id,caller)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature,request_id,caller,follow_up_of)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(project_id,request_id) WHERE request_id IS NOT NULL DO NOTHING",
             params![
                 r.id,
@@ -156,7 +167,8 @@ impl SqliteStore {
                 r.updated_at,
                 feature,
                 request_id,
-                caller
+                caller,
+                follow_up_of
             ],
         )?;
         if inserted == 1 {
@@ -177,6 +189,79 @@ impl SqliteStore {
         )?;
         let mut rows = stmt.query(params![project_id, request_id])?;
         Ok(rows.next()?.map(row_to_run))
+    }
+
+    pub fn run_follow_up_of(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT follow_up_of FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
+    }
+
+    pub fn run_request_id(&self, id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT request_id FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, Option<String>>(0).ok())
+            .flatten())
+    }
+
+    pub fn follow_up_chain(&self, id: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "WITH RECURSIVE up(id, parent, depth) AS (
+                SELECT id, follow_up_of, 0 FROM runs WHERE id=?1
+                UNION ALL
+                SELECT r.id, r.follow_up_of, up.depth+1 FROM runs r JOIN up ON r.id=up.parent
+                WHERE up.depth < 64
+             )
+             SELECT r.id,r.project_id,r.pane_id,r.preset_label,r.task,r.baseline,r.marker,r.status,r.created_at,r.updated_at
+             FROM up JOIN runs r ON r.id=up.id ORDER BY up.depth DESC",
+        )?;
+        let rows = stmt.query_map(params![id], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn follow_up_family(&self, root: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "WITH RECURSIVE fam(id) AS (
+                SELECT ?1
+                UNION
+                SELECT r.id FROM runs r JOIN fam ON r.follow_up_of=fam.id
+             )
+             SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE id IN (SELECT id FROM fam) ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![root], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn leader_runs(
+        &self,
+        project_id: &str,
+        pane_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LeaderRun>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,request_id,follow_up_of
+             FROM runs WHERE project_id=?1 AND pane_id=?2
+             ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![project_id, pane_id, limit as i64], |r| {
+            Ok(LeaderRun {
+                run: row_to_run(r),
+                request_id: r.get(10)?,
+                follow_up_of: r.get(11)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn project_for_corr(&self, corr: &str) -> Result<Option<String>> {
@@ -1050,10 +1135,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (7, migration_7_inbox),
     (8, migration_8_tasks),
     (9, migration_9_runs_session),
+    (10, migration_10_runs_follow_up),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -1195,6 +1281,18 @@ fn migration_9_runs_session(conn: &Connection) -> Result<()> {
     )?;
     if runs == 1 && !has_column(conn, "runs", "session_id")? {
         conn.execute("ALTER TABLE runs ADD COLUMN session_id TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn migration_10_runs_follow_up(conn: &Connection) -> Result<()> {
+    let runs: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='runs'",
+        [],
+        |r| r.get(0),
+    )?;
+    if runs == 1 && !has_column(conn, "runs", "follow_up_of")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN follow_up_of TEXT", [])?;
     }
     Ok(())
 }
@@ -2275,6 +2373,107 @@ mod tests {
             Some("the reply"),
             "a finish with no transcript leaves the stored one alone"
         );
+    }
+
+    #[test]
+    fn a_follow_up_run_stores_its_link_and_reads_its_chain_and_family() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        let root = queued_leader_run("r-root", "p1", "2026-08-16T00:00:00Z");
+        s.insert_follow_up_run(&root, None, Some("req-root"), None, None)
+            .unwrap();
+        let first = queued_leader_run("r-f1", "p1", "2026-08-16T00:00:01Z");
+        s.insert_follow_up_run(&first, None, None, None, Some("r-root"))
+            .unwrap();
+        let second = queued_leader_run("r-f2", "p1", "2026-08-16T00:00:02Z");
+        s.insert_follow_up_run(&second, None, None, None, Some("r-f1"))
+            .unwrap();
+        let sibling = queued_leader_run("r-f3", "p1", "2026-08-16T00:00:03Z");
+        s.insert_follow_up_run(&sibling, None, None, None, Some("r-root"))
+            .unwrap();
+        let stranger = queued_leader_run("r-x", "p1", "2026-08-16T00:00:04Z");
+        s.insert_follow_up_run(&stranger, None, None, None, None)
+            .unwrap();
+
+        assert_eq!(s.run_follow_up_of("r-f2").unwrap().as_deref(), Some("r-f1"));
+        assert_eq!(s.run_follow_up_of("r-root").unwrap(), None);
+        assert_eq!(
+            s.run_request_id("r-root").unwrap().as_deref(),
+            Some("req-root")
+        );
+        let chain: Vec<String> = s
+            .follow_up_chain("r-f2")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(chain, ["r-root", "r-f1", "r-f2"]);
+        let family: Vec<String> = s
+            .follow_up_family("r-root")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(family, ["r-root", "r-f1", "r-f2", "r-f3"]);
+    }
+
+    #[test]
+    fn leader_runs_lists_the_runs_on_one_pane_newest_first() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for (id, at, pane) in [
+            ("r-1", "2026-08-16T00:00:00Z", "paseo:lead-a"),
+            ("r-2", "2026-08-16T00:00:01Z", "paseo:lead-b"),
+            ("r-3", "2026-08-16T00:00:02Z", "paseo:lead-a"),
+        ] {
+            let mut run = queued_leader_run(id, "p1", at);
+            run.pane_id = pane.into();
+            let follow = (id == "r-3").then_some("r-1");
+            s.insert_follow_up_run(&run, None, Some(&format!("req-{id}")), None, follow)
+                .unwrap();
+        }
+        let runs = s.leader_runs("p1", "paseo:lead-a", 5).unwrap();
+        let rows: Vec<(&str, Option<&str>, Option<&str>)> = runs
+            .iter()
+            .map(|l| {
+                (
+                    l.run.id.as_str(),
+                    l.request_id.as_deref(),
+                    l.follow_up_of.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("r-3", Some("req-r-3"), Some("r-1")),
+                ("r-1", Some("req-r-1"), None)
+            ]
+        );
+        assert_eq!(s.leader_runs("p1", "paseo:lead-a", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrate_adds_the_follow_up_column_to_a_v9_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
+             INSERT INTO runs(id, project_id, task) VALUES ('r-old', 'p1', 'old task');
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+        super::migrate(&conn).unwrap();
+        assert!(has_column(&conn, "runs", "follow_up_of").unwrap());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let kept: Option<String> = conn
+            .query_row("SELECT follow_up_of FROM runs WHERE id='r-old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, None);
     }
 
     #[test]

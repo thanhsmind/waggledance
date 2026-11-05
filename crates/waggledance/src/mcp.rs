@@ -247,8 +247,13 @@ fn ask_state_schema() -> Value {
     whose .waggledance.toml says `orchestration = false`. `leaders` lists the Paseo agents labelled \
     waggledance.role=leader whose cwd sits in the project's root or one of its worktrees, \
     oldest first: {agent_id, status, cwd, created, via, labels, waiting_on, \
-    last_daemon_run}, where `via` is `wd` for a leader carrying \
-    waggledance.via=wd and `daemon` otherwise. `leaders` is ABSENT when \
+    last_daemon_run, runs}, where `via` is `wd` for a leader carrying \
+    waggledance.via=wd and `daemon` otherwise, and `runs` is the work that leader carries, \
+    newest first, at most 5: {run_id, request_id, status, follow_up_of, task_summary}, \
+    `task_summary` being the task's first line that is not a spec-drop or wd provenance line, \
+    cut to 200 characters. Read `runs` before a leader dispatch: when the new request extends \
+    work a live leader carries (same feature, same files, same output), dispatch with \
+    `follow_up_of` set to that run_id instead of opening a new leader. `leaders` is ABSENT when \
     `[paseo] enabled = false`, `null` beside a `leaders_error` reason when Paseo cannot \
     be read, and an array (possibly empty) beside `leaders_skipped`, the count of \
     leaders under no registered project, otherwise.",
@@ -269,8 +274,14 @@ fn dispatch_schema() -> Value {
     dispatch also needs terminal.enabled, and a refusal names the remedy. Either spawn a fresh agent via an operator-configured \
     preset label, target an already-running pane by id, or hand the task to the project's Paseo \
     leader with `leader: true` (queued and delivered by the waggledance daemon once the leader is \
-    idle) — exactly one of `preset`/`pane_id`/`leader`, and never a raw command. Returns a \
-    `run_id` immediately; poll completion with `waggledance_await`.",
+    idle) — exactly one of `preset`/`pane_id`/`leader`, and never a raw command. With \
+    `leader: true`, `follow_up_of` names a run (its run_id or request_id) whose leader should \
+    take this task instead of a new leader: first read `waggledance_ask_state` leaders[].runs, \
+    and when the new request extends work a live leader carries (same feature, same files, \
+    same output), pass that run_id here and no fresh correlation id in the task; otherwise \
+    leave it out and a new leader opens. The daemon waits while that leader is mid-turn, sends \
+    to it once idle, and starts a new leader carrying the earlier task text when it is gone. \
+    Returns a `run_id` immediately; poll completion with `waggledance_await`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -279,7 +290,8 @@ fn dispatch_schema() -> Value {
                 "pane_id": { "type": "string", "description": "An already-running pane id to target — mutually exclusive with preset" },
                 "leader": { "type": "boolean", "description": "true sends the task to the project's Paseo leader — mutually exclusive with preset and pane_id" },
                 "task": { "type": "string", "description": "The task text sent to the agent" },
-                "request_id": { "type": "string", "description": "Caller-chosen id for this request — pass one on every call so a retry never sends twice" }
+                "request_id": { "type": "string", "description": "Caller-chosen id for this request — pass one on every call so a retry never sends twice" },
+                "follow_up_of": { "type": "string", "description": "With leader: true only — the run_id or request_id of a run in this project whose leader should take this task as a follow-up instead of a new leader" }
             },
             "required": ["project", "task"]
         }
@@ -1006,6 +1018,55 @@ fn leader_owner<'a>(cwd: &Path, claims: &'a [LeaderClaim]) -> Option<&'a str> {
         .map(|(_, id)| id.as_str())
 }
 
+const LEADER_RUNS_LIMIT: usize = 5;
+const TASK_SUMMARY_CHARS: usize = 200;
+
+fn provenance_line(line: &str) -> bool {
+    let spec_drop = line
+        .strip_prefix("spec-drop ")
+        .is_some_and(|rest| rest.contains(" from waggledance@"));
+    spec_drop || paseo::wd_corr(line).is_some()
+}
+
+fn task_summary(task: &str) -> String {
+    let body = match paseo::wd_corr(task) {
+        Some(corr) => {
+            let preamble = paseo::wd_task(corr, "");
+            task.strip_prefix(preamble.as_str()).unwrap_or(task)
+        }
+        None => task,
+    };
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !provenance_line(l))
+        .unwrap_or_default();
+    match line.char_indices().nth(TASK_SUMMARY_CHARS) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.to_string(),
+    }
+}
+
+fn leader_runs(engine: &Engine, project_id: &str, agent_id: &str) -> Value {
+    let pane = format!("{}{agent_id}", orchestrate::PASEO_PANE_PREFIX);
+    let runs = engine
+        .leader_runs(project_id, &pane, LEADER_RUNS_LIMIT)
+        .unwrap_or_default();
+    Value::Array(
+        runs.into_iter()
+            .map(|l| {
+                json!({
+                    "run_id": l.run.id,
+                    "request_id": l.request_id,
+                    "status": l.run.status,
+                    "follow_up_of": l.follow_up_of,
+                    "task_summary": task_summary(&l.run.task)
+                })
+            })
+            .collect(),
+    )
+}
+
 fn attach_leaders(
     digest: &mut Value,
     engine: &Engine,
@@ -1065,6 +1126,7 @@ fn attach_leaders(
         .into_iter()
         .map(|(agent, cwd)| {
             let via = wd.contains(&agent.id).then_some("wd");
+            let runs = leader_runs(engine, &project.id, &agent.id);
             json!({
                 "agent_id": agent.id,
                 "status": agent.status,
@@ -1077,7 +1139,8 @@ fn attach_leaders(
                     "waggledance.via": via
                 },
                 "waiting_on": waiting_on,
-                "last_daemon_run": last_daemon_run
+                "last_daemon_run": last_daemon_run,
+                "runs": runs
             })
         })
         .collect();
@@ -1213,6 +1276,17 @@ fn handle_dispatch(
         .get("request_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    let follow_up_of = args
+        .get("follow_up_of")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if follow_up_of.is_some() && !leader {
+        return tool_error(
+            id,
+            "\"follow_up_of\" goes only with \"leader\": true — it names the run whose leader \
+             takes the follow-up, never a preset or pane_id",
+        );
+    }
     match [preset_label.is_some(), pane_id_arg.is_some(), leader]
         .iter()
         .filter(|t| **t)
@@ -1246,6 +1320,11 @@ fn handle_dispatch(
         }
     }
     if leader {
+        let follow_up_of = match follow_up_of.map(|of| follow_up_target(engine, &project, of)) {
+            None => None,
+            Some(Ok(run)) => Some(run.id),
+            Some(Err(refusal)) => return tool_error(id, &refusal),
+        };
         let caller = dispatch_caller(
             std::env::var("PASEO_AGENT_ID").ok(),
             std::env::var("WAGGLEDANCE_CALLER").ok(),
@@ -1255,8 +1334,11 @@ fn handle_dispatch(
             engine,
             &project,
             task,
-            request_id,
-            caller.as_deref(),
+            LeaderRequest {
+                request_id,
+                caller: caller.as_deref(),
+                follow_up_of: follow_up_of.as_deref(),
+            },
             &resolve_data_dir(None),
         );
     }
@@ -1370,15 +1452,42 @@ fn dispatch_caller(paseo_agent: Option<String>, waggledance: Option<String>) -> 
         .or_else(|| (waggledance.as_deref() == Some("wd")).then(|| paseo::WD_CALLER.to_string()))
 }
 
+fn follow_up_target(engine: &Engine, project: &Project, of: &str) -> Result<Run, String> {
+    match engine.get_run(of) {
+        Ok(Some(run)) if run.project_id == project.id => return Ok(run),
+        Ok(_) => {}
+        Err(e) => return Err(format!("follow_up_of lookup failed: {e}")),
+    }
+    match engine.run_by_request(&project.id, of) {
+        Ok(Some(run)) => Ok(run),
+        Ok(None) => Err(format!(
+            "follow_up_of {of:?} names no run in project {} — pass a run_id or request_id \
+             from waggledance_ask_state leaders[].runs or waggledance_runs",
+            project.id
+        )),
+        Err(e) => Err(format!("follow_up_of lookup failed: {e}")),
+    }
+}
+
+struct LeaderRequest<'a> {
+    request_id: Option<&'a str>,
+    caller: Option<&'a str>,
+    follow_up_of: Option<&'a str>,
+}
+
 fn dispatch_to_leader(
     id: Option<Value>,
     engine: &Engine,
     project: &Project,
     task: &str,
-    request_id: Option<&str>,
-    caller: Option<&str>,
+    request: LeaderRequest<'_>,
     data_dir: &Path,
 ) -> Value {
+    let LeaderRequest {
+        request_id,
+        caller,
+        follow_up_of,
+    } = request;
     if !engine.orchestration_allowed(project) {
         return tool_error(id, &dispatch_off(engine, project));
     }
@@ -1406,7 +1515,7 @@ fn dispatch_to_leader(
         created_at: now.clone(),
         updated_at: now,
     };
-    let stored = match engine.insert_run_with_request(&run, None, request_id, caller) {
+    let stored = match engine.insert_follow_up_run(&run, request_id, caller, follow_up_of) {
         Ok(stored) => stored,
         Err(e) => return tool_error(id, &format!("run persistence failed: {e}")),
     };
@@ -1444,6 +1553,7 @@ fn dispatch_to_leader(
                 "run_id": run.id,
                 "status": "queued",
                 "duplicate": false,
+                "follow_up_of": follow_up_of,
                 "warnings": warnings
             }
         }),
@@ -1532,8 +1642,11 @@ async fn task_action(
                 engine,
                 &project,
                 &body,
-                Some(&format!("{corr}:{n}")),
-                Some(paseo::WD_CALLER),
+                LeaderRequest {
+                    request_id: Some(&format!("{corr}:{n}")),
+                    caller: Some(paseo::WD_CALLER),
+                    follow_up_of: None,
+                },
                 data_dir,
             );
             if resp["result"]["structuredContent"]["duplicate"] != true {
@@ -1840,6 +1953,7 @@ fn handle_runs(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
                 "preset_label": r.preset_label,
                 "task": r.task,
                 "status": r.status,
+                "follow_up_of": engine.run_follow_up_of(&r.id).ok().flatten(),
                 "created_at": r.created_at,
                 "updated_at": r.updated_at
             })
@@ -2055,7 +2169,10 @@ mod tests {
     #[test]
     fn bee_upgrade_apply_without_projects_is_refused() {
         let engine = empty_engine();
-        for args in [json!({ "apply": true }), json!({ "apply": true, "projects": [] })] {
+        for args in [
+            json!({ "apply": true }),
+            json!({ "apply": true, "projects": [] }),
+        ] {
             let resp = call_tool(&engine, "waggledance_bee_upgrade", args);
             assert_eq!(resp["result"]["isError"], true, "{resp}");
             let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -2604,6 +2721,22 @@ mod tests {
         daemon_run.pane_id = "paseo:abc".to_string();
         daemon_run.status = "done".to_string();
         engine.insert_run(&daemon_run, None).unwrap();
+        let mut carried = seeded_run(&project.id, "run-old-1");
+        carried.pane_id = "paseo:old".to_string();
+        carried.status = "done".to_string();
+        carried.task = "spec-drop sup-1 from waggledance@abc\n\n# Build the widget".to_string();
+        carried.created_at = "2026-08-16T00:00:01Z".to_string();
+        engine
+            .insert_follow_up_run(&carried, Some("sup-1"), None, None)
+            .unwrap();
+        let mut follow = seeded_run(&project.id, "run-old-2");
+        follow.pane_id = "paseo:old".to_string();
+        follow.status = "queued".to_string();
+        follow.task = "add a test".to_string();
+        follow.created_at = "2026-08-16T00:00:02Z".to_string();
+        engine
+            .insert_follow_up_run(&follow, None, None, Some("run-old-1"))
+            .unwrap();
         let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
         let rollup = with_worktree(rollups.pop().unwrap(), "widgets--wt--polish");
         let mut claims = vec![(canonical(&project.root_path), project.id.clone())];
@@ -2656,6 +2789,21 @@ mod tests {
             json!({ "run_id": "run-paseo", "status": "done" })
         );
         assert_eq!(leaders[0]["created"], "3 days ago");
+        assert_eq!(
+            leaders[0]["runs"],
+            json!([
+                {
+                    "run_id": "run-old-2", "request_id": null, "status": "queued",
+                    "follow_up_of": "run-old-1", "task_summary": "add a test"
+                },
+                {
+                    "run_id": "run-old-1", "request_id": "sup-1", "status": "done",
+                    "follow_up_of": null, "task_summary": "# Build the widget"
+                }
+            ]),
+            "{digest}"
+        );
+        assert_eq!(leaders[1]["runs"], json!([]), "{digest}");
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -3484,8 +3632,11 @@ mod tests {
             engine,
             project,
             task,
-            request_id,
-            Some("agent-caller"),
+            LeaderRequest {
+                request_id,
+                caller: Some("agent-caller"),
+                follow_up_of: None,
+            },
             data_dir,
         )
     }
@@ -3621,6 +3772,145 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_of_is_refused_beside_a_preset_or_pane_or_without_leader() {
+        let (engine, project, _) = leader_engine("follow-xor", true, true, true);
+        for args in [
+            json!({ "project": project.id, "task": "go", "preset": "p", "follow_up_of": "run-1" }),
+            json!({ "project": project.id, "task": "go", "pane_id": "w:1", "follow_up_of": "run-1" }),
+            json!({ "project": project.id, "task": "go", "follow_up_of": "run-1" }),
+            json!({ "project": project.id, "task": "go", "leader": false, "follow_up_of": "run-1" }),
+        ] {
+            let resp = call_tool(&engine, "waggledance_dispatch", args.clone());
+            assert_eq!(resp["result"]["isError"], true, "{args}");
+            let text = text_of(&resp);
+            assert!(text.contains("\"follow_up_of\" goes only with"), "{text}");
+        }
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn follow_up_of_naming_no_run_in_the_project_is_refused_and_stores_nothing() {
+        let (engine, project, data_dir) = leader_engine("follow-unknown", true, true, true);
+        beat(&data_dir, 0);
+        let mut elsewhere = seeded_run("other-project", "run-elsewhere");
+        elsewhere.pane_id = "paseo:abc".to_string();
+        engine.insert_run(&elsewhere, None).unwrap();
+        for of in ["run-missing", "run-elsewhere"] {
+            let resp = call_tool(
+                &engine,
+                "waggledance_dispatch",
+                json!({ "project": project.id, "task": "go", "leader": true, "follow_up_of": of }),
+            );
+            assert_eq!(resp["result"]["isError"], true, "{resp}");
+            let text = text_of(&resp);
+            assert!(text.contains("names no run in project"), "{text}");
+        }
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn follow_up_of_by_run_id_or_request_id_stores_the_resolved_run_and_the_task_unchanged() {
+        let (engine, project, data_dir) = leader_engine("follow-known", true, true, true);
+        beat(&data_dir, 0);
+        let first = leader_call(&engine, &project, &data_dir, "build it", Some("sup-1"));
+        let first_id = first["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for (of, request_id) in [(first_id.as_str(), "sup-2"), ("sup-1", "sup-3")] {
+            let resp = call_tool(
+                &engine,
+                "waggledance_dispatch",
+                json!({
+                    "project": project.id, "task": "add a test", "leader": true,
+                    "request_id": request_id, "follow_up_of": of
+                }),
+            );
+            let sc = &resp["result"]["structuredContent"];
+            assert_eq!(sc["follow_up_of"], json!(first_id), "{resp}");
+            let run_id = sc["run_id"].as_str().unwrap();
+            assert_eq!(
+                engine.run_follow_up_of(run_id).unwrap().as_deref(),
+                Some(first_id.as_str())
+            );
+            assert_eq!(engine.get_run(run_id).unwrap().unwrap().task, "add a test");
+        }
+        let runs = call_tool(
+            &engine,
+            "waggledance_runs",
+            json!({ "project": project.id }),
+        );
+        let rows = runs["result"]["structuredContent"]["runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            rows.iter().any(|r| r["follow_up_of"] == json!(first_id)),
+            "{runs}"
+        );
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_duplicate_request_id_with_follow_up_of_returns_the_first_run() {
+        let (engine, project, data_dir) = leader_engine("follow-dup", true, true, true);
+        beat(&data_dir, 0);
+        let first = leader_call(&engine, &project, &data_dir, "build it", Some("sup-1"));
+        let first_id = first["result"]["structuredContent"]["run_id"].clone();
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({
+                "project": project.id, "task": "again", "leader": true,
+                "request_id": "sup-1", "follow_up_of": "run-missing"
+            }),
+        );
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["duplicate"], true, "{resp}");
+        assert_eq!(sc["run_id"], first_id);
+        assert_eq!(engine.list_runs(&project.id, 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn dispatch_and_ask_state_descriptions_teach_follow_up_of() {
+        let dispatch = dispatch_schema();
+        let desc = dispatch["description"].as_str().unwrap();
+        assert!(desc.contains("follow_up_of"), "{desc}");
+        assert!(desc.contains("leaders[].runs"), "{desc}");
+        assert!(dispatch["inputSchema"]["properties"]["follow_up_of"].is_object());
+        let ask = ask_state_schema();
+        let desc = ask["description"].as_str().unwrap();
+        assert!(
+            desc.contains("task_summary") && desc.contains("follow_up_of"),
+            "{desc}"
+        );
+    }
+
+    #[test]
+    fn a_task_summary_skips_provenance_lines_and_is_cut_to_200_chars() {
+        assert_eq!(
+            task_summary("spec-drop sup-1 from waggledance@14187c4\n\n# Ship the widget\nmore"),
+            "# Ship the widget"
+        );
+        assert_eq!(
+            task_summary(&paseo::wd_task(
+                "corr-1",
+                "Reply from the user:\nadd a test"
+            )),
+            "Reply from the user:"
+        );
+        assert_eq!(task_summary("\n  plain ask  \n"), "plain ask");
+        let long = "x".repeat(250);
+        let cut = task_summary(&long);
+        assert_eq!(cut.chars().count(), 201);
+        assert!(cut.ends_with('…'));
+        assert_eq!(task_summary(""), "");
+    }
+
+    #[test]
     fn a_wd_caller_comes_from_waggledance_caller_only_without_a_paseo_agent() {
         let some = |v: &str| Some(v.to_string());
         assert_eq!(
@@ -3651,8 +3941,11 @@ mod tests {
             &engine,
             &project,
             "ship it",
-            Some("corr-9"),
-            Some(paseo::WD_CALLER),
+            LeaderRequest {
+                request_id: Some("corr-9"),
+                caller: Some(paseo::WD_CALLER),
+                follow_up_of: None,
+            },
             &data_dir,
         );
         let run_id = resp["result"]["structuredContent"]["run_id"]
@@ -3678,8 +3971,11 @@ mod tests {
                 &engine,
                 &project,
                 task,
-                Some(request_id),
-                caller,
+                LeaderRequest {
+                    request_id: Some(request_id),
+                    caller,
+                    follow_up_of: None,
+                },
                 &data_dir,
             )
         };

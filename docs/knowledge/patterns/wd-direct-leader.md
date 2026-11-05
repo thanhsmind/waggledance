@@ -62,13 +62,24 @@ project's bee advisor (`bee dispatch prepare --kind advisor`) before a `question
 mail only what the advisor cannot decide, quoting the advisor's answer (D7).
 
 A wd hand-off starts its own new leader and never waits on another caller's leader; runs
-of one project go out in parallel (leader-per-task D1). A follow-up is the exception
-(leader-idle-close D2): a `reply` or `redo` run (`request_id` `<corr>:<n>`) goes to that
-task's recorded leader while the leader is not archived, and waits queued while it is
-`running` or `initializing`. When the leader is archived, a new leader starts and its
-prompt carries the original task text before the follow-up. A wd run's leader is not
-archived when the run ends `done`: it stays until `accept` (leader-per-task D2). An idle
-wd leader is still archived after 24 hours
+of one project go out in parallel (leader-per-task D1). A follow-up is the exception, and
+there are two kinds:
+
+- **wd's own** (leader-idle-close D2): a `reply` or `redo` run (`request_id`
+  `<corr>:<n>`) goes to that task's recorded leader.
+- **`follow_up_of`** (leader-follow-up D1/D2), open to every caller, wd included: a
+  `waggledance_dispatch` with `leader: true` and `follow_up_of: <run_id or request_id>`
+  goes to the leader its family last used — the newest earlier run in the referenced
+  run's `follow_up_of` chain that has a leader — and waits while an earlier run of that
+  family is still open. When it names `follow_up_of`, that link decides over the wd
+  corr.
+
+Either kind goes to its leader while the leader is not archived, and waits queued while
+it is `running` or `initializing`. When the leader is archived, a new leader starts and
+its prompt carries the original task text before the follow-up. The full rules are in
+`paseo-leader-dispatch.md` ("The follow-up exceptions"). No run's leader is archived when
+the run ends `done` (leader-follow-up D3, superseding leader-per-task D2): a wd leader
+stays until `accept`. An idle leader is still archived after 24 hours
 (leader-idle-close D1). Its task stays open: the heartbeat still lists it on the board, a
 `reply` or `redo` starts a new leader that carries the original task text, and `accept`
 closes it.
