@@ -592,6 +592,42 @@ impl Engine {
             .insert_run_with_request(run, feature, request_id, caller)
     }
 
+    pub fn insert_follow_up_run(
+        &self,
+        run: &Run,
+        request_id: Option<&str>,
+        caller: Option<&str>,
+        follow_up_of: Option<&str>,
+    ) -> Result<String> {
+        self.store
+            .insert_follow_up_run(run, None, request_id, caller, follow_up_of)
+    }
+
+    pub fn run_follow_up_of(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_follow_up_of(id)
+    }
+
+    pub fn run_request_id(&self, id: &str) -> Result<Option<String>> {
+        self.store.run_request_id(id)
+    }
+
+    pub fn follow_up_chain(&self, id: &str) -> Result<Vec<Run>> {
+        self.store.follow_up_chain(id)
+    }
+
+    pub fn follow_up_family(&self, root: &str) -> Result<Vec<Run>> {
+        self.store.follow_up_family(root)
+    }
+
+    pub fn leader_runs(
+        &self,
+        project_id: &str,
+        pane_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::LeaderRun>> {
+        self.store.leader_runs(project_id, pane_id, limit)
+    }
+
     pub fn run_by_request(&self, project_id: &str, request_id: &str) -> Result<Option<Run>> {
         self.store.run_by_request(project_id, request_id)
     }

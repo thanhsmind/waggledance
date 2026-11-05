@@ -95,6 +95,13 @@ pub struct Run {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct LeaderRun {
+    pub run: Run,
+    pub request_id: Option<String>,
+    pub follow_up_of: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxMessage {
     pub seq: i64,
