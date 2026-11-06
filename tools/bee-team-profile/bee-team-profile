@@ -41,9 +41,13 @@ def effective_agent(base, overlay, rt, role):
 def active_profile(base, overlay, profiles):
     current = {(rt, role): effective_agent(base, overlay, rt, role)
                for rt, roles in profiles[PROFILES[0]]["team"].items() for role in roles}
+    switchable = {a for p in profiles.values() for roles in p["team"].values() for a in roles.values()}
+    live = {k: v for k, v in current.items() if v in switchable}
+    if not live:
+        return "custom (not switchable)"
     for name, prof in profiles.items():
-        if all(current.get((rt, role)) == agent for rt, roles in prof["team"].items() for role, agent in roles.items()):
-            return name
+        if all(prof["team"].get(rt, {}).get(role) == agent for (rt, role), agent in live.items()):
+            return name + ("" if len(live) == len(current) else f" ({len(current) - len(live)} custom roles kept)")
     return "mixed"
 
 
@@ -66,20 +70,32 @@ def apply(root, profile, profiles, force):
     base = load(base_path)
     if not covered(base, profile):
         return "skipped (no bee team config)"
-    if not force and active_profile(base, load(overlay_path), profiles) == "mixed":
-        return "skipped (custom team, rerun with --force to overwrite)"
-    fixed = normalize_base(base, profile)
+    fixed = normalize_base(base, profile) if force else []
     if fixed:
         save(base_path, base)
     overlay = load(overlay_path)
+    switchable = {a for p in profiles.values() for roles in p["team"].values() for a in roles.values()}
     team = overlay.setdefault("team", {})
+    moved, kept = 0, []
     for rt, roles in profile["team"].items():
         for role, agent in roles.items():
+            if effective_agent(base, overlay, rt, role) not in switchable:
+                if role in ((base.get("team") or {}).get(rt) or {}):
+                    kept.append(f"{rt}.{role}")
+                continue
             team.setdefault(rt, {})[role] = {"kind": "herding", "agent": agent}
+            moved += 1
+    if not moved:
+        return "skipped (no agy or claude-pane roles)"
     agents = overlay.setdefault("herding", {}).setdefault("agents", {})
     agents.update(profile.get("herding_agents") or {})
     save(overlay_path, overlay)
-    return "applied" + (f" (base normalized: {', '.join(fixed)})" if fixed else "")
+    notes = []
+    if fixed:
+        notes.append(f"base normalized: {', '.join(fixed)}")
+    if kept:
+        notes.append(f"kept custom: {', '.join(kept)}")
+    return f"{moved} roles" + (f" ({'; '.join(notes)})" if notes else "")
 
 
 def main(argv):
