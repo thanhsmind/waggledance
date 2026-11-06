@@ -20,7 +20,6 @@ const NOTICE_WINDOW: Duration = Duration::from_secs(3600);
 const NOTICE_GAP: Duration = Duration::from_secs(30);
 const MAY_STILL_FINISH: &str = "the leader may still be finishing";
 const RESTARTED: &str = "daemon restarted — the leader may still be finishing; check its chat";
-const LEADER_IDLE_LIMIT: time::Duration = time::Duration::hours(24);
 const LEADER_RUNNING: [&str; 2] = ["running", "initializing"];
 
 pub type NotifySlot = Arc<Mutex<Option<Arc<NotifyStore>>>>;
@@ -109,8 +108,18 @@ fn pane(agent: Option<&str>) -> String {
     format!("{PASEO_PANE_PREFIX}{}", agent.unwrap_or("pending"))
 }
 
-fn idle_for(state: &paseo::AgentState, now: time::OffsetDateTime) -> Option<time::Duration> {
-    if state.archived || LEADER_RUNNING.contains(&state.status.as_str()) {
+fn settled(state: &paseo::AgentState) -> bool {
+    !state.archived
+        && state.pending_permissions == 0
+        && !LEADER_RUNNING.contains(&state.status.as_str())
+}
+
+fn idle_for(
+    state: &paseo::AgentState,
+    now: time::OffsetDateTime,
+    limit: time::Duration,
+) -> Option<time::Duration> {
+    if !settled(state) {
         return None;
     }
     let updated = time::OffsetDateTime::parse(
@@ -119,7 +128,7 @@ fn idle_for(state: &paseo::AgentState, now: time::OffsetDateTime) -> Option<time
     )
     .ok()?;
     let idle = now - updated;
-    (idle > LEADER_IDLE_LIMIT).then_some(idle)
+    (idle > limit).then_some(idle)
 }
 
 fn notice_text(project: &str, run_id: &str, status: &str) -> String {
@@ -221,11 +230,7 @@ impl Delivery {
                 return;
             }
         };
-        let busy = self.busy_leaders();
         for id in leaders {
-            if busy.contains(&id) {
-                continue;
-            }
             let state = match self.paseo.inspect(&id).await {
                 Ok(state) => state,
                 Err(e) => {
@@ -233,13 +238,18 @@ impl Delivery {
                     continue;
                 }
             };
-            let Some(idle) = idle_for(&state, now) else {
+            let carried = self.carried_runs(&id);
+            let limit = self.idle_limit(&carried);
+            let Some(idle) = idle_for(&state, now, limit) else {
                 continue;
             };
+            if self.family_open(&carried) {
+                continue;
+            }
             match self.paseo.archive(&id).await {
                 Ok(()) => tracing::info!(
                     leader = %id,
-                    idle_hours = idle.whole_hours(),
+                    idle_minutes = idle.whole_minutes(),
                     "idle sweep archived leader {id}"
                 ),
                 Err(e) => {
@@ -249,16 +259,101 @@ impl Delivery {
         }
     }
 
-    fn busy_leaders(&self) -> HashSet<String> {
-        let runs = self.engine.list_inflight_paseo_runs().unwrap_or_else(|e| {
-            tracing::warn!("idle sweep could not list in-flight leader runs: {e}");
-            Vec::new()
+    fn carried_runs(&self, leader: &str) -> Vec<Run> {
+        self.engine
+            .runs_on_pane(&pane(Some(leader)))
+            .unwrap_or_else(|e| {
+                tracing::warn!("delivery could not list leader {leader}'s runs: {e}");
+                Vec::new()
+            })
+    }
+
+    fn idle_limit(&self, carried: &[Run]) -> time::Duration {
+        let own = carried
+            .first()
+            .and_then(|run| self.engine.get_project(&run.project_id).ok().flatten())
+            .and_then(|p| self.engine.project_settings(&p).0.paseo.leader_idle_minutes);
+        let minutes = own.unwrap_or(self.engine.config.paseo.leader_idle_minutes);
+        time::Duration::minutes(i64::try_from(minutes).unwrap_or(i64::MAX / 120))
+    }
+
+    fn family_open(&self, carried: &[Run]) -> bool {
+        carried.iter().any(|run| {
+            if FAMILY_OPEN.contains(&run.status.as_str()) {
+                return true;
+            }
+            match self.family(&run.id) {
+                Some((_, family)) => family
+                    .iter()
+                    .any(|r| FAMILY_OPEN.contains(&r.status.as_str())),
+                None => true,
+            }
+        })
+    }
+
+    fn family(&self, of: &str) -> Option<(Vec<Run>, Vec<Run>)> {
+        let chain = self
+            .engine
+            .follow_up_chain(of)
+            .map_err(|e| tracing::warn!("delivery could not read run {of}'s chain: {e}"))
+            .ok()
+            .filter(|chain| !chain.is_empty())?;
+        let family = self
+            .engine
+            .follow_up_family(&chain[0].id)
+            .map_err(|e| tracing::warn!("delivery could not read run {of}'s family: {e}"))
+            .ok()?;
+        Some((chain, family))
+    }
+
+    fn handoff_of(&self, run: &Run, of: &str) -> (String, Vec<String>) {
+        let mut olds: Vec<String> = Vec::new();
+        if let Some((_, family)) = self.family(of) {
+            for leader in family
+                .iter()
+                .rev()
+                .filter(|r| r.id != run.id)
+                .filter_map(|r| started_leader(r))
+            {
+                if !olds.iter().any(|o| o == leader) {
+                    olds.push(leader.to_string());
+                }
+            }
+        }
+        let takes = olds
+            .first()
+            .map(|old| format!(": takes over from leader {old}"))
+            .unwrap_or_default();
+        (format!("[waggledance] handoff of run {of}{takes}"), olds)
+    }
+
+    fn retire(&self, old: String, deadline: Instant) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            while Instant::now() < deadline {
+                match this.paseo.inspect(&old).await {
+                    Ok(state) if state.archived => return,
+                    Ok(state) if settled(&state) && !this.carries_open(&old) => {
+                        match this.paseo.archive(&old).await {
+                            Ok(()) => {
+                                tracing::info!(leader = %old, "handoff archived leader {old}")
+                            }
+                            Err(e) => tracing::warn!("handoff could not archive leader {old}: {e}"),
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("handoff could not inspect leader {old}: {e}"),
+                }
+                tokio::time::sleep(this.permission_poll).await;
+            }
         });
-        runs.iter()
-            .filter_map(|run| run.pane_id.strip_prefix(PASEO_PANE_PREFIX))
-            .filter(|a| *a != "pending")
-            .map(str::to_string)
-            .collect()
+    }
+
+    fn carries_open(&self, leader: &str) -> bool {
+        self.carried_runs(leader)
+            .iter()
+            .any(|r| FAMILY_OPEN.contains(&r.status.as_str()))
     }
 
     async fn tick(&self, deliveries: &mut JoinSet<()>) {
@@ -370,7 +465,16 @@ impl Delivery {
         }
         let wd = matches!(self.engine.run_caller(&run.id), Ok(Some(c)) if c == paseo::WD_CALLER);
         let mode = paseo::leader_mode(config, &settings.paseo);
+        let handoff = self.engine.run_is_handoff(&run.id).unwrap_or(false);
+        let mut note = None;
+        let mut olds = Vec::new();
         let route = match self.engine.run_follow_up_of(&run.id) {
+            Ok(Some(of)) if handoff => {
+                let (line, leaders) = self.handoff_of(run, &of);
+                note = Some(line);
+                olds = leaders;
+                None
+            }
             Ok(Some(of)) => self.follow_up_of(run, &of),
             Ok(None) => wd.then(|| self.follow_up(run)).flatten().map(Route::Follow),
             Err(e) => {
@@ -381,7 +485,6 @@ impl Delivery {
                 wd.then(|| self.follow_up(run)).flatten().map(Route::Follow)
             }
         };
-        let mut note = None;
         let prompt = match route {
             Some(Route::Wait) => {
                 self.set_status(&run.id, "queued");
@@ -445,8 +548,13 @@ impl Delivery {
             .insert(run.id.clone(), header);
         let spec = start.spec(&prompt);
         let started = self.paseo.run_and_wait(&spec, timeout);
+        let retired = std::sync::atomic::AtomicBool::new(false);
         let finder = async {
             let id = self.new_leader(&project.id, &run.id).await;
+            if !retired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                olds.iter()
+                    .for_each(|old| self.retire(old.clone(), deadline));
+            }
             self.check_mode(run, &id, &mode).await;
         };
         tokio::pin!(started, finder);
@@ -460,6 +568,10 @@ impl Delivery {
         let (agent, outcome) = match result {
             Ok((id, end)) => {
                 if !checked {
+                    if !retired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        olds.iter()
+                            .for_each(|old| self.retire(old.clone(), deadline));
+                    }
                     self.check_mode(run, &id, &mode).await;
                 }
                 self.sent(run, &id, wd, &sent_at);
@@ -510,25 +622,30 @@ impl Delivery {
     }
 
     fn follow_up_of(&self, run: &Run, of: &str) -> Option<Route> {
-        let chain = self
+        let (chain, family) = self.family(of)?;
+        let handoffs = self
             .engine
-            .follow_up_chain(of)
-            .map_err(|e| tracing::warn!("delivery could not read run {of}'s chain: {e}"))
-            .ok()
-            .filter(|chain| !chain.is_empty())?;
-        let family = self
-            .engine
-            .follow_up_family(&chain[0].id)
-            .map_err(|e| tracing::warn!("delivery could not read run {of}'s family: {e}"))
-            .ok()?;
-        let earlier: Vec<&Run> = family.iter().take_while(|r| r.id != run.id).collect();
-        if earlier
+            .family_handoffs(&chain[0].id)
+            .unwrap_or_else(|e| {
+                tracing::warn!("delivery could not read run {of}'s handoffs: {e}");
+                HashSet::new()
+            });
+        let mut before = true;
+        let mut candidates: Vec<&Run> = Vec::new();
+        for r in &family {
+            if r.id == run.id {
+                before = false;
+            } else if before || handoffs.contains(&r.id) {
+                candidates.push(r);
+            }
+        }
+        if candidates
             .iter()
             .any(|r| FAMILY_OPEN.contains(&r.status.as_str()))
         {
             return Some(Route::Wait);
         }
-        let leader = earlier.iter().rev().find_map(|r| started_leader(r));
+        let leader = candidates.iter().rev().find_map(|r| started_leader(r));
         let prior = chain
             .iter()
             .map(|r| r.task.as_str())
@@ -1632,7 +1749,7 @@ mod tests {
             updated_at: at.into(),
         };
         r.engine
-            .insert_follow_up_run(&run, None, Some("caller-1"), Some(of))
+            .insert_follow_up_run(&run, None, Some("caller-1"), Some(of), false)
             .unwrap();
     }
 
@@ -1974,12 +2091,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_idle_sweep_keeps_a_leader_updated_within_a_day() {
+    async fn the_idle_sweep_keeps_a_leader_updated_within_the_limit() {
         let r = rig();
         r.fake
-            .add_listed_leader("fresh-lead", "idle", Some("2026-11-01T13:00:00Z"));
+            .add_listed_leader("fresh-lead", "idle", Some("2026-11-02T11:45:00Z"));
         r.sweep_at(clock(NOW)).await;
         assert!(!r.fake.archived("fresh-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_archives_at_31_minutes_and_not_at_29() {
+        let r = rig();
+        r.fake
+            .add_listed_leader("fresh-lead", "idle", Some("2026-11-02T11:31:00Z"));
+        r.fake
+            .add_listed_leader("stale-lead", "idle", Some("2026-11-02T11:29:00Z"));
+        r.sweep_at(clock(NOW)).await;
+        assert!(!r.fake.archived("fresh-lead"));
+        assert!(r.fake.archived("stale-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_keeps_a_leader_whose_run_is_blocked() {
+        let r = rig();
+        root_workspace(&r);
+        r.fake
+            .add_listed_leader("blocked-lead", "idle", Some("2026-11-01T11:00:00Z"));
+        r.queue("proj-1", "run-1", "build it", None);
+        r.engine
+            .set_run_pane("run-1", &format!("{PASEO_PANE_PREFIX}blocked-lead"))
+            .unwrap();
+        r.engine.claim_queued_run("run-1").unwrap();
+        r.engine
+            .update_run_status("run-1", "blocked", &now_rfc3339(), None, None)
+            .unwrap();
+        r.sweep_at(clock(NOW)).await;
+        assert!(!r.fake.archived("blocked-lead"));
+    }
+
+    #[tokio::test]
+    async fn the_idle_sweep_keeps_a_leader_whose_family_has_a_queued_run() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let leader = leader_of(&r, "run-1");
+        r.fake
+            .add_listed_leader(&leader, "idle", Some("2026-11-01T11:00:00Z"));
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.sweep_at(clock(NOW)).await;
+        assert!(!r.fake.archived(&leader));
+        r.engine
+            .finish_run("run-2", "done", &now_rfc3339(), Some("ok"), None)
+            .unwrap();
+        r.sweep_at(clock(NOW)).await;
+        assert!(r.fake.archived(&leader));
+    }
+
+    fn queue_handoff(r: &Rig, id: &str, of: &str, text: &str, at: &str) {
+        let run = Run {
+            id: id.into(),
+            project_id: "proj-1".into(),
+            pane_id: "paseo:pending".into(),
+            preset_label: None,
+            task: text.into(),
+            baseline: at.into(),
+            marker: String::new(),
+            status: "queued".into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+        };
+        r.engine
+            .insert_follow_up_run(&run, None, Some("caller-1"), Some(of), true)
+            .unwrap();
+    }
+
+    async fn settle_archive(r: &Rig, leader: &str) -> bool {
+        for _ in 0..200 {
+            if r.fake.archived(leader) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_handoff_archives_the_old_leader_only_once_it_is_idle() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let old = leader_of(&r, "run-1");
+        r.fake.set_status(&old, "running");
+        queue_handoff(&r, "run-2", "run-1", "carry on", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        assert_eq!(r.started_tasks(), vec!["build it", "carry on"]);
+        assert!(send_waits(&r).is_empty());
+        let fresh = leader_of(&r, "run-2");
+        assert_ne!(fresh, old);
+        assert!(r.transcript("run-2").contains(&format!(
+            "handoff of run run-1: takes over from leader {old}"
+        )));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!r.fake.archived(&old), "a running old leader is kept");
+        r.fake.set_status(&old, "idle");
+        assert!(settle_archive(&r, &old).await);
+        assert!(!r.fake.archived(&fresh));
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_of_an_old_run_goes_to_the_successor_even_when_queued_before_the_handoff() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let old = leader_of(&r, "run-1");
+        r.fake.set_status(&old, "idle");
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        queue_handoff(&r, "run-3", "run-1", "carry on", "2026-10-14T14:00:06Z");
+        r.engine
+            .update_run_status("run-3", "working", &now_rfc3339(), None, None)
+            .unwrap();
+        r.tick().await;
+        assert_eq!(r.status("run-2"), "queued", "waits for the open handoff");
+        r.engine
+            .set_run_pane("run-3", &format!("{PASEO_PANE_PREFIX}successor"))
+            .unwrap();
+        r.fake.add_leader("successor", "idle", false);
+        r.engine
+            .finish_run("run-3", "done", &now_rfc3339(), Some("ok"), None)
+            .unwrap();
+        r.tick().await;
+        assert_eq!(
+            send_waits(&r),
+            vec![("successor".to_string(), "add a test".to_string())]
+        );
+        queue_follow(&r, "run-4", "run-1", "and a doc", "2026-10-14T14:00:09Z");
+        r.tick().await;
+        assert_eq!(send_waits(&r).len(), 2);
+        assert_eq!(send_waits(&r)[1].0, "successor");
     }
 
     #[tokio::test]

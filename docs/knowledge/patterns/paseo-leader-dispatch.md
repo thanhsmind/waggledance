@@ -1,7 +1,7 @@
 ---
 type: bee.pattern
 title: Each request for a project starts its own Paseo leader through waggledance_dispatch
-description: "Practice: with a working Paseo CLI found and a registered project whose .waggledance.toml does not say orchestration = false, waggledance_dispatch with leader: true queues the task; the daemon starts a new labelled Paseo leader for that run, delivers it once, runs of one project in parallel, marks it done when Paseo reports that turn completed, keeps the leader for follow-ups until the 24-hour idle sweep archives it, routes a follow_up_of run to the leader that carries the referenced work, and tells the caller."
+description: "Practice: with a working Paseo CLI found and a registered project whose .waggledance.toml does not say orchestration = false, waggledance_dispatch with leader: true queues the task; the daemon starts a new labelled Paseo leader for that run, delivers it once, runs of one project in parallel, marks it done when Paseo reports that turn completed, keeps the leader for follow-ups until the idle sweep archives it ([paseo] leader_idle_minutes, default 30), routes a follow_up_of run to the newest leader of its family, lets a leader hand off to a successor with handoff: true, and tells the caller."
 timestamp: 2026-10-16
 bee:
   id: paseo-leader-dispatch
@@ -27,7 +27,10 @@ and `0398ca94`), now superseded by leader-follow-up D2/D3
 (`docs/history/leader-follow-up/CONTEXT.md`, decisions `b3c4d87a` and `1ab9a58b`):
 every run starts its own leader unless it names `follow_up_of`, and no leader is archived
 when its run ends `done`, and leader-idle-close D1 (`docs/history/leader-idle-close/CONTEXT.md`,
-decision `af012b0b`): a leader idle for more than 24 hours is archived, and
+decision `af012b0b`), now superseded by leader-lifecycle D5/D6
+(`docs/history/leader-lifecycle/CONTEXT.md`, decisions `344e1f58` and `e0f7806a`): a leader
+idle longer than `leader_idle_minutes` (default 30) with nothing open in its family is
+archived, and leader-lifecycle D1-D4/D7: a leader hands off with `handoff: true`, and
 leader-idle-close D2 (decision `12506149`): a wd `reply` or `redo` goes to its task's own
 leader while that leader is not archived, and leader-follow-up D1/D4 (decisions
 `0f51193e` and `aa16f27d`): `waggledance_dispatch` takes `follow_up_of`, and
@@ -89,6 +92,9 @@ thinking = "high"
   reports as available and enabled, and Paseo picks that provider's default model
   (paseo-auto-wiring D8). Paseo reports such CLI errors as a JSON `error` object on
   stderr; waggledance shows its code and message.
+- `[paseo] leader_idle_minutes` — how long an idle leader of this project, with nothing
+  open in its family, stays before the idle sweep archives it. It wins over the same key
+  in the global `[paseo]` block, whose default is 30 (leader-lifecycle D5).
 
 The file is re-read when its modification time changes, so an edit applies on the next
 dispatch without a restart. A file that exists but cannot be read or parsed turns
@@ -187,6 +193,30 @@ work a live leader carries — the same feature, the same files, the same output
 dispatch with `follow_up_of` set to that run's id and no fresh correlation id; otherwise
 mint a new correlation id and a new leader opens.
 
+Each `leaders[]` entry also names `family_root` — the root run of the family of the
+newest run that leader carries — and `current`: `true` when it is that family's newest
+leader (leader-lifecycle D7). A small follow-up ask on a live lane always goes through
+`follow_up_of` naming a run of the `current` leader; a new leader opens only for new,
+unrelated work.
+
+### handoff
+
+A leader that reaches its context mark hands its work to a successor with
+`{leader: true, follow_up_of: <its run>, handoff: true}` (leader-lifecycle D1).
+`handoff: true` without `follow_up_of`, or without `leader`, is refused. The run is
+stored in the referenced run's family with `runs.handoff` set. Delivery never waits on
+the family and never sends to an existing leader: it starts a fresh leader with the
+handoff task text, and the transcript header reads `[waggledance] handoff of run <of>:
+takes over from leader <old>` (D2). As soon as the successor's agent id is known, every
+older leader of the family is polled and archived once it is idle with no `queued`,
+`working` or `blocked` run on its pane; when that does not happen within
+`turn_timeout_secs`, the idle sweep takes it.
+
+A `leader: true` dispatch with no `follow_up_of` from a Paseo agent (`PASEO_AGENT_ID`)
+that is the pane of a run in the same project is treated as a handoff of that agent's
+newest run, and the answer's `warnings` tells it to pass `follow_up_of` with
+`handoff: true` (D4). `handoff: false` opts out.
+
 ## Delivery
 
 The daemon runs the delivery loop when it finds Paseo available, and writes the
@@ -208,9 +238,11 @@ starts a new leader, always.
 
 - **A `follow_up_of` run** (leader-follow-up D2), from any caller. It belongs to a
   family: the root of its `follow_up_of` chain and every run that follows up any run in
-  it. Its leader is the paseo pane of the newest earlier family run that has one, so a
-  chain of follow-ups follows the newest leader. While an earlier family run is still
-  `queued`, `working` or `blocked`, the run stays `queued`, so two follow-ups never land
+  it. Its leader is the paseo pane of the newest run that has one among the earlier
+  family runs plus every handoff run of the family, so a chain of follow-ups follows the
+  newest leader and a handoff successor wins even over runs queued before the handoff
+  (leader-lifecycle D3). While one of those runs is still `queued`, `working` or
+  `blocked`, the run stays `queued`, so two follow-ups never land
   in one leader at once. When a `follow_up_of` run is also a wd run, `follow_up_of`
   decides.
 - **A wd follow-up run** (leader-idle-close D2): one whose `request_id` is
@@ -235,11 +267,16 @@ Both then take the same three branches:
 The run's pane id becomes `paseo:<agent id>` as soon as the agent id is known.
 
 No leader is archived when its run ends `done`, `lost` or `blocked`: it stays so that a
-follow-up sent later in the working day lands on the same leader with its context
-(leader-follow-up D3, superseding leader-per-task D2). wd `accept` still archives a wd
-leader. Every 5 minutes, the delivery loop also archives any waggledance leader, wd leaders
-included, that is not `running` or `initializing` and whose Paseo `UpdatedAt` is more
-than 24 hours old. A leader with no `UpdatedAt` is never archived (leader-idle-close D1).
+follow-up sent soon after lands on the same leader with its context (leader-lifecycle
+D6). A leader is archived on three paths only: wd `accept`, handoff retirement, and the
+idle sweep. Every 5 minutes the delivery loop archives a waggledance leader, wd leaders
+included, only when it is not archived, not `running` or `initializing`, has no pending
+permission, its Paseo `UpdatedAt` is strictly older than the limit, it carries no
+`queued`, `working` or `blocked` run, and no run in the family of any run it carries is
+`queued`, `working` or `blocked` (leader-lifecycle D5). The limit is `[paseo]
+leader_idle_minutes` (default 30) from the global config, or from the `.waggledance.toml`
+of the project its newest carried run belongs to. A leader with no `UpdatedAt` is never
+archived. `waggledance doctor` shows the limit in force on its `leader idle close` row.
 
 ### Leader mode check
 

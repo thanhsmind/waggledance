@@ -2181,7 +2181,7 @@ fn proj_row_bee(rollup: Option<&BeeProjectRollup>, leader_waits: &[LeaderWait]) 
         pills.push_str(&format!(
             r#"<span class="proj-row__badge proj-row__badge--leader-wait" title="{since}">{label}</span>"#,
             label = wait.label,
-            since = esc(&wait.since),
+            since = esc(wait.since),
         ));
     }
     if pills.is_empty() {
@@ -24413,17 +24413,19 @@ mod tests {
             applied,
             projects: outcomes
                 .into_iter()
-                .map(|(id, outcome)| waggledance_core::bee_upgrade::ProjectUpgrade {
-                    id: id.into(),
-                    name: format!("name-{id}"),
-                    root: std::path::PathBuf::from(format!("/p/{id}")),
-                    branch: Some("main".into()),
-                    from_version: Some("1.0.0".into()),
-                    to_version: Some("9.9.9".into()),
-                    notices: vec!["n1".into()],
-                    outside_repo: Vec::new(),
-                    outcome,
-                })
+                .map(
+                    |(id, outcome)| waggledance_core::bee_upgrade::ProjectUpgrade {
+                        id: id.into(),
+                        name: format!("name-{id}"),
+                        root: std::path::PathBuf::from(format!("/p/{id}")),
+                        branch: Some("main".into()),
+                        from_version: Some("1.0.0".into()),
+                        to_version: Some("9.9.9".into()),
+                        notices: vec!["n1".into()],
+                        outside_repo: Vec::new(),
+                        outcome,
+                    },
+                )
                 .collect(),
         }
     }
@@ -24446,7 +24448,10 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(">Upgrade</button>"), "{html}");
-        assert!(html.contains(r#"<input type="hidden" name="all" value="1">"#), "{html}");
+        assert!(
+            html.contains(r#"<input type="hidden" name="all" value="1">"#),
+            "{html}"
+        );
         assert!(html.contains("Upgrade all pending"), "{html}");
         assert!(html.contains("/src/&lt;bee&gt;"), "{html}");
         assert!(html.contains("abc1234"), "{html}");

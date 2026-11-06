@@ -598,9 +598,22 @@ impl Engine {
         request_id: Option<&str>,
         caller: Option<&str>,
         follow_up_of: Option<&str>,
+        handoff: bool,
     ) -> Result<String> {
         self.store
-            .insert_follow_up_run(run, None, request_id, caller, follow_up_of)
+            .insert_follow_up_run(run, None, request_id, caller, follow_up_of, handoff)
+    }
+
+    pub fn run_is_handoff(&self, id: &str) -> Result<bool> {
+        self.store.run_is_handoff(id)
+    }
+
+    pub fn runs_on_pane(&self, pane_id: &str) -> Result<Vec<Run>> {
+        self.store.runs_on_pane(pane_id)
+    }
+
+    pub fn family_handoffs(&self, root: &str) -> Result<std::collections::HashSet<String>> {
+        self.store.family_handoffs(root)
     }
 
     pub fn run_follow_up_of(&self, id: &str) -> Result<Option<String>> {

@@ -58,6 +58,7 @@ pub fn run(as_json: bool, dry_run: bool, fix: bool) -> Result<()> {
     checks.push(check_agent_instruction(dry_run, fix));
     checks.push(check_skill(dry_run, fix));
     checks.push(check_supervisor_skill(dry_run, fix));
+    checks.push(check_leader_idle_close());
 
     if as_json {
         let arr: Vec<Value> = checks
@@ -82,6 +83,33 @@ pub fn run(as_json: bool, dry_run: bool, fix: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn check_leader_idle_close() -> Check {
+    leader_idle_close(&Config::load())
+}
+
+fn leader_idle_close(config: &Config) -> Check {
+    let name = "leader idle close".to_string();
+    if !crate::paseo::paseo_available(&config.paseo) {
+        return Check {
+            name,
+            status: Status::Skip,
+            detail: "Paseo leader dispatch is off — skipped".into(),
+        };
+    }
+    match config.paseo.leader_idle_minutes {
+        0 => Check {
+            name,
+            status: Status::Warn,
+            detail: "idle leaders close after 0 min ([paseo] leader_idle_minutes) — every idle leader is archived at once".into(),
+        },
+        n => Check {
+            name,
+            status: Status::Ok,
+            detail: format!("idle leaders close after {n} min ([paseo] leader_idle_minutes)"),
+        },
+    }
 }
 
 fn check_binary_in_path() -> Check {
@@ -1463,5 +1491,18 @@ mod mcp_register_tests {
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before); // never clobbered
         assert!(!backup_path(&p).exists());
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn leader_idle_close_row_reports_the_limit_and_warns_at_zero() {
+        let mut config = Config::default();
+        config.paseo.enabled = Some(false);
+        assert_eq!(leader_idle_close(&config).status, Status::Skip);
+        config.paseo.enabled = Some(true);
+        let ok = leader_idle_close(&config);
+        assert_eq!(ok.status, Status::Ok);
+        assert!(ok.detail.contains("close after 30 min"), "{}", ok.detail);
+        config.paseo.leader_idle_minutes = 0;
+        assert_eq!(leader_idle_close(&config).status, Status::Warn);
     }
 }

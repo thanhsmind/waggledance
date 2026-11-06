@@ -164,13 +164,15 @@ The daemon starts a new Paseo leader for each new task, so tasks for one project
 parallel. A follow-up is the one exception: it goes to the leader that already carries
 the work. Decide which one this request is before you dispatch:
 
-1. Call `waggledance_ask_state` for the project and read `leaders[].runs` — each entry
-   names a `run_id`, its `request_id`, its `status` and a `task_summary`.
+1. Call `waggledance_ask_state` for the project and read `leaders[]` — each entry names
+   its `family_root`, whether it is the family's `current` leader, and its `runs`, each
+   with a `run_id`, its `request_id`, its `status` and a `task_summary`.
 2. When the new spec extends work a live leader carries — the same feature, the same
    files, the same output — it is a follow-up. Dispatch it with `follow_up_of` set to
    that `run_id`, and mint no fresh correlation id for it: the provenance line keeps the
-   original corr.
-3. Otherwise it is new work: mint a new correlation id and dispatch without
+   original corr. A small follow-up ask on a live lane ALWAYS goes this way, naming a
+   run of the family's `current` leader — never a new leader for a small ask.
+3. Otherwise it is new, unrelated work: mint a new correlation id and dispatch without
    `follow_up_of`, which opens a new leader.
 
 Hand the task over through one of the two doors:
@@ -182,7 +184,10 @@ Hand the task over through one of the two doors:
   true, request_id}`, where `request_id` is the correlation id minted for this hand-off,
   so a retry never sends twice. For a follow-up, add `follow_up_of: <run_id>`; the
   daemon waits while that leader is mid-turn, sends to it once it is idle, and starts a
-  new leader carrying the earlier task text when the old one is gone.
+  new leader carrying the earlier task text when the old one is gone. A leader at its
+  context mark hands off with `follow_up_of: <its run_id>` and `handoff: true`: the
+  successor joins the same family and the old leader is archived once idle. Idle leaders
+  close after `[paseo] leader_idle_minutes` (default 30).
 
 The mode gate, the provenance line as line 1, the spec body, and the file-and-stop or
 execute-to-completion contract hold unchanged inside the task text. Never name a

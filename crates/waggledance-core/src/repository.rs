@@ -138,7 +138,7 @@ impl SqliteStore {
         request_id: Option<&str>,
         caller: Option<&str>,
     ) -> Result<String> {
-        self.insert_follow_up_run(r, feature, request_id, caller, None)
+        self.insert_follow_up_run(r, feature, request_id, caller, None, false)
     }
 
     pub fn insert_follow_up_run(
@@ -148,11 +148,12 @@ impl SqliteStore {
         request_id: Option<&str>,
         caller: Option<&str>,
         follow_up_of: Option<&str>,
+        handoff: bool,
     ) -> Result<String> {
         let c = self.conn.lock().unwrap();
         let inserted = c.execute(
-            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature,request_id,caller,follow_up_of)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+            "INSERT INTO runs(id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at,feature,request_id,caller,follow_up_of,handoff)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(project_id,request_id) WHERE request_id IS NOT NULL DO NOTHING",
             params![
                 r.id,
@@ -168,7 +169,8 @@ impl SqliteStore {
                 feature,
                 request_id,
                 caller,
-                follow_up_of
+                follow_up_of,
+                handoff
             ],
         )?;
         if inserted == 1 {
@@ -199,6 +201,40 @@ impl SqliteStore {
             .next()?
             .and_then(|r| r.get::<_, Option<String>>(0).ok())
             .flatten())
+    }
+
+    pub fn run_is_handoff(&self, id: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare("SELECT handoff FROM runs WHERE id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        Ok(rows
+            .next()?
+            .and_then(|r| r.get::<_, i64>(0).ok())
+            .is_some_and(|h| h != 0))
+    }
+
+    pub fn runs_on_pane(&self, pane_id: &str) -> Result<Vec<Run>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id,project_id,pane_id,preset_label,task,baseline,marker,status,created_at,updated_at
+             FROM runs WHERE pane_id=?1 ORDER BY created_at DESC, rowid DESC",
+        )?;
+        let rows = stmt.query_map(params![pane_id], |r| Ok(row_to_run(r)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn family_handoffs(&self, root: &str) -> Result<HashSet<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "WITH RECURSIVE fam(id) AS (
+                SELECT ?1
+                UNION
+                SELECT r.id FROM runs r JOIN fam ON r.follow_up_of=fam.id
+             )
+             SELECT id FROM runs WHERE handoff=1 AND id IN (SELECT id FROM fam)",
+        )?;
+        let rows = stmt.query_map(params![root], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn run_request_id(&self, id: &str) -> Result<Option<String>> {
@@ -1136,10 +1172,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (8, migration_8_tasks),
     (9, migration_9_runs_session),
     (10, migration_10_runs_follow_up),
+    (11, migration_11_runs_handoff),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -1293,6 +1330,21 @@ fn migration_10_runs_follow_up(conn: &Connection) -> Result<()> {
     )?;
     if runs == 1 && !has_column(conn, "runs", "follow_up_of")? {
         conn.execute("ALTER TABLE runs ADD COLUMN follow_up_of TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn migration_11_runs_handoff(conn: &Connection) -> Result<()> {
+    let runs: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='runs'",
+        [],
+        |r| r.get(0),
+    )?;
+    if runs == 1 && !has_column(conn, "runs", "handoff")? {
+        conn.execute(
+            "ALTER TABLE runs ADD COLUMN handoff INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -2380,19 +2432,19 @@ mod tests {
         let s = SqliteStore::open_in_memory().unwrap();
         s.upsert_project(&sample_project()).unwrap();
         let root = queued_leader_run("r-root", "p1", "2026-08-16T00:00:00Z");
-        s.insert_follow_up_run(&root, None, Some("req-root"), None, None)
+        s.insert_follow_up_run(&root, None, Some("req-root"), None, None, false)
             .unwrap();
         let first = queued_leader_run("r-f1", "p1", "2026-08-16T00:00:01Z");
-        s.insert_follow_up_run(&first, None, None, None, Some("r-root"))
+        s.insert_follow_up_run(&first, None, None, None, Some("r-root"), false)
             .unwrap();
         let second = queued_leader_run("r-f2", "p1", "2026-08-16T00:00:02Z");
-        s.insert_follow_up_run(&second, None, None, None, Some("r-f1"))
+        s.insert_follow_up_run(&second, None, None, None, Some("r-f1"), false)
             .unwrap();
         let sibling = queued_leader_run("r-f3", "p1", "2026-08-16T00:00:03Z");
-        s.insert_follow_up_run(&sibling, None, None, None, Some("r-root"))
+        s.insert_follow_up_run(&sibling, None, None, None, Some("r-root"), false)
             .unwrap();
         let stranger = queued_leader_run("r-x", "p1", "2026-08-16T00:00:04Z");
-        s.insert_follow_up_run(&stranger, None, None, None, None)
+        s.insert_follow_up_run(&stranger, None, None, None, None, false)
             .unwrap();
 
         assert_eq!(s.run_follow_up_of("r-f2").unwrap().as_deref(), Some("r-f1"));
@@ -2429,7 +2481,7 @@ mod tests {
             let mut run = queued_leader_run(id, "p1", at);
             run.pane_id = pane.into();
             let follow = (id == "r-3").then_some("r-1");
-            s.insert_follow_up_run(&run, None, Some(&format!("req-{id}")), None, follow)
+            s.insert_follow_up_run(&run, None, Some(&format!("req-{id}")), None, follow, false)
                 .unwrap();
         }
         let runs = s.leader_runs("p1", "paseo:lead-a", 5).unwrap();
@@ -2451,6 +2503,54 @@ mod tests {
             ]
         );
         assert_eq!(s.leader_runs("p1", "paseo:lead-a", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn handoff_flag_round_trips_and_runs_on_pane_lists_across_projects() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        for (id, at, handoff, of) in [
+            ("h-root", "2026-08-16T00:00:00Z", false, None),
+            ("h-hand", "2026-08-16T00:00:01Z", true, Some("h-root")),
+        ] {
+            let mut run = sample_run();
+            run.id = id.into();
+            run.pane_id = "paseo:lead-a".into();
+            run.created_at = at.into();
+            s.insert_follow_up_run(&run, None, None, None, of, handoff)
+                .unwrap();
+        }
+        assert!(!s.run_is_handoff("h-root").unwrap());
+        assert!(s.run_is_handoff("h-hand").unwrap());
+        assert_eq!(
+            s.family_handoffs("h-root").unwrap(),
+            HashSet::from(["h-hand".to_string()])
+        );
+        let ids: Vec<String> = s
+            .runs_on_pane("paseo:lead-a")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["h-hand", "h-root"]);
+    }
+
+    #[test]
+    fn migrate_adds_the_handoff_column_to_a_v10_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
+             INSERT INTO runs(id, project_id, task) VALUES ('r-old', 'p1', 'old task');
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+        super::migrate(&conn).unwrap();
+        let handoff: i64 = conn
+            .query_row("SELECT handoff FROM runs WHERE id='r-old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(handoff, 0);
     }
 
     #[test]
