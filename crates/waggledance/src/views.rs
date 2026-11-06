@@ -2181,7 +2181,7 @@ fn proj_row_bee(rollup: Option<&BeeProjectRollup>, leader_waits: &[LeaderWait]) 
         pills.push_str(&format!(
             r#"<span class="proj-row__badge proj-row__badge--leader-wait" title="{since}">{label}</span>"#,
             label = wait.label,
-            since = esc(&wait.since),
+            since = esc(wait.since),
         ));
     }
     if pills.is_empty() {

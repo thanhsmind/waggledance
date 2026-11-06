@@ -1622,7 +1622,8 @@ fn dispatch_to_leader(
         created_at: now.clone(),
         updated_at: now,
     };
-    let stored = match engine.insert_follow_up_run(&run, request_id, caller, follow_up_of, handoff) {
+    let stored = match engine.insert_follow_up_run(&run, request_id, caller, follow_up_of, handoff)
+    {
         Ok(stored) => stored,
         Err(e) => return tool_error(id, &format!("run persistence failed: {e}")),
     };
@@ -4007,7 +4008,10 @@ mod tests {
         let resp = call_tool(
             &engine,
             "waggledance_dispatch",
-            handoff_args(&project, json!({ "follow_up_of": first_id, "handoff": true })),
+            handoff_args(
+                &project,
+                json!({ "follow_up_of": first_id, "handoff": true }),
+            ),
         );
         let sc = &resp["result"]["structuredContent"];
         assert_eq!(sc["handoff"], true, "{resp}");
@@ -4031,7 +4035,10 @@ mod tests {
         );
         assert_eq!(resp["result"]["isError"], true, "{resp}");
         let text = text_of(&resp);
-        assert!(text.contains("handoff") && text.contains("follow_up_of"), "{text}");
+        assert!(
+            text.contains("handoff") && text.contains("follow_up_of"),
+            "{text}"
+        );
         let resp = call_tool(
             &engine,
             "waggledance_dispatch",
@@ -4078,9 +4085,14 @@ mod tests {
         engine.insert_run(&led, None).unwrap();
         let got = resolve_follow_up(&engine, &project, None, Some(false), Some("lead-1")).unwrap();
         assert!(got.follow_up_of.is_none() && !got.handoff && got.warning.is_none());
-        let named =
-            resolve_follow_up(&engine, &project, Some("run-led"), Some(false), Some("lead-1"))
-                .unwrap();
+        let named = resolve_follow_up(
+            &engine,
+            &project,
+            Some("run-led"),
+            Some(false),
+            Some("lead-1"),
+        )
+        .unwrap();
         assert_eq!(named.follow_up_of.as_deref(), Some("run-led"));
         assert!(!named.handoff);
         std::fs::remove_dir_all(&project.root_path).ok();
