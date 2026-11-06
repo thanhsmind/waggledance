@@ -18,6 +18,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub paseo: PaseoConfig,
     pub openclaw: OpenClawConfig,
+    pub worktree_sweep: WorktreeSweepConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +80,24 @@ impl Default for OpenClawConfig {
             hook_model: String::new(),
             hook_thinking: "low".into(),
             heartbeat_secs: 600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WorktreeSweepConfig {
+    pub enabled: bool,
+    pub interval_hours: u64,
+    pub older_than_days: u64,
+}
+
+impl Default for WorktreeSweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_hours: 6,
+            older_than_days: 2,
         }
     }
 }
@@ -683,6 +702,15 @@ mod tests {
         let c = Config::load_from(&p);
         assert_eq!(c.server.port, 7700);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worktree_sweep_defaults_on_every_six_hours_for_two_day_old_trees() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.worktree_sweep, WorktreeSweepConfig { enabled: true, interval_hours: 6, older_than_days: 2 });
+        let off: Config = toml::from_str("[worktree_sweep]\nenabled = false\n").unwrap();
+        assert!(!off.worktree_sweep.enabled);
+        assert_eq!(off.worktree_sweep.interval_hours, 6);
     }
 
     #[test]

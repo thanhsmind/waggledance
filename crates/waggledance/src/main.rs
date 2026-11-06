@@ -14,6 +14,7 @@ mod discovery;
 mod doctor;
 mod guide;
 mod heartbeat;
+mod worktree_sweep;
 mod herdr;
 mod mail;
 mod mcp;
@@ -108,6 +109,7 @@ pub struct TerminalBackground {
     delivery: Mutex<Option<JoinHandle<()>>>,
     wake: Mutex<Option<JoinHandle<()>>>,
     heartbeat: Mutex<Option<JoinHandle<()>>>,
+    sweep: Mutex<Option<JoinHandle<()>>>,
     /// The most recently stopped task's handle, kept only until the next
     /// switch-on has waited for it to finish.
     supervisor_stopping: Mutex<Option<JoinHandle<()>>>,
@@ -254,7 +256,27 @@ impl TerminalBackground {
                 .clone()
                 .filter(|e| wake::enabled(e) && paseo::paseo_available(&e.config.paseo)),
         );
+        self.reconcile_sweep(
+            engine
+                .clone()
+                .filter(|e| e.config.worktree_sweep.enabled),
+        );
         self.reconcile_notify(cfg.notify_enabled, herdr, notify_store, telegram, engine);
+    }
+
+    fn reconcile_sweep(&self, engine: Option<Arc<waggledance_core::Engine>>) {
+        let mut slot = self.sweep.lock().unwrap();
+        match (engine, slot.take()) {
+            (Some(_), Some(running)) => *slot = Some(running),
+            (Some(engine), None) => *slot = Some(tokio::spawn(worktree_sweep::run(engine))),
+            (None, Some(running)) => running.abort(),
+            (None, None) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn sweep_running(&self) -> bool {
+        self.sweep.lock().unwrap().is_some()
     }
 
     fn reconcile_delivery(&self, engine: Option<Arc<waggledance_core::Engine>>) {
@@ -1258,6 +1280,31 @@ mod terminal_background_tests {
             Some(engine()),
         );
         assert!(!bg.heartbeat_running(), "no agent_id stops the heartbeat");
+    }
+
+    #[tokio::test]
+    async fn the_worktree_sweep_runs_by_default_and_its_switch_stops_it() {
+        let bg = TerminalBackground::new();
+        let fake = Arc::new(FakeHerdr::new());
+        bg.reconcile(&TerminalConfig::default(), fake.clone(), store(), None, Some(engine()));
+        assert!(bg.sweep_running(), "the sweep is on by default");
+
+        let mut config = waggledance_core::Config::default();
+        config.worktree_sweep.enabled = false;
+        let off = Arc::new(waggledance_core::Engine::new(
+            waggledance_core::SqliteStore::open_in_memory().unwrap(),
+            config,
+        ));
+        bg.reconcile(&TerminalConfig::default(), fake, store(), None, Some(off));
+        assert!(!bg.sweep_running(), "enabled = false stops the sweep");
+    }
+
+    #[test]
+    fn the_sweep_interval_never_drops_below_an_hour() {
+        let mut config = waggledance_core::Config::default();
+        config.worktree_sweep.interval_hours = 0;
+        let e = waggledance_core::Engine::new(waggledance_core::SqliteStore::open_in_memory().unwrap(), config);
+        assert_eq!(worktree_sweep::every(&e), std::time::Duration::from_secs(3600));
     }
 
     /// The reaper's own teeth: `reaper_ticks` counts completed sweeps, so a
