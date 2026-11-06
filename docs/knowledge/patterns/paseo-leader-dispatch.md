@@ -1,13 +1,13 @@
 ---
 type: bee.pattern
 title: Each request for a project starts its own Paseo leader through waggledance_dispatch
-description: "Practice: with a working Paseo CLI found and a registered project whose .waggledance.toml does not say orchestration = false, waggledance_dispatch with leader: true queues the task; the daemon starts a new labelled Paseo leader for that run, delivers it once, runs of one project in parallel, marks it done when Paseo reports that turn completed, keeps the leader for follow-ups until the idle sweep archives it ([paseo] leader_idle_minutes, default 30), routes a follow_up_of run to the newest leader of its family, lets a leader hand off to a successor with handoff: true, and tells the caller."
+description: "Practice: with a working Paseo CLI found and a registered project whose .waggledance.toml does not say orchestration = false, waggledance_dispatch with leader: true queues the task; the daemon starts a new labelled Paseo leader for that run, delivers it once, runs of one project in parallel, marks it done when Paseo reports that turn completed, keeps the leader for follow-ups until the idle sweep archives it ([paseo] leader_idle_minutes, default 30), routes a follow_up_of run to the newest leader of its family, lets a leader hand off to a successor with handoff: true, sends a same-cluster running leader a context-only steer: true note, and tells the caller."
 timestamp: 2026-10-16
 bee:
   id: paseo-leader-dispatch
   lifecycle: active
   areas: [orchestration]
-  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md, docs/history/paseo-leader-mode/CONTEXT.md, docs/history/paseo-leader-mode/plan.md, docs/history/paseo-dispatch-default-on/CONTEXT.md, docs/history/paseo-dispatch-default-on/plan.md, docs/history/leader-per-task/CONTEXT.md, docs/history/leader-follow-up/CONTEXT.md]
+  sources: [docs/history/paseo-leader-dispatch/CONTEXT.md, docs/history/paseo-leader-dispatch/plan.md, docs/history/leader-delivery/CONTEXT.md, docs/history/leader-delivery/plan.md, docs/history/paseo-auto-wiring/CONTEXT.md, docs/history/paseo-auto-wiring/plan.md, docs/history/piggery-lessons/CONTEXT.md, docs/history/piggery-lessons/plan.md, docs/history/paseo-leader-mode/CONTEXT.md, docs/history/paseo-leader-mode/plan.md, docs/history/paseo-dispatch-default-on/CONTEXT.md, docs/history/paseo-dispatch-default-on/plan.md, docs/history/leader-per-task/CONTEXT.md, docs/history/leader-follow-up/CONTEXT.md, docs/history/leader-cluster-steer/CONTEXT.md]
   polarity: practice
   signature: request for a project running in Paseo
 ---
@@ -184,20 +184,52 @@ A name that matches no run in the project is refused and nothing is stored. The
 The resolved run id is stored on the new run as `runs.follow_up_of`; the task text is
 sent unchanged. `waggledance_runs` rows and the dispatch answer carry `follow_up_of`.
 
-Before a leader dispatch, read `waggledance_ask_state` → `leaders[].runs`: the runs whose
-pane is `paseo:<agent id>`, newest first, at most 5, each `{run_id, request_id, status,
-follow_up_of, task_summary}`. `task_summary` is the first task line that is not a
-`spec-drop <corr> from waggledance@<sha>` line or the wd `Task waggledance#<corr> from
-wd.` preamble, cut to 200 characters (leader-follow-up D4). When the new request extends
-work a live leader carries — the same feature, the same files, the same output —
-dispatch with `follow_up_of` set to that run's id and no fresh correlation id; otherwise
-mint a new correlation id and a new leader opens.
+Before every leader dispatch, read `waggledance_ask_state` → `leaders[].runs`. Every
+caller does this, leaders included (leader-cluster-steer D1). The rows are the runs
+whose pane is `paseo:<agent id>`, newest first, at most 5, each `{run_id, request_id,
+status, follow_up_of, steer, task_summary}`. `task_summary` is the first task line that
+is not a `spec-drop <corr> from waggledance@<sha>` line, the wd `Task waggledance#<corr>
+from wd.` preamble or the steer marker, cut to 200 characters (leader-follow-up D4).
+`steer` is `true` for a steer note (leader-cluster-steer D7), and the cluster judgment
+skips those rows. When a summary is not enough to judge, read the run's full `task`
+from `waggledance_runs`. No feature slug or path list is stored for this judgment,
+because waggledance knows neither (D8). Then pick one of three tiers:
+
+1. **Same work** (the same feature, the same files, the same output): dispatch with
+   `follow_up_of` set to that run's id and no fresh correlation id.
+2. **Same cluster** (the same area or module or overlapping paths, a different
+   feature): open a new leader whose task carries `Running nearby: <run_id> —
+   <task_summary>`, then send the running leader a steer note (see § steer) naming the
+   new request, its area, the new `run_id` and what to watch for (D2, D4, D5).
+3. **Not related**: mint a new correlation id, and a new leader opens. No steer.
+
+A leader that opens a new leader for tier 2 or tier 3 passes `handoff: false`.
+Otherwise the implicit handoff below takes its dispatch as a handoff of its own run
+(D9).
 
 Each `leaders[]` entry also names `family_root` — the root run of the family of the
 newest run that leader carries — and `current`: `true` when it is that family's newest
 leader (leader-lifecycle D7). A small follow-up ask on a live lane always goes through
 `follow_up_of` naming a run of the `current` leader; a new leader opens only for new,
 unrelated work.
+
+### steer
+
+A steer note is `{leader: true, follow_up_of: <a run of the running leader>, steer:
+true}` (leader-cluster-steer D2). `steer: true` without `leader` or `follow_up_of`, or
+with `handoff: true`, is refused and nothing is stored. The daemon stores the task with
+the fixed marker line `[waggledance steer] Context only, not new work: do not build it,
+claim cells for it, or reply with a plan.` above the caller's text (`paseo::STEER_MARKER`
+in `crates/waggledance/src/paseo.rs`), so no caller can misspell it. A steer run is a
+normal `follow_up_of` run in the family: it waits while the leader is mid-turn and lands
+once the leader is idle. A steer whose family has no live leader ends `lost` with
+`steer note for run <of> not delivered: its leader <id> is gone, and a steer never
+opens a leader`, and no leader starts (D3). The dispatch answer carries `steer`.
+
+The receiving leader treats a message whose first line is the marker as context only:
+it does not build it, claim cells for it or reply with a plan, keeps clear of the area
+the note names, and ends the turn (D6). The supervisor template says so, and its skill
+description loads on that marker.
 
 ### handoff
 

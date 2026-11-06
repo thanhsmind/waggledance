@@ -283,6 +283,31 @@ pub fn wd_corr(task: &str) -> Option<&str> {
         .strip_suffix(" from wd.")
 }
 
+pub const STEER_MARKER: &str = "[waggledance steer] Context only, not new work: do not build \
+                                it, claim cells for it, or reply with a plan.";
+
+pub fn steer_task(task: &str) -> String {
+    format!("{STEER_MARKER}\n\n{task}")
+}
+
+pub fn task_body(task: &str) -> &str {
+    match wd_corr(task) {
+        Some(corr) => {
+            let preamble = wd_task(corr, "");
+            task.strip_prefix(preamble.as_str()).unwrap_or(task)
+        }
+        None => task,
+    }
+}
+
+pub fn is_steer(task: &str) -> bool {
+    task_body(task)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        == Some(STEER_MARKER)
+}
+
 pub fn created_age_secs(created: &str) -> Option<u64> {
     let created = created.trim();
     if created == "just now" {

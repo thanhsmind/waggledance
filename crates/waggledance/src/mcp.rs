@@ -249,11 +249,16 @@ fn ask_state_schema() -> Value {
     oldest first: {agent_id, status, cwd, created, via, labels, waiting_on, \
     last_daemon_run, runs}, where `via` is `wd` for a leader carrying \
     waggledance.via=wd and `daemon` otherwise, and `runs` is the work that leader carries, \
-    newest first, at most 5: {run_id, request_id, status, follow_up_of, task_summary}, \
-    `task_summary` being the task's first line that is not a spec-drop or wd provenance line, \
-    cut to 200 characters. Read `runs` before a leader dispatch: when the new request extends \
-    work a live leader carries (same feature, same files, same output), dispatch with \
-    `follow_up_of` set to that run_id instead of opening a new leader. Each leader also carries \
+    newest first, at most 5: {run_id, request_id, status, follow_up_of, steer, task_summary}, \
+    `task_summary` being the task's first line that is not a spec-drop or wd provenance line or \
+    the steer marker, cut to 200 characters, and `steer` true for a context note sent with \
+    `steer: true` rather than work. Read `runs` before every leader dispatch, leaders included, \
+    skipping steer rows, and pick one of three tiers: (1) same work — same feature, same files, \
+    same output — dispatch with `follow_up_of` set to that run_id; (2) same cluster — same area \
+    or module or overlapping paths, different feature — open the new leader, then send the \
+    running leader a `steer: true` note naming the new request, its area, the new run_id and \
+    what to watch for; (3) unrelated — new leader, no steer. When a summary is not enough to \
+    judge, read the run's full `task` from `waggledance_runs`. Each leader also carries \
     `family_root` (the run id every run it carries descends from, null when it carries none) and \
     `current` (true when it is the family's newest leader, the one a follow-up reaches). \
     `leaders` is ABSENT when \
@@ -279,15 +284,23 @@ fn dispatch_schema() -> Value {
     leader with `leader: true` (queued and delivered by the waggledance daemon once the leader is \
     idle) — exactly one of `preset`/`pane_id`/`leader`, and never a raw command. With \
     `leader: true`, `follow_up_of` names a run (its run_id or request_id) whose leader should \
-    take this task instead of a new leader: first read `waggledance_ask_state` leaders[].runs, \
-    and when the new request extends work a live leader carries (same feature, same files, \
-    same output), pass that run_id here and no fresh correlation id in the task; otherwise \
-    leave it out and a new leader opens. The daemon waits while that leader is mid-turn, sends \
+    take this task instead of a new leader: first read `waggledance_ask_state` leaders[].runs \
+    — every caller, leaders included — and pick a tier. Same work (same feature, same files, \
+    same output): pass that run_id here and no fresh correlation id in the task. Same cluster \
+    (same area or module or overlapping paths, different feature): open a new leader whose \
+    task names the running leader's run_id and task_summary, then dispatch again with \
+    `follow_up_of` set to the running run and `steer: true`, the task naming the new request, \
+    its area, the new run_id and what to watch for. Unrelated: leave `follow_up_of` out and a \
+    new leader opens. The daemon waits while that leader is mid-turn, sends \
     to it once idle, and starts a new leader carrying the earlier task text when it is gone. \
+    `steer: true` puts a fixed context-only marker above the task; a steer whose leader is \
+    gone ends `lost` and opens no leader; it is refused without `follow_up_of` or with \
+    `handoff: true`. \
     With `leader: true` and `follow_up_of`, `handoff: true` starts a fresh leader that takes \
     over the family and retires the older one — use it when your own context is nearly full; \
     `handoff` without `follow_up_of` is refused, `handoff: false` opts out of the automatic \
-    handoff a leader's own dispatch otherwise becomes. \
+    handoff a leader's own dispatch otherwise becomes — a leader opening a new leader for \
+    other work passes `handoff: false`. \
     Returns a `run_id` immediately; poll completion with `waggledance_await`.",
         "inputSchema": {
             "type": "object",
@@ -299,7 +312,8 @@ fn dispatch_schema() -> Value {
                 "task": { "type": "string", "description": "The task text sent to the agent" },
                 "request_id": { "type": "string", "description": "Caller-chosen id for this request — pass one on every call so a retry never sends twice" },
                 "follow_up_of": { "type": "string", "description": "With leader: true only — the run_id or request_id of a run in this project whose leader should take this task as a follow-up instead of a new leader" },
-                "handoff": { "type": "boolean", "description": "With leader: true and follow_up_of — true starts a fresh leader that takes over that run's family and retires the older leader; false opts out of the automatic handoff" }
+                "handoff": { "type": "boolean", "description": "With leader: true and follow_up_of — true starts a fresh leader that takes over that run's family and retires the older leader; false opts out of the automatic handoff" },
+                "steer": { "type": "boolean", "description": "With leader: true and follow_up_of — true sends the task to that run's leader as a context-only note about nearby work, never as work to build; never with handoff: true" }
             },
             "required": ["project", "task"]
         }
@@ -1033,18 +1047,11 @@ fn provenance_line(line: &str) -> bool {
     let spec_drop = line
         .strip_prefix("spec-drop ")
         .is_some_and(|rest| rest.contains(" from waggledance@"));
-    spec_drop || paseo::wd_corr(line).is_some()
+    spec_drop || paseo::wd_corr(line).is_some() || line == paseo::STEER_MARKER
 }
 
 fn task_summary(task: &str) -> String {
-    let body = match paseo::wd_corr(task) {
-        Some(corr) => {
-            let preamble = paseo::wd_task(corr, "");
-            task.strip_prefix(preamble.as_str()).unwrap_or(task)
-        }
-        None => task,
-    };
-    let line = body
+    let line = paseo::task_body(task)
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !provenance_line(l))
@@ -1068,6 +1075,7 @@ fn leader_runs(engine: &Engine, project_id: &str, agent_id: &str) -> Value {
                     "request_id": l.request_id,
                     "status": l.run.status,
                     "follow_up_of": l.follow_up_of,
+                    "steer": paseo::is_steer(&l.run.task),
                     "task_summary": task_summary(&l.run.task)
                 })
             })
@@ -1327,6 +1335,21 @@ fn handle_dispatch(
              takes the follow-up, never a preset or pane_id",
         );
     }
+    let steer = args.get("steer").and_then(Value::as_bool).unwrap_or(false);
+    if steer && (!leader || follow_up_of.is_none()) {
+        return tool_error(
+            id,
+            "\"steer\": true goes only with \"leader\": true and \"follow_up_of\" — it names \
+             the running leader that takes the note",
+        );
+    }
+    if steer && handoff_arg == Some(true) {
+        return tool_error(
+            id,
+            "\"steer\": true is a context note for a running leader, never a handoff — drop \
+             \"handoff\"",
+        );
+    }
     match [preset_label.is_some(), pane_id_arg.is_some(), leader]
         .iter()
         .filter(|t| **t)
@@ -1384,6 +1407,7 @@ fn handle_dispatch(
                 caller: caller.as_deref(),
                 follow_up_of: follow.follow_up_of.as_deref(),
                 handoff: follow.handoff,
+                steer,
                 note: follow.warning,
             },
             &resolve_data_dir(None),
@@ -1521,6 +1545,7 @@ struct LeaderRequest<'a> {
     caller: Option<&'a str>,
     follow_up_of: Option<&'a str>,
     handoff: bool,
+    steer: bool,
     note: Option<String>,
 }
 
@@ -1593,8 +1618,17 @@ fn dispatch_to_leader(
         caller,
         follow_up_of,
         handoff,
+        steer,
         note,
     } = request;
+    let steered;
+    let task = match steer {
+        true => {
+            steered = paseo::steer_task(task);
+            steered.as_str()
+        }
+        false => task,
+    };
     if !engine.orchestration_allowed(project) {
         return tool_error(id, &dispatch_off(engine, project));
     }
@@ -1664,6 +1698,7 @@ fn dispatch_to_leader(
                 "duplicate": false,
                 "follow_up_of": follow_up_of,
                 "handoff": handoff,
+                "steer": steer,
                 "warnings": warnings
             }
         }),
@@ -1757,6 +1792,7 @@ async fn task_action(
                     caller: Some(paseo::WD_CALLER),
                     follow_up_of: None,
                     handoff: false,
+                    steer: false,
                     note: None,
                 },
                 data_dir,
@@ -2844,7 +2880,7 @@ mod tests {
         let mut follow = seeded_run(&project.id, "run-old-2");
         follow.pane_id = "paseo:old".to_string();
         follow.status = "queued".to_string();
-        follow.task = "add a test".to_string();
+        follow.task = paseo::steer_task("add a test");
         follow.created_at = "2026-08-16T00:00:02Z".to_string();
         engine
             .insert_follow_up_run(&follow, None, None, Some("run-old-1"), false)
@@ -2906,11 +2942,11 @@ mod tests {
             json!([
                 {
                     "run_id": "run-old-2", "request_id": null, "status": "queued",
-                    "follow_up_of": "run-old-1", "task_summary": "add a test"
+                    "follow_up_of": "run-old-1", "steer": true, "task_summary": "add a test"
                 },
                 {
                     "run_id": "run-old-1", "request_id": "sup-1", "status": "done",
-                    "follow_up_of": null, "task_summary": "# Build the widget"
+                    "follow_up_of": null, "steer": false, "task_summary": "# Build the widget"
                 }
             ]),
             "{digest}"
@@ -3749,6 +3785,7 @@ mod tests {
                 caller: Some("agent-caller"),
                 follow_up_of: None,
                 handoff: false,
+                steer: false,
                 note: None,
             },
             data_dir,
@@ -4025,6 +4062,75 @@ mod tests {
     }
 
     #[test]
+    fn a_steer_is_stored_with_the_marker_first_in_the_family_and_shown_as_steer() {
+        let (engine, project, data_dir) = leader_engine("steer-stored", true, true, true);
+        beat(&data_dir, 0);
+        let first = leader_call(&engine, &project, &data_dir, "build it", Some("sup-1"));
+        let first_id = first["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            handoff_args(
+                &project,
+                json!({ "follow_up_of": first_id, "steer": true, "task": "new leader run-x" }),
+            ),
+        );
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["steer"], true, "{resp}");
+        assert_eq!(sc["handoff"], false, "{resp}");
+        let run_id = sc["run_id"].as_str().unwrap();
+        let task = engine.get_run(run_id).unwrap().unwrap().task;
+        assert_eq!(task, format!("{}\n\nnew leader run-x", paseo::STEER_MARKER));
+        assert!(paseo::is_steer(&task));
+        assert_eq!(task_summary(&task), "new leader run-x");
+        assert!(!engine.run_is_handoff(run_id).unwrap());
+        assert_eq!(
+            engine.run_follow_up_of(run_id).unwrap().as_deref(),
+            Some(first_id.as_str())
+        );
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_steer_without_follow_up_of_or_with_handoff_is_refused_and_stores_nothing() {
+        let (engine, project, data_dir) = leader_engine("steer-refused", true, true, true);
+        beat(&data_dir, 0);
+        let first = leader_call(&engine, &project, &data_dir, "build it", Some("sup-1"));
+        let first_id = first["result"]["structuredContent"]["run_id"].clone();
+        for args in [
+            handoff_args(&project, json!({ "steer": true })),
+            handoff_args(
+                &project,
+                json!({ "steer": true, "follow_up_of": first_id, "handoff": true }),
+            ),
+            json!({ "project": project.id, "task": "go", "preset": "p", "steer": true }),
+        ] {
+            let resp = call_tool(&engine, "waggledance_dispatch", args);
+            assert_eq!(resp["result"]["isError"], true, "{resp}");
+            assert!(text_of(&resp).contains("steer"), "{resp}");
+        }
+        assert_eq!(engine.list_runs(&project.id, 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_steer_marker_is_found_only_as_the_first_body_line() {
+        assert!(paseo::is_steer(&paseo::steer_task("x")));
+        assert!(paseo::is_steer(&paseo::wd_task(
+            "corr-1",
+            &paseo::steer_task("x")
+        )));
+        assert!(!paseo::is_steer(&format!(
+            "build it\n{}",
+            paseo::STEER_MARKER
+        )));
+        assert!(!paseo::is_steer("build it"));
+    }
+
+    #[test]
     fn handoff_without_follow_up_of_is_refused_and_stores_nothing() {
         let (engine, project, data_dir) = leader_engine("handoff-bare", true, true, true);
         beat(&data_dir, 0);
@@ -4130,10 +4236,20 @@ mod tests {
         assert!(desc.contains("follow_up_of"), "{desc}");
         assert!(desc.contains("leaders[].runs"), "{desc}");
         assert!(dispatch["inputSchema"]["properties"]["follow_up_of"].is_object());
+        assert!(dispatch["inputSchema"]["properties"]["steer"].is_object());
+        assert!(
+            desc.contains("Same cluster") && desc.contains("steer: true"),
+            "{desc}"
+        );
+        assert!(desc.contains("handoff: false"), "{desc}");
         let ask = ask_state_schema();
         let desc = ask["description"].as_str().unwrap();
         assert!(
             desc.contains("task_summary") && desc.contains("follow_up_of"),
+            "{desc}"
+        );
+        assert!(
+            desc.contains("same cluster") && desc.contains("waggledance_runs"),
             "{desc}"
         );
     }
@@ -4195,6 +4311,7 @@ mod tests {
                 caller: Some(paseo::WD_CALLER),
                 follow_up_of: None,
                 handoff: false,
+                steer: false,
                 note: None,
             },
             &data_dir,
@@ -4227,6 +4344,7 @@ mod tests {
                     caller,
                     follow_up_of: None,
                     handoff: false,
+                    steer: false,
                     note: None,
                 },
                 &data_dir,

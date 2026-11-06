@@ -1,6 +1,6 @@
 ---
 name: waggledance-supervisor
-description: Hand a spec into a target project's own team via a lead agent opened through waggledance's dispatch door — relay mode files it as a proposed PBI and stops; execute mode has the lead run its own full chain to a finished result. Use whenever a request routes work into another repo, whether to file it (hand off, drop, route) or to get it fully built/done there (làm hoàn chỉnh, do it completely, build it, finish it) — the skill states which mode first, always. Never drives that repo's work directly from this session in either mode. Also use whenever the human asks to send or hand a task to a project's leader ("gửi qua leader của project X", "gửi cho leader X", "send it to X's leader", "tell the X leader") — that is leader mode, which hands it to the project's leader through waggledance.
+description: Hand a spec into a target project's own team via a lead agent opened through waggledance's dispatch door — relay mode files it as a proposed PBI and stops; execute mode has the lead run its own full chain to a finished result. Use whenever a request routes work into another repo, whether to file it (hand off, drop, route) or to get it fully built/done there (làm hoàn chỉnh, do it completely, build it, finish it) — the skill states which mode first, always. Never drives that repo's work directly from this session in either mode. Also use whenever the human asks to send or hand a task to a project's leader ("gửi qua leader của project X", "gửi cho leader X", "send it to X's leader", "tell the X leader") — that is leader mode, which hands it to the project's leader through waggledance. Also use when a message's first line starts with `[waggledance steer]` — that is a context-only note about nearby work, never a task.
 ---
 
 # waggledance-supervisor
@@ -161,30 +161,56 @@ workspaces to find it. The mode gate still decides scope: a routing phrase with 
 completion verb is relay mode.
 
 The daemon starts a new Paseo leader for each new task, so tasks for one project run in
-parallel. A follow-up is the one exception: it goes to the leader that already carries
-the work. Decide which one this request is before you dispatch:
+parallel. Before every leader dispatch, decide how the request relates to the leaders
+already running. This holds for every caller: a human session, aicoworker, and a leader
+that hands new work to another leader.
 
-1. Call `waggledance_ask_state` for the project and read `leaders[]` — each entry names
-   its `family_root`, whether it is the family's `current` leader, and its `runs`, each
-   with a `run_id`, its `request_id`, its `status` and a `task_summary`.
-2. When the new spec extends work a live leader carries — the same feature, the same
-   files, the same output — it is a follow-up. Dispatch it with `follow_up_of` set to
-   that `run_id`, and mint no fresh correlation id for it: the provenance line keeps the
-   original corr. A small follow-up ask on a live lane ALWAYS goes this way, naming a
-   run of the family's `current` leader — never a new leader for a small ask.
-3. Otherwise it is new, unrelated work: mint a new correlation id and dispatch without
-   `follow_up_of`, which opens a new leader.
+1. Call `waggledance_ask_state` for the project and read `leaders[]`. Each entry names
+   its `family_root`, whether it is the family's `current` leader, and its `runs`. Each
+   run has a `run_id`, its `request_id`, its `status`, `steer`, and a `task_summary`.
+   Skip runs with `steer: true`: they are notes, not work. When a `task_summary` is not
+   enough to judge, read that run's full `task` from `waggledance_runs`.
+2. Pick one of three tiers:
+   1. **Same work**: the same feature, the same files, the same output. This is a
+      follow-up. Dispatch it with `follow_up_of` set to a run of the family's `current`
+      leader, and mint no fresh correlation id: the provenance line keeps the original
+      corr. A small follow-up ask on a live lane always goes this way, never to a new
+      leader.
+   2. **Same cluster**: the same area or module, or overlapping paths, but a different
+      feature. Open a new leader as in tier 3, and add one line near the top of its
+      task: `Running nearby: <run_id> — <task_summary>`. Once the dispatch returns the
+      new `run_id`, send the running leader a steer note: dispatch again with
+      `follow_up_of: <its run_id>` and `steer: true`. The note says what the new request
+      is, which area it touches, the new `run_id`, and what to watch for (shared files,
+      a migration, a contract both may change). Keep it to a few lines.
+   3. **Not related**: mint a new correlation id and dispatch without `follow_up_of`,
+      which opens a new leader. Send no steer.
+3. A leader that opens a new leader for tier 2 or tier 3 passes `handoff: false`.
+   Without it, the daemon treats a leader's own dispatch without `follow_up_of` as a
+   handoff of that leader's run.
+
+### Receiving a steer note
+
+A message whose first line starts with `[waggledance steer]` is context, not work. The
+daemon writes that line; nobody types it. Do not build what the note describes, do not
+claim cells or open a feature for it, and do not reply with a plan. Keep it in mind for
+the rest of your work: before you touch the area it names, check whether the other
+leader's run has landed, and keep clear of the shared files it lists. Then end the turn.
+A steer whose leader is already gone ends `lost` and opens no leader, so a closed family
+is never woken up for a note.
 
 Hand the task over through one of the two doors:
 
 - From aicoworker, run `wd-bridge.py handoff --project <project> --task "<task>"`.
   Keep the `corr` it prints; `reply`, `redo` and `accept` carry it, and those are its
-  follow-ups.
+  follow-ups. `handoff` carries neither `follow_up_of` nor `steer`, so for tier 2 aicoworker
+  names the running leader in the new task's `Running nearby:` line and sends no steer.
 - From any other session, call `waggledance_dispatch` with `{project, task, leader:
   true, request_id}`, where `request_id` is the correlation id minted for this hand-off,
   so a retry never sends twice. For a follow-up, add `follow_up_of: <run_id>`; the
   daemon waits while that leader is mid-turn, sends to it once it is idle, and starts a
-  new leader carrying the earlier task text when the old one is gone. A leader at its
+  new leader carrying the earlier task text when the old one is gone. A steer note
+  waits the same way, so it lands when the running leader's current turn ends. A leader at its
   context mark hands off with `follow_up_of: <its run_id>` and `handoff: true`: the
   successor joins the same family and the old leader is archived once idle. Idle leaders
   close after `[paseo] leader_idle_minutes` (default 30).
@@ -234,7 +260,9 @@ mode unless noted. Recognize each one for what it is — most are not failures.
 - **A lead is already working that repo.** Not an MCP error — this is what step 2's
   `waggledance_ask_state` check is for, in both modes. Seeing a live lead means: do not
   dispatch a second one. Report the existing run to the human instead of spawning a
-  competing one.
+  competing one. Leader mode is different: leaders run in parallel, and the three tiers
+  in "Leader mode" decide between a follow-up, a new leader with a steer note, and a
+  new leader.
 
 - **Duplicate PBI id (relay mode).** When the lead runs `bee backlog pbi add --id
   <corr-id>`, a duplicate `--id` **refuses** rather than overwriting — `--id` is a
