@@ -1,0 +1,46 @@
+{
+  "herding_agents": {
+    "paseo-claude-haiku": {
+      "paseo": {
+        "provider": "claude",
+        "model": "claude-haiku-5-5",
+        "thinking": "high",
+        "mode": "bypassPermissions"
+      }
+    }
+  },
+  "team": {
+    "claude": {
+      "code": "paseo-claude-sonnet",
+      "read": "paseo-claude-haiku",
+      "docs": "paseo-claude-sonnet",
+      "deploy": "paseo-claude-sonnet",
+      "extraction": "paseo-claude-haiku",
+      "generation": "paseo-claude-sonnet",
+      "supervisor": "paseo-claude-haiku"
+    },
+    "codex": {
+      "code": "paseo-claude-sonnet",
+      "read": "paseo-claude-haiku",
+      "test": "paseo-claude-sonnet",
+      "docs": "paseo-claude-sonnet",
+      "extraction": "paseo-claude-haiku",
+      "generation": "paseo-claude-sonnet",
+      "supervisor": "paseo-claude-haiku",
+      "lane-3": "paseo-claude-sonnet",
+      "hat-value": "paseo-claude-opus",
+      "hat-user-impact": "paseo-claude-opus"
+    },
+    "pi": {
+      "code": "paseo-claude-sonnet",
+      "read": "paseo-claude-haiku",
+      "test": "paseo-claude-sonnet",
+      "docs": "paseo-claude-sonnet",
+      "deploy": "paseo-claude-sonnet",
+      "extraction": "paseo-claude-haiku",
+      "generation": "paseo-claude-sonnet",
+      "supervisor": "paseo-claude-haiku",
+      "lane-3": "paseo-claude-sonnet"
+    }
+  }
+}

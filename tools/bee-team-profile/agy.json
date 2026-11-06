@@ -1,0 +1,46 @@
+{
+  "herding_agents": {
+    "paseo-claude-haiku": {
+      "paseo": {
+        "provider": "claude",
+        "model": "claude-haiku-5-5",
+        "thinking": "high",
+        "mode": "bypassPermissions"
+      }
+    }
+  },
+  "team": {
+    "claude": {
+      "code": "paseo-pi-agy-flash",
+      "read": "paseo-pi-agy-flash",
+      "docs": "paseo-pi-agy-flash",
+      "deploy": "paseo-pi-agy-flash",
+      "extraction": "paseo-pi-agy-flash",
+      "generation": "paseo-pi-agy-flash",
+      "supervisor": "paseo-pi-agy-flash"
+    },
+    "codex": {
+      "code": "paseo-pi-agy-flash",
+      "read": "paseo-pi-agy-flash",
+      "test": "paseo-pi-agy-flash",
+      "docs": "paseo-pi-agy-flash",
+      "extraction": "paseo-pi-agy-flash",
+      "generation": "paseo-pi-agy-flash",
+      "supervisor": "paseo-pi-agy-flash",
+      "lane-3": "paseo-pi-agy-flash",
+      "hat-value": "paseo-pi-agy-flash",
+      "hat-user-impact": "paseo-pi-agy-flash"
+    },
+    "pi": {
+      "code": "paseo-pi-agy-flash",
+      "read": "paseo-pi-agy-flash",
+      "test": "paseo-pi-agy-flash",
+      "docs": "paseo-pi-agy-flash",
+      "deploy": "paseo-pi-agy-flash",
+      "extraction": "paseo-pi-agy-flash",
+      "generation": "paseo-pi-agy-flash",
+      "supervisor": "paseo-pi-agy-flash",
+      "lane-3": "paseo-pi-agy-flash"
+    }
+  }
+}
