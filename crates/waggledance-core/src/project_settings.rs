@@ -4,7 +4,13 @@ use std::path::{Path, PathBuf};
 pub const FILE_NAME: &str = ".waggledance.toml";
 
 const TOP_KEYS: [&str; 2] = ["orchestration", "paseo"];
-const PASEO_KEYS: [&str; 4] = ["workspace", "provider", "mode", "thinking"];
+const PASEO_KEYS: [&str; 5] = [
+    "workspace",
+    "provider",
+    "mode",
+    "thinking",
+    "leader_idle_minutes",
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -22,6 +28,7 @@ pub struct ProjectPaseo {
     pub provider: Option<String>,
     pub mode: Option<String>,
     pub thinking: Option<String>,
+    pub leader_idle_minutes: Option<u64>,
 }
 
 pub fn settings_path(root: &Path) -> PathBuf {
@@ -114,7 +121,7 @@ mod tests {
         let d = dir("paseo");
         std::fs::write(
             settings_path(&d),
-            "orchestration = true\n[paseo]\nworkspace = \"wks_1\"\nprovider = \"claude\"\nmode = \"bypassPermissions\"\nthinking = \"high\"\n",
+            "orchestration = true\n[paseo]\nworkspace = \"wks_1\"\nprovider = \"claude\"\nmode = \"bypassPermissions\"\nthinking = \"high\"\nleader_idle_minutes = 7\n",
         )
         .unwrap();
         let (s, warnings) = load(&d);
@@ -126,6 +133,7 @@ mod tests {
                 provider: Some("claude".into()),
                 mode: Some("bypassPermissions".into()),
                 thinking: Some("high".into()),
+                leader_idle_minutes: Some(7),
             }
         );
         std::fs::remove_dir_all(&d).ok();

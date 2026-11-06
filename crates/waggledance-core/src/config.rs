@@ -29,6 +29,7 @@ pub struct PaseoConfig {
     pub mode: String,
     pub thinking: String,
     pub turn_timeout_secs: u64,
+    pub leader_idle_minutes: u64,
     pub leaders: Vec<PaseoLeader>,
 }
 
@@ -41,6 +42,7 @@ impl Default for PaseoConfig {
             mode: "bypassPermissions".into(),
             thinking: String::new(),
             turn_timeout_secs: 3600,
+            leader_idle_minutes: 30,
             leaders: Vec::new(),
         }
     }
@@ -962,6 +964,7 @@ mod tests {
         assert_eq!(c.paseo.enabled, None);
         assert!(c.paseo.binary.is_empty());
         assert_eq!(c.paseo.turn_timeout_secs, 3600);
+        assert_eq!(c.paseo.leader_idle_minutes, 30);
         assert!(c.paseo.provider.is_empty() && c.paseo.thinking.is_empty());
         assert_eq!(c.paseo.mode, "bypassPermissions");
 
@@ -979,6 +982,9 @@ mod tests {
         assert_eq!(parsed.paseo.turn_timeout_secs, 3600);
         let tuned: Config = toml::from_str("[paseo]\nturn_timeout_secs = 90\n").unwrap();
         assert_eq!(tuned.paseo.turn_timeout_secs, 90);
+        assert_eq!(tuned.paseo.leader_idle_minutes, 30);
+        let idle: Config = toml::from_str("[paseo]\nleader_idle_minutes = 5\n").unwrap();
+        assert_eq!(idle.paseo.leader_idle_minutes, 5);
         assert_eq!(
             parsed.paseo.workspace_for("p-1", "waggledance"),
             Some("wks_a")

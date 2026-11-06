@@ -1515,7 +1515,7 @@ fn dispatch_to_leader(
         created_at: now.clone(),
         updated_at: now,
     };
-    let stored = match engine.insert_follow_up_run(&run, request_id, caller, follow_up_of) {
+    let stored = match engine.insert_follow_up_run(&run, request_id, caller, follow_up_of, false) {
         Ok(stored) => stored,
         Err(e) => return tool_error(id, &format!("run persistence failed: {e}")),
     };
@@ -2727,7 +2727,7 @@ mod tests {
         carried.task = "spec-drop sup-1 from waggledance@abc\n\n# Build the widget".to_string();
         carried.created_at = "2026-08-16T00:00:01Z".to_string();
         engine
-            .insert_follow_up_run(&carried, Some("sup-1"), None, None)
+            .insert_follow_up_run(&carried, Some("sup-1"), None, None, false)
             .unwrap();
         let mut follow = seeded_run(&project.id, "run-old-2");
         follow.pane_id = "paseo:old".to_string();
@@ -2735,7 +2735,7 @@ mod tests {
         follow.task = "add a test".to_string();
         follow.created_at = "2026-08-16T00:00:02Z".to_string();
         engine
-            .insert_follow_up_run(&follow, None, None, Some("run-old-1"))
+            .insert_follow_up_run(&follow, None, None, Some("run-old-1"), false)
             .unwrap();
         let mut rollups = bee::read_rollup(std::slice::from_ref(&project.root_path));
         let rollup = with_worktree(rollups.pop().unwrap(), "widgets--wt--polish");

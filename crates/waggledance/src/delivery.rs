@@ -1632,7 +1632,7 @@ mod tests {
             updated_at: at.into(),
         };
         r.engine
-            .insert_follow_up_run(&run, None, Some("caller-1"), Some(of))
+            .insert_follow_up_run(&run, None, Some("caller-1"), Some(of), false)
             .unwrap();
     }
 
