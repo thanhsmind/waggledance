@@ -171,6 +171,11 @@ whose pane id starts with `paseo:`. Entries are ordered oldest first.
 
 A Paseo failure never turns into a tool error; the bee half of the answer is intact.
 
+Today each entry also carries `family_root`, `current` and `runs`. Each run row carries
+`steer`. The three-tier rule that reads them before a leader dispatch (same work, same
+cluster with a steer note, unrelated) lives in
+[paseo-leader-dispatch](paseo-leader-dispatch.md) § follow_up_of and § steer.
+
 ## Commands
 
 ### waggledance supervisor ensure

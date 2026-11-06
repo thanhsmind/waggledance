@@ -53,6 +53,11 @@ dispatch `request_id`, so a retried hand-off returns the same run.
 - `waggledance_ask_state` reports each leader's `via` as `wd` or `daemon`. A leader
   still labelled `waggledance.via=supervisor` reads `daemon`.
 - A hand-off (a `request_id` with no `:`) inserts the task row `open`.
+- Before a hand-off, wd picks a tier the same way every caller does (same work, same
+  cluster, unrelated; see [paseo-leader-dispatch](paseo-leader-dispatch.md) §
+  follow_up_of). `wd-bridge.py handoff` carries neither `follow_up_of` nor `steer`, so a
+  same-cluster hand-off from wd names the running leader in a `Running nearby: <run_id> —
+  <task_summary>` line of the new task and sends no steer note (leader-cluster-steer).
 
 The leader receives the task text behind a fixed prefix (`paseo::wd_task`):
 `Task waggledance#<corr> from wd.`, the mail rule, the advisor rule, then the task

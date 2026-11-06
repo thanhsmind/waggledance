@@ -60,4 +60,6 @@ same gap.
 ## Out of scope
 
 Mid-turn injection into a running leader (Paseo delivery stays turn-based),
-wd's `reply`/`redo`/`accept`, and the herdr pane path.
+wd's `reply`/`redo`/`accept`, a `steer` or `follow_up_of` argument for
+`wd-bridge.py handoff` (from aicoworker, tier 2 carries only the `Running nearby:`
+line), and the herdr pane path.
