@@ -128,3 +128,4 @@ never a generation timestamp or any other wall-clock value.
 - [waggledance-rename/](waggledance-rename/index.md) — 1 concept(s)
 - [waggledance-supervisor-mode-gate/](waggledance-supervisor-mode-gate/index.md) — 1 concept(s)
 - [waiting-on-badge/](waiting-on-badge/index.md) — 1 concept(s)
+- [worktree-auto-sweep/](worktree-auto-sweep/index.md) — 1 concept(s)

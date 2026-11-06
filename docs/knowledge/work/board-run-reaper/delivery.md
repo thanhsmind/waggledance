@@ -35,3 +35,7 @@ Each cell below was capped only against a recorded passing verify result — bee
 ## Provenance
 
 Proposed by `bee knowledge promote --work board-run-reaper` from 2 capped cell trace(s) in `.bee/cells/` and the anchor `docs/history/board-run-reaper/CONTEXT.md`, `docs/history/board-run-reaper/plan.md`. Every line above is copied from a trace or from the work item; nothing here is curated truth until a human or agent accepts it.
+
+## Related
+
+- [worktree-auto-sweep](../worktree-auto-sweep/worktree-sweep.md): the other timed daemon task that tidies up, here for finished bee worktrees instead of board runs.
