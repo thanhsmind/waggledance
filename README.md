@@ -260,7 +260,9 @@ leaves dispatch on. A file that exists but cannot be read or parsed also turns d
 off until it is fixed. The Orchestration section of the settings page shows each
 project's state and why. `terminal.enabled` still gates pane dispatch.
 `[paseo]` optionally names the workspace a new leader starts in, and takes `provider`,
-`mode`, and `thinking` for it. `mode` defaults to `bypassPermissions`. Every key is
+`mode`, and `thinking` for it. `mode` defaults to `bypassPermissions`.
+`leader_idle_minutes` (default 30, also settable in the global `[paseo]` block) is how
+long an idle leader with nothing open in its family stays before it is archived. Every key is
 described in
 [.waggledance.toml](docs/knowledge/patterns/paseo-leader-dispatch.md#waggledancetoml).
 
