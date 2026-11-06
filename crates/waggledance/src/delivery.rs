@@ -505,6 +505,15 @@ impl Delivery {
                     (Some(leader), Some(Ok(state))) if !state.archived => {
                         return self.follow_on(&name, run, leader, &mode, timeout, wd).await;
                     }
+                    (leader, _) if paseo::is_steer(&run.task) => {
+                        let of = follow.of.as_deref().unwrap_or("its family");
+                        let why = format!(
+                            "steer note for run {of} not delivered: its leader {} is gone, and a \
+                             steer never opens a leader",
+                            leader.unwrap_or("was never started")
+                        );
+                        return self.lose(&name, run, None, &why);
+                    }
                     (leader, _) => {
                         note = follow.of.as_deref().map(|of| gone_note(of, leader));
                         format!("{}\n\n{}", follow.prior, run.task)
@@ -1820,6 +1829,43 @@ mod tests {
             )),
             "{transcript}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_steer_to_an_archived_leader_ends_lost_and_starts_no_leader() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let old = leader_of(&r, "run-1");
+        r.fake.archive(&old).await.unwrap();
+        let note = paseo::steer_task("new leader run-9 works nearby");
+        queue_follow(&r, "run-2", "run-1", &note, "2026-10-14T14:00:05Z");
+        r.tick().await;
+        assert_eq!(r.started_tasks(), vec!["build it"]);
+        assert!(send_waits(&r).is_empty());
+        assert_eq!(r.status("run-2"), "lost");
+        let transcript = r.transcript("run-2");
+        assert!(
+            transcript.contains("steer note for run run-1 not delivered"),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_steer_to_an_idle_leader_is_sent_to_it() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        let leader = leader_of(&r, "run-1");
+        r.fake.set_status(&leader, "idle");
+        let note = paseo::steer_task("new leader run-9 works nearby");
+        queue_follow(&r, "run-2", "run-1", &note, "2026-10-14T14:00:05Z");
+        r.tick().await;
+        assert_eq!(r.started_tasks(), vec!["build it"]);
+        assert_eq!(leader_of(&r, "run-2"), leader);
+        assert_eq!(r.status("run-2"), "done");
     }
 
     #[tokio::test]
