@@ -253,7 +253,10 @@ fn ask_state_schema() -> Value {
     `task_summary` being the task's first line that is not a spec-drop or wd provenance line, \
     cut to 200 characters. Read `runs` before a leader dispatch: when the new request extends \
     work a live leader carries (same feature, same files, same output), dispatch with \
-    `follow_up_of` set to that run_id instead of opening a new leader. `leaders` is ABSENT when \
+    `follow_up_of` set to that run_id instead of opening a new leader. Each leader also carries \
+    `family_root` (the run id every run it carries descends from, null when it carries none) and \
+    `current` (true when it is the family's newest leader, the one a follow-up reaches). \
+    `leaders` is ABSENT when \
     `[paseo] enabled = false`, `null` beside a `leaders_error` reason when Paseo cannot \
     be read, and an array (possibly empty) beside `leaders_skipped`, the count of \
     leaders under no registered project, otherwise.",
@@ -281,6 +284,10 @@ fn dispatch_schema() -> Value {
     same output), pass that run_id here and no fresh correlation id in the task; otherwise \
     leave it out and a new leader opens. The daemon waits while that leader is mid-turn, sends \
     to it once idle, and starts a new leader carrying the earlier task text when it is gone. \
+    With `leader: true` and `follow_up_of`, `handoff: true` starts a fresh leader that takes \
+    over the family and retires the older one — use it when your own context is nearly full; \
+    `handoff` without `follow_up_of` is refused, `handoff: false` opts out of the automatic \
+    handoff a leader's own dispatch otherwise becomes. \
     Returns a `run_id` immediately; poll completion with `waggledance_await`.",
         "inputSchema": {
             "type": "object",
@@ -291,7 +298,8 @@ fn dispatch_schema() -> Value {
                 "leader": { "type": "boolean", "description": "true sends the task to the project's Paseo leader — mutually exclusive with preset and pane_id" },
                 "task": { "type": "string", "description": "The task text sent to the agent" },
                 "request_id": { "type": "string", "description": "Caller-chosen id for this request — pass one on every call so a retry never sends twice" },
-                "follow_up_of": { "type": "string", "description": "With leader: true only — the run_id or request_id of a run in this project whose leader should take this task as a follow-up instead of a new leader" }
+                "follow_up_of": { "type": "string", "description": "With leader: true only — the run_id or request_id of a run in this project whose leader should take this task as a follow-up instead of a new leader" },
+                "handoff": { "type": "boolean", "description": "With leader: true and follow_up_of — true starts a fresh leader that takes over that run's family and retires the older leader; false opts out of the automatic handoff" }
             },
             "required": ["project", "task"]
         }
@@ -1067,6 +1075,28 @@ fn leader_runs(engine: &Engine, project_id: &str, agent_id: &str) -> Value {
     )
 }
 
+fn leader_family(engine: &Engine, agent_id: &str, runs: &Value) -> (Value, bool) {
+    let Some(newest) = runs.get(0).and_then(|r| r["run_id"].as_str()) else {
+        return (Value::Null, true);
+    };
+    let Some(root) = engine
+        .follow_up_chain(newest)
+        .ok()
+        .and_then(|chain| chain.into_iter().next())
+    else {
+        return (Value::Null, true);
+    };
+    let pane = format!("{}{agent_id}", orchestrate::PASEO_PANE_PREFIX);
+    let current = engine
+        .follow_up_family(&root.id)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find(|r| r.pane_id != format!("{}pending", orchestrate::PASEO_PANE_PREFIX))
+        .is_none_or(|r| r.pane_id == pane);
+    (json!(root.id), current)
+}
+
 fn attach_leaders(
     digest: &mut Value,
     engine: &Engine,
@@ -1127,6 +1157,7 @@ fn attach_leaders(
         .map(|(agent, cwd)| {
             let via = wd.contains(&agent.id).then_some("wd");
             let runs = leader_runs(engine, &project.id, &agent.id);
+            let (family_root, current) = leader_family(engine, &agent.id, &runs);
             json!({
                 "agent_id": agent.id,
                 "status": agent.status,
@@ -1140,7 +1171,9 @@ fn attach_leaders(
                 },
                 "waiting_on": waiting_on,
                 "last_daemon_run": last_daemon_run,
-                "runs": runs
+                "runs": runs,
+                "family_root": family_root,
+                "current": current
             })
         })
         .collect();
@@ -1280,6 +1313,13 @@ fn handle_dispatch(
         .get("follow_up_of")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    let handoff_arg = args.get("handoff").and_then(Value::as_bool);
+    if handoff_arg == Some(true) && !leader {
+        return tool_error(
+            id,
+            "\"handoff\": true goes only with \"leader\": true and \"follow_up_of\"",
+        );
+    }
     if follow_up_of.is_some() && !leader {
         return tool_error(
             id,
@@ -1320,15 +1360,20 @@ fn handle_dispatch(
         }
     }
     if leader {
-        let follow_up_of = match follow_up_of.map(|of| follow_up_target(engine, &project, of)) {
-            None => None,
-            Some(Ok(run)) => Some(run.id),
-            Some(Err(refusal)) => return tool_error(id, &refusal),
-        };
         let caller = dispatch_caller(
             std::env::var("PASEO_AGENT_ID").ok(),
             std::env::var("WAGGLEDANCE_CALLER").ok(),
         );
+        let follow = match resolve_follow_up(
+            engine,
+            &project,
+            follow_up_of,
+            handoff_arg,
+            caller.as_deref(),
+        ) {
+            Ok(follow) => follow,
+            Err(refusal) => return tool_error(id, &refusal),
+        };
         return dispatch_to_leader(
             id,
             engine,
@@ -1337,7 +1382,9 @@ fn handle_dispatch(
             LeaderRequest {
                 request_id,
                 caller: caller.as_deref(),
-                follow_up_of: follow_up_of.as_deref(),
+                follow_up_of: follow.follow_up_of.as_deref(),
+                handoff: follow.handoff,
+                note: follow.warning,
             },
             &resolve_data_dir(None),
         );
@@ -1473,6 +1520,64 @@ struct LeaderRequest<'a> {
     request_id: Option<&'a str>,
     caller: Option<&'a str>,
     follow_up_of: Option<&'a str>,
+    handoff: bool,
+    note: Option<String>,
+}
+
+struct ResolvedFollowUp {
+    follow_up_of: Option<String>,
+    handoff: bool,
+    warning: Option<String>,
+}
+
+fn resolve_follow_up(
+    engine: &Engine,
+    project: &Project,
+    follow_up_of: Option<&str>,
+    handoff: Option<bool>,
+    caller: Option<&str>,
+) -> Result<ResolvedFollowUp, String> {
+    if let Some(of) = follow_up_of {
+        let run = follow_up_target(engine, project, of)?;
+        return Ok(ResolvedFollowUp {
+            follow_up_of: Some(run.id),
+            handoff: handoff == Some(true),
+            warning: None,
+        });
+    }
+    let leading = match (handoff, caller) {
+        (Some(false), _) | (_, None) => None,
+        (_, Some(c)) if c == paseo::WD_CALLER => None,
+        (_, Some(c)) => {
+            let pane = format!("{}{c}", orchestrate::PASEO_PANE_PREFIX);
+            let runs = engine
+                .runs_on_pane(&pane)
+                .map_err(|e| format!("caller run lookup failed: {e}"))?;
+            runs.into_iter()
+                .find(|r| r.project_id == project.id)
+                .map(|run| (c, run.id))
+        }
+    };
+    match leading {
+        Some((caller, run_id)) => Ok(ResolvedFollowUp {
+            warning: Some(format!(
+                "leader {caller} dispatched a new leader without follow_up_of; treated as a \
+                 handoff of run {run_id} — pass follow_up_of with handoff: true"
+            )),
+            follow_up_of: Some(run_id),
+            handoff: true,
+        }),
+        None if handoff == Some(true) => Err(
+            "\"handoff\": true needs \"follow_up_of\" — name the run whose family the new \
+             leader takes over"
+                .to_string(),
+        ),
+        None => Ok(ResolvedFollowUp {
+            follow_up_of: None,
+            handoff: false,
+            warning: None,
+        }),
+    }
 }
 
 fn dispatch_to_leader(
@@ -1487,6 +1592,8 @@ fn dispatch_to_leader(
         request_id,
         caller,
         follow_up_of,
+        handoff,
+        note,
     } = request;
     if !engine.orchestration_allowed(project) {
         return tool_error(id, &dispatch_off(engine, project));
@@ -1515,7 +1622,7 @@ fn dispatch_to_leader(
         created_at: now.clone(),
         updated_at: now,
     };
-    let stored = match engine.insert_follow_up_run(&run, request_id, caller, follow_up_of, false) {
+    let stored = match engine.insert_follow_up_run(&run, request_id, caller, follow_up_of, handoff) {
         Ok(stored) => stored,
         Err(e) => return tool_error(id, &format!("run persistence failed: {e}")),
     };
@@ -1531,6 +1638,7 @@ fn dispatch_to_leader(
     } else {
         Vec::new()
     };
+    warnings.extend(note);
     let hand_off = request_id.filter(|r| caller == Some(paseo::WD_CALLER) && !r.contains(':'));
     if let Some(corr) = hand_off {
         if let Err(e) = engine.insert_task(corr, &project.id, &run.created_at) {
@@ -1554,6 +1662,7 @@ fn dispatch_to_leader(
                 "status": "queued",
                 "duplicate": false,
                 "follow_up_of": follow_up_of,
+                "handoff": handoff,
                 "warnings": warnings
             }
         }),
@@ -1646,6 +1755,8 @@ async fn task_action(
                     request_id: Some(&format!("{corr}:{n}")),
                     caller: Some(paseo::WD_CALLER),
                     follow_up_of: None,
+                    handoff: false,
+                    note: None,
                 },
                 data_dir,
             );
@@ -3636,6 +3747,8 @@ mod tests {
                 request_id,
                 caller: Some("agent-caller"),
                 follow_up_of: None,
+                handoff: false,
+                note: None,
             },
             data_dir,
         )
@@ -3874,6 +3987,130 @@ mod tests {
         std::fs::remove_dir_all(&project.root_path).ok();
     }
 
+    fn handoff_args(project: &Project, extra: Value) -> Value {
+        let mut args = json!({ "project": project.id, "task": "go", "leader": true });
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        args
+    }
+
+    #[test]
+    fn explicit_handoff_is_stored_with_the_flag_and_the_family_link() {
+        let (engine, project, data_dir) = leader_engine("handoff-explicit", true, true, true);
+        beat(&data_dir, 0);
+        let first = leader_call(&engine, &project, &data_dir, "build it", Some("sup-1"));
+        let first_id = first["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            handoff_args(&project, json!({ "follow_up_of": first_id, "handoff": true })),
+        );
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["handoff"], true, "{resp}");
+        let run_id = sc["run_id"].as_str().unwrap();
+        assert!(engine.run_is_handoff(run_id).unwrap());
+        assert_eq!(
+            engine.run_follow_up_of(run_id).unwrap().as_deref(),
+            Some(first_id.as_str())
+        );
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn handoff_without_follow_up_of_is_refused_and_stores_nothing() {
+        let (engine, project, data_dir) = leader_engine("handoff-bare", true, true, true);
+        beat(&data_dir, 0);
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            handoff_args(&project, json!({ "handoff": true })),
+        );
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = text_of(&resp);
+        assert!(text.contains("handoff") && text.contains("follow_up_of"), "{text}");
+        let resp = call_tool(
+            &engine,
+            "waggledance_dispatch",
+            json!({ "project": project.id, "task": "go", "preset": "p", "handoff": true }),
+        );
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        assert!(engine.list_runs(&project.id, 10).unwrap().is_empty());
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn a_leader_caller_without_follow_up_of_becomes_a_handoff_with_a_warning() {
+        let (engine, project, _) = leader_engine("handoff-implicit", true, true, true);
+        let mut led = seeded_run(&project.id, "run-led");
+        led.pane_id = "paseo:lead-1".to_string();
+        engine.insert_run(&led, None).unwrap();
+        let mut elsewhere = seeded_run("other-project", "run-else");
+        elsewhere.pane_id = "paseo:lead-2".to_string();
+        engine.insert_run(&elsewhere, None).unwrap();
+
+        let got = resolve_follow_up(&engine, &project, None, None, Some("lead-1")).unwrap();
+        assert_eq!(got.follow_up_of.as_deref(), Some("run-led"));
+        assert!(got.handoff);
+        let warning = got.warning.unwrap();
+        assert!(
+            warning.contains("leader lead-1 dispatched a new leader without follow_up_of")
+                && warning.contains("run run-led")
+                && warning.contains("handoff: true"),
+            "{warning}"
+        );
+
+        let other = resolve_follow_up(&engine, &project, None, None, Some("lead-2")).unwrap();
+        assert!(other.follow_up_of.is_none() && !other.handoff && other.warning.is_none());
+        let wd = resolve_follow_up(&engine, &project, None, None, Some(paseo::WD_CALLER)).unwrap();
+        assert!(wd.follow_up_of.is_none() && !wd.handoff);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn handoff_false_opts_out_of_the_implicit_handoff() {
+        let (engine, project, _) = leader_engine("handoff-optout", true, true, true);
+        let mut led = seeded_run(&project.id, "run-led");
+        led.pane_id = "paseo:lead-1".to_string();
+        engine.insert_run(&led, None).unwrap();
+        let got = resolve_follow_up(&engine, &project, None, Some(false), Some("lead-1")).unwrap();
+        assert!(got.follow_up_of.is_none() && !got.handoff && got.warning.is_none());
+        let named =
+            resolve_follow_up(&engine, &project, Some("run-led"), Some(false), Some("lead-1"))
+                .unwrap();
+        assert_eq!(named.follow_up_of.as_deref(), Some("run-led"));
+        assert!(!named.handoff);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
+    #[test]
+    fn leaders_of_one_family_share_a_root_and_only_the_newest_is_current() {
+        let (engine, project, _) = leader_engine("family-current", true, true, true);
+        let mut old = seeded_run(&project.id, "run-old");
+        old.pane_id = "paseo:lead-old".to_string();
+        old.created_at = "2026-01-01T00:00:00Z".to_string();
+        engine.insert_run(&old, None).unwrap();
+        let mut new = seeded_run(&project.id, "run-new");
+        new.pane_id = "paseo:lead-new".to_string();
+        new.created_at = "2026-01-02T00:00:00Z".to_string();
+        engine
+            .insert_follow_up_run(&new, None, None, Some("run-old"), true)
+            .unwrap();
+        let runs = |agent: &str| leader_runs(&engine, &project.id, agent);
+        let (root, current) = leader_family(&engine, "lead-old", &runs("lead-old"));
+        assert_eq!(root, "run-old");
+        assert!(!current);
+        let (root, current) = leader_family(&engine, "lead-new", &runs("lead-new"));
+        assert_eq!(root, "run-old");
+        assert!(current);
+        let (root, current) = leader_family(&engine, "lead-none", &runs("lead-none"));
+        assert!(root.is_null() && current);
+        std::fs::remove_dir_all(&project.root_path).ok();
+    }
+
     #[test]
     fn dispatch_and_ask_state_descriptions_teach_follow_up_of() {
         let dispatch = dispatch_schema();
@@ -3945,6 +4182,8 @@ mod tests {
                 request_id: Some("corr-9"),
                 caller: Some(paseo::WD_CALLER),
                 follow_up_of: None,
+                handoff: false,
+                note: None,
             },
             &data_dir,
         );
@@ -3975,6 +4214,8 @@ mod tests {
                     request_id: Some(request_id),
                     caller,
                     follow_up_of: None,
+                    handoff: false,
+                    note: None,
                 },
                 &data_dir,
             )
