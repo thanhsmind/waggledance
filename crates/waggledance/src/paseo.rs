@@ -1250,7 +1250,7 @@ pub mod fake {
         pub no_providers: bool,
         pub store: Vec<StoredWorkspace>,
         pub logs: HashMap<String, String>,
-        pub turn_ends: VecDeque<TurnEnd>,
+        pub turn_ends: VecDeque<Option<TurnEnd>>,
         pub permits: Vec<Permit>,
         pub modes: HashMap<String, VecDeque<Option<String>>>,
         pub stuck: std::collections::HashSet<String>,
@@ -1258,6 +1258,7 @@ pub mod fake {
         pub archive_fails: std::collections::HashSet<String>,
         pub appear_after: Duration,
         pub run_after: Duration,
+        pub gone_after_run: bool,
         pub calls: Vec<Call>,
     }
 
@@ -1345,7 +1346,11 @@ pub mod fake {
         }
 
         pub fn push_turn_end(&self, end: TurnEnd) {
-            self.state.lock().unwrap().turn_ends.push_back(end);
+            self.state.lock().unwrap().turn_ends.push_back(Some(end));
+        }
+
+        pub fn push_timeout(&self) {
+            self.state.lock().unwrap().turn_ends.push_back(None);
         }
 
         pub fn set_status(&self, id: &str, status: &str) {
@@ -1368,13 +1373,16 @@ pub mod fake {
             }
         }
 
-        fn next_turn_end(&self) -> TurnEnd {
-            self.state
-                .lock()
-                .unwrap()
-                .turn_ends
-                .pop_front()
-                .unwrap_or(TurnEnd::Completed)
+        fn next_turn_end(&self, command: &str) -> Result<TurnEnd> {
+            match self.state.lock().unwrap().turn_ends.pop_front() {
+                Some(Some(end)) => Ok(end),
+                Some(None) => Err(PaseoError::Timeout {
+                    binary: "fake".into(),
+                    command: command.into(),
+                    secs: 3600,
+                }),
+                None => Ok(TurnEnd::Completed),
+            }
         }
 
         pub fn add_workspace(&self, id: &str, isolation: &str, cwd: &Path) {
@@ -1503,13 +1511,21 @@ pub mod fake {
                 .or_default()
                 .push(id.clone());
             tokio::time::sleep(run_after).await;
+            {
+                let mut s = self.state.lock().unwrap();
+                if s.gone_after_run {
+                    if let Some(a) = s.agents.get_mut(&id) {
+                        a.archived = true;
+                    }
+                }
+            }
             self.record(Call::RunDone(id.clone()));
-            Ok((id, self.next_turn_end()))
+            Ok((id, self.next_turn_end("run")?))
         }
 
         async fn send_and_wait(&self, id: &str, text: &str, _timeout: Duration) -> Result<TurnEnd> {
             self.record(Call::SendAndWait(id.to_string(), text.to_string()));
-            Ok(self.next_turn_end())
+            self.next_turn_end("send")
         }
 
         async fn send(&self, id: &str, text: &str) -> Result<()> {
@@ -1519,7 +1535,7 @@ pub mod fake {
 
         async fn wait(&self, id: &str, _timeout: Duration) -> Result<TurnEnd> {
             self.record(Call::Wait(id.to_string()));
-            Ok(self.next_turn_end())
+            self.next_turn_end("wait")
         }
 
         async fn logs_since(&self, id: &str, since: &str) -> Result<String> {

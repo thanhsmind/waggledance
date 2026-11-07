@@ -121,8 +121,9 @@ The `[paseo]` block in `~/.waggledance/config.toml` is optional and only overrid
   that line. `enabled = true` is no longer needed.
 - `binary` names a `paseo` CLI to try first; see
   [Which paseo binary runs](#which-paseo-binary-runs).
-- `turn_timeout_secs` defaults to `3600`. It bounds how long one delivery waits for the
-  leader's turn to end.
+- `turn_timeout_secs` defaults to `3600`. It bounds one blocking `paseo run`, `send` or
+  `wait` call. When it passes, waggledance checks the leader and waits again; it never
+  ends the run on the timeout alone.
 - `provider`, `mode`, and `thinking` are host-wide defaults beneath the project file's.
 - `[[paseo.leaders]]` (`project`, `workspace`) is a deprecated fallback kept for hosts
   that already carry it. Use `[paseo] workspace` in the project's `.waggledance.toml`.
@@ -343,7 +344,8 @@ waggledance never infers done from an idle status or from log text.
 |--------------|------------|
 | the blocking call returns `completed` | `done` |
 | the blocking call returns `permission` | `blocked`; once no permission is pending, `paseo wait` decides: `idle` → `done`, `permission` → `blocked` again |
-| `turn_timeout_secs` passes, or any other status | `lost`, "the leader may still be finishing" |
+| `turn_timeout_secs` passes, the call reports `timeout`, or the call fails after the send | the run stays `working` while `paseo inspect` shows the leader not archived, and `paseo wait` runs again; `lost`, "the leader <id> is gone without a result", once the leader is archived or three reads in a row fail |
+| any other status, such as `error` | `lost`, "the leader may still be finishing" |
 
 The `idle` that `paseo wait` reports after a permission is a turn end, not a guess from
 idle state. After `permit allow`, the agent stays `running`, and `wait` blocks until the
@@ -352,22 +354,32 @@ instead (piggery-lessons D5). The fixtures `inspect-after-allow.out`,
 `wait-after-allow.out` and `wait-second-permission.out` pin all three answers.
 
 The transcript of a `done` run is the leader's text after the last `[User] <first line of
-the task>` in `paseo logs`. Paseo 0.11.2 ignores `logs --since`, so the reply is found by
-that line, not by time.
+the prompt sent>` in `paseo logs`. The prompt sent is the run's task, or the earlier
+tasks plus this one when a follow-up starts a fresh leader. Paseo 0.11.2 ignores
+`logs --since`, so the reply is found by that line, not by time. When no reply is
+found, the transcript says so and names the leader, so a `done` with an empty
+transcript cannot happen.
+
+The run row records its leader (`paseo:<id>`) as soon as the leader is found, even
+when the blocking `paseo run` call fails or times out. A follow-up therefore sees that
+the earlier run started a leader, waits while that run is still `working`, and then
+goes to the same leader.
 
 ### Failures, timeouts, and restarts
 
 - **Before the send.** A failure to resolve the leader, a missing binary, or an
   unreachable Paseo puts the run back to `queued` with backoff (10 s, 30 s, 1 min, 5 min).
   The fifth failure marks it `lost` with the error (D6).
-- **After the send.** A timeout marks the run `lost` "the leader may still be
-  finishing", and its leader is left alone. Killing a blocking
+- **After the send.** A timeout keeps the run `working` while its leader is alive (see
+  the table above), and the leader is left alone. Killing a blocking
   send does not end the leader's turn, so the task is never sent again (D6). Only a
   failure to start the binary or to write the prompt file counts as "before the send";
   any other send error is treated as sent, so a request is never delivered twice.
 - **Daemon restart.** A run claimed but not yet sent (still `paseo:pending`) goes back to
-  `queued`. A run already sent becomes `lost` with "daemon restarted — the leader may
-  still be finishing; check its chat", and is never re-sent (D6).
+  `queued`. A run already sent to a known leader is watched again: waggledance checks
+  the leader and waits for its turn end, so it ends `done` or `lost` by the same rules,
+  and is never re-sent (D6). A `blocked` run with no recorded leader becomes `lost` with
+  "daemon restarted — the leader may still be finishing; check its chat".
 
 ## Run status
 
@@ -380,7 +392,7 @@ they run no `paseo` command.
 | `working` | delivered, or being delivered; the leader's turn has not ended |
 | `blocked` | the leader waits on a permission in its Paseo chat; the human answers it there |
 | `done` | the turn ended; the transcript is the leader's reply |
-| `lost` | the turn's end was not seen; the transcript says why |
+| `lost` | the leader is gone without a result, or Paseo reported an error status; the transcript says why |
 
 The board shows a leader that needs the human (piggery-lessons D6). A leader run that
 is `blocked`, or `lost` within the last hour, is a leader wait. `GET /api/board` lists
