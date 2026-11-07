@@ -20,7 +20,10 @@ const NOTICE_WINDOW: Duration = Duration::from_secs(3600);
 const NOTICE_GAP: Duration = Duration::from_secs(30);
 const MAY_STILL_FINISH: &str = "the leader may still be finishing";
 const RESTARTED: &str = "daemon restarted — the leader may still be finishing; check its chat";
+const NO_REPLY: &str = "[waggledance] the leader ended its turn but left no reply to this task in its log — read its Paseo chat";
 const LEADER_RUNNING: [&str; 2] = ["running", "initializing"];
+const UNFINISHED: &str = "timeout";
+const UNREAD_LIMIT: u32 = 3;
 
 pub type NotifySlot = Arc<Mutex<Option<Arc<NotifyStore>>>>;
 
@@ -360,7 +363,7 @@ impl Delivery {
         self.beat();
         let first = !std::mem::replace(&mut self.state.lock().unwrap().recovered, true);
         if first {
-            self.recover();
+            self.recover(deliveries);
         }
         self.flush_notices().await;
         let projects = self
@@ -396,7 +399,7 @@ impl Delivery {
         }
     }
 
-    fn recover(&self) {
+    fn recover(&self, deliveries: &mut JoinSet<()>) {
         let runs = self.engine.list_inflight_paseo_runs().unwrap_or_else(|e| {
             tracing::warn!("delivery could not list in-flight leader runs: {e}");
             Vec::new()
@@ -410,7 +413,24 @@ impl Delivery {
                 self.set_status(&run.id, "queued");
                 continue;
             }
-            self.end(&self.name_of(&run), &run, "lost", Some(RESTARTED), agent);
+            let Some(agent) = agent.map(str::to_string) else {
+                self.end(&self.name_of(&run), &run, "lost", Some(RESTARTED), None);
+                continue;
+            };
+            if !self.state.lock().unwrap().inflight.insert(run.id.clone()) {
+                continue;
+            }
+            let this = self.clone();
+            deliveries.spawn(async move {
+                let name = this.name_of(&run);
+                let unseen = Ok(TurnEnd::Other {
+                    status: UNFINISHED.to_string(),
+                    message: "daemon restarted before the leader's turn end was seen".to_string(),
+                });
+                this.follow_turn(&name, &run, &agent, unseen, &run.task)
+                    .await;
+                this.state.lock().unwrap().inflight.remove(&run.id);
+            });
         }
     }
 
@@ -558,8 +578,10 @@ impl Delivery {
         let spec = start.spec(&prompt);
         let started = self.paseo.run_and_wait(&spec, timeout);
         let retired = std::sync::atomic::AtomicBool::new(false);
+        let found: Mutex<Option<String>> = Mutex::new(None);
         let finder = async {
             let id = self.new_leader(&project.id, &run.id).await;
+            *found.lock().unwrap() = Some(id.clone());
             if !retired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 olds.iter()
                     .for_each(|old| self.retire(old.clone(), deadline));
@@ -586,29 +608,132 @@ impl Delivery {
                 self.sent(run, &id, wd, &sent_at);
                 (Some(id), Ok(end))
             }
-            Err(e) => (None, Err(e)),
+            Err(e @ (PaseoError::Spawn { .. } | PaseoError::PromptFile(_))) => (None, Err(e)),
+            Err(e) => {
+                let found = found.lock().unwrap().clone();
+                let id = match found {
+                    Some(id) => Some(id),
+                    None => self
+                        .paseo
+                        .run_leaders(&project.id, &run.id)
+                        .await
+                        .ok()
+                        .and_then(|ids| ids.into_iter().next()),
+                };
+                if let Some(id) = &id {
+                    self.sent(run, id, wd, &sent_at);
+                }
+                (id, Err(e))
+            }
         };
         let run = Run {
             pane_id: pane(agent.as_deref()),
             ..run.clone()
         };
-        let agent = agent.as_deref();
-        match outcome {
-            Err(e @ (PaseoError::Spawn { .. } | PaseoError::PromptFile(_))) => {
-                self.presend_failed(&name, &run, &e.to_string())
+        self.settle(&name, &run, agent.as_deref(), outcome, &prompt)
+            .await;
+    }
+
+    async fn settle(
+        &self,
+        name: &str,
+        run: &Run,
+        agent: Option<&str>,
+        end: paseo::Result<TurnEnd>,
+        sent: &str,
+    ) {
+        match (agent, end) {
+            (_, Err(e @ (PaseoError::Spawn { .. } | PaseoError::PromptFile(_)))) => {
+                self.presend_failed(name, run, &e.to_string())
             }
-            Err(e) => self.lose(&name, &run, agent, &e.to_string()),
-            Ok(TurnEnd::Completed) => self.done(&name, &run, agent).await,
-            Ok(TurnEnd::Permission) => match agent {
-                Some(agent) => self.blocked_then_done(&name, &run, agent, deadline).await,
-                None => self.lose(&name, &run, None, "permission requested"),
-            },
-            Ok(TurnEnd::Other { status, message }) => self.lose(
-                &name,
-                &run,
-                agent,
+            (Some(agent), end) => self.follow_turn(name, run, agent, end, sent).await,
+            (None, Ok(TurnEnd::Completed)) => self.done(name, run, None, sent).await,
+            (None, Ok(TurnEnd::Permission)) => self.lose(name, run, None, "permission requested"),
+            (None, Ok(TurnEnd::Other { status, message })) => self.lose(
+                name,
+                run,
+                None,
                 &format!("paseo reported {status}: {message}"),
             ),
+            (None, Err(e)) => self.lose(name, run, None, &e.to_string()),
+        }
+    }
+
+    async fn follow_turn(
+        &self,
+        name: &str,
+        run: &Run,
+        agent: &str,
+        mut end: paseo::Result<TurnEnd>,
+        sent: &str,
+    ) {
+        let timeout = Duration::from_secs(self.engine.config.paseo.turn_timeout_secs);
+        let mut unread = 0;
+        loop {
+            let why = match end {
+                Ok(TurnEnd::Completed) => return self.done(name, run, Some(agent), sent).await,
+                Ok(TurnEnd::Other { status, .. }) if status == "idle" => {
+                    return self.done(name, run, Some(agent), sent).await
+                }
+                Ok(TurnEnd::Permission) => {
+                    if let Some(why) = self.hold_for_permission(name, run, agent).await {
+                        return self.gone(name, run, agent, &why);
+                    }
+                    end = self.paseo.wait(agent, timeout).await;
+                    continue;
+                }
+                Ok(TurnEnd::Other { status, message }) if status != UNFINISHED => {
+                    let why = format!("paseo reported {status}: {message}");
+                    return self.lose(name, run, Some(agent), &why);
+                }
+                Ok(TurnEnd::Other { status, message }) => {
+                    format!("paseo reported {status}: {message}")
+                }
+                Err(e) => e.to_string(),
+            };
+            match self.paseo.inspect(agent).await {
+                Ok(state) if state.archived => {
+                    return self.gone(name, run, agent, &format!("archived; {why}"))
+                }
+                Ok(_) => unread = 0,
+                Err(e) => {
+                    unread += 1;
+                    if unread >= UNREAD_LIMIT {
+                        let why = format!("{why}; its state could not be read: {e}");
+                        return self.gone(name, run, agent, &why);
+                    }
+                }
+            }
+            tracing::info!(
+                run = %run.id,
+                leader = agent,
+                "delivery keeps run {} working: its leader is still at work ({why})",
+                run.id
+            );
+            tokio::time::sleep(self.permission_poll).await;
+            end = self.paseo.wait(agent, timeout).await;
+        }
+    }
+
+    async fn hold_for_permission(&self, name: &str, run: &Run, agent: &str) -> Option<String> {
+        self.end(name, run, "blocked", None, Some(agent));
+        let mut unread = 0;
+        loop {
+            tokio::time::sleep(self.permission_poll).await;
+            match self.paseo.inspect(agent).await {
+                Ok(s) if s.archived => {
+                    return Some("archived while a permission was pending".to_string())
+                }
+                Ok(s) if s.pending_permissions == 0 => return None,
+                Ok(_) => unread = 0,
+                Err(e) => {
+                    tracing::warn!("delivery could not inspect leader {agent}: {e}");
+                    unread += 1;
+                    if unread >= UNREAD_LIMIT {
+                        return Some(format!("its state could not be read: {e}"));
+                    }
+                }
+            }
         }
     }
 
@@ -682,22 +807,8 @@ impl Delivery {
             pane_id: pane(Some(leader)),
             ..run.clone()
         };
-        let deadline = Instant::now() + timeout;
-        let agent = Some(leader);
-        match self.paseo.send_and_wait(leader, &run.task, timeout).await {
-            Err(e @ (PaseoError::Spawn { .. } | PaseoError::PromptFile(_))) => {
-                self.presend_failed(name, &run, &e.to_string())
-            }
-            Err(e) => self.lose(name, &run, agent, &e.to_string()),
-            Ok(TurnEnd::Completed) => self.done(name, &run, agent).await,
-            Ok(TurnEnd::Permission) => self.blocked_then_done(name, &run, leader, deadline).await,
-            Ok(TurnEnd::Other { status, message }) => self.lose(
-                name,
-                &run,
-                agent,
-                &format!("paseo reported {status}: {message}"),
-            ),
-        }
+        let end = self.paseo.send_and_wait(leader, &run.task, timeout).await;
+        self.settle(name, &run, Some(leader), end, &run.task).await;
     }
 
     async fn new_leader(&self, project_id: &str, run_id: &str) -> String {
@@ -740,36 +851,6 @@ impl Delivery {
         }
     }
 
-    async fn blocked_then_done(&self, name: &str, run: &Run, agent: &str, deadline: Instant) {
-        loop {
-            self.end(name, run, "blocked", None, Some(agent));
-            loop {
-                if Instant::now() >= deadline {
-                    return self.lose(name, run, Some(agent), "permission still pending");
-                }
-                tokio::time::sleep(self.permission_poll).await;
-                match self.paseo.inspect(agent).await {
-                    Ok(s) if s.pending_permissions == 0 => break,
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("delivery could not inspect leader {agent}: {e}"),
-                }
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.paseo.wait(agent, remaining).await {
-                Ok(TurnEnd::Completed) => return self.done(name, run, Some(agent)).await,
-                Ok(TurnEnd::Other { status, .. }) if status == "idle" => {
-                    return self.done(name, run, Some(agent)).await
-                }
-                Ok(TurnEnd::Permission) => {}
-                Ok(TurnEnd::Other { status, message }) => {
-                    let why = format!("paseo reported {status}: {message}");
-                    return self.lose(name, run, Some(agent), &why);
-                }
-                Err(e) => return self.lose(name, run, Some(agent), &e.to_string()),
-            }
-        }
-    }
-
     fn mail(&self, run: &Run, to: &str, kind: &str, body: &str) {
         let corr = paseo::wd_corr(&run.task).unwrap_or(&run.id);
         let now = now_rfc3339();
@@ -781,7 +862,7 @@ impl Delivery {
         }
     }
 
-    async fn done(&self, name: &str, run: &Run, agent: Option<&str>) {
+    async fn done(&self, name: &str, run: &Run, agent: Option<&str>, sent: &str) {
         let logs = match agent {
             Some(agent) => self
                 .paseo
@@ -793,8 +874,18 @@ impl Delivery {
                 }),
             None => String::new(),
         };
-        let reply = leader_reply(&logs, &run.task);
+        let reply = leader_reply(&logs, sent);
+        let reply = if reply.trim().is_empty() {
+            format!("{NO_REPLY} (leader {})", agent.unwrap_or("not started"))
+        } else {
+            reply
+        };
         self.end(name, run, "done", Some(&reply), agent);
+    }
+
+    fn gone(&self, name: &str, run: &Run, agent: &str, why: &str) {
+        let transcript = format!("the leader {agent} is gone without a result ({why})");
+        self.end(name, run, "lost", Some(&transcript), Some(agent));
     }
 
     fn lose(&self, name: &str, run: &Run, agent: Option<&str>, why: &str) {
@@ -1426,7 +1517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_marks_an_unfinished_turn_lost_and_keeps_its_leader() {
+    async fn an_unfinished_turn_waits_on_a_live_leader_and_is_lost_only_once_it_is_gone() {
         let r = rig();
         root_workspace(&r);
         r.fake.push_turn_end(TurnEnd::Other {
@@ -1435,18 +1526,115 @@ mod tests {
         });
         r.queue_at("proj-1", "run-1", "one", None, "2026-10-14T14:00:01Z");
         r.tick().await;
-        assert_eq!(r.status("run-1"), "lost");
-        assert!(r.transcript("run-1").contains(MAY_STILL_FINISH));
-        let lost = agent_of(&r.engine.get_run("run-1").unwrap().unwrap()).to_string();
-        assert!(!r.fake.archived(&lost), "a lost run keeps its leader");
+        assert_eq!(r.status("run-1"), "done");
+        let first = leader_of(&r, "run-1");
+        assert!(r.fake.calls().contains(&Call::Wait(first.clone())));
+        assert!(!r.fake.archived(&first), "a done run keeps its leader");
 
-        r.fake.push_turn_end(TurnEnd::Completed);
+        r.fake.state.lock().unwrap().gone_after_run = true;
+        r.fake.push_turn_end(TurnEnd::Other {
+            status: "timeout".into(),
+            message: "still running".into(),
+        });
         r.queue_at("proj-1", "run-2", "two", None, "2026-10-14T14:00:02Z");
         r.tick().await;
-        assert_eq!(r.status("run-2"), "done");
-        let done = agent_of(&r.engine.get_run("run-2").unwrap().unwrap()).to_string();
-        assert_ne!(lost, done, "each run has its own leader");
-        assert!(!r.fake.archived(&done), "a done run keeps its leader");
+        assert_eq!(r.status("run-2"), "lost");
+        let gone = leader_of(&r, "run-2");
+        assert_ne!(first, gone, "each run has its own leader");
+        assert!(
+            r.transcript("run-2")
+                .contains(&format!("the leader {gone} is gone without a result")),
+            "{}",
+            r.transcript("run-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrapper_timeout_with_a_live_leader_is_not_lost_and_ends_on_the_leaders_turn_end() {
+        let r = rig();
+        root_workspace(&r);
+        r.fake.add_leader("caller-1", "idle", false);
+        r.fake.push_timeout();
+        r.fake.push_timeout();
+        r.set_logs("agent-2", "[User] build it\nmerged and released v2.82.0\n");
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        assert_eq!(r.status("run-1"), "done", "{}", r.transcript("run-1"));
+        assert_eq!(leader_of(&r, "run-1"), "agent-2");
+        let transcript = r.transcript("run-1");
+        assert!(
+            transcript.ends_with("merged and released v2.82.0"),
+            "{transcript}"
+        );
+        assert!(!transcript.contains(MAY_STILL_FINISH), "{transcript}");
+        let waits = r
+            .fake
+            .calls()
+            .into_iter()
+            .filter(|c| *c == Call::Wait("agent-2".into()))
+            .count();
+        assert_eq!(
+            waits, 2,
+            "the leader is waited on until its turn really ends"
+        );
+        r.tick().await;
+        let notices = r.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].1.contains("(done)"), "{notices:?}");
+
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        assert_eq!(
+            r.started_tasks().len(),
+            1,
+            "the follow-up starts no second leader"
+        );
+        assert_eq!(
+            send_waits(&r),
+            vec![("agent-2".to_string(), "add a test".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrapper_timeout_whose_leader_is_gone_ends_lost_and_still_names_its_leader() {
+        let r = rig();
+        root_workspace(&r);
+        r.fake.state.lock().unwrap().gone_after_run = true;
+        r.fake.push_timeout();
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.tick().await;
+        assert_eq!(r.status("run-1"), "lost");
+        assert_eq!(leader_of(&r, "run-1"), "agent-1");
+        assert!(
+            r.transcript("run-1").contains("agent-1"),
+            "{}",
+            r.transcript("run-1")
+        );
+
+        r.fake.state.lock().unwrap().gone_after_run = false;
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        let transcript = r.transcript("run-2");
+        assert!(
+            transcript.contains("follow-up of run run-1: its leader agent-1 was gone"),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("no leader was ever started"),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_done_run_whose_leader_left_no_reply_says_so() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", None);
+        r.tick().await;
+        assert_eq!(r.status("run-1"), "done");
+        let transcript = r.transcript("run-1");
+        assert!(transcript.contains(NO_REPLY), "{transcript}");
+        assert!(transcript.contains("agent-1"), "{transcript}");
     }
 
     #[tokio::test]
@@ -1494,7 +1682,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_restart_requeues_unsent_runs_and_loses_sent_ones_without_resending() {
+    async fn delivery_restart_requeues_unsent_runs_and_keeps_watching_sent_ones_without_resending()
+    {
         let r = rig();
         root_workspace(&r);
         r.fake.add_leader("running-lead", "running", false);
@@ -1515,13 +1704,18 @@ mod tests {
 
         r.tick().await;
         assert_eq!(r.status("run-pending"), "done");
-        assert_eq!(r.status("run-sent"), "lost");
-        assert_eq!(r.transcript("run-sent"), RESTARTED);
+        assert_eq!(r.status("run-sent"), "done");
+        assert!(r.fake.calls().contains(&Call::Wait("running-lead".into())));
+        assert!(r.fake.calls().iter().all(|c| !matches!(
+            c,
+            Call::SendAndWait(id, _) if id == "running-lead"
+        )));
         assert!(r.fake.calls().iter().all(|c| !matches!(
             c,
             Call::RunDone(id) if id == "running-lead"
         )));
         assert!(!r.fake.archived("running-lead"));
+        r.tick().await;
         assert_eq!(r.notices().len(), 1);
         assert_eq!(r.notice_state("run-sent").as_deref(), Some("sent"));
     }
@@ -1946,6 +2140,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fresh_leader_carrying_both_tasks_reports_its_reply() {
+        let r = rig();
+        root_workspace(&r);
+        r.queue("proj-1", "run-1", "build it", Some("caller-1"));
+        r.engine
+            .finish_run("run-1", "lost", &now_rfc3339(), Some("never sent"), None)
+            .unwrap();
+        r.set_logs(
+            "agent-1",
+            "[User] build it\n\nadd a test\nbuilt it and added the test\n",
+        );
+        queue_follow(&r, "run-2", "run-1", "add a test", "2026-10-14T14:00:05Z");
+        r.tick().await;
+        assert_eq!(r.status("run-2"), "done");
+        let transcript = r.transcript("run-2");
+        assert!(
+            transcript.ends_with("built it and added the test"),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_reply_goes_to_the_tasks_idle_leader_and_starts_no_new_one() {
         let r = rig();
         root_workspace(&r);
@@ -2095,6 +2311,7 @@ mod tests {
     async fn a_lost_wd_run_mails_one_error_and_sends_no_notice() {
         let r = rig();
         root_workspace(&r);
+        r.fake.state.lock().unwrap().gone_after_run = true;
         r.fake.push_turn_end(TurnEnd::Other {
             status: "timeout".into(),
             message: "still running".into(),
@@ -2109,7 +2326,11 @@ mod tests {
             (mail[0].kind.as_str(), mail[0].corr.as_str()),
             ("error", "corr-3")
         );
-        assert!(mail[0].body.contains(MAY_STILL_FINISH), "{}", mail[0].body);
+        assert!(
+            mail[0].body.contains("gone without a result"),
+            "{}",
+            mail[0].body
+        );
         r.tick().await;
         assert!(r.notices().is_empty());
     }
