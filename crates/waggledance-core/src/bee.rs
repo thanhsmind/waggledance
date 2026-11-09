@@ -2865,7 +2865,12 @@ fn parse_session(
     let lane = v.get("lane").and_then(Value::as_str).map(String::from);
 
     let heartbeat_age_minutes = (now - heartbeat).as_seconds_f64() / 60.0;
-    let live = heartbeat_age_minutes <= SESSION_LIVE_MINUTES;
+    let closed_after_heartbeat = v
+        .get("closed_at")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .is_some_and(|closed| closed >= heartbeat);
+    let live = !closed_after_heartbeat && heartbeat_age_minutes <= SESSION_LIVE_MINUTES;
 
     let activity = v.get("activity").and_then(|a| parse_activity(a, now));
     let work = v.get("work").and_then(|w| parse_work(w, root));
@@ -6267,6 +6272,44 @@ mod tests {
         format!(
             r#"{{"id":"{id}","started_at":"{hb}","last_heartbeat":"{hb}","workspace_id":"main","source":"startup"}}"#
         )
+    }
+
+    fn session_json_closed(id: &str, heartbeat_ago: i64, closed_ago: i64) -> String {
+        let now = time::OffsetDateTime::now_utc();
+        let fmt = |m: i64| {
+            (now - time::Duration::minutes(m))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        format!(
+            r#"{{"id":"{id}","started_at":"{}","last_heartbeat":"{}","closed_at":"{}","workspace_id":"main","source":"startup"}}"#,
+            fmt(heartbeat_ago),
+            fmt(heartbeat_ago),
+            fmt(closed_ago)
+        )
+    }
+
+    #[test]
+    fn closed_session_with_fresh_heartbeat_is_not_live() {
+        let root = fresh_root("closed-session");
+        write(
+            &root,
+            ".bee/sessions/closed.json",
+            &session_json_closed("closed", 5, 4),
+        );
+        write(
+            &root,
+            ".bee/sessions/reopened.json",
+            &session_json_closed("reopened", 1, 4),
+        );
+
+        let snap = read_snapshot(&root);
+        let closed = snap.sessions.iter().find(|s| s.id == "closed").unwrap();
+        let reopened = snap.sessions.iter().find(|s| s.id == "reopened").unwrap();
+        assert!(!closed.live, "a session closed after its last heartbeat is not live");
+        assert!(reopened.live, "a heartbeat after closed_at means the session came back");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
