@@ -1196,16 +1196,23 @@ impl SqliteStore {
 
     pub fn reclaim_legacy_index(&self) -> Result<bool> {
         let c = self.conn.lock().unwrap();
-        let populated: bool =
-            c.query_row("SELECT EXISTS(SELECT 1 FROM files_fts_content)", [], |r| {
-                r.get(0)
-            })?;
+        let populated: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files_fts_content)
+                 OR EXISTS(SELECT 1 FROM files_fts_data WHERE rowid > 10)",
+            [],
+            |r| r.get(0),
+        )?;
         if !populated {
             return Ok(false);
         }
-        for table in ["files_fts_content", "files_fts_docsize", "files_fts_data"] {
-            let sql =
-                format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} LIMIT 200)");
+        for (table, keep) in [
+            ("files_fts_content", ""),
+            ("files_fts_docsize", ""),
+            ("files_fts_data", " WHERE rowid > 10"),
+        ] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table}{keep} LIMIT 200)"
+            );
             loop {
                 c.execute_batch("BEGIN IMMEDIATE")?;
                 let deleted = match c.execute(&sql, []) {
@@ -1987,6 +1994,51 @@ mod tests {
         assert_eq!(s.file_count("p1").unwrap(), 1);
         assert!(s.get_run("r1").unwrap().is_some());
         assert!(!s.reclaim_legacy_index().unwrap());
+    }
+
+    #[test]
+    fn reclaim_legacy_index_works_on_a_connection_that_never_opened_the_old_table() {
+        let dir = std::env::temp_dir().join(format!("waggledance-reclaim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("registry.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let s = SqliteStore::open(&db).unwrap();
+            s.upsert_project(&sample_project()).unwrap();
+            s.upsert_file(&file("docs/a.md", "Alpha"), "h").unwrap();
+            s.insert_run(&sample_run(), None).unwrap();
+        }
+        {
+            let c = Connection::open(&db).unwrap();
+            for i in 0..450 {
+                c.execute(
+                    "INSERT INTO files_fts(project_id,rel_path,title,content) VALUES('p1',?1,'T',?2)",
+                    params![format!("docs/f{i}.md"), "body text ".repeat(200)],
+                )
+                .unwrap();
+            }
+        }
+        let s = SqliteStore::open(&db).unwrap();
+        assert!(s.reclaim_legacy_index().unwrap());
+        drop(s);
+        let c = Connection::open(&db).unwrap();
+        let fts: i64 = c
+            .query_row("SELECT COUNT(*) FROM files_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, 0);
+        c.execute(
+            "INSERT INTO files_fts(project_id,rel_path,title,content) VALUES('p1','docs/old.md','T','old binary write')",
+            [],
+        )
+        .unwrap();
+        drop(c);
+        let s = SqliteStore::open(&db).unwrap();
+        assert_eq!(s.file_count("p1").unwrap(), 1);
+        assert!(s.get_run("r1").unwrap().is_some());
+        assert!(s.reclaim_legacy_index().unwrap());
+        assert!(!s.reclaim_legacy_index().unwrap());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
