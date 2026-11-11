@@ -98,6 +98,17 @@ fn orchestration_handle<'a>(
     Ok(slot.as_ref().expect("just initialized above"))
 }
 
+pub(crate) fn call_tool(name: &str, args: Value) -> Result<Value> {
+    let engine = Engine::new(SqliteStore::open(&registry_db_path())?, Config::load());
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": args }
+    });
+    Ok(handle_tool_call(Some(json!(1)), &engine, &mut None, &req))
+}
+
 pub fn run() -> Result<()> {
     let engine = Engine::new(SqliteStore::open(&registry_db_path())?, Config::load());
     let stdin = std::io::stdin();
@@ -188,7 +199,8 @@ fn ask_state_schema() -> Value {
         "description": "Ask waggledance for a project's parsed bee state (active feature, \
     phase, open/blocked cells, recent decisions, sessions, handoff, attention) \
     without reading any .bee file yourself. Omit `project` to get a rollup across \
-    every registered project. Two fields describe the fleet rather than the store: \
+    every registered project; each rollup digest drops `sessions` and `recent_decisions` \
+    and carries `session_count` instead, while a one-project answer keeps every field. Two fields describe the fleet rather than the store: \
     `herding` names the agent kinds this project offers — {default, agents, resolvable} \
     as LABELS, never the argv behind them, and a label listed in `agents` but absent \
     from `resolvable` is one that will not start today; `panes` is the project's own \
@@ -211,7 +223,7 @@ fn ask_state_schema() -> Value {
     or module or overlapping paths, different feature — open the new leader, then send the \
     running leader a `steer: true` note naming the new request, its area, the new run_id and \
     what to watch for; (3) unrelated — new leader, no steer. When a summary is not enough to \
-    judge, read the run's full `task` from `waggledance_runs`. Each leader also carries \
+    judge, read the run's full `task` from `waggledance_runs` with its `run_id` argument. Each leader also carries \
     `family_root` (the run id every run it carries descends from, null when it carries none) and \
     `current` (true when it is the family's newest leader, the one a follow-up reaches). \
     `leaders` is ABSENT when \
@@ -296,11 +308,15 @@ fn runs_schema() -> Value {
     json!({
         "name": "waggledance_runs",
         "description": "List dispatched runs and their current status (read-only, D8), \
-    optionally filtered to one project.",
+    optionally filtered to one project. Each row carries `task_summary`, the task's first \
+    line that is not a spec-drop or wd provenance line or the steer marker, cut to 200 \
+    characters, never the full `task`. Pass `run_id` to get exactly that run as a one-row \
+    list carrying its full `task` beside `task_summary`; an unknown id is a tool error.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project": { "type": "string", "description": "Optional project id to narrow to a single project's runs" }
+                "project": { "type": "string", "description": "Optional project id to narrow to a single project's runs" },
+                "run_id": { "type": "string", "description": "Optional run id: return only that run, with its full task" }
             }
         }
     })
@@ -534,6 +550,14 @@ fn handle_ask_state(
                 .zip(rollups.iter())
                 .map(|(p, rollup)| {
                     let mut digest = ask_state_digest(&p.id, &rollup.snapshot);
+                    if let Some(map) = digest.as_object_mut() {
+                        map.remove("sessions");
+                        map.remove("recent_decisions");
+                        map.insert(
+                            "session_count".into(),
+                            json!(rollup.snapshot.sessions.len()),
+                        );
+                    }
                     attach_panes(&mut digest, p, rollup, &fleet);
                     attach_leaders(&mut digest, engine, p, rollup, &claims, &leaders);
                     digest
@@ -1846,38 +1870,56 @@ fn handle_await(
 /// `waggledance_runs`: the run store, read-only (D8), optionally narrowed to
 /// one project.
 fn handle_runs(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
+    let run_id = args
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
     let project_filter = args
         .get("project")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let project_ids: Vec<String> = match project_filter {
-        Some(p) => vec![p.to_string()],
-        None => match engine.list_projects() {
-            Ok(ps) => ps.into_iter().map(|p| p.id).collect(),
-            Err(e) => return tool_error(id, &format!("could not list registered projects: {e}")),
-        },
-    };
     let mut runs: Vec<Run> = Vec::new();
-    for pid in &project_ids {
-        match engine.list_runs(pid, RUNS_LIST_LIMIT) {
-            Ok(rs) => runs.extend(rs),
-            Err(e) => return tool_error(id, &format!("run listing failed: {e}")),
+    if let Some(rid) = run_id {
+        match engine.get_run(rid) {
+            Ok(Some(r)) => runs.push(r),
+            Ok(None) => return tool_error(id, &format!("no such run: {rid}")),
+            Err(e) => return tool_error(id, &format!("run lookup failed: {e}")),
+        }
+    } else {
+        let project_ids: Vec<String> = match project_filter {
+            Some(p) => vec![p.to_string()],
+            None => match engine.list_projects() {
+                Ok(ps) => ps.into_iter().map(|p| p.id).collect(),
+                Err(e) => {
+                    return tool_error(id, &format!("could not list registered projects: {e}"))
+                }
+            },
+        };
+        for pid in &project_ids {
+            match engine.list_runs(pid, RUNS_LIST_LIMIT) {
+                Ok(rs) => runs.extend(rs),
+                Err(e) => return tool_error(id, &format!("run listing failed: {e}")),
+            }
         }
     }
     let rows: Vec<Value> = runs
         .iter()
         .map(|r| {
-            json!({
+            let mut row = json!({
                 "id": r.id,
                 "project_id": r.project_id,
                 "pane_id": r.pane_id,
                 "preset_label": r.preset_label,
-                "task": r.task,
+                "task_summary": task_summary(&r.task),
                 "status": r.status,
                 "follow_up_of": engine.run_follow_up_of(&r.id).ok().flatten(),
                 "created_at": r.created_at,
                 "updated_at": r.updated_at
-            })
+            });
+            if run_id.is_some() {
+                row["task"] = json!(r.task);
+            }
+            row
         })
         .collect();
     ok(
@@ -2644,6 +2686,21 @@ mod tests {
             b["present"], false,
             "absent .bee/ must report absent, not error: {b}"
         );
+        for e in entries {
+            assert!(e.get("sessions").is_none(), "{e}");
+            assert!(e.get("recent_decisions").is_none(), "{e}");
+            assert_eq!(e["session_count"], 0, "{e}");
+        }
+
+        let one = call_tool(
+            &engine,
+            "waggledance_ask_state",
+            json!({ "project": pa.id }),
+        );
+        let one = &one["result"]["structuredContent"]["project"];
+        assert!(one["sessions"].is_array(), "{one}");
+        assert!(one["recent_decisions"].is_array(), "{one}");
+        assert!(one.get("session_count").is_none(), "{one}");
 
         std::fs::remove_dir_all(&pa.root_path).ok();
         std::fs::remove_dir_all(&pb.root_path).ok();
@@ -3128,6 +3185,41 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1, "{resp}");
         assert_eq!(rows[0]["id"], "run-a");
+        assert_eq!(rows[0]["task_summary"], "do the thing");
+        assert!(rows[0].get("task").is_none(), "{resp}");
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+        std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    #[test]
+    fn runs_by_run_id_returns_that_run_with_its_full_task_and_a_miss_names_the_id() {
+        let (engine, pa, pb) = two_project_engine("runs-by-id");
+        engine
+            .insert_run(&seeded_run(&pa.id, "run-a"), None)
+            .unwrap();
+        engine
+            .insert_run(&seeded_run(&pb.id, "run-b"), None)
+            .unwrap();
+
+        let resp = call_tool(&engine, "waggledance_runs", json!({ "run_id": "run-b" }));
+        let rows = resp["result"]["structuredContent"]["runs"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{resp}");
+        assert_eq!(rows[0]["id"], "run-b");
+        assert_eq!(rows[0]["task"], "do the thing");
+        assert_eq!(rows[0]["task_summary"], "do the thing");
+
+        let miss = call_tool(&engine, "waggledance_runs", json!({ "run_id": "run-zzz" }));
+        assert_eq!(miss["result"]["isError"], true, "{miss}");
+        assert!(
+            miss["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("run-zzz"),
+            "{miss}"
+        );
 
         std::fs::remove_dir_all(&pa.root_path).ok();
         std::fs::remove_dir_all(&pb.root_path).ok();
