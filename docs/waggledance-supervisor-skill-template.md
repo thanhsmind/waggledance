@@ -15,6 +15,13 @@ Everything mechanical this skill uses already exists in waggledance:
 `waggledance_ask_state`, `waggledance_dispatch`, `waggledance_await`, `waggledance_runs`.
 This skill adds no new tool and no control loop.
 
+Each tool has a CLI verb that runs the same handler and prints compact JSON: prefer the
+verb, and fall back to the MCP tool when Bash is not available. The verbs are
+`waggledance state`, `waggledance dispatch`, `waggledance await`, `waggledance runs` and
+`waggledance task`. They print a summary by default; `--full` prints the MCP answer
+unchanged, `--fields a,b` keeps those keys per row and `--limit N` caps the rows.
+`waggledance search "<what you want>"` and `waggledance schema [verb]` find a verb.
+
 ## Mode gate — decide before anything else
 
 State explicitly, before dispatching anything, which mode this run is in and why.
@@ -60,14 +67,15 @@ either — ask the human which mode, rather than guessing.
    `sup-<yyyymmdd>-<4-char hex>`). This id is what makes a re-send after a timeout safe
    — see the duplicate-PBI refusal below.
 
-2. **Check for a live lead first.** Call `waggledance_ask_state` for the target project
-   before dispatching. Reuse-before-spawn is *this skill's* policy, not something
+2. **Check for a live lead first.** Call `waggledance_ask_state` (CLI:
+   `waggledance state <project>`) for the target project before dispatching. Reuse-before-spawn is *this skill's* policy, not something
    waggledance enforces — if the fleet read shows an agent already actively working that
    repo, do not spawn a second one. Tell the human a lead is already live there and wait,
    rather than dispatching a competing run.
 
-3. **Dispatch through the door.** Call `waggledance_dispatch` with `{project, task,
-   preset}` — name a **preset label** only, never raw argv, an environment variable, or a
+3. **Dispatch through the door.** Call `waggledance_dispatch` (CLI: `waggledance
+   dispatch --project <project> --preset <label>`, the task from `--task`, `--task-file`
+   or stdin) with `{project, task, preset}` — name a **preset label** only, never raw argv, an environment variable, or a
    working directory; those are not accepted inputs and never appear in a `task` string
    either. The `task` has exactly three parts, in this order:
 
@@ -97,9 +105,10 @@ either — ask the human which mode, rather than guessing.
    `waggledance_dispatch` returns `{run_id, warnings}` — keep the `run_id`.
 
 4. **Track the run.** Report the `run_id` to the human immediately. Check progress with
-   `waggledance_runs` (the run list for the project) or `waggledance_await` (poll one run,
-   up to 60s per call) — poll `waggledance_await` in a loop if a longer wait is needed,
-   rather than blocking on a single call.
+   `waggledance_runs` (CLI: `waggledance runs --project <project>`, the run list for the
+   project) or `waggledance_await` (CLI: `waggledance await <run_id>`, poll one run, up to
+   60s per call) — poll `waggledance_await` in a loop if a longer wait is needed, rather
+   than blocking on a single call.
 
 5. **Never merge, and never ask for a merge.** Merging to the target repo's main branch
    is the human's gesture, made in that repo, on that repo's own terms. This skill has no
@@ -115,8 +124,9 @@ either — ask the human which mode, rather than guessing.
    applies to execute mode exactly as it does to relay mode. A live lead already working
    that repo means: report it and wait, never dispatch a competing one.
 
-3. **Dispatch through the door.** Call `waggledance_dispatch` with `{project, task,
-   preset}` — a **preset label** only, never raw argv, an environment variable, or a
+3. **Dispatch through the door.** Call `waggledance_dispatch` (CLI: `waggledance
+   dispatch --project <project> --preset <label>`) with `{project, task, preset}` — a
+   **preset label** only, never raw argv, an environment variable, or a
    working directory. The `task` again has three parts, in this order:
 
    - **Line 1 — the same provenance line format** as relay mode
@@ -141,8 +151,9 @@ either — ask the human which mode, rather than guessing.
 
 4. **Track the run.** Report the `run_id` to the human immediately. This is a
    longer-running chain than relay mode's file-and-stop — expect multiple checkpoints,
-   not one. Check progress with `waggledance_runs` or `waggledance_await` (poll one run,
-   up to 60s per call), polling in a loop rather than blocking on a single call, and
+   not one. Check progress with `waggledance_runs` (CLI: `waggledance runs`) or
+   `waggledance_await` (CLI: `waggledance await <run_id>`, poll one run, up to 60s per
+   call), polling in a loop rather than blocking on a single call, and
    relay the lead's own progress reports as they arrive.
 
 5. **Never merge, and never approve that repo's gates.** Even though execute mode asks
@@ -165,11 +176,13 @@ parallel. Before every leader dispatch, decide how the request relates to the le
 already running. This holds for every caller: a human session, aicoworker, and a leader
 that hands new work to another leader.
 
-1. Call `waggledance_ask_state` for the project and read `leaders[]`. Each entry names
+1. Call `waggledance_ask_state` (CLI: `waggledance state <project>`) for the project and
+   read `leaders[]`. Each entry names
    its `family_root`, whether it is the family's `current` leader, and its `runs`. Each
    run has a `run_id`, its `request_id`, its `status`, `steer`, and a `task_summary`.
    Skip runs with `steer: true`: they are notes, not work. When a `task_summary` is not
-   enough to judge, read that run's full `task` from `waggledance_runs`.
+   enough to judge, read that run's full `task` with `waggledance runs show <run_id>`, or
+   `waggledance_runs` with `run_id`.
 2. Pick one of three tiers:
    1. **Same work**: the same feature, the same files, the same output. This is a
       follow-up. Dispatch it with `follow_up_of` set to a run of the family's `current`
@@ -180,12 +193,14 @@ that hands new work to another leader.
       feature. Open a new leader as in tier 3, and add one line near the top of its
       task: `Running nearby: <run_id> — <task_summary>`. Once the dispatch returns the
       new `run_id`, send the running leader a steer note: dispatch again with
-      `follow_up_of: <its run_id>` and `steer: true`. The note says what the new request
+      `follow_up_of: <its run_id>` and `steer: true` (CLI: `--follow-up-of <run_id>
+      --steer`). The note says what the new request
       is, which area it touches, the new `run_id`, and what to watch for (shared files,
       a migration, a contract both may change). Keep it to a few lines.
    3. **Not related**: mint a new correlation id and dispatch without `follow_up_of`,
       which opens a new leader. Send no steer.
-3. A leader that opens a new leader for tier 2 or tier 3 passes `handoff: false`.
+3. A leader that opens a new leader for tier 2 or tier 3 passes `handoff: false` (CLI:
+   `--no-handoff`).
    Without it, the daemon treats a leader's own dispatch without `follow_up_of` as a
    handoff of that leader's run.
 
@@ -205,13 +220,15 @@ Hand the task over through one of the two doors:
   Keep the `corr` it prints; `reply`, `redo` and `accept` carry it, and those are its
   follow-ups. `handoff` carries neither `follow_up_of` nor `steer`, so for tier 2 aicoworker
   names the running leader in the new task's `Running nearby:` line and sends no steer.
-- From any other session, call `waggledance_dispatch` with `{project, task, leader:
+- From any other session, call `waggledance_dispatch` (CLI: `waggledance dispatch
+  --project <project> --leader --request-id <id>`) with `{project, task, leader:
   true, request_id}`, where `request_id` is the correlation id minted for this hand-off,
-  so a retry never sends twice. For a follow-up, add `follow_up_of: <run_id>`; the
+  so a retry never sends twice. For a follow-up, add `follow_up_of: <run_id>` (CLI: `--follow-up-of`); the
   daemon waits while that leader is mid-turn, sends to it once it is idle, and starts a
   new leader carrying the earlier task text when the old one is gone. A steer note
   waits the same way, so it lands when the running leader's current turn ends. A leader at its
-  context mark hands off with `follow_up_of: <its run_id>` and `handoff: true`: the
+  context mark hands off with `follow_up_of: <its run_id>` and `handoff: true` (CLI:
+  `--handoff`): the
   successor joins the same family and the old leader is archived once idle. Idle leaders
   close after `[paseo] leader_idle_minutes` (default 30).
 
@@ -269,7 +286,7 @@ mode unless noted. Recognize each one for what it is — most are not failures.
   migration-only override and first-add wins. **This means the drop already landed under
   that correlation id, not that anything failed.** On a re-send after a timeout, this is
   the expected and correct outcome: do not re-mint a new correlation id and try again:
-  check `waggledance_runs` / the target's backlog for the existing PBI instead of
+  check `waggledance_runs` (CLI: `waggledance runs`) / the target's backlog for the existing PBI instead of
   treating the refusal as an error to route around. Execute mode's lead is not required
   to register a PBI at all — its own chain may create backlog/decision state as a normal
   part of shaping and planning, on its own repo's terms.

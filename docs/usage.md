@@ -76,7 +76,9 @@ The server exposes seven tools: `waggledance_projects`, `waggledance_ask_state`,
 `waggledance_bee_upgrade`. Each is described in the [README](../README.md#agent-integration-mcp).
 
 Drop the snippet from [`waggledance-agents-template.md`](waggledance-agents-template.md)
-into your project's `AGENTS.md` / `CLAUDE.md` so its agents know the tools exist.
+into your project's `AGENTS.md` / `CLAUDE.md` so its agents know the tools exist. The
+snippet tells agents to use the CLI verbs below first and the MCP tools when Bash is not
+available.
 
 The pi extension and the OpenClaw bridge reach the same tools over stdio:
 
@@ -99,6 +101,15 @@ waggledance stop                                     # stop the daemon
 waggledance restart                                  # restart the daemon (apply config changes)
 waggledance doctor [--fix] [--json] [--dry-run]      # diagnose & repair integration
 waggledance mcp                                      # MCP server over stdio
+waggledance projects                                 # agent verb: registered projects
+waggledance state [<project>]                        # agent verb: bee state and panes
+waggledance dispatch --project <id> (--leader | --preset <label> | --pane-id <id>) [--task "..." | --task-file <path>]
+waggledance await <run_id> [--timeout <secs>]        # agent verb: wait on one run
+waggledance runs [--project <id>] [--limit N]        # agent verb: dispatched runs
+waggledance runs show <run_id>                       # one run with its full task
+waggledance task <corr> reply|redo|accept|allow|deny [--text "..."] [--req-id <id>]
+waggledance search "<what you want>"                 # rank the verbs for a need
+waggledance schema [<verb>]                          # verbs, flags and help as JSON
 waggledance setup <pi|openclaw> [--remove]           # install or remove an integration
 waggledance mail send --to <wd> --corr <id> --kind <kind> [--body-file <path>]
 waggledance hold --why "<reason>" [--minutes N]      # this leader is waiting; --release ends it
@@ -106,6 +117,15 @@ waggledance bee upgrade [--apply] [--project <id>]   # upgrade bee in registered
 waggledance config edit                              # edit ~/.waggledance/config.toml in $EDITOR
 ```
 Most commands accept `--json` for scripting.
+
+The agent verbs (`projects`, `state`, `dispatch`, `await`, `runs`, `task`) print JSON only,
+pretty on a terminal and compact when piped. They print a summary by default; `--full`
+prints the MCP tool's answer unchanged, `--fields a,b` keeps those keys on each row and
+`--limit N` caps the rows. A tool error prints to stderr and exits 1. `schema` and
+`search` help an agent find a verb without loading every description.
+
+`wg` can be a symlink to `waggledance` that you make yourself. No installer creates one,
+because `wg` is also the WireGuard command.
 
 ---
 
