@@ -128,9 +128,6 @@ The `[paseo]` block in `~/.waggledance/config.toml` is optional and only overrid
 - `[[paseo.leaders]]` (`project`, `workspace`) is a deprecated fallback kept for hosts
   that already carry it. Use `[paseo] workspace` in the project's `.waggledance.toml`.
 
-`waggledance setup paseo` prints the CLI it chose, every rejected candidate with why,
-and a warning for each global line that is no longer needed.
-
 `terminal.enabled` does not gate the leader path, and the leader path never talks to
 herdr.
 
@@ -394,12 +391,10 @@ they run no `paseo` command.
 | `done` | the turn ended; the transcript is the leader's reply |
 | `lost` | the leader is gone without a result, or Paseo reported an error status; the transcript says why |
 
-The board shows a leader that needs the human (piggery-lessons D6). A leader run that
-is `blocked`, or `lost` within the last hour, is a leader wait. `GET /api/board` lists
-these waits as `leader_waiting: [{project_id, project_name, run_id, status, since,
-url}]`, newest first, and the project's home rail row shows one pill:
-"Leader waiting — permission" or "Leader lost — may still be finishing". When both kinds
-are present, the blocked pill is the one shown. Both read the runs table only.
+A leader run that is `blocked`, or `lost` within the last hour, is a leader wait
+(piggery-lessons D6). The browser board and its home-rail pill that used to show it were
+removed by headless-supervisor; the wait now reaches a person through `waggledance_runs`,
+`waggledance_ask_state` and the notify path.
 
 ## Caller notices
 
@@ -433,7 +428,7 @@ The notice text:
   (run <run_id>) — approve or deny it there.`
 
 A caller that is a Paseo agent can wait for this notice instead of polling
-`waggledance_await`. The Paseo plugin's request box is not a Paseo agent; it polls.
+`waggledance_await`.
 
 ## Workspace discovery
 
@@ -523,11 +518,8 @@ the leader wrote. waggledance never interrupts a turn itself (D5).
 
 ## Sources
 
-Each source names the project itself:
+Each source names the project itself. The Paseo sidebar plugin that used to be a source was removed by headless-supervisor (D5):
 
-- **The Waggle Dance Paseo plugin.** The request box in the workspace panel spawns
-  `waggledance mcp` over stdio and calls `waggledance_dispatch` with the panel's project,
-  the typed task, `leader: true`, and one `request_id` per draft.
 - **External MCP agents.** Any MCP client that runs `waggledance mcp` can still call the
   same tool with the same arguments.
 - **wd.** `wd-bridge.py handoff` runs `waggledance mcp` with `WAGGLEDANCE_CALLER=wd` and
@@ -543,15 +535,10 @@ Each source names the project itself:
   `crates/waggledance-core/src/engine.rs` turn it into the effective dispatch switch.
   `dispatch_off` in `crates/waggledance/src/mcp.rs` writes the refusal.
 - `crates/waggledance/src/discovery.rs` — workspace discovery and its filters.
-- `crates/waggledance/src/setup.rs` — `waggledance setup paseo` and its leftover-line
-  warnings.
 - `crates/waggledance-core/src/repository.rs` — runs migration 5: `request_id`,
   `caller`, `attempts`, the queue and claim functions. Migration 6 and its functions:
   `notice`, `notice_state`, `notice_until`, `finish_run`, `pending_notices`,
   `set_notice_state` and `list_leader_waits`.
-- `crates/waggledance/src/server.rs` — `api_board` with `leader_waiting`, and
-  `leader_waits_by_project` for the home rail. `views.rs` holds `proj_row_bee` and
-  `leader_wait_label`.
 - `crates/waggledance/src/paseo.rs` — the `paseo` CLI client, `candidates`, `detect`,
   `paseo_available`, the environment scrub, `TurnEnd`, labels, lock, `resolve_leader`,
   `pick_workspace`, `delivery_heartbeat_path`, and the mode check: `leader_mode`,
@@ -562,8 +549,6 @@ Each source names the project itself:
   notices, and `check_mode`, which reports a leader still in the wrong mode.
 - `crates/waggledance/testdata/fixtures/paseo-0.11.2/` — the captured Paseo answers the
   client is tested against, with a README per file.
-- `integrations/paseo/server/dispatch.ts` and `integrations/paseo/client/composer.tsx` —
-  the plugin's request box.
 - `docs/waggledance-supervisor-skill-template.md` — the supervisor skill's leader mode,
   which hands a task through this door.
 - `docs/knowledge/patterns/existence-is-not-evidence.md` — why every Paseo behaviour the

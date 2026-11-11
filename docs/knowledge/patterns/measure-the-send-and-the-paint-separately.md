@@ -1,11 +1,11 @@
 ---
 type: bee.pattern
 title: Measure the send and the paint separately before you speed anything up
-description: "Practice: a UI that feels slow invites a faster transport or a shorter interval, but splitting the measurement into the send and the paint usually shows both are already fast and the whole delay is the client waiting for its own next tick."
+description: "Retired, the web surface it covered is gone. Practice: a UI that feels slow invites a faster transport or a shorter interval, but splitting the measurement into the send and the paint usually shows both are already fast and the whole delay is the client waiting for its own next tick."
 timestamp: 2026-08-31
 bee:
   id: measure-the-send-and-the-paint-separately
-  lifecycle: active
+  lifecycle: retired
   areas: [agent-terminal]
   sources: [.bee/cells/pkr-1.json]
   polarity: practice
@@ -13,6 +13,8 @@ bee:
 ---
 
 # Measure the send and the paint separately before you speed anything up
+
+Retired by headless-supervisor D3: the browser surface this page describes was removed, so nothing live can hit it. The text below is kept as the record of why it was once true.
 
 ## The situation
 

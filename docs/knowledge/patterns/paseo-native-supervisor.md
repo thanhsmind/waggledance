@@ -241,13 +241,12 @@ copy it set aside, restores the newest `openclaw.json.bak-*`, and deletes
 
 Both paths label a leader `waggledance.role=leader` and
 `waggledance.project=<project id>`; only the supervisor adds `waggledance.via=supervisor`
-and reads it. A project reached through the Paseo plugin's request box and through the
+and reads it. A project reached through the daemon queue and through the
 supervisor at once may hold two leaders: one the daemon started (`via: daemon`), which
 the supervisor never reuses or archives, and one the supervisor opened
 (`via: supervisor`). `leaders` lists both. The daemon's `resolve_leader` filters on the
 role and project labels only, so it takes the first unarchived leader of either kind
-and may deliver into the supervisor's. Routing the request box through the supervisor
-waits on trigger `the-waggle-dance-paseo-plugin-s-request-b__469884e6`.
+and may deliver into the supervisor's.
 
 ## Pointers
 

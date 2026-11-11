@@ -48,8 +48,7 @@ dispatch `request_id`, so a retried hand-off returns the same run.
 - A wd run starts its leader with `waggledance.role=leader`,
   `waggledance.project=<project id>`, `waggledance.run=<run id>` and
   `waggledance.via=wd`.
-- No other caller's run is delivered into that leader, so the Paseo plugin's request
-  box and other MCP callers never reach wd's leader (D2, D12).
+- No other caller's run is delivered into that leader, so other MCP callers never reach wd's leader (D2, D12).
 - `waggledance_ask_state` reports each leader's `via` as `wd` or `daemon`. A leader
   still labelled `waggledance.via=supervisor` reads `daemon`.
 - A hand-off (a `request_id` with no `:`) inserts the task row `open`.

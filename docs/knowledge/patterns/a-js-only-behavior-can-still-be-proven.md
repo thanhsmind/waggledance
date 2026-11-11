@@ -1,11 +1,11 @@
 ---
 type: bee.pattern
 title: "A JS-only behavior can still be proven, with a DOM probe over the real asset"
-description: "Practice: behavior that only exists once app.js runs is routinely capped on a string assertion that cannot see it — a node script that builds the rendered DOM and loads the real asset proves the behavior itself, red before and green after."
+description: "Retired, the web surface it covered is gone. Practice: behavior that only exists once app.js runs is routinely capped on a string assertion that cannot see it — a node script that builds the rendered DOM and loads the real asset proves the behavior itself, red before and green after."
 timestamp: 2026-08-31
 bee:
   id: a-js-only-behavior-can-still-be-proven
-  lifecycle: active
+  lifecycle: retired
   areas: [agent-terminal, changes-diff-screen]
   sources: [.bee/cells/pkr-1.json, .bee/cells/dfc-1.json]
   polarity: practice
@@ -13,6 +13,8 @@ bee:
 ---
 
 # A JS-only behavior can still be proven, with a DOM probe over the real asset
+
+Retired by headless-supervisor D3: the browser surface this page describes was removed, so nothing live can hit it. The text below is kept as the record of why it was once true.
 
 ## The situation
 

@@ -29,3 +29,5 @@ The binary crate owns its own `DaemonInfo` (pid, started_at, version) and `runni
 ## Proof
 
 `crates/waggledance/tests/e2e_daemon.rs` runs the real binary under a scratch HOME: `serve` writes the lock, holds no listening TCP socket, `status` reports it running, `stop` ends it; a lock naming an unrelated live pid is cleared without killing that process.
+
+The daemon boundary this belongs to is in [the supervisor daemon area](../areas/supervisor-daemon.md).
