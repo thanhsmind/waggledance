@@ -5,7 +5,8 @@
 use crate::code_source::{self, DirListing, SourceContent};
 use crate::config::Config;
 use crate::domain::{
-    InboxMessage, IndexedFile, PermissionRequest, Project, RenderedPage, Run, SearchResult, WdTask,
+    InboxMessage, IndexedFile, LeaderHold, PermissionRequest, Project, RenderedPage, Run,
+    SearchResult, WdTask,
 };
 use crate::error::{Error, Result};
 use crate::fuzzy::{self, FuzzyHit};
@@ -533,6 +534,41 @@ impl Engine {
 
     pub fn mark_task_mail(&self, corr: &str, at: &str) -> Result<()> {
         self.store.mark_task_mail(corr, at)
+    }
+
+    pub fn set_hold(
+        &self,
+        leader_id: &str,
+        why: &str,
+        minutes: Option<u64>,
+        now: &str,
+    ) -> Result<LeaderHold> {
+        let max = self.config.paseo.hold_max_minutes;
+        let minutes = minutes.unwrap_or(max).min(max);
+        let start = OffsetDateTime::parse(now, &Rfc3339)
+            .map_err(|e| Error::Other(format!("bad timestamp `{now}`: {e}")))?;
+        let until = (start + time::Duration::minutes(minutes as i64))
+            .format(&Rfc3339)
+            .map_err(|e| Error::Other(e.to_string()))?;
+        self.store.set_hold(leader_id, why, now, &until)?;
+        Ok(LeaderHold {
+            leader_id: leader_id.into(),
+            why: why.into(),
+            set_at: now.into(),
+            until,
+        })
+    }
+
+    pub fn release_hold(&self, leader_id: &str) -> Result<bool> {
+        self.store.release_hold(leader_id)
+    }
+
+    pub fn live_hold(&self, leader_id: &str, now: &str) -> Result<Option<LeaderHold>> {
+        self.store.live_hold(leader_id, now)
+    }
+
+    pub fn stamp_late_reply(&self, run_id: &str, at: &str) -> Result<()> {
+        self.store.stamp_late_reply(run_id, at)
     }
 
     pub fn close_task(&self, corr: &str, at: &str) -> Result<()> {

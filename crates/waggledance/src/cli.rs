@@ -98,6 +98,17 @@ pub enum Command {
         #[command(subcommand)]
         action: MailAction,
     },
+    #[command(
+        about = "Tell waggledance this leader is waiting on handed-out work, or release the wait."
+    )]
+    Hold {
+        #[arg(long, required_unless_present = "release", conflicts_with = "release")]
+        why: Option<String>,
+        #[arg(long)]
+        minutes: Option<u64>,
+        #[arg(long)]
+        release: bool,
+    },
     /// Edit configuration.
     Config {
         #[command(subcommand)]
@@ -181,6 +192,11 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
         } => crate::setup::run(target, remove, json),
         Command::Mail { action } => crate::mail::run(action),
+        Command::Hold {
+            why,
+            minutes,
+            release,
+        } => crate::hold::run(why, minutes, release),
         Command::Config { action } => match action {
             ConfigAction::Edit => cmd_config_edit(),
         },

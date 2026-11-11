@@ -89,6 +89,11 @@ fn send(
         Some(project) if problems.is_empty() => {
             let seq = engine.insert_inbox_message(RECIPIENT, corr, &project, kind, body, now)?;
             engine.mark_task_mail(corr, now)?;
+            if kind == "result" {
+                if let Some(leader) = engine.get_task(corr)?.and_then(|t| t.leader_id) {
+                    engine.release_hold(&leader)?;
+                }
+            }
             Ok(Ok(seq))
         }
         _ => Ok(Err(problems)),
@@ -219,6 +224,23 @@ mod tests {
             assert_eq!(t.last_mail_at.as_deref(), Some(at), "{kind}");
             assert_eq!(t.changed_at, at, "{kind}");
         }
+    }
+
+    #[test]
+    fn a_result_mail_clears_the_hold_of_the_tasks_leader_and_other_kinds_do_not() {
+        let e = engine();
+        run_at(&e, "r1", "proj-1", "c-7", NOW);
+        e.insert_task("c-7", "proj-1", NOW).unwrap();
+        e.mark_task_delivered("c-7", "lead-1", NOW).unwrap();
+        e.set_hold("lead-1", "waiting", Some(30), NOW).unwrap();
+        e.set_hold("lead-2", "other", Some(30), NOW).unwrap();
+        send(&e, "wd", "c-7", "progress", FULL, NOW)
+            .unwrap()
+            .unwrap();
+        assert!(e.live_hold("lead-1", NOW).unwrap().is_some());
+        send(&e, "wd", "c-7", "result", FULL, NOW).unwrap().unwrap();
+        assert!(e.live_hold("lead-1", NOW).unwrap().is_none());
+        assert!(e.live_hold("lead-2", NOW).unwrap().is_some());
     }
 
     #[test]

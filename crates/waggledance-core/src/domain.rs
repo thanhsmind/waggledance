@@ -155,3 +155,11 @@ pub struct RenderedPage {
     /// back to source lines (copy-as-markdown) via the `data-sourcepos` attrs.
     pub source: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderHold {
+    pub leader_id: String,
+    pub why: String,
+    pub set_at: String,
+    pub until: String,
+}

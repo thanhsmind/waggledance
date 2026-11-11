@@ -14,8 +14,8 @@ mod discovery;
 mod doctor;
 mod guide;
 mod heartbeat;
-mod worktree_sweep;
 mod herdr;
+mod hold;
 mod mail;
 mod mcp;
 mod notify;
@@ -33,6 +33,7 @@ mod views;
 mod wake;
 mod watch;
 mod watcher;
+mod worktree_sweep;
 
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -256,11 +257,7 @@ impl TerminalBackground {
                 .clone()
                 .filter(|e| wake::enabled(e) && paseo::paseo_available(&e.config.paseo)),
         );
-        self.reconcile_sweep(
-            engine
-                .clone()
-                .filter(|e| e.config.worktree_sweep.enabled),
-        );
+        self.reconcile_sweep(engine.clone().filter(|e| e.config.worktree_sweep.enabled));
         self.reconcile_notify(cfg.notify_enabled, herdr, notify_store, telegram, engine);
     }
 
@@ -1286,7 +1283,13 @@ mod terminal_background_tests {
     async fn the_worktree_sweep_runs_by_default_and_its_switch_stops_it() {
         let bg = TerminalBackground::new();
         let fake = Arc::new(FakeHerdr::new());
-        bg.reconcile(&TerminalConfig::default(), fake.clone(), store(), None, Some(engine()));
+        bg.reconcile(
+            &TerminalConfig::default(),
+            fake.clone(),
+            store(),
+            None,
+            Some(engine()),
+        );
         assert!(bg.sweep_running(), "the sweep is on by default");
 
         let mut config = waggledance_core::Config::default();
@@ -1303,8 +1306,14 @@ mod terminal_background_tests {
     fn the_sweep_interval_never_drops_below_an_hour() {
         let mut config = waggledance_core::Config::default();
         config.worktree_sweep.interval_hours = 0;
-        let e = waggledance_core::Engine::new(waggledance_core::SqliteStore::open_in_memory().unwrap(), config);
-        assert_eq!(worktree_sweep::every(&e), std::time::Duration::from_secs(3600));
+        let e = waggledance_core::Engine::new(
+            waggledance_core::SqliteStore::open_in_memory().unwrap(),
+            config,
+        );
+        assert_eq!(
+            worktree_sweep::every(&e),
+            std::time::Duration::from_secs(3600)
+        );
     }
 
     /// The reaper's own teeth: `reaper_ticks` counts completed sweeps, so a
