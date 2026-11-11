@@ -249,6 +249,20 @@ fn open_notify_store(
     })
 }
 
+fn reclaim_legacy_index_at_startup(engine: &Engine) {
+    let path = waggledance_core::config::registry_db_path();
+    let size = || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let before = size();
+    match engine.store.reclaim_legacy_index() {
+        Ok(true) => tracing::info!(
+            "reclaimed the legacy full-text index: registry {before} -> {} bytes",
+            size()
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("legacy full-text index reclaim failed ({e}); continuing"),
+    }
+}
+
 /// Start the daemon: watcher + HTTP server. Blocks until shutdown.
 pub async fn serve() -> Result<()> {
     let engine = Arc::new(runtime::build_engine()?);
@@ -285,6 +299,8 @@ pub async fn serve() -> Result<()> {
             logs.runs(&homes, since);
         });
     }
+
+    reclaim_legacy_index_at_startup(&engine);
 
     // D7: reconcile the live background against whatever the config already
     // says, once at startup — a config that already had a switch on before

@@ -49,7 +49,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Full-text search across projects.
+    /// Search titles and paths across projects.
     Search {
         query: String,
         #[arg(long)]
@@ -548,7 +548,7 @@ fn cmd_search(query: &str, project: Option<&str>, limit: usize, json: bool) -> R
         println!("No matches.");
     } else {
         for r in &results {
-            println!("{}  {}\n  {}", r.title, r.url, r.excerpt.replace('\n', " "));
+            println!("{}  {}", r.title, r.url);
         }
     }
     Ok(())

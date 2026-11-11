@@ -181,17 +181,17 @@ fn view_file_schema() -> Value {
 fn search_schema() -> Value {
     json!({
         "name": "waggledance_search",
-        "description": "Full-text search across every registered project's indexed markdown \
-    (or one project, when `project` is given). Re-indexes changed files in the \
+        "description": "Search the titles and paths of every registered project's indexed markdown \
+    (or one project, when `project` is given); every term must appear in the title or \
+    the path, accents and case ignored. Re-indexes changed files in the \
     searched project(s) before answering and reports any project whose refresh \
     failed in `structuredContent.refresh` — hits still return, but a failed \
-    project's results may lag disk. Each hit carries a rich, <mark>-highlighted \
-    excerpt — enough to answer without a follow-up read, never a bare path list \
-    or a whole file.",
+    project's results may lag disk. File contents are not searched: read a hit \
+    to see what it says.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Full-text query" },
+                "query": { "type": "string", "description": "Words to find in a title or path" },
                 "project": { "type": "string", "description": "Optional project id to narrow the search to" },
                 "limit": { "type": "integer", "description": "Max hits to return (default 10)" }
             },
@@ -457,15 +457,15 @@ fn handle_view_file(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
     }
 }
 
-/// `waggledance_search`: FTS5 hits over one or every registered project.
+/// `waggledance_search`: title and path hits over one or every registered project.
 ///
 /// D4 (never silently stale): re-indexes the searched project(s) before
 /// querying — just the filtered project, or every registered project when
 /// unfiltered (D1) — and reports which projects refreshed cleanly and which
 /// failed (review P1-2: a refresh failure must surface, never masquerade as
 /// a fresh result). D2 (rich, not bare): each hit carries `project_id`,
-/// `rel_path`, `title`, a `<mark>`-highlighted `excerpt`, and `score` — no
-/// whole-file content, no bare path list.
+/// `rel_path`, `title`, an empty `excerpt`, and `score` 0 — contents are
+/// never searched.
 fn handle_search(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     if query.trim().is_empty() {
@@ -507,7 +507,7 @@ fn handle_search(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
     match engine.search(query, project, limit) {
         Ok(hits) => {
             let mut text = if hits.is_empty() {
-                format!("No hits for {query:?}.")
+                format!("No hits for {query:?}: only titles and paths were searched, not file contents.")
             } else {
                 format!("{} hit(s) for {query:?}.", hits.len())
             };
@@ -2238,12 +2238,12 @@ mod tests {
         write(
             &dir_a,
             "docs/a.md",
-            "# Project A\nThe grapefruit orchard thrives in spring.",
+            "# Grapefruit A\nThe orchard thrives in spring.",
         );
         write(
             &dir_b,
             "docs/b.md",
-            "# Project B\nA grapefruit smoothie recipe for summer.",
+            "# Grapefruit B\nA smoothie recipe for summer.",
         );
 
         let mut config = Config::default();
@@ -2351,7 +2351,7 @@ mod tests {
     }
 
     #[test]
-    fn search_unfiltered_spans_multiple_projects_with_marked_excerpts() {
+    fn search_unfiltered_spans_multiple_projects_by_title() {
         let (engine, pa, pb) = two_project_engine("search-multi");
         let resp = call_tool(
             &engine,
@@ -2369,7 +2369,7 @@ mod tests {
         assert!(ids.contains(&pa.id.as_str()));
         assert!(ids.contains(&pb.id.as_str()));
         for h in hits {
-            assert!(h["excerpt"].as_str().unwrap().contains("<mark>"));
+            assert_eq!(h["excerpt"], "");
         }
 
         std::fs::remove_dir_all(&pa.root_path).ok();
@@ -2400,11 +2400,7 @@ mod tests {
         // Edit project a's file after registration (which already indexed
         // it once) — D4: the next search must see the new content without a
         // separate refresh call.
-        write(
-            &pa.root_path,
-            "docs/a.md",
-            "# Project A\nNow mentions pineapple instead.",
-        );
+        write(&pa.root_path, "docs/a.md", "# Pineapple A\nNow retitled.");
         let resp = call_tool(
             &engine,
             "waggledance_search",
@@ -2415,6 +2411,30 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1, "edited content must be searchable: {resp}");
         assert_eq!(hits[0]["project_id"], pa.id);
+
+        std::fs::remove_dir_all(&pa.root_path).ok();
+        std::fs::remove_dir_all(&pb.root_path).ok();
+    }
+
+    #[test]
+    fn search_matches_a_path_and_zero_hits_say_titles_and_paths() {
+        let (engine, pa, pb) = two_project_engine("search-path");
+        let resp = call_tool(
+            &engine,
+            "waggledance_search",
+            json!({ "query": "docs/a.md" }),
+        );
+        let hits = resp["result"]["structuredContent"]["hits"]
+            .as_array()
+            .unwrap();
+        assert_eq!(hits.len(), 1, "path hit expected: {resp}");
+        assert_eq!(hits[0]["rel_path"], "docs/a.md");
+        let resp = call_tool(&engine, "waggledance_search", json!({ "query": "orchard" }));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("only titles and paths were searched"),
+            "{text}"
+        );
 
         std::fs::remove_dir_all(&pa.root_path).ok();
         std::fs::remove_dir_all(&pb.root_path).ok();

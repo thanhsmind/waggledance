@@ -145,12 +145,7 @@ impl Engine {
             .store
             .get_project(project_id)?
             .ok_or_else(|| Error::ProjectNotFound(project_id.to_string()))?;
-        let n = IndexService::index_project(
-            &self.store,
-            &project,
-            &self.config.indexing.exclude_patterns,
-            self.max_bytes(),
-        )?;
+        let n = self.refresh_stale(project_id)?;
         self.reindex_links(&project)?;
         Ok(n)
     }
@@ -159,8 +154,8 @@ impl Engine {
     /// stored `files` row (D4): re-reads/upserts only what changed, indexes
     /// new files, and removes files that vanished from disk. Reuses the same
     /// walk (`scan_markdown_files`) and per-file indexing
-    /// (`IndexService::index_file`/`remove_file`) `index_project` uses, so
-    /// there is exactly one walk/index code path.
+    /// (`IndexService::index_file`/`remove_file`), and is the one walk path
+    /// `refresh` also runs.
     ///
     /// Returns the number of files actually re-read (excludes untouched
     /// files, which are compared by metadata only — never content-read).
@@ -208,6 +203,8 @@ impl Engine {
             &self.config.indexing.exclude_patterns,
         );
         let existing = self.store.list_files(&project.id)?;
+        let by_rel: HashMap<&str, &IndexedFile> =
+            existing.iter().map(|f| (f.rel_path.as_str(), f)).collect();
 
         let mut seen: HashSet<String> = HashSet::new();
         let mut n = 0usize;
@@ -236,7 +233,7 @@ impl Engine {
                 .and_then(|t| OffsetDateTime::from(t).format(&Rfc3339).ok())
                 .unwrap_or_default();
 
-            let stale = match existing.iter().find(|f| f.rel_path == rel) {
+            let stale = match by_rel.get(rel.as_str()) {
                 None => true,
                 Some(f) => f.size_bytes != meta.len() || f.modified_at != modified_at,
             };
@@ -287,31 +284,22 @@ impl Engine {
     /// Returns whether the file's content actually changed relative to what was
     /// previously stored (D2, `backlog-groom-1`): the live-reload watcher uses
     /// this to skip broadcasting a reload for a touch / byte-identical rewrite.
-    /// A path with no prior stored content (brand-new, or unreadable before)
-    /// always counts as changed. The compare happens against the content read
-    /// just before this call overwrites it — no extra hashing pass, a plain
-    /// blob compare against the `files_fts.content` column the indexer already
-    /// writes.
+    /// A path with no stored row always counts as changed; a stored row
+    /// whose content hash is equal reports no change.
     pub fn index_file_incremental(&self, project: &Project, abs: &Path) -> Result<bool> {
         let rel = indexer::rel_path_str(&project.root_path, abs);
         let previous = if rel.is_empty() {
             None
         } else {
-            self.store.file_content(&project.id, &rel)?
+            self.store.file_hash(&project.id, &rel)?
         };
-        let new_content = std::fs::read_to_string(abs).ok();
         let indexed = IndexService::index_file(&self.store, project, abs, self.max_bytes())?;
         self.compute_file_links(project, abs)?;
-        let changed = match (&indexed, &new_content) {
-            (Some(_), Some(c)) => previous.as_deref() != Some(c.as_str()),
-            // Indexed despite our own read failing (a race with the writer) —
-            // treat conservatively as changed so a real edit is never dropped.
-            (Some(_), None) => true,
-            // Skipped by IndexService (too big / unreadable) — nothing in the
-            // index moved, so there is nothing to reload for.
-            (None, _) => false,
+        let Some(indexed) = indexed else {
+            return Ok(false);
         };
-        Ok(changed)
+        let current = self.store.file_hash(&project.id, &indexed.rel_path)?;
+        Ok(previous.is_none() || previous != current)
     }
 
     /// Drop a file from the index (and its outgoing links).
@@ -993,6 +981,25 @@ mod tests {
     }
 
     #[test]
+    fn refresh_of_an_unchanged_project_writes_nothing_while_another_writer_holds_the_lock() {
+        let dir = std::env::temp_dir().join(format!("waggledance-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# Alpha\nsee [b](b.md)");
+        write(&dir, "docs/b.md", "# Beta");
+        let db = dir.join("registry.db");
+        let engine = Engine::new(SqliteStore::open(&db).unwrap(), Config::default());
+        let project = engine.ensure_project(&dir, None).unwrap();
+
+        let other = rusqlite::Connection::open(&db).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let refreshed = engine.refresh(&project.id);
+        other.execute_batch("ROLLBACK").unwrap();
+
+        assert!(refreshed.is_ok(), "{refreshed:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn index_file_incremental_reports_changed_only_when_content_differs() {
         let dir = std::env::temp_dir().join(format!("waggledance-incr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1024,6 +1031,35 @@ mod tests {
             engine.index_file_incremental(&project, &abs).unwrap(),
             "differing content must report changed"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_touched_byte_identical_file_reports_no_change_but_updates_its_metadata() {
+        let dir = std::env::temp_dir().join(format!("waggledance-touch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# A\nsame");
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&dir, None).unwrap();
+        let abs = dir.join("docs/a.md");
+        let before = engine
+            .store
+            .get_file(&project.id, "docs/a.md")
+            .unwrap()
+            .unwrap();
+
+        write_bumped(&abs, "# A\nsame", 120);
+        assert!(!engine.index_file_incremental(&project, &abs).unwrap());
+        let after = engine
+            .store
+            .get_file(&project.id, "docs/a.md")
+            .unwrap()
+            .unwrap();
+        assert_ne!(before.modified_at, after.modified_at);
+
+        write_bumped(&abs, "# A\nedited", 240);
+        assert!(engine.index_file_incremental(&project, &abs).unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1099,9 +1135,10 @@ mod tests {
 
         let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
         let project = engine.register(&dir, None).unwrap();
+        let original = engine.store.file_hash(&project.id, "docs/a.md").unwrap();
         assert_eq!(
-            engine.store.file_content(&project.id, "docs/a.md").unwrap(),
-            Some("# A\noriginal body".to_string())
+            original,
+            Some(indexer::content_hash("# A\noriginal body".as_bytes()))
         );
 
         // A different length changes size_bytes even at the same wall-clock
@@ -1111,8 +1148,10 @@ mod tests {
         let n = engine.refresh_stale(&project.id).unwrap();
         assert_eq!(n, 1, "the one modified file must be re-indexed");
         assert_eq!(
-            engine.store.file_content(&project.id, "docs/a.md").unwrap(),
-            Some("# A\nchanged body, much longer now".to_string())
+            engine.store.file_hash(&project.id, "docs/a.md").unwrap(),
+            Some(indexer::content_hash(
+                "# A\nchanged body, much longer now".as_bytes()
+            ))
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1149,7 +1188,7 @@ mod tests {
         let n = engine.refresh_stale(&project.id).unwrap();
         assert_eq!(n, 0, "an untouched file must not count as re-indexed");
         assert_eq!(
-            engine.store.file_content(&project.id, "docs/a.md").unwrap(),
+            engine.store.file_hash(&project.id, "docs/a.md").unwrap(),
             Some("MARKER_UNTOUCHED_NOT_REREAD".to_string()),
             "content must not have been re-read from disk"
         );
@@ -1255,10 +1294,10 @@ mod tests {
         assert_eq!(
             engine
                 .store
-                .file_content(&project.id, "target/notes.md")
+                .file_hash(&project.id, "target/notes.md")
                 .unwrap(),
-            Some("# Notes\nkept alive".to_string()),
-            "the row's content/searchability must remain intact"
+            Some(indexer::content_hash("# Notes\nkept alive".as_bytes())),
+            "the row's hash must remain intact"
         );
 
         std::fs::remove_dir_all(&dir).ok();

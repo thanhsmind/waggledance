@@ -20,6 +20,7 @@ syntect.workspace = true
 ammonia.workspace = true
 rusqlite.workspace = true
 ignore.workspace = true
+unicode-normalization.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
 nucleo-matcher.workspace = true
