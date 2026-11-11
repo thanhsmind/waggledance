@@ -4,7 +4,7 @@
 
 use crate::runtime;
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use waggledance_core::bee_upgrade::{self, Outcome, UpgradeOptions, UpgradeReport};
 use waggledance_core::Config;
@@ -13,7 +13,8 @@ use waggledance_core::Config;
 #[command(
     name = "waggledance",
     version,
-    about = "Supervisor for AI agent workflows"
+    about = "Supervisor for AI agent workflows",
+    after_help = "Agent verbs: projects, state, dispatch, await, runs, task, schema, search.\nFind the verb for a job with `waggledance search <text>`; `waggledance schema` lists every verb and flag as JSON."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -97,6 +98,132 @@ pub enum Command {
     },
     /// Print the version (same value as `--version`).
     Version,
+    #[command(about = "List registered projects as JSON.")]
+    Projects(OutputArgs),
+    #[command(about = "Show bee state: one summary row per project, or one project's digest.")]
+    State {
+        project: Option<String>,
+        #[command(flatten)]
+        out: OutputArgs,
+    },
+    #[command(
+        about = "Dispatch a task to a project's leader, a fresh agent preset or a running pane; returns a run_id."
+    )]
+    Dispatch {
+        #[arg(long, help = "Registered project id")]
+        project: String,
+        #[arg(
+            long,
+            conflicts_with_all = ["preset", "pane_id"],
+            help = "Hand the task to the project's Paseo leader"
+        )]
+        leader: bool,
+        #[arg(long, help = "Spawn a fresh agent from this preset label")]
+        preset: Option<String>,
+        #[arg(long, help = "Send the task to this running pane id")]
+        pane_id: Option<String>,
+        #[arg(long, conflicts_with = "task_file", help = "The task text")]
+        task: Option<String>,
+        #[arg(
+            long,
+            help = "Read the task text from this file; stdin when no task is given"
+        )]
+        task_file: Option<PathBuf>,
+        #[arg(long, help = "Caller-chosen id so a retry never sends twice")]
+        request_id: Option<String>,
+        #[arg(
+            long,
+            help = "Run id or request id whose leader takes the task as a follow-up"
+        )]
+        follow_up_of: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "no_handoff",
+            help = "Start a fresh leader that takes over the follow-up's family"
+        )]
+        handoff: bool,
+        #[arg(long, help = "Opt out of the automatic leader handoff")]
+        no_handoff: bool,
+        #[arg(
+            long,
+            help = "Send the task to the follow-up's leader as a context-only note"
+        )]
+        steer: bool,
+    },
+    #[command(
+        about = "Wait for a dispatched run to finish or block; prints its status and transcript tail."
+    )]
+    Await {
+        run_id: String,
+        #[arg(long, help = "Max seconds to wait, clamped to 60")]
+        timeout: Option<u64>,
+        #[command(flatten)]
+        out: OutputArgs,
+    },
+    #[command(
+        about = "List dispatched runs with a one-line task summary; `runs show` prints one run in full."
+    )]
+    Runs {
+        #[arg(long, help = "Only this project's runs")]
+        project: Option<String>,
+        #[command(flatten)]
+        out: OutputArgs,
+        #[command(subcommand)]
+        action: Option<RunsAction>,
+    },
+    #[command(about = "Answer a leader's task by corr: reply, redo, accept, allow or deny.")]
+    Task {
+        corr: String,
+        #[arg(value_enum)]
+        action: TaskVerb,
+        #[arg(long, help = "The user's words, required for reply and redo")]
+        text: Option<String>,
+        #[arg(long, help = "Permission request id for allow and deny")]
+        req_id: Option<String>,
+        #[command(flatten)]
+        out: OutputArgs,
+    },
+    #[command(about = "Print every agent verb, or one verb, with its flags and help as JSON.")]
+    Schema { verb: Option<String> },
+    #[command(about = "Find the agent verb for a job: ranks verbs by the words you give.")]
+    Search {
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+}
+
+#[derive(Args, Clone, Default)]
+pub struct OutputArgs {
+    #[arg(
+        long,
+        global = true,
+        help = "Print the tool's full structuredContent unchanged"
+    )]
+    pub full: bool,
+    #[arg(
+        long,
+        global = true,
+        value_delimiter = ',',
+        help = "Keep only these comma-separated keys on each row"
+    )]
+    pub fields: Vec<String>,
+    #[arg(long, global = true, help = "Cap the number of rows")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Subcommand)]
+pub enum RunsAction {
+    #[command(about = "Print one run in full, including its whole task.")]
+    Show { run_id: String },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+pub enum TaskVerb {
+    Reply,
+    Redo,
+    Accept,
+    Allow,
+    Deny,
 }
 
 #[derive(Subcommand)]
@@ -180,6 +307,7 @@ pub fn run(cli: Cli) -> Result<()> {
             println!("waggledance {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        agent => crate::agent_cli::run(agent),
     }
 }
 

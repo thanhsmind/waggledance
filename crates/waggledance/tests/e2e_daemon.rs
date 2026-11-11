@@ -274,7 +274,7 @@ fn serve_writes_the_lock_status_reports_it_running_and_stop_ends_it() {
 fn the_viewer_subcommands_are_gone() {
     let bin = env!("CARGO_BIN_EXE_waggledance");
     let home = scratch_home("removed-commands");
-    for args in [&["open", "x.md"][..], &["search", "x"], &["refresh"]] {
+    for args in [&["open", "x.md"][..], &["refresh"]] {
         let output = run_with_timeout(bin, args, &home, Duration::from_secs(5))
             .expect("waggledance did not return promptly");
         assert!(!output.status.success(), "{args:?} must fail");

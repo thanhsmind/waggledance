@@ -8,13 +8,13 @@ bee:
   id: supervisor-daemon
   lifecycle: active
   areas: [orchestration]
-  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs]
-  sources: [docs/history/headless-supervisor/CONTEXT.md, docs/history/headless-supervisor/plan.md]
+  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/agent_cli.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs]
+  sources: [docs/history/headless-supervisor/CONTEXT.md, docs/history/headless-supervisor/plan.md, docs/history/agent-cli/CONTEXT.md, docs/history/agent-cli/plan.md]
 ---
 
 # The supervisor daemon is headless and MCP serves seven tools
 
-Read when: you look for the board, the terminal page, a docs or code viewer, `search`, `open`, `refresh`, `/health` or the Paseo sidebar plugin, or you wonder why `status` cannot dial the daemon.
+Read when: you look for the board, the terminal page, a docs or code viewer, `open`, `refresh`, `/health` or the Paseo sidebar plugin, or you wonder why `status` cannot dial the daemon.
 
 ## Boundary
 
@@ -35,3 +35,22 @@ waggledance supervises agents and nothing else. Locked by headless-supervisor D1
 
 - `crates/waggledance/src/watcher.rs` — the bee status watch trigger and notify keep using; it is not the removed file watcher.
 - `crates/waggledance-core/src/repository.rs` — `SCHEMA` and `MIGRATIONS`; the file tables are dropped by migration, not by editing history.
+
+## Agent CLI verbs
+
+Read when: you wonder why `waggledance search` answers again after the viewer was removed, why a CLI verb prints less than its MCP tool, or where the verbs call into MCP.
+
+- `projects`, `state`, `dispatch`, `await`, `runs`, `task`, `schema` and `search` (`agent_cli.rs`) are a thin layer over `mcp::call_tool`: each maps flags to the tool's arguments and shapes `structuredContent`. No tool logic lives in the CLI (agent-cli D1, `docs/history/agent-cli/CONTEXT.md`).
+- `search` here is verb discovery ranked from the clap tree (D3), not the removed viewer search; `tests/e2e_daemon.rs` no longer lists it among removed commands.
+- Default output is a summary; `--full` is the unchanged `structuredContent`, so a drift between CLI and MCP shows up in the `--full` equality tests (D2). `--fields` and `--limit` narrow rows after the summary, never before it.
+- `schema` and `search` read the clap command tree, so a new verb is discoverable the moment it exists; no second list of verbs is kept (D3).
+- The CLI builds its engine from the registry database like the stdio loop, so a verb works with the daemon down.
+- A tool error goes to stderr with exit 1; stdout stays JSON only.
+
+## Trimmed MCP payloads
+
+Read when: a caller reads `task` from `waggledance_runs` and finds `task_summary`, or reads `sessions` from the all-projects `waggledance_ask_state` and finds `session_count`.
+
+- `waggledance_runs` rows carry `task_summary`; the full `task` comes only from the `run_id` argument. `waggledance_ask_state` without `project` drops `sessions` and `recent_decisions` per project and adds `session_count`; with `project` the answer is unchanged (agent-cli D4, `mcp.rs`).
+- Why: on 2026-11-11 the rollup measured 324,669 bytes and the run list 587,737, mostly session lists and task text no caller needed to choose a next step.
+- Rejected: trimming only in the CLI left MCP callers paying the full cost; a separate `wg` binary duplicated install and logic. `wg` stays a user-made symlink because the name collides with WireGuard (D5).

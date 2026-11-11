@@ -1,5 +1,6 @@
 //! waggledance — a supervisor for AI agent workflows.
 
+mod agent_cli;
 mod cli;
 mod daemon;
 mod delivery;

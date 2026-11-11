@@ -127,6 +127,33 @@ stdio (`waggledance mcp`) and exposes seven tools:
 Drop the snippet from [`docs/waggledance-agents-template.md`](docs/waggledance-agents-template.md)
 into your project's `AGENTS.md` / `CLAUDE.md` so its agents know the supervisor tools exist.
 
+### Agent CLI
+
+Agents with a shell can drive the same tools through CLI verbs, which cost fewer tokens
+than the MCP tool descriptions and answers. Each verb runs the handler its MCP tool runs:
+
+```sh
+waggledance projects                      # waggledance_projects
+waggledance state [project]               # waggledance_ask_state
+waggledance dispatch --project <id> (--leader | --preset <label> | --pane-id <id>) --task "..."
+waggledance await <run_id> [--timeout N]  # waggledance_await
+waggledance runs [--project <id>]         # waggledance_runs
+waggledance runs show <run_id>            # one run with its full task
+waggledance task <corr> reply|redo|accept|allow|deny [--text ...]
+waggledance search "<what you want>"      # rank the verbs for a need
+waggledance schema [verb]                 # verbs, flags and help as JSON
+```
+
+Output is JSON only: pretty on a terminal, compact when piped. A verb prints a summary by
+default. `--full` prints the MCP tool's answer unchanged, `--fields a,b` keeps only those
+keys on each row, and `--limit N` caps the rows. A tool error prints its message to stderr
+and exits 1. The MCP tools stay as the fallback for agents without Bash; their run list
+and all-projects state are trimmed to match (`waggledance_runs` rows carry `task_summary`,
+and `run_id` returns one run's full `task`).
+
+The binary is `waggledance`. You can make `wg` a symlink to it yourself, but no installer
+creates one: `wg` is also the WireGuard command, and a link would shadow it.
+
 ### Paseo leaders
 
 When waggledance runs beside Paseo, each project can have one long-lived leader agent in its
@@ -187,6 +214,8 @@ waggledance stop                          # stop the daemon
 waggledance restart                       # restart the daemon (apply config changes)
 waggledance doctor [--fix]                # diagnose & repair the integration
 waggledance mcp                           # MCP server over stdio (agent tools call this)
+waggledance projects | state | dispatch | await | runs | task   # agent verbs, JSON out
+waggledance search <text> | schema [verb] # find an agent verb
 waggledance setup <pi|openclaw>           # install an integration
 waggledance mail send --to ... --corr ... --kind ...   # a leader reports back
 waggledance hold --why ... [--minutes N]  # tell the daemon this leader is waiting
