@@ -34,10 +34,21 @@ proposed scope points the same day.
 
 ## Read set
 
-- `crates/waggledance/src/server.rs` (`serve`, lines 267-385)
-- `crates/waggledance/src/mcp.rs` (tool list 160-410, pane helpers 894-960)
-- `crates/waggledance/src/watcher.rs` (bee status watch, kept)
-- `crates/waggledance/src/main.rs` (`TerminalBackground`, 60-720)
-- `crates/waggledance/src/doctor.rs` (agent snippet and skill install, 600-700)
-- `crates/waggledance-core/src/repository.rs` (`SCHEMA`, `MIGRATIONS`)
-- `docs/history/registry-db-lock/CONTEXT.md` (the last change to the file store)
+### Knowledge
+
+| Concept | Grade at read | Why it matters |
+|---------|---------------|----------------|
+| docs/knowledge/patterns/an-fts5-delete-by-unindexed-column-scans-the-whole-table.md | unverified | the file store this feature drops was the registry lock source |
+| docs/knowledge/patterns/the-binary-you-ran-is-not-the-one-you-built.md | unverified | the daemon proof must run the binary just built |
+| docs/knowledge/patterns/prove-the-whole-path.md | unverified | the headless daemon owes one end-to-end run |
+
+### Code
+
+| Path | What it decides |
+|------|-----------------|
+| `crates/waggledance/src/server.rs` | `serve` starts the loops and the HTTP listener; holds pane helpers MCP borrows |
+| `crates/waggledance/src/mcp.rs` | the MCP tool list and its stdio loop |
+| `crates/waggledance/src/watcher.rs` | the bee status watch that trigger and notify keep using |
+| `crates/waggledance/src/main.rs` | `TerminalBackground`, the supervisor loop host |
+| `crates/waggledance/src/doctor.rs` | the agent snippet and viewer skill install |
+| `crates/waggledance-core/src/repository.rs` | `SCHEMA` and `MIGRATIONS` for the file tables |
