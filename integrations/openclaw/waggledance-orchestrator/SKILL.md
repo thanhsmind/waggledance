@@ -1,24 +1,20 @@
 ---
 name: waggledance-orchestrator
-description: "Orchestrate multi-project workflows across repositories managed by Waggledance and Beehive. Supports monitoring real-time project states, querying registered workspaces, full-text searching indexed markdown docs, and dispatching tasks (relay/execute mode) to worker agent panes via Waggledance."
+description: "Orchestrate multi-project workflows across repositories managed by Waggledance and Beehive. Supports monitoring real-time project states, querying registered workspaces, and dispatching tasks (relay/execute mode) to worker agent panes via Waggledance."
 ---
 
 # Waggledance Orchestrator
 
-This skill enables OpenClaw to communicate with the local **Waggledance** instance (daemon at `http://127.0.0.1:7700` and MCP bridge) to orchestrate, monitor, search, and dispatch tasks across all managed projects (`beehive`, `waggledance`, `anphabe-bi-dashboard`, `a-blog`, `memorypad`, `jarvis`, etc.).
+This skill enables OpenClaw to communicate with the local **Waggledance** instance (MCP bridge) to orchestrate, monitor, and dispatch tasks across all managed projects (`beehive`, `waggledance`, `anphabe-bi-dashboard`, `a-blog`, `memorypad`, `jarvis`, etc.).
 
 ## Available Capabilities
 
 1. **Project Inspection & Rollup**:
-   - Query all registered repositories, root paths, and indexing status.
+   - Query all registered repositories and their root paths.
    - Read parsed Beehive project state (active feature, phase, cell counts, recent decisions, open P1 review findings, agent panes).
-2. **Global Doc & Knowledge Search**:
-   - Full-text search across documentation, decisions, and knowledge bases in one or all projects.
-3. **Task & Spec Orchestration (Dispatch Door)**:
+2. **Task & Spec Orchestration (Dispatch Door)**:
    - **Relay mode**: File specs/PBIs into a target project's backlog with correlation tracking (`spec-drop <corr-id> from waggledance@<sha>`).
    - **Execute mode**: Dispatch a lead agent in the target repo to run its full working chain to completion.
-4. **Markdown Preview**:
-   - Open and generate shareable local browser URLs for markdown documents.
 
 ---
 
@@ -47,20 +43,13 @@ wd-bridge.py state
 wd-bridge.py state --project beehive
 ```
 
-### 3. `search`
-Search across indexed project documentation:
-```bash
-wd-bridge.py search "herding transport" --limit 5
-wd-bridge.py search "pipeline status" --project anphabe-bi-dashboard
-```
-
-### 4. `runs`
+### 3. `runs`
 Inspect dispatched agent runs:
 ```bash
 wd-bridge.py runs [--project <project_id>]
 ```
 
-### 5. `dispatch`
+### 4. `dispatch`
 Dispatch a task or spec to an agent pane:
 ```bash
 # Dispatch via preset (e.g., claude-sonnet, pi-gpt-5.6-luna, agy-flash)
@@ -70,19 +59,13 @@ wd-bridge.py dispatch --project beehive --preset agy-flash --task "spec-drop ...
 wd-bridge.py dispatch --project beehive --pane-id w1:p3A --task "..."
 ```
 
-### 6. `await`
+### 5. `await`
 Wait for a run to finish (up to 60s per call):
 ```bash
 wd-bridge.py await <run_id> --timeout 60
 ```
 
-### 7. `open`
-Preview markdown file in browser via Waggledance:
-```bash
-wd-bridge.py open docs/decisions/0012-model-tiers-config.md --project-root /home/thanhsmind/Projects/goglbe/beehive
-```
-
-### 8. `handoff` — give a task to a project's leader
+### 6. `handoff` — give a task to a project's leader
 
 This is the default way to get work done in a project. You pick the project, the daemon
 opens or reuses that project's own leader, and the leader's reports come back into this
@@ -111,7 +94,7 @@ Hand-off does not wait for the work: the daemon queues the task for that project
 and delivers it when the leader is idle, so a `queued` run id is a sent task, not a
 finished one. Say what you handed off and to which project; do not report the work done.
 
-### 9. `reply`, `redo`, `accept`, `permit` — relay the user's answer
+### 7. `reply`, `redo`, `accept`, `permit` — relay the user's answer
 ```bash
 wd-bridge.py reply --corr t-1a2b3c --text "Dùng định dạng ngày dd/mm/yyyy"
 wd-bridge.py redo --corr t-1a2b3c --text "Nút phải nằm bên phải"

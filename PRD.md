@@ -4,6 +4,8 @@
 **Date:** July 2026  
 **Status:** Draft
 
+> **Superseded in part (2026-11-11).** The headless-supervisor change removed the web viewer, search, the desktop shell and the file index described below. This document is the original viewer design; the current role is in [README.md](README.md).
+
 > **Changelog**
 > - **1.2** — Đơn giản hoá MCP còn **1 tool** (`waggledance_view_file`); project registry chuyển sang **implicit** (auto-create khi register file); yêu cầu code theo **clean architecture** (ports & adapters, service/command/DTO). Xem §5.1, §5.5, §7.4.
 > - **1.1** — Bổ sung **desktop viewer** (Linux/Windows/macOS) qua Tauri như lớp phủ trên cùng core, không đổi ngôn ngữ. Xem §7.1, §7.5, §9, NFR-04.

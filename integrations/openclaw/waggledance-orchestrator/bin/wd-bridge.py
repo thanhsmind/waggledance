@@ -128,11 +128,6 @@ def main():
     state_parser = subparsers.add_parser("state", help="Ask state of projects")
     state_parser.add_argument("--project", "-p", help="Project ID")
 
-    search_parser = subparsers.add_parser("search", help="Full-text search in projects")
-    search_parser.add_argument("query", help="Search query")
-    search_parser.add_argument("--project", "-p", help="Project ID")
-    search_parser.add_argument("--limit", "-l", type=int, default=10, help="Max hits")
-
     dispatch_parser = subparsers.add_parser("dispatch", help="Dispatch task to project")
     dispatch_parser.add_argument("--project", "-p", required=True, help="Target project ID")
     dispatch_parser.add_argument("--task", "-t", required=True, help="Task description / spec")
@@ -145,10 +140,6 @@ def main():
     await_parser = subparsers.add_parser("await", help="Wait for a run")
     await_parser.add_argument("run_id", help="Run ID")
     await_parser.add_argument("--timeout", type=int, default=60, help="Timeout seconds (max 60)")
-
-    open_parser = subparsers.add_parser("open", help="Get browser URL for a markdown file")
-    open_parser.add_argument("path", help="Relative or absolute path to markdown file")
-    open_parser.add_argument("--project-root", help="Project root path")
 
     handoff_parser = subparsers.add_parser("handoff", help="Hand a task to a project's leader")
     handoff_parser.add_argument("--project", "-p", required=True, help="Target project ID")
@@ -185,10 +176,6 @@ def main():
             arguments["project"] = args.project
         res = call_mcp("waggledance_ask_state", arguments)
         print(json.dumps(res, indent=2, ensure_ascii=False))
-    elif args.command == "search":
-        cmd = ["waggledance", "search", args.query]
-        subprocess.run(cmd)
-        return
     elif args.command == "dispatch":
         arguments = {"project": args.project, "task": args.task}
         if args.preset:
@@ -206,15 +193,6 @@ def main():
     elif args.command == "await":
         arguments = {"run_id": args.run_id, "timeout_seconds": args.timeout}
         res = call_mcp("waggledance_await", arguments)
-        print(json.dumps(res, indent=2, ensure_ascii=False))
-    elif args.command == "open":
-        arguments = {"relative_path": args.path}
-        if args.project_root:
-            arguments["project_root"] = args.project_root
-        else:
-            subprocess.run(["waggledance", "open", args.path])
-            return
-        res = call_mcp("waggledance_view_file", arguments)
         print(json.dumps(res, indent=2, ensure_ascii=False))
     elif args.command == "handoff":
         corr = args.corr or f"t-{secrets.token_hex(3)}"

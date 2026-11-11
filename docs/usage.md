@@ -1,10 +1,8 @@
 # waggledance — Usage Guide
 
-Practical guide to installing and running waggledance on Linux/macOS, including the
-common **SSH-into-a-server** workflow.
-
-- Web mode is the primary way to use waggledance (works great over SSH).
-- Desktop mode is a native window and needs a graphical display.
+Practical guide to installing and running the waggledance supervisor on Linux/macOS.
+waggledance has no web page and no window: it is a daemon, a CLI and an MCP server in one
+binary.
 
 ---
 
@@ -24,7 +22,6 @@ cargo install --git https://github.com/thanhsmind/waggledance waggledance
 # or, inside a clone:
 cargo build --release -p waggledance     # binary at target/release/waggledance
 ```
-The CLI/daemon does **not** need any GUI system libraries.
 
 **Iterating on the code?** Use the `fast` profile instead. `release` is tuned for
 the shipped binary — fat LTO plus `codegen-units = 1` force the final codegen onto
@@ -39,39 +36,22 @@ runtime, which is why releases still go out on `release`.
 
 ---
 
-## 2. Web mode (recommended)
+## 2. Run the supervisor
 
 ```bash
-waggledance register /path/to/project     # recursive scan + index
-waggledance open README.md                # print a URL — auto-starts the daemon if needed
+waggledance register /path/to/project     # add a project to the registry
+waggledance list                          # list registered projects
+waggledance serve                         # start the supervisor daemon
 waggledance status                        # is it running?
 ```
 
-The daemon **auto-starts** on the first `open` or MCP call and keeps running in
-its own session (it survives the terminal that launched it). You only need
-`waggledance serve` to pre-start it or to bind a custom host/port — see §4.
+`waggledance serve` runs the background loops — heartbeat, reaper, wake, trigger, notify,
+worktree sweep and the bee status watch — and opens no network port. It writes
+`~/.waggledance/daemon.lock`; `waggledance status` reads that file. Use
+`waggledance doctor` for a full check.
 
-Open <http://localhost:7700> in a browser. You get: project list, per-file
-rendering with **cross-folder links that don't 404**, live reload on file
-change, full-text search, backlinks, table of contents, and breadcrumbs.
-
-### Running on a remote Ubuntu server over SSH
-The server binds to `127.0.0.1` by default. To view it from your laptop,
-forward the port:
-
-```bash
-# on your laptop:
-ssh -L 7700:localhost:7700 user@ubuntu-host
-# then open http://localhost:7700 in your laptop's browser
-```
-
-Alternatively, expose it on the LAN (less secure — everything except the
-agent terminal is unauthenticated, so anyone who can reach the port can read
-every indexed file and each project's path):
-```bash
-waggledance serve --host 0.0.0.0
-# then browse http://<server-ip>:7700 from another machine on the network
-```
+Registering a project records where it lives. waggledance does not copy, index or watch the
+project's files.
 
 ---
 
@@ -79,7 +59,7 @@ waggledance serve --host 0.0.0.0
 
 ```bash
 waggledance doctor --fix     # register the MCP server for every agent tool present
-waggledance doctor           # re-check: PATH, config, daemon, MCP per tool, skill
+waggledance doctor           # re-check: PATH, config, daemon, MCP per tool
 ```
 
 `doctor --fix` sets up the MCP server for **whichever agent tools it detects** on
@@ -91,31 +71,39 @@ your machine — and never touches one you don't have (reported `SKIP`):
 | Codex | `~/.codex/` / `codex` on PATH | `~/.codex/config.toml` (`[mcp_servers.waggledance]`, format-preserving) |
 | Antigravity | `~/.gemini/config/` / `antigravity` on PATH | `~/.gemini/config/mcp_config.json` (`mcpServers`) |
 
-After that, an agent calls the single tool
-**`waggledance_view_file(project_root, relative_path)`** and gets a browser URL back.
-The project is auto-registered on first use — no separate registration step.
+The server exposes seven tools: `waggledance_projects`, `waggledance_ask_state`,
+`waggledance_dispatch`, `waggledance_await`, `waggledance_runs`, `waggledance_task` and
+`waggledance_bee_upgrade`. Each is described in the [README](../README.md#agent-integration-mcp).
 
 Drop the snippet from [`waggledance-agents-template.md`](waggledance-agents-template.md)
-into your project's `AGENTS.md` / `CLAUDE.md` so agents surface a viewable URL
-after writing docs.
+into your project's `AGENTS.md` / `CLAUDE.md` so its agents know the tools exist.
+
+The pi extension and the OpenClaw bridge reach the same tools over stdio:
+
+```bash
+waggledance setup pi
+waggledance setup openclaw
+```
 
 ---
 
 ## 4. CLI reference
 
 ```bash
-waggledance serve [--port 7700] [--host 0.0.0.0]     # optional: pre-start the daemon (auto-starts otherwise)
-waggledance register <dir> [--name "My App"]         # index a project
-waggledance open <file.md>                           # print the browser URL for a file
+waggledance serve                                    # run the supervisor daemon
+waggledance register <dir> [--name "My App"]         # add a project to the registry
 waggledance list                                     # list projects
-waggledance search "query" [--project <id>]          # full-text search
-waggledance refresh [<project-id>]                   # re-scan to reconcile the index
-waggledance status                                   # daemon status
-waggledance config edit                              # edit ~/.waggledance/config.toml in $EDITOR
 waggledance unregister <project-id>                  # remove a project (files kept)
+waggledance status                                   # daemon status
 waggledance stop                                     # stop the daemon
 waggledance restart                                  # restart the daemon (apply config changes)
 waggledance doctor [--fix] [--json] [--dry-run]      # diagnose & repair integration
+waggledance mcp                                      # MCP server over stdio
+waggledance setup <pi|openclaw> [--remove]           # install or remove an integration
+waggledance mail send --to <wd> --corr <id> --kind <kind> [--body-file <path>]
+waggledance hold --why "<reason>" [--minutes N]      # this leader is waiting; --release ends it
+waggledance bee upgrade [--apply] [--project <id>]   # upgrade bee in registered projects
+waggledance config edit                              # edit ~/.waggledance/config.toml in $EDITOR
 ```
 Most commands accept `--json` for scripting.
 
@@ -123,52 +111,24 @@ Most commands accept `--json` for scripting.
 
 ## 5. Settings
 
-Two ways to change settings — server host/port, theme, indexing (debounce, max
-file size, exclude patterns), and MCP options — both writing the same
-`~/.waggledance/config.toml`:
+Run `waggledance config edit`. It opens `~/.waggledance/config.toml` in your
+`$VISUAL`/`$EDITOR` (falling back to `vi`, or `notepad` on Windows), pre-filled with the
+current values. On save it validates the TOML and warns if it's broken (an invalid file is
+ignored — waggledance falls back to defaults until you fix it).
 
-- **Web UI:** open <http://localhost:7700/settings> and edit the form.
-- **CLI / editor:** run `waggledance config edit`. It opens `~/.waggledance/config.toml`
-  in your `$VISUAL`/`$EDITOR` (falling back to `vi`, or `notepad` on Windows),
-  pre-filled with the current values. On save it validates the TOML and warns if
-  it's broken (an invalid file is ignored — waggledance falls back to defaults until
-  you fix it).
-
-Server/indexing changes apply after a daemon restart — `waggledance restart` (or
+Changes apply after a daemon restart — `waggledance restart` (or
 `waggledance stop && waggledance serve`).
 
----
-
-## 6. Desktop app (needs a display)
-
-The desktop shell is a native window onto the same daemon. It requires a
-graphical session — it will **not** run over a bare SSH connection.
-
-```bash
-cd crates/waggledance-desktop
-cargo run                 # on a desktop session
-```
-
-Prerequisites (Linux): `libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev
-libjavascriptcoregtk-4.1-dev libdbus-1-dev librsvg2-dev build-essential`.
-
-Over SSH you have two options:
-- Use **web mode** instead (recommended), or
-- Enable X forwarding: `ssh -X user@ubuntu-host` then `cargo run`.
-
-Run over a bare SSH session and waggledance prints a helpful message with the web URL
-instead of crashing.
-
-Closing the window hides it to the system tray (the daemon keeps serving); quit
-from the tray to stop it.
+Per-project dispatch settings live in a `.waggledance.toml` at the project root; see the
+[README](../README.md#per-project-settings-waggledancetoml).
 
 ---
 
-## 7. Where things live
+## 6. Where things live
 
-- `~/.waggledance/registry.db` — project registry + file index (SQLite)
+- `~/.waggledance/registry.db` — project registry, dispatched runs and the leader mailbox (SQLite)
 - `~/.waggledance/config.toml` — configuration
 - `~/.waggledance/daemon.lock` — the single-daemon coordination file
 
-Only registered project roots are served; requests are path-traversal guarded.
-waggledance never writes to your files — it is a read-only viewer.
+waggledance never writes to your project files, except `bee upgrade --apply`, which commits
+bee's own files in the projects you name.

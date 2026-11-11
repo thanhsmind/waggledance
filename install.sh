@@ -76,4 +76,4 @@ else
 fi
 echo "Next:"
 echo "  $BIN doctor --fix     # wire up Claude Code MCP integration"
-echo "  $BIN serve            # start the viewer (http://localhost:7700)"
+echo "  $BIN serve            # start the supervisor daemon"

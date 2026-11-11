@@ -7,6 +7,6 @@ export default function waggledance(pi: ExtensionAPI): void {
 		command: waggledancePath || "waggledance",
 		args: ["mcp"],
 		exposure: "direct",
-		description: "Waggle Dance: view docs in the browser, search docs and bee state across projects, dispatch work to agent panes",
+		description: "Waggle Dance supervisor: list projects, read bee state, dispatch work to a project leader or agent pane, await runs, follow up on tasks, upgrade bee",
 	});
 }
