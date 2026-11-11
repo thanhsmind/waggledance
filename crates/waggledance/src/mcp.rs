@@ -2400,11 +2400,7 @@ mod tests {
         // Edit project a's file after registration (which already indexed
         // it once) — D4: the next search must see the new content without a
         // separate refresh call.
-        write(
-            &pa.root_path,
-            "docs/a.md",
-            "# Pineapple A\nNow retitled.",
-        );
+        write(&pa.root_path, "docs/a.md", "# Pineapple A\nNow retitled.");
         let resp = call_tool(
             &engine,
             "waggledance_search",
@@ -2423,7 +2419,11 @@ mod tests {
     #[test]
     fn search_matches_a_path_and_zero_hits_say_titles_and_paths() {
         let (engine, pa, pb) = two_project_engine("search-path");
-        let resp = call_tool(&engine, "waggledance_search", json!({ "query": "docs/a.md" }));
+        let resp = call_tool(
+            &engine,
+            "waggledance_search",
+            json!({ "query": "docs/a.md" }),
+        );
         let hits = resp["result"]["structuredContent"]["hits"]
             .as_array()
             .unwrap();
@@ -2431,7 +2431,10 @@ mod tests {
         assert_eq!(hits[0]["rel_path"], "docs/a.md");
         let resp = call_tool(&engine, "waggledance_search", json!({ "query": "orchard" }));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("only titles and paths were searched"), "{text}");
+        assert!(
+            text.contains("only titles and paths were searched"),
+            "{text}"
+        );
 
         std::fs::remove_dir_all(&pa.root_path).ok();
         std::fs::remove_dir_all(&pb.root_path).ok();

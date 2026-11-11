@@ -209,8 +209,7 @@ pub fn walk_would_index(root: &Path, path: &Path, exclude: &[String]) -> bool {
         let verdict = ignores
             .iter()
             .map(|g| g.matched(&current, is_dir))
-            .filter(|m| !m.is_none())
-            .next_back();
+            .rfind(|m| !m.is_none());
         if verdict.is_some_and(|m| m.is_ignore()) {
             return false;
         }
