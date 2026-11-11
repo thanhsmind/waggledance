@@ -2663,6 +2663,7 @@ dependencies = [
  "time",
  "toml",
  "tracing",
+ "unicode-normalization",
  "yaml-rust",
 ]
 

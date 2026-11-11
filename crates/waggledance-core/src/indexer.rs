@@ -48,9 +48,12 @@ impl IndexService {
         if meta.len() > max_bytes {
             return Ok(None);
         }
-        let content = match std::fs::read_to_string(abs) {
-            Ok(c) => c,
-            Err(_) => return Ok(None),
+        let content = match std::fs::read(abs)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(c) => c,
+            None => return Ok(None),
         };
         let rel = rel_path_str(&project.root_path, abs);
         if rel.is_empty() {
@@ -70,7 +73,7 @@ impl IndexService {
             size_bytes: meta.len(),
             modified_at,
         };
-        store.upsert_file(&f, &content)?;
+        store.upsert_file(&f, &content_hash(content.as_bytes()))?;
         Ok(Some(f))
     }
 
@@ -82,6 +85,15 @@ impl IndexService {
         }
         Ok(())
     }
+}
+
+pub fn content_hash(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}{:x}", bytes.len())
 }
 
 /// Walk `root` recursively, returning absolute paths of markdown files.
