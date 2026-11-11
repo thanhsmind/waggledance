@@ -176,6 +176,8 @@ tasks that have a leader. The rules are code, not a model turn (D8):
    `board` message (corr `board`, project `all`) listing every open task as
    `<corr> <project> <leader state>`, then stamps `board_sent_at` on every task.
 
+A leader held by `waggledance hold` or a live Paseo child is skipped by rule 1: no nudge while it waits. A `result` mail clears the hold, so the leader is nudgeable again afterwards. A leader's reply after its run ended `done` or `lost` reaches wd as one `progress` mail headed `late reply`, unless a mail arrived after the run's end. See [Each request for a project starts its own Paseo leader](paseo-leader-dispatch.md).
+
 ## The permission watcher
 
 The same task runs `paseo permit ls --json` every 30 seconds. Rows land in the

@@ -31,6 +31,7 @@ pub struct PaseoConfig {
     pub thinking: String,
     pub turn_timeout_secs: u64,
     pub leader_idle_minutes: u64,
+    pub hold_max_minutes: u64,
     pub leaders: Vec<PaseoLeader>,
 }
 
@@ -44,6 +45,7 @@ impl Default for PaseoConfig {
             thinking: String::new(),
             turn_timeout_secs: 3600,
             leader_idle_minutes: 30,
+            hold_max_minutes: 120,
             leaders: Vec::new(),
         }
     }
@@ -707,7 +709,14 @@ mod tests {
     #[test]
     fn worktree_sweep_defaults_on_every_six_hours_for_two_day_old_trees() {
         let c: Config = toml::from_str("").unwrap();
-        assert_eq!(c.worktree_sweep, WorktreeSweepConfig { enabled: true, interval_hours: 6, older_than_days: 2 });
+        assert_eq!(
+            c.worktree_sweep,
+            WorktreeSweepConfig {
+                enabled: true,
+                interval_hours: 6,
+                older_than_days: 2
+            }
+        );
         let off: Config = toml::from_str("[worktree_sweep]\nenabled = false\n").unwrap();
         assert!(!off.worktree_sweep.enabled);
         assert_eq!(off.worktree_sweep.interval_hours, 6);
@@ -1013,6 +1022,7 @@ mod tests {
         assert_eq!(tuned.paseo.leader_idle_minutes, 30);
         let idle: Config = toml::from_str("[paseo]\nleader_idle_minutes = 5\n").unwrap();
         assert_eq!(idle.paseo.leader_idle_minutes, 5);
+        assert_eq!(parsed.paseo.hold_max_minutes, 120);
         assert_eq!(
             parsed.paseo.workspace_for("p-1", "waggledance"),
             Some("wks_a")

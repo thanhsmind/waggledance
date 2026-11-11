@@ -2,7 +2,8 @@
 //! Behind a `Mutex<Connection>` so it is Send+Sync for the async daemon.
 
 use crate::domain::{
-    InboxMessage, IndexedFile, LeaderRun, PermissionRequest, Project, Run, SearchResult, WdTask,
+    InboxMessage, IndexedFile, LeaderHold, LeaderRun, PermissionRequest, Project, Run,
+    SearchResult, WdTask,
 };
 use crate::error::Result;
 use crate::short_link;
@@ -807,6 +808,51 @@ impl SqliteStore {
         self.update_task("last_mail_at=?2, changed_at=?2", corr, &[at])
     }
 
+    pub fn set_hold(&self, leader_id: &str, why: &str, set_at: &str, until: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO leader_holds(leader_id, why, set_at, until) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(leader_id) DO UPDATE SET why=?2, set_at=?3, until=?4",
+            params![leader_id, why, set_at, until],
+        )?;
+        Ok(())
+    }
+
+    pub fn release_hold(&self, leader_id: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "DELETE FROM leader_holds WHERE leader_id=?1",
+            params![leader_id],
+        )? == 1)
+    }
+
+    pub fn live_hold(&self, leader_id: &str, now: &str) -> Result<Option<LeaderHold>> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.query_row(
+            "SELECT leader_id, why, set_at, until FROM leader_holds
+             WHERE leader_id=?1 AND until>?2",
+            params![leader_id, now],
+            |r| {
+                Ok(LeaderHold {
+                    leader_id: r.get(0)?,
+                    why: r.get(1)?,
+                    set_at: r.get(2)?,
+                    until: r.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+    }
+
+    pub fn stamp_late_reply(&self, run_id: &str, at: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE runs SET late_reply_at=?2 WHERE id=?1",
+            params![run_id, at],
+        )?;
+        Ok(())
+    }
+
     pub fn close_task(&self, corr: &str, at: &str) -> Result<()> {
         self.update_task("state='closed', changed_at=?2", corr, &[at])
     }
@@ -1173,10 +1219,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (9, migration_9_runs_session),
     (10, migration_10_runs_follow_up),
     (11, migration_11_runs_handoff),
+    (12, migration_12_leader_holds),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -1345,6 +1392,26 @@ fn migration_11_runs_handoff(conn: &Connection) -> Result<()> {
             "ALTER TABLE runs ADD COLUMN handoff INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    Ok(())
+}
+
+fn migration_12_leader_holds(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS leader_holds (
+             leader_id TEXT PRIMARY KEY,
+             why TEXT NOT NULL,
+             set_at TEXT NOT NULL,
+             until TEXT NOT NULL
+         );",
+    )?;
+    let runs: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='runs'",
+        [],
+        |r| r.get(0),
+    )?;
+    if runs == 1 && !has_column(conn, "runs", "late_reply_at")? {
+        conn.execute("ALTER TABLE runs ADD COLUMN late_reply_at TEXT", [])?;
     }
     Ok(())
 }
@@ -2551,6 +2618,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(handoff, 0);
+    }
+
+    #[test]
+    fn migration_12_adds_leader_holds_and_late_reply_at_keeping_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
+             INSERT INTO runs(id, project_id, task) VALUES ('r-old', 'p1', 'old task');
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+        super::migrate(&conn).unwrap();
+        super::migrate(&conn).unwrap();
+        assert!(has_column(&conn, "runs", "late_reply_at").unwrap());
+        assert!(has_column(&conn, "leader_holds", "until").unwrap());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM runs WHERE id='r-old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1);
     }
 
     #[test]

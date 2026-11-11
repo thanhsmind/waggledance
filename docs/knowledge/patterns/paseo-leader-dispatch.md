@@ -498,7 +498,21 @@ Every `paseo` child process drops `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` and kee
 other variable, `PASEO_HOME` included. With those two set, a new agent becomes a child of
 the calling agent, and `paseo run` attaches it to the caller's workspace.
 
+## A held leader keeps its run working
+
+Read when: a leader ends its turn while work it handed out still runs, and its run reads done too soon, its leader is archived, or the heartbeat nudges it.
+
+The leader declares its own wait with `waggledance hold --why <reason> [--minutes N]` (it reads `PASEO_AGENT_ID`, exits 2 naming the variable when absent) and releases it with `--release`. A hold lasts at most `[paseo] hold_max_minutes` (default 120, the 2-hour ceiling) and `--minutes` is capped to it; waggledance never infers delegated work from a provider timeline (D1, D2). A `result` mail from the leader also clears the hold (D4).
+
+A leader is held while it has an unexpired `waggledance hold` row or a Paseo child whose `ParentAgentId` is the leader, running or initializing (`paseo::held_work`). `paseo ls` has no parent field, so the children lookup lists running agents and inspects each; it runs only when a decision needs it, and a hold row decides first.
+
+A held leader's completed or idle turn end leaves the run `working` and polls `inspect` every `permission_poll` until `UpdatedAt` moves. Paseo's `wait` is never called on an idle leader, and a wake turn is never caught by seeing `running` (polling status every 5 s missed both). When the hold ends the run ends as before; an expiry adds `hold expired after N min (why)` to the transcript header. The idle sweep and the heartbeat skip a held leader. Every leader prompt but a steer note ends with the hold line, appended at send time so the stored task stays the caller's.
+
+A leader turn after its run ended `done` or `lost` is a late reply (D5), found by the five-minute sweep (`pass_on_late_reply`): the newest run the leader carries, an unarchived settled leader whose `UpdatedAt` is later than that run's end, no `late reply` line in the transcript yet. `late_reply_at` is stamped but never read back, because the engine has no reader and the transcript line is the once-only mark. An empty turn records nothing and is read again next sweep. An `openclaw:` caller gets one `progress` mail headed `late reply`, skipped when the task's `last_mail_at` is after the run's end so a result the leader already mailed is not repeated; any other caller gets a run notice naming the late reply.
+
 ## Known limit
+
+A message a person types into a leader's Paseo chat after its run ended `done` gets a reply that is passed on once as a late reply, not as a fresh run: the caller reads it as a late reply notice, and the person's own chat still shows the reply.
 
 A human who types to the leader while a delivery is in flight interrupts that turn —
 Paseo's own behaviour for a message sent into a running turn. The blocking send then
