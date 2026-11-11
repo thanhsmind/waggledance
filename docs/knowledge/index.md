@@ -13,9 +13,8 @@ never a generation timestamp or any other wall-clock value.
 
 ## Sections
 
-- [areas/](areas/index.md) — 1 concept(s)
-- [patterns/](patterns/index.md) — 31 concept(s)
-- [work/](work/index.md) — 120 concept(s)
+- [areas/](areas/index.md) — 2 concept(s)
+- [patterns/](patterns/index.md) — 33 concept(s)
 
 ## Critical patterns
 

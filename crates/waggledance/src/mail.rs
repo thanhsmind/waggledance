@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::Path;
 
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 use waggledance_core::Engine;
 
 const RECIPIENT: &str = "wd";

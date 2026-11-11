@@ -1,11 +1,11 @@
 ---
 type: bee.pattern
 title: "Read the live theme's token definition, never the base contract's"
-description: "Pitfall: a design token borrowed by reading contract.css can mean something entirely different in the theme actually serving the page, and the sibling defect in the same report shows why green contains() assertions are no evidence that a stylesheet still parses."
+description: "Retired, the web surface it covered is gone. Pitfall: a design token borrowed by reading contract.css can mean something entirely different in the theme actually serving the page, and the sibling defect in the same report shows why green contains() assertions are no evidence that a stylesheet still parses."
 timestamp: 2026-08-31
 bee:
   id: read-the-live-themes-token-not-the-base-contracts
-  lifecycle: active
+  lifecycle: retired
   areas: [agent-board]
   sources: [crates/waggledance/assets/atelier/console.css]
   polarity: pitfall
@@ -13,6 +13,8 @@ bee:
 ---
 
 # Read the live theme's token definition, never the base contract's
+
+Retired by headless-supervisor D3: the browser surface this page describes was removed, so nothing live can hit it. The text below is kept as the record of why it was once true.
 
 ## The trap
 

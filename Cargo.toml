@@ -1,10 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["crates/waggledance-core", "crates/waggledance"]
-# Desktop shell (Tauri) is excluded from the default workspace build because it
-# requires system libraries (webkit2gtk/gtk3 on Linux) not present everywhere.
-# Build it explicitly from its own directory — see crates/waggledance-desktop/README.md.
-exclude = ["crates/waggledance-desktop"]
 
 [workspace.package]
 version = "0.5.5"
@@ -23,27 +19,14 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
-unicode-normalization = "0.1"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "local-offset"] }
 
-# rendering
-comrak = "0.29"
-syntect = "5"
-ammonia = "4"
-
-# storage / indexing
+# storage
 rusqlite = { version = "0.32", features = ["bundled"] }
-ignore = "0.4"
-notify = "6"
-notify-debouncer-full = "0.3"
-nucleo-matcher = "0.3"
 
-# server / cli
-axum = { version = "0.7", features = ["ws"] }
+# runtime / cli
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
 clap = { version = "4", features = ["derive"] }
-minijinja = { version = "2", features = ["loader"] }
 async-trait = "0.1"
 interprocess = { version = "2.4.2", features = ["tokio"] }
 rand = "0.8"

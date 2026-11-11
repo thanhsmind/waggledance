@@ -67,4 +67,4 @@ if (Test-Path $DestExe) {
 }
 Write-Host "Next:"
 Write-Host "  $Bin doctor --fix     # wire up Claude Code MCP integration"
-Write-Host "  $Bin serve            # start the viewer (http://localhost:7700)"
+Write-Host "  $Bin serve            # start the supervisor daemon"

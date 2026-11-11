@@ -1,11 +1,11 @@
 ---
 type: bee.pattern
 title: "Resolve a pane's project from its own form, never from the page"
-description: "Pitfall: the homepage Terminals tab hosts panes from many projects and carries no page-level project id, so any per-pane feature that reads the project from the page works everywhere it was tested and silently loses context there."
+description: "Retired, the web surface it covered is gone. Pitfall: the homepage Terminals tab hosts panes from many projects and carries no page-level project id, so any per-pane feature that reads the project from the page works everywhere it was tested and silently loses context there."
 timestamp: 2026-08-31
 bee:
   id: resolve-a-panes-project-from-the-form-not-the-page
-  lifecycle: active
+  lifecycle: retired
   areas: [agent-terminal]
   sources: [.bee/cells/csl-3.json]
   polarity: pitfall
@@ -13,6 +13,8 @@ bee:
 ---
 
 # Resolve a pane's project from its own form, never from the page
+
+Retired by headless-supervisor D3: the browser surface this page describes was removed, so nothing live can hit it. The text below is kept as the record of why it was once true.
 
 ## The trap
 

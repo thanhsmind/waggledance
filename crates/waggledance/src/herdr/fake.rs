@@ -287,16 +287,6 @@ impl FakeHerdr {
         }
     }
 
-    /// Empty runtime (recovery tests).
-    pub fn empty() -> Self {
-        let f = Self::new();
-        {
-            let mut s = f.inner.snapshot.try_lock().expect("fresh, uncontended");
-            *s = Snapshot::default();
-        }
-        f
-    }
-
     pub fn set_available(&self, up: bool) {
         self.inner
             .available
@@ -331,44 +321,6 @@ impl FakeHerdr {
         };
         let mut screens = self.inner.screens.try_lock().expect("fresh, uncontended");
         screens.insert(pane_id.to_string(), screen);
-    }
-
-    /// Test-only: append another page reachable by one more PageUp beyond
-    /// what `seed_scroll_pane`'s single `escape_reveal` already seeded --
-    /// models multi-page scroll-back (repeated PageUp keeps revealing
-    /// successively older content).
-    pub fn push_escape_page(&self, pane_id: &str, page: &str) {
-        let mut screens = self.inner.screens.try_lock().expect("fresh, uncontended");
-        if let Some(screen) = screens.get_mut(pane_id) {
-            screen.escape_pages.push(page.to_string());
-        }
-    }
-
-    /// Test-only: make `pane_id`'s already-seeded escape-reveal only become
-    /// visible after `reads` additional `Visible` reads while scrolled --
-    /// models a real alt-screen agent's asynchronous redraw lag, reproduced
-    /// live against Claude Code 2.1.220 / herdr 0.7.4 (an immediate read
-    /// right after `send_text(PAGE_UP)` raced ahead of the TUI's re-render
-    /// and returned the stale, pre-scroll screen).
-    pub fn set_reveal_delay(&self, pane_id: &str, reads: usize) {
-        let mut screens = self.inner.screens.try_lock().expect("fresh, uncontended");
-        if let Some(screen) = screens.get_mut(pane_id) {
-            screen.reveal_after_reads = reads;
-        }
-    }
-
-    /// Test-only: make `pane_id` keep showing `escape_reveal` for `reads`
-    /// additional `Visible` reads after Ctrl+End is sent (`scrolled` flips
-    /// false) -- models the same asynchronous-redraw lag on the exit side,
-    /// reproduced live: a real keystroke (e.g. a Reply-sheet Send) arriving
-    /// while Claude Code was still mid-transition out of its own scroll view
-    /// got swallowed as "dismiss scroll view" instead of reaching the
-    /// composer, so typed text landed with no Enter.
-    pub fn set_restore_delay(&self, pane_id: &str, reads: usize) {
-        let mut screens = self.inner.screens.try_lock().expect("fresh, uncontended");
-        if let Some(screen) = screens.get_mut(pane_id) {
-            screen.restore_after_reads = reads;
-        }
     }
 
     /// The `send_text` bytes recorded for `pane_id`, in call order -- lets a

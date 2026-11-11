@@ -7,14 +7,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use waggledance_core::bee_upgrade::{self, Outcome, UpgradeOptions, UpgradeReport};
-use waggledance_core::indexer;
 use waggledance_core::Config;
 
 #[derive(Parser)]
 #[command(
     name = "waggledance",
     version,
-    about = "Multi-project markdown viewer for AI agent workflows"
+    about = "Supervisor for AI agent workflows"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -23,24 +22,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the daemon (HTTP server + file watcher + live reload).
-    Serve {
-        #[arg(long)]
-        port: Option<u16>,
-        #[arg(long)]
-        host: Option<String>,
-    },
-    /// Register a project (recursive scan + index).
+    /// Start the supervisor daemon (background loops, no web server).
+    Serve,
+    /// Register a project.
     Register {
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Get the browser URL for a markdown file (indexing it if needed).
-    Open {
-        path: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -49,29 +37,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Search titles and paths across projects.
-    Search {
-        query: String,
-        #[arg(long)]
-        project: Option<String>,
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
     /// Show daemon status.
     Status {
         #[arg(long)]
         json: bool,
     },
-    /// Re-scan a project (or all) to reconcile the index.
-    Refresh { project: Option<String> },
     /// Remove a project from the registry (files are not deleted).
     Unregister { project_id: String },
     /// Stop the running daemon.
     Stop,
     /// Restart the daemon: stop the running one (if any), then start a fresh
-    /// detached daemon. Useful after changing config (host, port, theme).
+    /// detached daemon. Useful after changing config (config changes).
     Restart,
     /// Diagnose & auto-fix integration with Claude Code.
     Doctor {
@@ -84,7 +60,7 @@ pub enum Command {
     },
     /// Run the MCP server over stdio (used by Claude Code).
     Mcp,
-    /// Install (or --remove) the pi extension, the Paseo plugin, or the OpenClaw bridge.
+    /// Install (or --remove) the pi extension or the OpenClaw bridge.
     Setup {
         #[arg(value_enum)]
         target: crate::setup::Target,
@@ -169,18 +145,10 @@ pub fn run(cli: Cli) -> Result<()> {
     // `run`, so the migration stays disarmed for the entire test suite.
     waggledance_core::config::arm_data_dir_migration();
     match cli.command {
-        Command::Serve { port, host } => cmd_serve(port, host),
+        Command::Serve => cmd_serve(),
         Command::Register { path, name, json } => cmd_register(&path, name.as_deref(), json),
-        Command::Open { path, json } => cmd_open(&path, json),
         Command::List { json } => cmd_list(json),
-        Command::Search {
-            query,
-            project,
-            limit,
-            json,
-        } => cmd_search(&query, project.as_deref(), limit, json),
         Command::Status { json } => cmd_status(json),
-        Command::Refresh { project } => cmd_refresh(project.as_deref()),
         Command::Unregister { project_id } => cmd_unregister(&project_id),
         Command::Stop => cmd_stop(),
         Command::Restart => cmd_restart(),
@@ -368,150 +336,31 @@ fn render_upgrade_text(report: &UpgradeReport) -> String {
     out
 }
 
-fn cmd_serve(port: Option<u16>, host: Option<String>) -> Result<()> {
-    // Apply overrides by persisting to config before the daemon reads it.
-    if port.is_some() || host.is_some() {
-        let mut cfg = waggledance_core::Config::load();
-        if let Some(p) = port {
-            cfg.server.port = p;
-        }
-        if let Some(h) = host {
-            cfg.server.host = h;
-        }
-        cfg.save().ok();
-    }
+fn cmd_serve() -> Result<()> {
     if runtime::running_daemon().is_some() {
         println!("A waggledance daemon is already running.");
         return Ok(());
     }
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(crate::server::serve())
+    rt.block_on(crate::daemon::serve())
 }
 
 fn cmd_register(path: &Path, name: Option<&str>, json: bool) -> Result<()> {
     let engine = runtime::build_engine()?;
     let project = engine.register(path, name)?;
-    let count = engine.file_count(&project.id)?;
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "project_id": project.id, "name": project.name,
-                "root_path": project.root_path, "file_count": count,
-                "url": format!("/p/{}/", project.id)
+                "root_path": project.root_path
             })
         );
     } else {
-        println!(
-            "Registered '{}' ({}) — {} markdown files",
-            project.name, project.id, count
-        );
+        println!("Registered '{}' ({})", project.name, project.id);
         println!("  {}", project.root_path.display());
     }
     Ok(())
-}
-
-fn cmd_open(path: &Path, json: bool) -> Result<()> {
-    let abs =
-        std::fs::canonicalize(path).with_context(|| format!("no such file: {}", path.display()))?;
-    let engine = runtime::build_engine()?;
-    let root = find_project_root(&engine, &abs);
-    let rel = indexer::rel_path_str(&root, &abs);
-    let vf = engine.view_file(&root, &rel)?;
-    // Short form, same as the MCP tool emits (D9): a deep path pushes the full
-    // URL past a terminal's width, where it wraps and stops being clickable.
-    let bases = runtime::ensure_daemon_bases();
-    let urls: Vec<String> = bases
-        .iter()
-        .map(|base| format!("{base}/s/{}", vf.code))
-        .collect();
-    let long_urls: Vec<String> = bases
-        .iter()
-        .map(|base| format!("{base}{}", vf.url))
-        .collect();
-    if json {
-        println!("{}", open_json(&urls, &long_urls, &vf.code, &vf.project_id));
-    } else if urls.len() > 1 {
-        println!("{}", format_url_choices(&urls));
-    } else {
-        println!("{}", urls.first().cloned().unwrap_or_default());
-    }
-    Ok(())
-}
-
-/// Pure JSON-shape builder for `cmd_open --json` (unit-tested without a live
-/// daemon): `url` stays the primary (first) URL for back-compat, `urls` is
-/// the full list mirroring the MCP `structuredContent` contract
-/// (decision `d88c028b`).
-fn open_json(
-    urls: &[String],
-    long_urls: &[String],
-    code: &str,
-    project_id: &str,
-) -> serde_json::Value {
-    let primary = urls.first().cloned().unwrap_or_default();
-    serde_json::json!({
-        "url": primary,
-        "urls": urls,
-        "long_url": long_urls.first().cloned().unwrap_or_default(),
-        "long_urls": long_urls,
-        "code": code,
-        "project_id": project_id
-    })
-}
-
-/// Multi-line "pick a reachable IP" framing for text-mode output when
-/// `ensure_daemon_bases()` returns more than one URL, matching the format
-/// `mcp.rs::handle_tool_call` already uses (D3: CLI/MCP text parity).
-fn format_url_choices(urls: &[String]) -> String {
-    let lines = urls
-        .iter()
-        .map(|u| format!("  {u}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("Viewable at (pick a reachable IP):\n{lines}")
-}
-
-/// Find the registered project root containing `file`, else the nearest ancestor
-/// with a project marker, else the file's parent directory.
-fn find_project_root(engine: &waggledance_core::Engine, file: &Path) -> PathBuf {
-    if let Ok(projects) = engine.list_projects() {
-        if let Some(p) = projects.iter().find(|p| file.starts_with(&p.root_path)) {
-            return p.root_path.clone();
-        }
-    }
-    root_by_marker(file).unwrap_or_else(|| {
-        file.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    })
-}
-
-/// Filenames that mark a directory as a project root.
-///
-/// `.mdview.json` is kept on purpose, not left behind (D8). This marker lives in
-/// other people's repositories — it is their file, not ours — so dropping it would
-/// silently lose project-root detection in repos whose owners did nothing wrong.
-const PROJECT_MARKERS: &[&str] = &[
-    ".waggledance.json",
-    ".mdview.json",
-    ".git",
-    "CLAUDE.md",
-    "README.md",
-];
-
-/// Walks up from `file` for the nearest directory carrying a [`PROJECT_MARKERS`]
-/// entry. Split out from [`find_project_root`] so the walk is testable without an
-/// [`waggledance_core::Engine`].
-fn root_by_marker(file: &Path) -> Option<PathBuf> {
-    let mut dir = file.parent();
-    while let Some(d) = dir {
-        if PROJECT_MARKERS.iter().any(|m| d.join(m).exists()) {
-            return Some(d.to_path_buf());
-        }
-        dir = d.parent();
-    }
-    None
 }
 
 fn cmd_list(json: bool) -> Result<()> {
@@ -520,35 +369,14 @@ fn cmd_list(json: bool) -> Result<()> {
     if json {
         let arr: Vec<_> = projects
             .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "id": p.id, "name": p.name, "root_path": p.root_path,
-                    "file_count": engine.file_count(&p.id).unwrap_or(0)
-                })
-            })
+            .map(|p| serde_json::json!({ "id": p.id, "name": p.name, "root_path": p.root_path }))
             .collect();
         println!("{}", serde_json::json!({ "projects": arr }));
     } else if projects.is_empty() {
         println!("No projects registered.");
     } else {
         for p in &projects {
-            let c = engine.file_count(&p.id).unwrap_or(0);
-            println!("{:<20} {:>5} files  {}", p.id, c, p.root_path.display());
-        }
-    }
-    Ok(())
-}
-
-fn cmd_search(query: &str, project: Option<&str>, limit: usize, json: bool) -> Result<()> {
-    let engine = runtime::build_engine()?;
-    let results = engine.search(query, project, limit)?;
-    if json {
-        println!("{}", serde_json::json!({ "results": results }));
-    } else if results.is_empty() {
-        println!("No matches.");
-    } else {
-        for r in &results {
-            println!("{}  {}", r.title, r.url);
+            println!("{:<20} {}", p.id, p.root_path.display());
         }
     }
     Ok(())
@@ -558,41 +386,22 @@ fn cmd_status(json: bool) -> Result<()> {
     let engine = runtime::build_engine()?;
     let daemon = runtime::running_daemon();
     let projects = engine.list_projects()?;
-    let files = engine.store.total_file_count()?;
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "running": daemon.is_some(),
-                "server_url": daemon.as_ref().map(|d| format!("http://{}:{}", d.host, d.port)),
+                "pid": daemon.as_ref().map(|d| d.pid),
                 "version": env!("CARGO_PKG_VERSION"),
                 "project_count": projects.len(),
-                "indexed_file_count": files,
             })
         );
     } else {
         match &daemon {
-            Some(d) => println!("running: http://{}:{} (pid {})", d.host, d.port, d.pid),
+            Some(d) => println!("running: pid {}", d.pid),
             None => println!("running: no"),
         }
-        println!("projects: {}  indexed files: {}", projects.len(), files);
-    }
-    Ok(())
-}
-
-fn cmd_refresh(project: Option<&str>) -> Result<()> {
-    let engine = runtime::build_engine()?;
-    match project {
-        Some(id) => {
-            let n = engine.refresh(id)?;
-            println!("Reindexed {n} files in '{id}'.");
-        }
-        None => {
-            for p in engine.list_projects()? {
-                let n = engine.refresh(&p.id)?;
-                println!("{}: {n} files", p.id);
-            }
-        }
+        println!("projects: {}", projects.len());
     }
     Ok(())
 }
@@ -604,18 +413,8 @@ fn cmd_unregister(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stop the daemon named by the lock file, if any. Removes the lock either way
-/// (a failed kill means the process is already gone). Returns `(pid, killed_ok)`
-/// when a lock existed, or `None` when no daemon was recorded.
 fn stop_daemon() -> Option<(u32, bool)> {
     let info = runtime::read_lock()?;
-    // Confirm the lock's host:port actually answers as an waggledance daemon
-    // BEFORE sending a kill signal by pid. A stale lock's pid may since have
-    // been recycled by an unrelated live process; killing by pid alone,
-    // without this check, would signal that unrelated process even though
-    // it is not the daemon the lock once named. A lock whose port doesn't
-    // answer is stale by definition (same test `running_daemon()` uses
-    // everywhere else) — nothing to kill, so just clear it.
     if runtime::running_daemon().is_none() {
         runtime::remove_lock();
         return Some((info.pid, false));
@@ -632,11 +431,6 @@ fn stop_daemon() -> Option<(u32, bool)> {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    // Clear the lock unless the daemon is genuinely orphaned — a kill that
-    // failed while the daemon still answers on its port. Deleting the lock in
-    // that case would strand a live daemon that `stop`/`status` can no longer
-    // reach and let `restart` spawn a second one. A failed kill on an already
-    // dead process (health check fails) is a stale lock and is cleared.
     let orphaned = !ok && runtime::running_daemon().is_some();
     if !orphaned {
         runtime::remove_lock();
@@ -673,7 +467,7 @@ fn cmd_stop() -> Result<()> {
 
 fn cmd_restart() -> Result<()> {
     println!("{}", restart_stop_message(stop_daemon()));
-    // Wait for the old process to actually exit so the port and lock are free.
+    // Wait for the old process to actually exit so the lock is free.
     for _ in 0..30 {
         if runtime::running_daemon().is_none() {
             break;
@@ -685,11 +479,7 @@ fn cmd_restart() -> Result<()> {
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Some(info) = runtime::running_daemon() {
-            let primary = runtime::ensure_daemon_bases()
-                .into_iter()
-                .next()
-                .unwrap_or_default();
-            println!("Started daemon (pid {}) at {}", info.pid, primary);
+            println!("Started daemon (pid {}).", info.pid);
             return Ok(());
         }
     }
@@ -796,104 +586,6 @@ mod stop_restart_message_tests {
     #[test]
     fn restart_stop_message_reports_no_daemon_was_running() {
         assert_eq!(restart_stop_message(None), "No daemon was running.");
-    }
-}
-
-#[cfg(test)]
-mod open_url_shape_tests {
-    use super::*;
-
-    fn urls(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn open_json_single_url_sets_url_and_urls_consistently() {
-        let u = urls(&["http://127.0.0.1:7700/s/a3f9c1d20b74"]);
-        let long = urls(&["http://127.0.0.1:7700/p/proj1/docs/a.md"]);
-        let v = open_json(&u, &long, "a3f9c1d20b74", "proj1");
-        assert_eq!(v["url"], "http://127.0.0.1:7700/s/a3f9c1d20b74");
-        assert_eq!(
-            v["urls"],
-            serde_json::json!(["http://127.0.0.1:7700/s/a3f9c1d20b74"])
-        );
-        assert_eq!(v["project_id"], "proj1");
-    }
-
-    #[test]
-    fn open_json_multi_url_keeps_primary_as_first_and_lists_all() {
-        let u = urls(&[
-            "http://192.168.1.5:7700/s/a3f9c1d20b74",
-            "http://10.0.0.2:7700/s/a3f9c1d20b74",
-        ]);
-        let long = urls(&[
-            "http://192.168.1.5:7700/p/proj1/docs/a.md",
-            "http://10.0.0.2:7700/p/proj1/docs/a.md",
-        ]);
-        let v = open_json(&u, &long, "a3f9c1d20b74", "proj1");
-        assert_eq!(v["url"], "http://192.168.1.5:7700/s/a3f9c1d20b74");
-        assert_eq!(v["urls"], serde_json::json!(u));
-        assert_eq!(v["url"], v["urls"][0]);
-    }
-
-    #[test]
-    fn open_json_empty_urls_defaults_primary_to_empty_string() {
-        let v = open_json(&[], &[], "", "proj1");
-        assert_eq!(v["url"], "");
-        assert_eq!(v["urls"], serde_json::json!(Vec::<String>::new()));
-    }
-
-    /// The long form stays reachable for anyone who still wants the real path;
-    /// only which one is *primary* changed.
-    #[test]
-    fn open_json_still_carries_the_long_url() {
-        let u = urls(&["http://127.0.0.1:7700/s/a3f9c1d20b74"]);
-        let long = urls(&["http://127.0.0.1:7700/p/proj1/docs/a.md"]);
-        let v = open_json(&u, &long, "a3f9c1d20b74", "proj1");
-        assert_eq!(v["long_url"], "http://127.0.0.1:7700/p/proj1/docs/a.md");
-        assert_eq!(v["code"], "a3f9c1d20b74");
-    }
-
-    /// D8: the old marker filename keeps working. It sits in repositories this
-    /// project does not own, so a clean break would strand people who did nothing.
-    #[test]
-    fn both_marker_filenames_resolve_a_project_root() {
-        for marker in [".waggledance.json", ".mdview.json"] {
-            let root = std::env::temp_dir().join(format!(
-                "waggledance-marker-{}-{}-{}",
-                marker.trim_start_matches('.'),
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let nested = root.join("docs").join("deep");
-            std::fs::create_dir_all(&nested).unwrap();
-            // Only this one marker exists — no .git, no README.md, nothing else
-            // that could resolve the root for the wrong reason.
-            std::fs::write(root.join(marker), b"{}").unwrap();
-            let file = nested.join("a.md");
-            std::fs::write(&file, b"# a").unwrap();
-
-            assert_eq!(
-                root_by_marker(&file).as_deref(),
-                Some(root.as_path()),
-                "{marker} must mark a project root"
-            );
-
-            std::fs::remove_dir_all(&root).ok();
-        }
-    }
-
-    #[test]
-    fn format_url_choices_lists_every_url_indented_with_pick_framing() {
-        let u = urls(&["http://192.168.1.5:7700", "http://10.0.0.2:7700"]);
-        let text = format_url_choices(&u);
-        assert_eq!(
-            text,
-            "Viewable at (pick a reachable IP):\n  http://192.168.1.5:7700\n  http://10.0.0.2:7700"
-        );
     }
 }
 

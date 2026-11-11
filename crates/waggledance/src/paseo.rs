@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use waggledance_core::config::PaseoConfig;
 use waggledance_core::domain::{LeaderHold, Project};
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 use waggledance_core::project_settings::ProjectPaseo;
 use waggledance_core::Engine;
 
