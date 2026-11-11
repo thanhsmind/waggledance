@@ -7,7 +7,7 @@ bee:
   id: an-fts5-delete-by-unindexed-column-scans-the-whole-table
   lifecycle: active
   areas: [registry]
-  anchors: [crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/engine.rs, crates/waggledance-core/src/indexer.rs, crates/waggledance/src/watch.rs]
+  anchors: [crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/engine.rs, crates/waggledance-core/src/indexer.rs, crates/waggledance/src/watch.rs, crates/waggledance/src/server.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/views.rs, crates/waggledance/src/cli.rs]
   sources: [docs/history/registry-db-lock/CONTEXT.md, docs/history/registry-db-lock/plan.md]
   polarity: pitfall
   critical: true
@@ -28,6 +28,7 @@ Read when: runs fail with "database is locked", registry.db is far larger than i
 - The reproduction is a second connection holding `BEGIN IMMEDIATE` while `Engine::refresh` reconciles an indexed, unchanged project: red on the base commit with "database is locked", green after.
 - `reclaim_legacy_index` empties the legacy table's shadow tables in 200-rowid `BEGIN IMMEDIATE` batches, then drops, recreates empty, `VACUUM`s and truncates the WAL. A bare `DROP TABLE` on the full table held the lock 43.5 s.
 - The watcher indexed any markdown path it saw, including ignored and excluded ones the walk never lists. It now indexes a path only when `indexer::walk_would_index` agrees with the walk or the path already has a `files` row, so a known ignored file still reports its change.
+- `serve` calls `reclaim_legacy_index` once before the startup reconcile and keeps starting when it errors. Old MCP servers still running refill `files_fts`, so every later `serve` start reclaims again. Search surfaces (MCP, CLI, web page) say titles and paths and show no excerpt; a zero-hit MCP answer says contents were not searched.
 
 ## Rejected
 

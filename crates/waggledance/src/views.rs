@@ -11325,11 +11325,10 @@ pub fn search_page(project: &Project, query: &str, results: &[SearchResult]) -> 
         for r in results {
             items.push_str(&format!(
                 "<a class=\"fg-card\" href=\"{url}\"><div class=\"fg-card__title\">{title}</div>\
-                 <div class=\"fg-card__sub\">{rel}</div><div class=\"fg-card__sub\">{excerpt}</div></a>",
+                 <div class=\"fg-card__sub\">{rel}</div></a>",
                 url = esc(&r.url),
                 title = esc(&r.title),
                 rel = esc(&r.rel_path),
-                excerpt = highlight_excerpt(&r.excerpt),
             ));
         }
     }
@@ -11350,13 +11349,6 @@ pub fn search_page(project: &Project, query: &str, results: &[SearchResult]) -> 
         items = items,
     );
     layout_with_drawer(&format!("search: {query}"), "", &body, false)
-}
-
-/// FTS snippets contain `<mark>…</mark>`. Escape everything, then restore marks.
-fn highlight_excerpt(excerpt: &str) -> String {
-    esc(excerpt)
-        .replace("&lt;mark&gt;", "<mark class=\"fg-mark\">")
-        .replace("&lt;/mark&gt;", "</mark>")
 }
 
 /// What the settings page's notification section renders for the Telegram
@@ -23846,6 +23838,22 @@ mod tests {
             html.contains("<title>Projects · Waggle Dance</title>"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn search_page_shows_title_and_path_without_an_excerpt() {
+        let project = sample_project();
+        let hit = SearchResult {
+            project_id: project.id.clone(),
+            rel_path: "docs/spec.md".into(),
+            title: "The Spec".into(),
+            url: "/p/x/docs/spec.md".into(),
+            excerpt: String::new(),
+            score: 0.0,
+        };
+        let html = search_page(&project, "spec", &[hit]);
+        assert!(html.contains("The Spec"));
+        assert!(html.contains("docs/spec.md"));
     }
 
     /// D2 reflected path: `search_page` builds its title from the raw query
