@@ -20,7 +20,8 @@ pub async fn run(engine: Arc<Engine>) {
         let e = engine.clone();
         let days = engine.config.worktree_sweep.older_than_days;
         let report = tokio::task::spawn_blocking(move || {
-            e.list_projects().map(|projects| sweep(&projects, days, PER_PROJECT_DEADLINE))
+            e.list_projects()
+                .map(|projects| sweep(&projects, days, PER_PROJECT_DEADLINE))
         })
         .await;
         match report {
@@ -37,9 +38,17 @@ fn log(report: &[ProjectSweep]) {
     let mut failed = 0;
     for project in report {
         match &project.outcome {
-            Outcome::Swept { removed: r, kept: k } => {
+            Outcome::Swept {
+                removed: r,
+                kept: k,
+            } => {
                 for v in r {
-                    tracing::info!("worktree sweep removed {} in {}: {}", v.worktree, project.project_id, v.reason);
+                    tracing::info!(
+                        "worktree sweep removed {} in {}: {}",
+                        v.worktree,
+                        project.project_id,
+                        v.reason
+                    );
                 }
                 removed += r.len();
                 kept += k.len();

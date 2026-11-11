@@ -498,6 +498,14 @@ Every `paseo` child process drops `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` and kee
 other variable, `PASEO_HOME` included. With those two set, a new agent becomes a child of
 the calling agent, and `paseo run` attaches it to the caller's workspace.
 
+## A held leader keeps its run working
+
+Read when: a leader ends its turn while work it handed out still runs, and its run reads done too soon, its leader is archived, or the heartbeat nudges it.
+
+A leader is held while it has an unexpired `waggledance hold` row or a Paseo child whose `ParentAgentId` is the leader, running or initializing (`paseo::held_work`). `paseo ls` has no parent field, so the children lookup lists running agents and inspects each; it runs only when a decision needs it, and a hold row decides first.
+
+A held leader's completed or idle turn end leaves the run `working` and polls `inspect` every `permission_poll` until `UpdatedAt` moves. Paseo's `wait` is never called on an idle leader, and a wake turn is never caught by seeing `running` (polling status every 5 s missed both). When the hold ends the run ends as before; an expiry adds `hold expired after N min (why)` to the transcript header. The idle sweep and the heartbeat skip a held leader. Every leader prompt but a steer note ends with the hold line, appended at send time so the stored task stays the caller's.
+
 ## Known limit
 
 A human who types to the leader while a delivery is in flight interrupts that turn —

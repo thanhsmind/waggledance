@@ -7,7 +7,7 @@ use waggledance_core::domain::{PermissionRequest, WdTask};
 use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::Engine;
 
-use crate::paseo::{AgentState, LeaderLock, Paseo, Permit};
+use crate::paseo::{self, AgentState, LeaderLock, Paseo, Permit};
 
 const RECIPIENT: &str = "wd";
 const WATCH_EVERY: Duration = Duration::from_secs(30);
@@ -192,7 +192,12 @@ impl Heartbeat {
             };
             if let (Some(leader), Some(state)) = (&task.leader_id, &state) {
                 if task.nudged_at.is_none() {
-                    if idle(state) && silent(task) {
+                    if idle(state)
+                        && silent(task)
+                        && paseo::held_work(self.paseo.as_ref(), &self.engine, leader)
+                            .await
+                            .is_none()
+                    {
                         self.nudge(task, leader).await;
                     }
                 } else if task.progress_sent_at.is_none() && silent(task) {
@@ -472,5 +477,28 @@ mod tests {
         r.engine.mark_task_mail("c-1", &now_rfc3339()).unwrap();
         r.heartbeat.beat().await;
         assert_eq!(r.kinds("board").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_held_silent_idle_leader_is_not_nudged() {
+        let r = rig();
+        r.task("c-1", "2026-10-22T10:01:00Z");
+        r.engine
+            .set_hold("lead", "waiting", Some(30), &now_rfc3339())
+            .unwrap();
+        r.heartbeat.beat().await;
+        assert!(r.nudges().is_empty());
+        r.engine.release_hold("lead").unwrap();
+        r.fake
+            .state
+            .lock()
+            .unwrap()
+            .children
+            .insert("lead".into(), vec!["kid".into()]);
+        r.heartbeat.beat().await;
+        assert!(r.nudges().is_empty());
+        r.fake.state.lock().unwrap().children.clear();
+        r.heartbeat.beat().await;
+        assert_eq!(r.nudges().len(), 1);
     }
 }

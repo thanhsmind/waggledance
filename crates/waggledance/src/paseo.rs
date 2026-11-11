@@ -6,8 +6,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 use waggledance_core::config::PaseoConfig;
-use waggledance_core::domain::Project;
+use waggledance_core::domain::{LeaderHold, Project};
+use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::project_settings::ProjectPaseo;
+use waggledance_core::Engine;
 
 pub const ROLE_LABEL: &str = "waggledance.role=leader";
 pub const WD_LABEL: &str = "waggledance.via=wd";
@@ -62,6 +64,7 @@ pub struct AgentState {
     pub pending_permissions: usize,
     pub permissions: Vec<PendingPermission>,
     pub updated_at: Option<String>,
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -156,6 +159,7 @@ pub trait Paseo: Send + Sync {
     async fn run_leaders(&self, project_id: &str, run_id: &str) -> Result<Vec<String>>;
     async fn all_leaders(&self) -> Result<Vec<String>>;
     async fn inspect(&self, id: &str) -> Result<AgentState>;
+    async fn children(&self, id: &str) -> Result<Vec<String>>;
     async fn workspaces(&self) -> Result<Vec<Workspace>>;
     async fn providers(&self) -> Result<Vec<String>>;
     fn stored_workspaces(&self) -> Vec<StoredWorkspace>;
@@ -290,7 +294,50 @@ pub fn steer_task(task: &str) -> String {
     format!("{STEER_MARKER}\n\n{task}")
 }
 
+pub const HOLD_LINE: &str = "Before ending a turn while work you handed out is still running, \
+                             run `waggledance hold --why \"<what it waits for>\"`; when that work \
+                             reports, mail your result or run `waggledance hold --release`.";
+
+pub fn with_hold_line(task: &str) -> String {
+    match is_steer(task) {
+        true => task.to_string(),
+        false => format!("{task}\n\n{HOLD_LINE}"),
+    }
+}
+
+pub struct Held {
+    pub why: String,
+    pub hold: Option<LeaderHold>,
+}
+
+pub async fn held_work(paseo: &dyn Paseo, engine: &Engine, leader: &str) -> Option<Held> {
+    match engine.live_hold(leader, &now_rfc3339()) {
+        Ok(Some(hold)) => {
+            return Some(Held {
+                why: format!("held: {}", hold.why),
+                hold: Some(hold),
+            })
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("could not read leader {leader}'s hold: {e}"),
+    }
+    match paseo.children(leader).await {
+        Ok(kids) if !kids.is_empty() => Some(Held {
+            why: format!("its Paseo child {} is still running", kids.join(", ")),
+            hold: None,
+        }),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("could not list leader {leader}'s children: {e}");
+            None
+        }
+    }
+}
+
 pub fn task_body(task: &str) -> &str {
+    let task = task
+        .strip_suffix(&format!("\n\n{HOLD_LINE}"))
+        .unwrap_or(task);
     match wd_corr(task) {
         Some(corr) => {
             let preamble = wd_task(corr, "");
@@ -704,6 +751,7 @@ pub fn parse_inspect(stdout: &str) -> std::result::Result<AgentState, String> {
         pending_permissions: i.pending_permissions.len(),
         permissions: i.pending_permissions,
         updated_at: i.updated_at,
+        parent: i.parent_agent_id,
     })
 }
 
@@ -855,6 +903,8 @@ struct Inspected {
     pending_permissions: Vec<PendingPermission>,
     #[serde(default)]
     updated_at: Option<String>,
+    #[serde(default)]
+    parent_agent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -885,6 +935,24 @@ impl Paseo for PaseoCli {
             .exec(&["inspect".into(), id.into(), "--json".into()], TIMEOUT)
             .await?;
         parse_inspect(&out).map_err(|e| unparsable(&binary, "inspect", e))
+    }
+
+    async fn children(&self, id: &str) -> Result<Vec<String>> {
+        let (binary, out) = self
+            .exec(&["ls".into(), "-g".into(), "--json".into()], TIMEOUT)
+            .await?;
+        let listed = parse_listed(&out).map_err(|e| unparsable(&binary, "ls", e))?;
+        let mut kids = Vec::new();
+        for agent in listed
+            .into_iter()
+            .filter(|a| matches!(a.status.as_str(), "running" | "initializing"))
+        {
+            let state = self.inspect(&agent.id).await?;
+            if !state.archived && state.parent.as_deref() == Some(id) {
+                kids.push(agent.id);
+            }
+        }
+        Ok(kids)
     }
 
     async fn workspaces(&self) -> Result<Vec<Workspace>> {
@@ -1225,6 +1293,7 @@ pub mod fake {
     pub enum Call {
         RunLeaders(String, String),
         Inspect(String),
+        Children(String),
         Workspaces,
         Providers,
         CreateWorkspace(PathBuf),
@@ -1259,6 +1328,7 @@ pub mod fake {
         pub appear_after: Duration,
         pub run_after: Duration,
         pub gone_after_run: bool,
+        pub children: HashMap<String, Vec<String>>,
         pub calls: Vec<Call>,
     }
 
@@ -1282,6 +1352,7 @@ pub mod fake {
                     pending_permissions: 0,
                     permissions: Vec::new(),
                     updated_at: None,
+                    parent: None,
                 },
             );
             s.modes
@@ -1430,6 +1501,18 @@ pub mod fake {
                 command: "inspect".into(),
                 status: "no such agent".into(),
             })
+        }
+
+        async fn children(&self, id: &str) -> Result<Vec<String>> {
+            self.record(Call::Children(id.to_string()));
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .children
+                .get(id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn workspaces(&self) -> Result<Vec<Workspace>> {
@@ -2057,6 +2140,7 @@ mod tests {
                     tool: String::new(),
                 }],
                 updated_at: Some("2026-10-14T14:04:56.399Z".into()),
+                parent: None,
             }
         );
         assert_eq!(cli.workspaces().await.unwrap()[0].id, "wks_1");
@@ -2808,5 +2892,13 @@ mod tests {
             paseo_home(Some("/srv/ph".into())),
             Some(PathBuf::from("/srv/ph"))
         );
+    }
+
+    #[test]
+    fn inspect_reads_the_parent_agent_id() {
+        let child = parse_inspect(r#"{"Status":"running","ParentAgentId":"lead-1"}"#).unwrap();
+        assert_eq!(child.parent.as_deref(), Some("lead-1"));
+        let root = parse_inspect(r#"{"Status":"idle","ParentAgentId":null}"#).unwrap();
+        assert_eq!(root.parent, None);
     }
 }

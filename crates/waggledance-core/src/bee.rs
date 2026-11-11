@@ -6306,8 +6306,14 @@ mod tests {
         let snap = read_snapshot(&root);
         let closed = snap.sessions.iter().find(|s| s.id == "closed").unwrap();
         let reopened = snap.sessions.iter().find(|s| s.id == "reopened").unwrap();
-        assert!(!closed.live, "a session closed after its last heartbeat is not live");
-        assert!(reopened.live, "a heartbeat after closed_at means the session came back");
+        assert!(
+            !closed.live,
+            "a session closed after its last heartbeat is not live"
+        );
+        assert!(
+            reopened.live,
+            "a heartbeat after closed_at means the session came back"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
