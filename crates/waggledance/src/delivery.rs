@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use waggledance_core::domain::Run;
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 use waggledance_core::notify_store::NotifyStore;
 use waggledance_core::Engine;
 

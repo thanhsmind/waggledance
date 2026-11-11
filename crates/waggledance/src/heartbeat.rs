@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 use waggledance_core::domain::{PermissionRequest, WdTask};
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 use waggledance_core::Engine;
 
 use crate::paseo::{self, AgentState, LeaderLock, Paseo, Permit};

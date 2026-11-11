@@ -46,7 +46,7 @@ use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use waggledance_core::domain::Run;
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 use waggledance_core::Engine;
 
 use crate::herdr::{AgentStatus, Herdr, ReadSource, Snapshot};

@@ -16,7 +16,7 @@ use std::path::Path;
 use waggledance_core::bee;
 use waggledance_core::config::{registry_db_path, resolve_data_dir};
 use waggledance_core::domain::{Project, Run};
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 use waggledance_core::notify_store::NotifyStore;
 use waggledance_core::{Config, Engine, SqliteStore};
 
@@ -2186,7 +2186,7 @@ mod tests {
         write(&inside, "docs/a.md", "# Project");
         // A live bee session claiming w1:p1 — the join's whole input. Its
         // heartbeat is stamped now so the session reads live.
-        let now = waggledance_core::indexer::now_rfc3339();
+        let now = waggledance_core::engine::now_rfc3339();
         write(
             &inside,
             ".bee/sessions/s1.json",
@@ -3097,7 +3097,7 @@ mod tests {
     }
 
     fn seeded_run(project_id: &str, id: &str) -> Run {
-        let now = waggledance_core::indexer::now_rfc3339();
+        let now = waggledance_core::engine::now_rfc3339();
         Run {
             id: id.to_string(),
             project_id: project_id.to_string(),

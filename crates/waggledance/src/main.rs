@@ -1055,12 +1055,12 @@ mod terminal_background_tests {
             id: "proj-1".into(),
             name: "test-proj".into(),
             root_path: std::path::PathBuf::from("/tmp/test"),
-            created_at: waggledance_core::indexer::now_rfc3339(),
-            last_seen_at: waggledance_core::indexer::now_rfc3339(),
+            created_at: waggledance_core::engine::now_rfc3339(),
+            last_seen_at: waggledance_core::engine::now_rfc3339(),
             orchestration_enabled: true,
         };
         engine.store.upsert_project(&project).unwrap();
-        let now = waggledance_core::indexer::now_rfc3339();
+        let now = waggledance_core::engine::now_rfc3339();
 
         // 1. Working run owns the pane -> is_pane_owned_by_run is true
         let run = waggledance_core::domain::Run {

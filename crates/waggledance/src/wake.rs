@@ -8,7 +8,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use waggledance_core::config::OpenClawConfig;
 use waggledance_core::domain::InboxMessage;
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 use waggledance_core::Engine;
 
 use crate::paseo::parse_document;

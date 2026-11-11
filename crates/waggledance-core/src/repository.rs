@@ -1,17 +1,12 @@
-//! SQLite adapter: project registry + file index + title/path search.
+//! SQLite adapter: project registry, runs, inbox, tasks and holds.
 //! Behind a `Mutex<Connection>` so it is Send+Sync for the async daemon.
 
-use crate::domain::{
-    InboxMessage, IndexedFile, LeaderHold, LeaderRun, PermissionRequest, Project, Run,
-    SearchResult, WdTask,
-};
+use crate::domain::{InboxMessage, LeaderHold, LeaderRun, PermissionRequest, Project, Run, WdTask};
 use crate::error::Result;
-use crate::short_link;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -93,8 +88,6 @@ impl SqliteStore {
 
     pub fn delete_project(&self, id: &str) -> Result<()> {
         let c = self.conn.lock().unwrap();
-        c.execute("DELETE FROM files WHERE project_id=?1", params![id])?;
-        c.execute("DELETE FROM links WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM runs WHERE project_id=?1", params![id])?;
         c.execute("DELETE FROM inbox WHERE project_id=?1", params![id])?;
         c.execute(
@@ -950,297 +943,6 @@ impl SqliteStore {
         )?;
         Ok(tasks + requests)
     }
-
-    // ---- files ----
-
-    pub fn upsert_file(&self, f: &IndexedFile, content_hash: &str) -> Result<()> {
-        let c = self.conn.lock().unwrap();
-        c.execute(
-            "INSERT INTO files(project_id,rel_path,abs_path,title,size_bytes,modified_at,path_hash,content_hash)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(project_id,rel_path) DO UPDATE SET
-               abs_path=?3, title=?4, size_bytes=?5, modified_at=?6, path_hash=?7, content_hash=?8",
-            params![
-                f.project_id,
-                f.rel_path,
-                f.abs_path.to_string_lossy(),
-                f.title,
-                f.size_bytes as i64,
-                f.modified_at,
-                short_link::path_hash(&f.project_id, &f.rel_path),
-                content_hash
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_file(&self, project_id: &str, rel_path: &str) -> Result<()> {
-        let c = self.conn.lock().unwrap();
-        c.execute(
-            "DELETE FROM files WHERE project_id=?1 AND rel_path=?2",
-            params![project_id, rel_path],
-        )?;
-        c.execute(
-            "DELETE FROM links WHERE project_id=?1 AND source_rel=?2",
-            params![project_id, rel_path],
-        )?;
-        Ok(())
-    }
-
-    // ---- links / backlinks (FR-18) ----
-
-    /// Replace the set of outgoing internal links for a source file.
-    pub fn set_file_links(
-        &self,
-        project_id: &str,
-        source_rel: &str,
-        targets: &[String],
-    ) -> Result<()> {
-        let c = self.conn.lock().unwrap();
-        let stored: HashSet<String> = {
-            let mut stmt =
-                c.prepare("SELECT target_rel FROM links WHERE project_id=?1 AND source_rel=?2")?;
-            let rows = stmt.query_map(params![project_id, source_rel], |r| r.get(0))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        if stored.len() == targets.iter().collect::<HashSet<_>>().len()
-            && targets.iter().all(|t| stored.contains(t))
-        {
-            return Ok(());
-        }
-        c.execute(
-            "DELETE FROM links WHERE project_id=?1 AND source_rel=?2",
-            params![project_id, source_rel],
-        )?;
-        for t in targets {
-            c.execute(
-                "INSERT OR IGNORE INTO links(project_id,source_rel,target_rel) VALUES(?1,?2,?3)",
-                params![project_id, source_rel, t],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Files that link *to* `target_rel` → (source_rel, title).
-    pub fn backlinks(&self, project_id: &str, target_rel: &str) -> Result<Vec<(String, String)>> {
-        let c = self.conn.lock().unwrap();
-        let mut stmt = c.prepare(
-            "SELECT l.source_rel, COALESCE(f.title, l.source_rel)
-             FROM links l
-             LEFT JOIN files f ON f.project_id = l.project_id AND f.rel_path = l.source_rel
-             WHERE l.project_id = ?1 AND l.target_rel = ?2
-             ORDER BY l.source_rel",
-        )?;
-        let rows = stmt.query_map(params![project_id, target_rel], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    pub fn get_file(&self, project_id: &str, rel_path: &str) -> Result<Option<IndexedFile>> {
-        let c = self.conn.lock().unwrap();
-        let mut stmt = c.prepare("SELECT project_id,abs_path,rel_path,title,size_bytes,modified_at FROM files WHERE project_id=?1 AND rel_path=?2")?;
-        let mut rows = stmt.query(params![project_id, rel_path])?;
-        Ok(rows.next()?.map(row_to_file))
-    }
-
-    pub fn list_files(&self, project_id: &str) -> Result<Vec<IndexedFile>> {
-        let c = self.conn.lock().unwrap();
-        let mut stmt = c.prepare("SELECT project_id,abs_path,rel_path,title,size_bytes,modified_at FROM files WHERE project_id=?1 ORDER BY rel_path")?;
-        let rows = stmt.query_map(params![project_id], |r| Ok(row_to_file(r)))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    pub fn file_hash(&self, project_id: &str, rel_path: &str) -> Result<Option<String>> {
-        let c = self.conn.lock().unwrap();
-        let mut stmt =
-            c.prepare("SELECT content_hash FROM files WHERE project_id=?1 AND rel_path=?2")?;
-        let mut rows = stmt.query(params![project_id, rel_path])?;
-        Ok(rows.next()?.map(|r| r.get_unwrap::<_, String>(0)))
-    }
-
-    /// Absolute paths of every indexed file in a project — the link resolver index.
-    pub fn file_abs_paths(&self, project_id: &str) -> Result<HashSet<PathBuf>> {
-        let c = self.conn.lock().unwrap();
-        let mut stmt = c.prepare("SELECT abs_path FROM files WHERE project_id=?1")?;
-        let rows = stmt.query_map(params![project_id], |r| r.get::<_, String>(0))?;
-        Ok(rows.filter_map(|r| r.ok()).map(PathBuf::from).collect())
-    }
-
-    /// The file a short code points at, or `None` when nothing matches.
-    ///
-    /// The pattern is built in Rust and bound as one parameter. Concatenating in
-    /// SQL (`path_hash GLOB ?1 || '*'`) returns the same rows but makes the
-    /// right-hand side an expression, which disables SQLite's GLOB index
-    /// optimisation and silently turns this into a full table scan — see
-    /// `short_link::hash_prefix_pattern`.
-    ///
-    /// Two files sharing a 12-character prefix is ~1.8e-5 likely even at 100k
-    /// files, so the tie-break only has to be *stable*, not clever: order by the
-    /// primary key and take the first.
-    pub fn find_by_hash_prefix(&self, code: &str) -> Result<Option<(String, String)>> {
-        if code.is_empty() {
-            return Ok(None);
-        }
-        let c = self.conn.lock().unwrap();
-        let mut stmt = c.prepare(
-            "SELECT project_id, rel_path FROM files
-             WHERE path_hash GLOB ?1
-             ORDER BY project_id, rel_path
-             LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![short_link::hash_prefix_pattern(code)])?;
-        match rows.next()? {
-            Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
-            None => Ok(None),
-        }
-    }
-
-    /// Query plan for [`find_by_hash_prefix`], so a test can prove it still uses
-    /// the hash index rather than only proving it returns the right row.
-    #[cfg(test)]
-    fn hash_prefix_query_plan(&self, code: &str) -> Result<String> {
-        let c = self.conn.lock().unwrap();
-        let mut stmt = c.prepare(
-            "EXPLAIN QUERY PLAN
-             SELECT project_id, rel_path FROM files
-             WHERE path_hash GLOB ?1
-             ORDER BY project_id, rel_path
-             LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![short_link::hash_prefix_pattern(code)])?;
-        let mut plan = String::new();
-        while let Some(r) = rows.next()? {
-            plan.push_str(&r.get::<_, String>(3)?);
-            plan.push('\n');
-        }
-        Ok(plan)
-    }
-
-    pub fn file_count(&self, project_id: &str) -> Result<usize> {
-        let c = self.conn.lock().unwrap();
-        let n: i64 = c.query_row(
-            "SELECT COUNT(*) FROM files WHERE project_id=?1",
-            params![project_id],
-            |r| r.get(0),
-        )?;
-        Ok(n as usize)
-    }
-
-    /// `(schema version, files still missing a short-link code)` — what `mdview
-    /// doctor` reports so an operator can see whether an upgrade finished.
-    pub fn schema_report(&self) -> Result<(i64, usize)> {
-        let c = self.conn.lock().unwrap();
-        let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        let unhashed: i64 =
-            c.query_row("SELECT COUNT(*) FROM files WHERE path_hash=''", [], |r| {
-                r.get(0)
-            })?;
-        Ok((version, unhashed as usize))
-    }
-
-    pub fn total_file_count(&self) -> Result<usize> {
-        let c = self.conn.lock().unwrap();
-        let n: i64 = c.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
-        Ok(n as usize)
-    }
-
-    // ---- search (title and path) ----
-
-    pub fn search(
-        &self,
-        query: &str,
-        project_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>> {
-        let terms: Vec<String> = query.split_whitespace().map(fold).collect();
-        if terms.is_empty() {
-            return Ok(vec![]);
-        }
-        let rows: Vec<(String, String, String)> = {
-            let c = self.conn.lock().unwrap();
-            let mut stmt = c.prepare(
-                "SELECT project_id, rel_path, title FROM files WHERE (?1 IS NULL OR project_id = ?1)",
-            )?;
-            let rows = stmt.query_map(params![project_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        let mut hits: Vec<(bool, String, String, String)> = rows
-            .into_iter()
-            .filter_map(|(project_id, rel_path, title)| {
-                let folded_title = fold(&title);
-                let folded_path = fold(&rel_path);
-                let matched = terms
-                    .iter()
-                    .all(|t| folded_title.contains(t) || folded_path.contains(t));
-                let in_title = terms.iter().all(|t| folded_title.contains(t));
-                matched.then_some((!in_title, rel_path, project_id, title))
-            })
-            .collect();
-        hits.sort();
-        Ok(hits
-            .into_iter()
-            .take(limit)
-            .map(|(_, rel_path, project_id, title)| SearchResult {
-                url: format!("/p/{project_id}/{rel_path}"),
-                project_id,
-                rel_path,
-                title,
-                excerpt: String::new(),
-                score: 0.0,
-            })
-            .collect())
-    }
-
-    pub fn reclaim_legacy_index(&self) -> Result<bool> {
-        let c = self.conn.lock().unwrap();
-        let populated: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM files_fts_content)
-                 OR EXISTS(SELECT 1 FROM files_fts_data WHERE rowid > 10)",
-            [],
-            |r| r.get(0),
-        )?;
-        if !populated {
-            return Ok(false);
-        }
-        for (table, keep) in [
-            ("files_fts_content", ""),
-            ("files_fts_docsize", ""),
-            ("files_fts_data", " WHERE rowid > 10"),
-        ] {
-            let sql = format!(
-                "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table}{keep} LIMIT 200)"
-            );
-            loop {
-                c.execute_batch("BEGIN IMMEDIATE")?;
-                let deleted = match c.execute(&sql, []) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        c.execute_batch("ROLLBACK").ok();
-                        return Err(e.into());
-                    }
-                };
-                c.execute_batch("COMMIT")?;
-                if deleted == 0 {
-                    break;
-                }
-            }
-        }
-        c.execute_batch(
-            "DROP TABLE files_fts;
-             CREATE VIRTUAL TABLE files_fts USING fts5(
-                 project_id UNINDEXED,
-                 rel_path UNINDEXED,
-                 title,
-                 content
-             );
-             VACUUM;",
-        )?;
-        c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-        Ok(true)
-    }
 }
 
 /// Ordered, append-only migration steps.
@@ -1257,7 +959,6 @@ impl SqliteStore {
 /// mechanical swap rather than a redesign.
 type MigrationStep = (i64, fn(&Connection) -> Result<()>);
 const MIGRATIONS: &[MigrationStep] = &[
-    (1, migration_1_path_hash),
     (2, migration_2_orchestration_enabled),
     (3, migration_3_runs_feature),
     (4, migration_4_runs_final_transcript),
@@ -1269,11 +970,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (10, migration_10_runs_follow_up),
     (11, migration_11_runs_handoff),
     (12, migration_12_leader_holds),
-    (13, migration_13_content_hash),
+    (14, migration_14_drop_file_store),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -1294,37 +995,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// v1 — short-link support. `path_hash` lets `/s/<code>` find a file without a
-/// separate shortlink table, so a code's lifetime is its index row's lifetime.
-fn migration_1_path_hash(conn: &Connection) -> Result<()> {
-    // A database created by this build already has the column from SCHEMA; one
-    // created by an older build does not, because `CREATE TABLE IF NOT EXISTS`
-    // leaves an existing table alone. The index has to be created here rather
-    // than in SCHEMA for the same reason: on a legacy database SCHEMA runs
-    // first, while the column still does not exist.
-    if !has_column(conn, "files", "path_hash")? {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN path_hash TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-    }
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(path_hash)",
-        [],
+fn migration_14_drop_file_store(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS files_fts;
+         DROP TABLE IF EXISTS links;
+         DROP TABLE IF EXISTS files;",
     )?;
-    backfill_path_hash(conn)
-}
-
-/// v13 (registry-db-lock D3) — content hash for change detection. Not
-/// backfilled: the migration reads no file, so the first change event for a
-/// pre-upgrade file reports a change once.
-fn migration_13_content_hash(conn: &Connection) -> Result<()> {
-    if !has_column(conn, "files", "content_hash")? {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-    }
     Ok(())
 }
 
@@ -1520,36 +1196,6 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Fill `path_hash` for every row still carrying the empty default.
-///
-/// Scoped to empty values rather than rewriting the whole table so an
-/// interrupted run costs only what it did not finish, and so a re-run after a
-/// crash is cheap rather than a full rewrite of 15k+ rows.
-fn backfill_path_hash(conn: &Connection) -> Result<()> {
-    let pending: Vec<(String, String)> = {
-        let mut stmt =
-            conn.prepare("SELECT project_id, rel_path FROM files WHERE path_hash = ''")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    if pending.is_empty() {
-        return Ok(());
-    }
-    conn.execute_batch("BEGIN")?;
-    for (project_id, rel_path) in &pending {
-        conn.execute(
-            "UPDATE files SET path_hash=?3 WHERE project_id=?1 AND rel_path=?2",
-            params![
-                project_id,
-                rel_path,
-                short_link::path_hash(project_id, rel_path)
-            ],
-        )?;
-    }
-    conn.execute_batch("COMMIT")?;
-    Ok(())
-}
-
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -1559,30 +1205,6 @@ CREATE TABLE IF NOT EXISTS projects (
     last_seen_at TEXT NOT NULL,
     orchestration_enabled INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS files (
-    project_id TEXT NOT NULL,
-    rel_path TEXT NOT NULL,
-    abs_path TEXT NOT NULL,
-    title TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
-    modified_at TEXT NOT NULL,
-    path_hash TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY(project_id, rel_path)
-);
-CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-    project_id UNINDEXED,
-    rel_path UNINDEXED,
-    title,
-    content
-);
-CREATE TABLE IF NOT EXISTS links (
-    project_id TEXT NOT NULL,
-    source_rel TEXT NOT NULL,
-    target_rel TEXT NOT NULL,
-    PRIMARY KEY(project_id, source_rel, target_rel)
-);
-CREATE INDEX IF NOT EXISTS idx_links_target ON links(project_id, target_rel);
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -1632,29 +1254,10 @@ fn row_to_run(r: &rusqlite::Row) -> Run {
     }
 }
 
-fn row_to_file(r: &rusqlite::Row) -> IndexedFile {
-    IndexedFile {
-        project_id: r.get_unwrap(0),
-        abs_path: PathBuf::from(r.get_unwrap::<_, String>(1)),
-        rel_path: r.get_unwrap(2),
-        title: r.get_unwrap(3),
-        size_bytes: r.get_unwrap::<_, i64>(4) as u64,
-        modified_at: r.get_unwrap(5),
-    }
-}
-
-fn fold(text: &str) -> String {
-    text.nfd()
-        .filter(|c| !is_combining_mark(*c))
-        .flat_map(|c| c.to_lowercase())
-        .map(|c| if c == 'đ' { 'd' } else { c })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{IndexedFile, Project, Run};
+    use crate::domain::{Project, Run};
 
     fn sample_project() -> Project {
         Project {
@@ -1682,21 +1285,33 @@ mod tests {
         }
     }
 
-    fn file(rel: &str, title: &str) -> IndexedFile {
-        IndexedFile {
-            project_id: "p1".into(),
-            abs_path: PathBuf::from("/proj").join(rel),
-            rel_path: rel.into(),
-            title: title.into(),
-            size_bytes: 10,
-            modified_at: "2026-07-15T00:00:00Z".into(),
-        }
+    #[test]
+    fn a_fresh_database_is_stamped_with_the_current_version_and_has_no_file_tables() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let c = s.conn.lock().unwrap();
+        let version: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(file_store_tables(&c), 0);
     }
 
-    /// A database as an older build left it: no `path_hash`, no `user_version`.
-    fn legacy_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
+    fn file_store_tables(c: &Connection) -> i64 {
+        c.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('files','links','files_fts')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migration_14_drops_the_file_tables_and_keeps_projects_and_runs() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_project(&sample_project()).unwrap();
+        s.insert_run(&sample_run(), Some("feat")).unwrap();
+        let c = s.conn.lock().unwrap();
+        c.execute_batch(
             "CREATE TABLE files (
                  project_id TEXT NOT NULL,
                  rel_path TEXT NOT NULL,
@@ -1704,351 +1319,53 @@ mod tests {
                  title TEXT NOT NULL,
                  size_bytes INTEGER NOT NULL,
                  modified_at TEXT NOT NULL,
+                 path_hash TEXT NOT NULL DEFAULT '',
+                 content_hash TEXT NOT NULL DEFAULT '',
                  PRIMARY KEY(project_id, rel_path)
              );
-             INSERT INTO files VALUES('mdview','docs/a.md','/x/docs/a.md','A',1,'t');
-             INSERT INTO files VALUES('mdview','README.md','/x/README.md','R',1,'t');",
+             CREATE INDEX idx_files_project ON files(project_id);
+             CREATE INDEX idx_files_hash ON files(path_hash);
+             CREATE TABLE links (
+                 project_id TEXT NOT NULL,
+                 source_rel TEXT NOT NULL,
+                 target_rel TEXT NOT NULL,
+                 PRIMARY KEY(project_id, source_rel, target_rel)
+             );
+             CREATE INDEX idx_links_target ON links(project_id, target_rel);
+             CREATE VIRTUAL TABLE files_fts USING fts5(
+                 project_id UNINDEXED, rel_path UNINDEXED, title, content
+             );
+             INSERT INTO files(project_id,rel_path,abs_path,title,size_bytes,modified_at)
+                 VALUES('p1','a.md','/proj/a.md','A',1,'t');
+             INSERT INTO links VALUES('p1','a.md','b.md');
+             INSERT INTO files_fts(project_id,rel_path,title,content)
+                 VALUES('p1','a.md','A','body');
+             PRAGMA user_version = 13;",
         )
         .unwrap();
-        conn
-    }
+        assert_eq!(file_store_tables(&c), 3);
 
-    #[test]
-    fn migrate_backfills_a_legacy_database() {
-        let store = SqliteStore::from_conn(legacy_conn()).unwrap();
-        let c = store.conn.lock().unwrap();
+        migrate(&c).unwrap();
 
-        let version: i64 = c
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-
-        let hash: String = c
+        let leftovers: i64 = c
             .query_row(
-                "SELECT path_hash FROM files WHERE rel_path='docs/a.md'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'files%' OR name LIKE 'links%' OR name LIKE 'idx_files%' OR name LIKE 'idx_links%'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(hash, short_link::path_hash("mdview", "docs/a.md"));
-
-        let unfilled: i64 = c
-            .query_row("SELECT COUNT(*) FROM files WHERE path_hash=''", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(unfilled, 0, "every legacy row must be backfilled");
-    }
-
-    #[test]
-    fn migrate_is_idempotent() {
-        let store = SqliteStore::from_conn(legacy_conn()).unwrap();
-        {
-            let c = store.conn.lock().unwrap();
-            // Second pass over an already-migrated database must change nothing
-            // and must not fail on the column already existing.
-            migrate(&c).unwrap();
-            let version: i64 = c
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(version, SCHEMA_VERSION);
-        }
-        assert_eq!(
-            store
-                .find_by_hash_prefix(&short_link::short_code(&short_link::path_hash(
-                    "mdview",
-                    "docs/a.md"
-                )))
-                .unwrap(),
-            Some(("mdview".into(), "docs/a.md".into()))
-        );
-    }
-
-    #[test]
-    fn a_fresh_database_needs_no_alter_table() {
-        // SCHEMA already carries path_hash, so migrate must recognise that and
-        // still stamp the version rather than trying to add the column again.
-        let store = SqliteStore::open_in_memory().unwrap();
-        let c = store.conn.lock().unwrap();
+        assert_eq!(leftovers, 0);
         let version: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn upsert_file_records_the_path_hash() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/a.md", "Alpha"), "alpha").unwrap();
-
-        let code = short_link::short_code(&short_link::path_hash("p1", "docs/a.md"));
-        assert_eq!(
-            s.find_by_hash_prefix(&code).unwrap(),
-            Some(("p1".into(), "docs/a.md".into()))
-        );
-    }
-
-    #[test]
-    fn re_indexing_keeps_the_same_hash() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/a.md", "Alpha"), "first").unwrap();
-        let code = short_link::short_code(&short_link::path_hash("p1", "docs/a.md"));
-
-        // Same path, new content/title — the link handed out earlier must survive.
-        let mut changed = file("docs/a.md", "Alpha v2");
-        changed.size_bytes = 999;
-        s.upsert_file(&changed, "second").unwrap();
-
-        assert_eq!(
-            s.find_by_hash_prefix(&code).unwrap(),
-            Some(("p1".into(), "docs/a.md".into()))
-        );
-    }
-
-    #[test]
-    fn unknown_code_resolves_to_nothing() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/a.md", "Alpha"), "alpha").unwrap();
-
-        assert_eq!(s.find_by_hash_prefix("ffffffffffff").unwrap(), None);
-        assert_eq!(s.find_by_hash_prefix("").unwrap(), None);
-    }
-
-    /// Regression guard with teeth: a functional test passes whether or not the
-    /// query uses the index, because both forms return the same rows. Only the
-    /// query plan distinguishes the fast path from a silent full scan.
-    #[test]
-    fn prefix_lookup_uses_the_hash_index() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        for i in 0..200 {
-            s.upsert_file(&file(&format!("docs/f{i}.md"), "T"), "body")
-                .unwrap();
-        }
-        let plan = s.hash_prefix_query_plan("a3f9c1d20b74").unwrap();
-        assert!(
-            plan.contains("idx_files_hash"),
-            "prefix lookup must hit idx_files_hash, got plan: {plan}"
-        );
-    }
-
-    #[test]
-    fn project_and_file_roundtrip() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/a.md", "Alpha"), "alpha content here")
+        let projects: i64 = c
+            .query_row("SELECT COUNT(*) FROM projects WHERE id='p1'", [], |r| r.get(0))
             .unwrap();
-        s.upsert_file(&file("src/b.md", "Beta"), "beta words")
+        let runs: i64 = c
+            .query_row("SELECT COUNT(*) FROM runs WHERE id='r1'", [], |r| r.get(0))
             .unwrap();
-
-        assert_eq!(s.file_count("p1").unwrap(), 2);
-        assert_eq!(
-            s.get_file("p1", "docs/a.md").unwrap().unwrap().title,
-            "Alpha"
-        );
-        assert!(s
-            .file_abs_paths("p1")
-            .unwrap()
-            .contains(&PathBuf::from("/proj/docs/a.md")));
-
-        let found = s.find_project_by_root(Path::new("/proj")).unwrap();
-        assert_eq!(found.unwrap().id, "p1");
-    }
-
-    #[test]
-    fn delete_file_removes_the_row_and_its_search_hit() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/unique-token.md", "Alpha"), "h1")
-            .unwrap();
-        assert_eq!(s.search("unique-token", Some("p1"), 10).unwrap().len(), 1);
-        s.delete_file("p1", "docs/unique-token.md").unwrap();
-        assert_eq!(s.file_count("p1").unwrap(), 0);
-        assert_eq!(s.search("unique-token", Some("p1"), 10).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn file_hash_reads_back_the_stored_hash_and_none_when_absent() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        assert_eq!(s.file_hash("p1", "docs/a.md").unwrap(), None);
-
-        s.upsert_file(&file("docs/a.md", "Alpha"), "first").unwrap();
-        assert_eq!(
-            s.file_hash("p1", "docs/a.md").unwrap(),
-            Some("first".to_string())
-        );
-        s.upsert_file(&file("docs/a.md", "Alpha"), "second")
-            .unwrap();
-        assert_eq!(
-            s.file_hash("p1", "docs/a.md").unwrap(),
-            Some("second".to_string())
-        );
-    }
-
-    #[test]
-    fn search_matches_titles_and_paths_with_every_term() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/a.md", "Deployment Guide"), "h")
-            .unwrap();
-        s.upsert_file(&file("ops/runbook.md", "Other"), "h")
-            .unwrap();
-
-        let by_title = s.search("DEPLOY guide", Some("p1"), 10).unwrap();
-        assert_eq!(by_title.len(), 1);
-        assert_eq!(by_title[0].rel_path, "docs/a.md");
-        assert_eq!(by_title[0].url, "/p/p1/docs/a.md");
-        assert_eq!(by_title[0].excerpt, "");
-
-        let by_path = s.search("runbook", None, 10).unwrap();
-        assert_eq!(by_path.len(), 1);
-        assert_eq!(by_path[0].rel_path, "ops/runbook.md");
-
-        assert_eq!(s.search("deploy docs", None, 10).unwrap().len(), 1);
-        assert!(s.search("deploy runbook", None, 10).unwrap().is_empty());
-        assert!(s.search("deploy missing", None, 10).unwrap().is_empty());
-        assert!(s.search("   ", None, 10).unwrap().is_empty());
-    }
-
-    #[test]
-    fn search_ranks_title_hits_before_path_only_hits_and_filters_by_project() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("a/notes.md", "Other"), "h").unwrap();
-        s.upsert_file(&file("z/x.md", "Notes"), "h").unwrap();
-        let mut elsewhere = file("m/notes.md", "Notes");
-        elsewhere.project_id = "p2".into();
-        s.upsert_file(&elsewhere, "h").unwrap();
-
-        let hits = s.search("notes", Some("p1"), 10).unwrap();
-        let order: Vec<&str> = hits.iter().map(|h| h.rel_path.as_str()).collect();
-        assert_eq!(order, vec!["z/x.md", "a/notes.md"]);
-        assert_eq!(s.search("notes", None, 10).unwrap().len(), 3);
-    }
-
-    #[test]
-    fn search_folds_diacritics_and_case() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/spec.md", "Đặc tả"), "h").unwrap();
-
-        let hits = s.search("dac ta", Some("p1"), 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].title, "Đặc tả");
-        assert_eq!(s.search("ĐẶC", None, 10).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn set_file_links_writes_only_when_the_targets_differ() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.set_file_links("p1", "a.md", &["b.md".into(), "c.md".into()])
-            .unwrap();
-        let rowid = |s: &SqliteStore| -> Vec<i64> {
-            let c = s.conn.lock().unwrap();
-            let mut stmt = c
-                .prepare("SELECT rowid FROM links WHERE source_rel='a.md' ORDER BY target_rel")
-                .unwrap();
-            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
-            rows.map(|r| r.unwrap()).collect()
-        };
-        let before = rowid(&s);
-        s.set_file_links("p1", "a.md", &["c.md".into(), "b.md".into()])
-            .unwrap();
-        assert_eq!(rowid(&s), before);
-
-        s.set_file_links("p1", "a.md", &["b.md".into()]).unwrap();
-        assert_eq!(s.backlinks("p1", "c.md").unwrap().len(), 0);
-        assert_eq!(s.backlinks("p1", "b.md").unwrap().len(), 1);
-    }
-
-    #[test]
-    fn reclaim_legacy_index_empties_the_old_table_and_keeps_the_rest() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/a.md", "Alpha"), "h").unwrap();
-        s.insert_run(&sample_run(), None).unwrap();
-        {
-            let c = s.conn.lock().unwrap();
-            for i in 0..450 {
-                c.execute(
-                    "INSERT INTO files_fts(project_id,rel_path,title,content) VALUES('p1',?1,'T','body')",
-                    params![format!("docs/f{i}.md")],
-                )
-                .unwrap();
-            }
-        }
-        let fts_rows = |s: &SqliteStore| -> i64 {
-            let c = s.conn.lock().unwrap();
-            c.query_row("SELECT COUNT(*) FROM files_fts", [], |r| r.get(0))
-                .unwrap()
-        };
-        assert_eq!(fts_rows(&s), 450);
-
-        assert!(s.reclaim_legacy_index().unwrap());
-        assert_eq!(fts_rows(&s), 0);
-        assert_eq!(s.file_count("p1").unwrap(), 1);
-        assert!(s.get_run("r1").unwrap().is_some());
-        assert!(!s.reclaim_legacy_index().unwrap());
-    }
-
-    #[test]
-    fn reclaim_legacy_index_works_on_a_connection_that_never_opened_the_old_table() {
-        let dir = std::env::temp_dir().join(format!("waggledance-reclaim-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("registry.db");
-        let _ = std::fs::remove_file(&db);
-        {
-            let s = SqliteStore::open(&db).unwrap();
-            s.upsert_project(&sample_project()).unwrap();
-            s.upsert_file(&file("docs/a.md", "Alpha"), "h").unwrap();
-            s.insert_run(&sample_run(), None).unwrap();
-        }
-        {
-            let c = Connection::open(&db).unwrap();
-            for i in 0..450 {
-                c.execute(
-                    "INSERT INTO files_fts(project_id,rel_path,title,content) VALUES('p1',?1,'T',?2)",
-                    params![format!("docs/f{i}.md"), "body text ".repeat(200)],
-                )
-                .unwrap();
-            }
-        }
-        let s = SqliteStore::open(&db).unwrap();
-        assert!(s.reclaim_legacy_index().unwrap());
-        drop(s);
-        let c = Connection::open(&db).unwrap();
-        let fts: i64 = c
-            .query_row("SELECT COUNT(*) FROM files_fts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(fts, 0);
-        c.execute(
-            "INSERT INTO files_fts(project_id,rel_path,title,content) VALUES('p1','docs/old.md','T','old binary write')",
-            [],
-        )
-        .unwrap();
-        drop(c);
-        let s = SqliteStore::open(&db).unwrap();
-        assert_eq!(s.file_count("p1").unwrap(), 1);
-        assert!(s.get_run("r1").unwrap().is_some());
-        assert!(s.reclaim_legacy_index().unwrap());
-        assert!(!s.reclaim_legacy_index().unwrap());
-        drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migration_13_adds_content_hash_without_reading_files() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.upsert_project(&sample_project()).unwrap();
-        s.upsert_file(&file("docs/a.md", "Alpha"), "").unwrap();
-        let c = s.conn.lock().unwrap();
-        assert!(has_column(&c, "files", "content_hash").unwrap());
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!((projects, runs), (1, 1));
     }
 
     #[test]
@@ -2762,8 +2079,7 @@ mod tests {
     fn migrate_adds_the_handoff_column_to_a_v10_database_keeping_its_runs() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE files (project_id TEXT NOT NULL, rel_path TEXT NOT NULL);
-             CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
+            "CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
              INSERT INTO runs(id, project_id, task) VALUES ('r-old', 'p1', 'old task');
              PRAGMA user_version = 10;",
         )
@@ -2781,8 +2097,7 @@ mod tests {
     fn migration_12_adds_leader_holds_and_late_reply_at_keeping_runs() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE files (project_id TEXT NOT NULL, rel_path TEXT NOT NULL);
-             CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
+            "CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
              INSERT INTO runs(id, project_id, task) VALUES ('r-old', 'p1', 'old task');
              PRAGMA user_version = 11;",
         )
@@ -2807,8 +2122,7 @@ mod tests {
     fn migrate_adds_the_follow_up_column_to_a_v9_database_keeping_its_runs() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE files (project_id TEXT NOT NULL, rel_path TEXT NOT NULL);
-             CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
+            "CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
              INSERT INTO runs(id, project_id, task) VALUES ('r-old', 'p1', 'old task');
              PRAGMA user_version = 9;",
         )
@@ -2951,7 +2265,7 @@ mod tests {
     /// A database as a pre-D6 build left it: `projects` exists but has no
     /// `orchestration_enabled` column.
     fn legacy_projects_conn() -> Connection {
-        let conn = legacy_conn();
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE projects (
                  id TEXT PRIMARY KEY,

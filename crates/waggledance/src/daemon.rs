@@ -2,7 +2,7 @@ use crate::runtime::{self, DaemonInfo};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 
 pub(crate) fn open_notify_store(
     cfg: &waggledance_core::config::TerminalConfig,

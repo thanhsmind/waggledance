@@ -1,31 +1,18 @@
-//! waggledance-core — domain + application + adapters for the waggledance markdown server.
-//!
-//! Dependency rule (PRD §7.4): this crate never depends on Axum/Tauri. Adapters
-//! (SQLite, notify) live here behind ports; the HTTP/MCP/CLI wiring is in the
-//! `waggledance` binary crate.
+//! waggledance-core — domain, application and adapters for the waggledance supervisor.
 
 pub mod agent_usage;
 pub mod ansi;
 pub mod bee;
 pub mod bee_upgrade;
-pub mod code_source;
 pub mod config;
-pub mod daemon;
-pub mod doc_links;
 pub mod domain;
 pub mod engine;
 pub mod error;
-pub mod fuzzy;
-pub mod git_diff;
-pub mod indexer;
-pub mod link_resolver;
 pub mod notify_store;
 pub mod paths_boundary;
 pub mod process;
 pub mod project_settings;
-pub mod render;
 pub mod repository;
-pub mod short_link;
 pub mod transcript;
 pub mod usage;
 pub mod usage_rows;

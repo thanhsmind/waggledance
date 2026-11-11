@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use waggledance_core::indexer::now_rfc3339;
+use waggledance_core::engine::now_rfc3339;
 use waggledance_core::Engine;
 
 const LEADER_ENV: &str = "PASEO_AGENT_ID";

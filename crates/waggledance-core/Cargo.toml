@@ -11,19 +11,10 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 dirs.workspace = true
 time.workspace = true
-comrak.workspace = true
-syntect.workspace = true
-ammonia.workspace = true
 rusqlite.workspace = true
-ignore.workspace = true
-unicode-normalization.workspace = true
-notify.workspace = true
-notify-debouncer-full.workspace = true
-nucleo-matcher.workspace = true
 libc.workspace = true
 # Fresh randomness for the notify credential's temp-file suffix
 # (`save_notify_credential`, agent-terminal-21) — mirrors
