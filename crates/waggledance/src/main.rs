@@ -1,18 +1,10 @@
-//! waggledance — multi-project markdown viewer for AI agent workflows.
-
-// This crate's request helpers return `Result<T, axum::response::Response>`:
-// the Err arm is not an error value the caller inspects, it IS the complete
-// HTTP refusal the caller returns verbatim. Boxing it to shrink the variant
-// would buy a lint's approval with an allocation and an unwrap at every call
-// site — the lint has misread the idiom, so it is silenced once here rather
-// than five times per function (lint-gates-green D1, 89c6098c).
-#![allow(clippy::result_large_err)]
+//! waggledance — a supervisor for AI agent workflows.
 
 mod cli;
+mod daemon;
 mod delivery;
 mod discovery;
 mod doctor;
-mod guide;
 mod heartbeat;
 mod herdr;
 mod hold;
@@ -20,18 +12,14 @@ mod mail;
 mod mcp;
 mod notify;
 mod orchestrate;
+mod panes;
 mod paseo;
 mod reaper;
 mod runtime;
-mod server;
 mod setup;
-mod slash;
-mod slash_builtins;
 mod supervisor;
 mod trigger;
-mod views;
 mod wake;
-mod watch;
 mod watcher;
 mod worktree_sweep;
 
@@ -65,8 +53,8 @@ fn main() {
 
 /// D7's live-controllable pair: the herdr supervisor and the status
 /// watcher/notifier, reconciled against a [`waggledance_core::config::TerminalConfig`]
-/// on every switch write (`server::update_terminal_config`) and once at
-/// startup (`server::serve`) — so flipping a switch takes effect
+/// on every switch write (the config reload) and once at
+/// startup (`daemon::serve`) — so flipping a switch takes effect
 /// immediately, with **no restart**, and turning one off stops exactly the
 /// task it started. This is the only place either module (agent-terminal-17)
 /// is ever constructed: [`reconcile`](Self::reconcile) is the single
@@ -220,7 +208,7 @@ impl TerminalBackground {
     /// the second time.
     ///
     /// `telegram` is `Some((token, chat_id))` only when both halves of the
-    /// notify destination/credential are configured (`server::telegram_credentials`)
+    /// notify destination/credential are configured (`daemon::telegram_credentials`)
     /// — `None` falls back to `notify::NullNotifier`, which only logs, so a
     /// configuration missing either half never attempts a delivery even
     /// with the switch on.

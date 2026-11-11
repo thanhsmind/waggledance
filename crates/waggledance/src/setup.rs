@@ -5,12 +5,9 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum Target {
     Pi,
-    Paseo,
     #[value(name = "openclaw")]
     OpenClaw,
 }
-
-const PASEO_ID: &str = "waggledance";
 
 const PI_FILES: &[(&str, &str)] = &[
     (
@@ -24,61 +21,6 @@ const PI_FILES: &[(&str, &str)] = &[
     (
         "package.json",
         include_str!("../../../integrations/pi/package.json"),
-    ),
-];
-
-const PASEO_FILES: &[(&str, &str)] = &[
-    (
-        "paseo-plugin.json",
-        include_str!("../../../integrations/paseo/paseo-plugin.json"),
-    ),
-    (
-        "package.json",
-        include_str!("../../../integrations/paseo/package.json"),
-    ),
-    (
-        "tsconfig.json",
-        include_str!("../../../integrations/paseo/tsconfig.json"),
-    ),
-    (
-        "index.server.ts",
-        include_str!("../../../integrations/paseo/index.server.ts"),
-    ),
-    (
-        "index.client.tsx",
-        include_str!("../../../integrations/paseo/index.client.tsx"),
-    ),
-    (
-        "client/board.tsx",
-        include_str!("../../../integrations/paseo/client/board.tsx"),
-    ),
-    (
-        "client/composer.tsx",
-        include_str!("../../../integrations/paseo/client/composer.tsx"),
-    ),
-    (
-        "client/settings.tsx",
-        include_str!("../../../integrations/paseo/client/settings.tsx"),
-    ),
-    (
-        "server/dispatch.ts",
-        include_str!("../../../integrations/paseo/server/dispatch.ts"),
-    ),
-    (
-        "server/installed.ts",
-        include_str!("../../../integrations/paseo/server/installed.ts"),
-    ),
-    (
-        "server/waggledance.ts",
-        include_str!("../../../integrations/paseo/server/waggledance.ts"),
-    ),
-    (
-        "shared/board.ts",
-        include_str!("../../../integrations/paseo/shared/board.ts"),
-    ),
-    (
-        "shared/rpc.ts",
-        include_str!("../../../integrations/paseo/shared/rpc.ts"),
     ),
 ];
 
@@ -101,7 +43,6 @@ const SUPERVISOR_SKILL_FILES: &[(&str, &str)] = &[(
 const HOOK_SESSION_KEY: &str = "hook:waggledance";
 
 type Files = BTreeMap<String, String>;
-type Runner<'a> = &'a mut dyn FnMut(&[&str]) -> Result<String>;
 
 fn files(table: &[(&str, &str)], installed: &str, exe: &Path) -> Files {
     let quoted = serde_json::to_string(&exe.to_string_lossy()).unwrap_or_default();
@@ -122,10 +63,6 @@ fn files(table: &[(&str, &str)], installed: &str, exe: &Path) -> Files {
 
 fn pi_files(exe: &Path) -> Files {
     files(PI_FILES, "installed.ts", exe)
-}
-
-fn paseo_files(exe: &Path) -> Files {
-    files(PASEO_FILES, "server/installed.ts", exe)
 }
 
 fn openclaw_files() -> Files {
@@ -608,121 +545,6 @@ fn dev_build_warning(exe: &Path) -> Option<String> {
     })
 }
 
-#[derive(serde::Deserialize)]
-struct Listed {
-    id: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    enabled: bool,
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(a) == canon(b)
-}
-
-fn paseo_listed(run: Runner) -> Result<Option<Listed>> {
-    let out = run(&["plugin", "ls", "--json"])?;
-    let all: Vec<Listed> = crate::paseo::parse_document(&out)
-        .map_err(|e| anyhow::anyhow!("reading `paseo plugin ls --json`: {e}"))?;
-    Ok(all.into_iter().find(|p| p.id == PASEO_ID))
-}
-
-fn paseo_install(dst: &Path, want: &Files, run: Runner) -> Result<Vec<String>> {
-    let listed = paseo_listed(run)?;
-    let wrote = write_tree(dst, want)?;
-    let dst_str = dst.to_string_lossy();
-    let cmds: Vec<Vec<&str>> = match &listed {
-        Some(p) if !same_path(Path::new(&p.path), dst) => vec![
-            vec!["plugin", "remove", PASEO_ID],
-            vec!["plugin", "install", &dst_str],
-        ],
-        None => vec![vec!["plugin", "install", &dst_str]],
-        Some(p) if !p.enabled => vec![vec!["plugin", "enable", PASEO_ID]],
-        Some(_) if wrote => vec![vec!["plugin", "reload", PASEO_ID]],
-        Some(_) => vec![],
-    };
-    let mut done = Vec::new();
-    if wrote {
-        done.push(format!("wrote {}", dst.display()));
-    }
-    if let Some(p) = listed
-        .as_ref()
-        .filter(|p| !same_path(Path::new(&p.path), dst))
-    {
-        done.push(format!("replaced the plugin installed from {}", p.path));
-    }
-    for cmd in cmds {
-        run(&cmd)?;
-        done.push(format!("ran paseo {}", cmd.join(" ")));
-    }
-    Ok(done)
-}
-
-fn paseo_remove(dst: &Path, run: Runner) -> Result<Vec<String>> {
-    refuse_foreign(dst)?;
-    let mut done = Vec::new();
-    match paseo_listed(run)? {
-        Some(p) if same_path(Path::new(&p.path), dst) => {
-            run(&["plugin", "remove", PASEO_ID])?;
-            done.push(format!("ran paseo plugin remove {PASEO_ID}"));
-        }
-        Some(p) => done.push(format!(
-            "left the plugin installed from {} (not setup's): paseo plugin remove {PASEO_ID}",
-            p.path
-        )),
-        None => {}
-    }
-    if remove_tree(dst)? {
-        done.push(format!("removed {}", dst.display()));
-    }
-    Ok(done)
-}
-
-fn paseo_unneeded_lines(config: &waggledance_core::config::PaseoConfig) -> Vec<String> {
-    let file = "~/.waggledance/config.toml";
-    let mut lines = Vec::new();
-    if config.enabled.is_some() {
-        lines.push(format!(
-            "`enabled` under [paseo] in {file} is no longer needed: Paseo support turns on when a \
-             working CLI is found; every project accepts dispatched work unless its own \
-             .waggledance.toml says `orchestration = false`"
-        ));
-    }
-    if !config.binary.is_empty() {
-        lines.push(format!(
-            "`binary` under [paseo] in {file} is no longer needed: waggledance finds the Paseo \
-             CLI itself; keep it only to override that choice"
-        ));
-    }
-    if !config.leaders.is_empty() {
-        lines.push(format!(
-            "[[paseo.leaders]] in {file} is deprecated: name the leader's workspace with \
-             `workspace = \"<id>\"` under [paseo] in the project's .waggledance.toml"
-        ));
-    }
-    lines
-}
-
-fn paseo_cli(binary: &str, args: &[&str]) -> Result<String> {
-    let out = std::process::Command::new(binary)
-        .args(args)
-        .env_remove("PASEO_AGENT_ID")
-        .env_remove("PASEO_AGENT_CWD")
-        .output()
-        .with_context(|| format!("running `{binary}`"))?;
-    if !out.status.success() {
-        bail!(
-            "paseo {} failed: {}{}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim(),
-            String::from_utf8_lossy(&out.stdout).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
     let exe = std::env::current_exe().context("locating the waggledance binary")?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
@@ -745,35 +567,6 @@ pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
                 notes.push("running pi sessions pick it up after /reload".into());
                 warnings.extend(mcp_override(&agent));
             }
-            (dst, done)
-        }
-        Target::Paseo => {
-            let dst = waggledance_core::config::data_dir().join("paseo");
-            let config = waggledance_core::Config::load();
-            let found = crate::paseo::detect_binary(&config.paseo);
-            let Some(binary) = found.binary.clone() else {
-                bail!("{}", found.unavailable());
-            };
-            notes.push(format!("using the Paseo CLI {binary}"));
-            notes.extend(
-                found
-                    .rejected
-                    .iter()
-                    .map(|(candidate, why)| format!("skipped Paseo CLI {candidate}: {why}")),
-            );
-            notes.extend(found.notes);
-            warnings.extend(paseo_unneeded_lines(&config.paseo));
-            let mut paseo = |args: &[&str]| paseo_cli(&binary, args);
-            let done = if remove {
-                paseo_remove(&dst, &mut paseo)?
-            } else {
-                let done = paseo_install(&dst, &paseo_files(&exe), &mut paseo)?;
-                notes.push("'Waggle Dance' appears in the Paseo sidebar".into());
-                notes.push(
-                    "turn on plugins in Paseo settings once if the sidebar does not show it".into(),
-                );
-                done
-            };
             (dst, done)
         }
         Target::OpenClaw => {
@@ -814,7 +607,6 @@ pub fn run(target: Target, remove: bool, json: bool) -> Result<()> {
     }
     let name = match target {
         Target::Pi => "pi",
-        Target::Paseo => "paseo",
         Target::OpenClaw => "openclaw",
     };
     if json {
@@ -846,21 +638,6 @@ mod tests {
 
     fn exe() -> PathBuf {
         PathBuf::from("/opt/wd/bin/waggledance")
-    }
-
-    #[test]
-    fn fresh_write_lays_down_every_file_and_version() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("paseo");
-        let want = paseo_files(&exe());
-        assert!(write_tree(&dst, &want).unwrap());
-        let mut have = Files::new();
-        read_tree(&dst, &dst, &mut have).unwrap();
-        assert_eq!(have, want);
-        assert_eq!(have["VERSION"].trim(), env!("CARGO_PKG_VERSION"));
-        assert!(!dst.join("test").exists());
-        assert!(!dst.join("node_modules").exists());
-        assert!(!tmp.path().join("paseo.waggledance-tmp").exists());
     }
 
     #[test]
@@ -908,11 +685,6 @@ mod tests {
             pi["installed.ts"].trim(),
             "export const waggledancePath = \"/opt/wd/bin/waggledance\";"
         );
-        let paseo = paseo_files(&exe());
-        assert_eq!(
-            paseo["server/installed.ts"].trim(),
-            "export const waggledancePath = \"/opt/wd/bin/waggledance\";"
-        );
     }
 
     fn shipped(dir: &Path) -> BTreeSet<String> {
@@ -935,9 +707,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../integrations");
         let names = |t: &[(&str, &str)]| t.iter().map(|(n, _)| n.to_string()).collect();
         let pi: BTreeSet<String> = names(PI_FILES);
-        let paseo: BTreeSet<String> = names(PASEO_FILES);
         assert_eq!(pi, shipped(&root.join("pi")));
-        assert_eq!(paseo, shipped(&root.join("paseo")));
         let openclaw: BTreeSet<String> = names(OPENCLAW_FILES);
         assert_eq!(
             openclaw,
@@ -1361,101 +1131,6 @@ mod tests {
         assert!(notes[1].contains("-H \"Authorization: Bearer $(cat /d/hook.token)\""));
         assert!(notes[1].contains(r#""deliver":true,"channel":"telegram""#));
         assert!(notes[2].contains("restart"));
-    }
-
-    fn install_calls(ls: &str, pre_write: bool) -> Vec<String> {
-        let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("paseo");
-        let want = paseo_files(&exe());
-        if pre_write {
-            write_tree(&dst, &want).unwrap();
-        }
-        let ls = ls.replace("{dst}", &dst.to_string_lossy());
-        let mut calls = Vec::new();
-        let mut run = |args: &[&str]| -> Result<String> {
-            calls.push(args.join(" "));
-            Ok(if args[1] == "ls" {
-                ls.clone()
-            } else {
-                String::new()
-            })
-        };
-        paseo_install(&dst, &want, &mut run).unwrap();
-        calls
-            .into_iter()
-            .filter(|c| c != "plugin ls --json")
-            .map(|c| c.replace(&*dst.to_string_lossy(), "{dst}"))
-            .collect()
-    }
-
-    #[test]
-    fn paseo_install_decides_from_plugin_ls() {
-        assert_eq!(install_calls("[]", false), ["plugin install {dst}"]);
-        assert_eq!(
-            install_calls(
-                r#"[{"id":"waggledance","path":"/elsewhere","enabled":true}]"#,
-                true
-            ),
-            ["plugin remove waggledance", "plugin install {dst}"]
-        );
-        assert_eq!(
-            install_calls(
-                r#"[{"id":"waggledance","path":"{dst}","enabled":false}]"#,
-                true
-            ),
-            ["plugin enable waggledance"]
-        );
-        assert_eq!(
-            install_calls(
-                r#"[{"id":"waggledance","path":"{dst}","enabled":true}]"#,
-                false
-            ),
-            ["plugin reload waggledance"]
-        );
-        assert!(install_calls(
-            r#"[{"id":"other","path":"/x","enabled":true},{"id":"waggledance","path":"{dst}","enabled":true}]"#,
-            true
-        )
-        .is_empty());
-    }
-
-    #[test]
-    fn paseo_setup_reads_plugin_ls_past_the_wrappers_log_lines() {
-        for out in [
-            include_str!("../testdata/fixtures/paseo-0.11.2/wrapper-plugin-ls.out"),
-            include_str!("../testdata/fixtures/paseo-0.11.2/npm-plugin-ls.out"),
-        ] {
-            let mut run = |_: &[&str]| -> Result<String> { Ok(out.to_string()) };
-            let listed = paseo_listed(&mut run).unwrap().unwrap();
-            assert_eq!(listed.path, "/home/thanhsmind/.waggledance/paseo");
-            assert!(listed.enabled);
-        }
-        let mut noise =
-            |_: &[&str]| -> Result<String> { Ok("23:51:21.452 › only noise\n".into()) };
-        let err = paseo_listed(&mut noise).err().unwrap().to_string();
-        assert!(err.contains("plugin ls"), "{err}");
-    }
-
-    #[test]
-    fn paseo_setup_names_global_lines_that_are_no_longer_needed() {
-        use waggledance_core::config::{PaseoConfig, PaseoLeader};
-        assert!(paseo_unneeded_lines(&PaseoConfig::default()).is_empty());
-        let old = PaseoConfig {
-            enabled: Some(true),
-            binary: "/home/u/.local/bin/paseo".into(),
-            leaders: vec![PaseoLeader {
-                project: "p".into(),
-                workspace: "wks_a".into(),
-            }],
-            ..PaseoConfig::default()
-        };
-        let lines = paseo_unneeded_lines(&old);
-        assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(lines[0].contains("unless its own .waggledance.toml says `orchestration = false`"));
-        assert!(lines[1].contains("`binary`"));
-        assert!(
-            lines[2].contains("[[paseo.leaders]]") && lines[2].contains("workspace = \"<id>\"")
-        );
     }
 
     #[test]

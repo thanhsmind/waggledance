@@ -1,16 +1,14 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
-//! Exposes the agent-facing query surface (PRD §5.5): the original write-side
-//! `waggledance_view_file`, three read-only query tools —
-//! `waggledance_search`, `waggledance_projects`, `waggledance_ask_state`
-//! (mcp-query-surface D3) — and the orchestrator-dispatch write surface
+//! Exposes the supervisor surface: the read-only query tools
+//! `waggledance_projects` and `waggledance_ask_state`, `waggledance_bee_upgrade`,
+//! and the orchestrator-dispatch write surface
 //! (`docs/history/orchestrator-dispatch/plan.md` D2): `waggledance_dispatch`,
-//! `waggledance_await`, `waggledance_runs`. Hand-rolled to avoid a heavy SDK
-//! dependency; the protocol surface here is intentionally small.
+//! `waggledance_await`, `waggledance_runs`, `waggledance_task`. Hand-rolled to
+//! avoid a heavy SDK dependency; the protocol surface here is intentionally small.
 
 use crate::herdr::{socket::SocketHerdr, Herdr};
 use crate::orchestrate;
 use crate::paseo;
-use crate::runtime;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -20,10 +18,7 @@ use waggledance_core::config::{registry_db_path, resolve_data_dir};
 use waggledance_core::domain::{Project, Run};
 use waggledance_core::indexer::now_rfc3339;
 use waggledance_core::notify_store::NotifyStore;
-use waggledance_core::{Config, Engine, Error, SqliteStore};
-
-/// Default `waggledance_search` hit cap when the caller does not pass `limit`.
-const DEFAULT_SEARCH_LIMIT: usize = 10;
+use waggledance_core::{Config, Engine, SqliteStore};
 
 /// Default `waggledance_runs` row cap per project when the caller does not
 /// pass `limit` (no `limit` field is exposed on the tool at all — every
@@ -55,7 +50,7 @@ impl Orchestration {
     ) -> std::result::Result<Self, String> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| format!("failed to start the orchestration runtime: {e}"))?;
-        // Mirrors `server.rs`'s own best-effort fallback: an unresolvable
+        // Best-effort: fallback: an unresolvable
         // default socket path never blocks startup, it just means every
         // herdr call below fails with a named "unavailable" error instead
         // of a crash.
@@ -75,7 +70,7 @@ impl Orchestration {
 /// Per D6 the opt-in switch still governs: open the store and pass Some only
 /// when the notify switch is enabled in the configuration, and None when it is off.
 /// A store that fails to open falls back to None and logs one warning, matching
-/// the degrade-rather-than-fail shape server.rs uses.
+/// the degrade-rather-than-fail shape daemon.rs uses.
 fn open_notify_store(
     cfg: &waggledance_core::config::TerminalConfig,
     override_dir: Option<&Path>,
@@ -131,22 +126,7 @@ pub fn run() -> Result<()> {
                     "serverInfo": { "name": "waggledance", "version": env!("CARGO_PKG_VERSION") }
                 }),
             )),
-            "tools/list" => Some(ok(
-                id,
-                json!({
-                    "tools": [
-                        view_file_schema(),
-                        search_schema(),
-                        projects_schema(),
-                        bee_upgrade_schema(),
-                        ask_state_schema(),
-                        dispatch_schema(),
-                        await_schema(),
-                        runs_schema(),
-                        task_schema()
-                    ]
-                }),
-            )),
+            "tools/list" => Some(ok(id, json!({ "tools": tool_schemas() }))),
             "tools/call" => Some(handle_tool_call(id, &engine, &mut orchestration, &req)),
             "ping" => Some(ok(id, json!({}))),
             _ if id.is_some() => Some(err(id, -32601, "method not found")),
@@ -161,50 +141,23 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn view_file_schema() -> Value {
-    json!({
-        "name": "waggledance_view_file",
-        "description": "Make a markdown file viewable in the browser and return its URL. \
-    Auto-registers the project on first use and indexes the file immediately. \
-    Pass the project root and the file path relative to that root.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "project_root": { "type": "string", "description": "Absolute path to the project root" },
-                "relative_path": { "type": "string", "description": "Markdown file path relative to project_root" }
-            },
-            "required": ["project_root", "relative_path"]
-        }
-    })
-}
-
-fn search_schema() -> Value {
-    json!({
-        "name": "waggledance_search",
-        "description": "Search the titles and paths of every registered project's indexed markdown \
-    (or one project, when `project` is given); every term must appear in the title or \
-    the path, accents and case ignored. Re-indexes changed files in the \
-    searched project(s) before answering and reports any project whose refresh \
-    failed in `structuredContent.refresh` — hits still return, but a failed \
-    project's results may lag disk. File contents are not searched: read a hit \
-    to see what it says.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Words to find in a title or path" },
-                "project": { "type": "string", "description": "Optional project id to narrow the search to" },
-                "limit": { "type": "integer", "description": "Max hits to return (default 10)" }
-            },
-            "required": ["query"]
-        }
-    })
+fn tool_schemas() -> Vec<Value> {
+    vec![
+        projects_schema(),
+        bee_upgrade_schema(),
+        ask_state_schema(),
+        dispatch_schema(),
+        await_schema(),
+        runs_schema(),
+        task_schema(),
+    ]
 }
 
 fn projects_schema() -> Value {
     json!({
         "name": "waggledance_projects",
-        "description": "List every registered project: id, name, root path, indexed file \
-    count, and when it was last seen.",
+        "description": "List every registered project: id, name, root path, and when it \
+    was last seen.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -391,8 +344,6 @@ fn handle_tool_call(
         .and_then(|n| n.as_str())
         .unwrap_or("");
     match name {
-        "waggledance_view_file" => handle_view_file(id, engine, &args),
-        "waggledance_search" => handle_search(id, engine, &args),
         "waggledance_projects" => handle_projects(id, engine),
         "waggledance_bee_upgrade" => handle_bee_upgrade(id, engine, &args),
         "waggledance_ask_state" => handle_ask_state(id, engine, orchestration, &args),
@@ -406,183 +357,6 @@ fn handle_tool_call(
     }
 }
 
-fn handle_view_file(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
-    let root = args
-        .get("project_root")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let rel = args
-        .get("relative_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if root.is_empty() || rel.is_empty() {
-        return tool_error(id, "project_root and relative_path are required");
-    }
-
-    match engine.view_file(Path::new(root), rel) {
-        Ok(vf) => {
-            // Ensure a daemon is up so the URL is actually viewable. When the
-            // daemon binds a wildcard host with no host_name override, this is
-            // one URL per reachable machine IP so the caller can pick a routable
-            // address; otherwise it is a single URL.
-            let bases = runtime::ensure_daemon_bases();
-            let urls: Vec<String> = bases
-                .iter()
-                .map(|base| format!("{base}/s/{}", vf.code))
-                .collect();
-            let long_urls: Vec<String> = bases
-                .iter()
-                .map(|base| format!("{base}{}", vf.url))
-                .collect();
-            // Primary URL kept for back-compat with clients reading `url`.
-            let primary = urls.first().cloned().unwrap_or_default();
-            let text = viewable_text(&urls, &vf.rel_path, &vf.project_id);
-            ok(
-                id,
-                json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "structuredContent": {
-                        "url": primary,
-                        "urls": urls,
-                        "long_url": long_urls.first().cloned().unwrap_or_default(),
-                        "long_urls": long_urls,
-                        "path": vf.url,
-                        "code": vf.code,
-                        "project_id": vf.project_id
-                    }
-                }),
-            )
-        }
-        Err(e) => tool_error(id, &format!("view_file failed: {e}")),
-    }
-}
-
-/// `waggledance_search`: title and path hits over one or every registered project.
-///
-/// D4 (never silently stale): re-indexes the searched project(s) before
-/// querying — just the filtered project, or every registered project when
-/// unfiltered (D1) — and reports which projects refreshed cleanly and which
-/// failed (review P1-2: a refresh failure must surface, never masquerade as
-/// a fresh result). D2 (rich, not bare): each hit carries `project_id`,
-/// `rel_path`, `title`, an empty `excerpt`, and `score` 0 — contents are
-/// never searched.
-fn handle_search(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
-    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    if query.trim().is_empty() {
-        return tool_error(id, "query is required");
-    }
-    let project = args
-        .get("project")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_SEARCH_LIMIT);
-
-    let refresh_results: Vec<(String, Result<usize, Error>)> = match project {
-        Some(project_id) => {
-            if engine.get_project(project_id).ok().flatten().is_none() {
-                return tool_error(id, &format!("no such project: {project_id}"));
-            }
-            // The search itself still runs either way — a refresh failure is
-            // reported, not fatal (results just stay as fresh as the last
-            // successful index for that project).
-            vec![(project_id.to_string(), engine.refresh_stale(project_id))]
-        }
-        None => {
-            let Ok(projects) = engine.list_projects() else {
-                return tool_error(id, "could not list registered projects");
-            };
-            projects
-                .iter()
-                .map(|p| (p.id.clone(), engine.refresh_stale(&p.id)))
-                .collect()
-        }
-    };
-    let refresh = summarize_refresh(refresh_results);
-
-    match engine.search(query, project, limit) {
-        Ok(hits) => {
-            let mut text = if hits.is_empty() {
-                format!("No hits for {query:?}: only titles and paths were searched, not file contents.")
-            } else {
-                format!("{} hit(s) for {query:?}.", hits.len())
-            };
-            if let Some(warning) = &refresh.warning {
-                text.push_str("; ");
-                text.push_str(warning);
-            }
-            let structured_hits: Vec<Value> = hits
-                .iter()
-                .map(|h| {
-                    json!({
-                        "project_id": h.project_id,
-                        "rel_path": h.rel_path,
-                        "title": h.title,
-                        "excerpt": h.excerpt,
-                        "score": h.score
-                    })
-                })
-                .collect();
-            ok(
-                id,
-                json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "structuredContent": { "hits": structured_hits, "refresh": refresh.structured }
-                }),
-            )
-        }
-        Err(e) => tool_error(id, &format!("search failed: {e}")),
-    }
-}
-
-/// The per-project refresh outcome for a `waggledance_search` call, folded
-/// into the shape the response carries and the one-line warning appended to
-/// the human-readable text when at least one project's refresh failed
-/// (review P1-2 — a stale-serving refresh failure must never be silent).
-struct RefreshSummary {
-    /// `structuredContent.refresh`: `{"refreshed": <ok count>, "failed": [...]}`.
-    structured: Value,
-    /// `Some` only when `failed` is non-empty.
-    warning: Option<String>,
-}
-
-/// Pure so the failure shape is testable without a real store error: fold a
-/// project id + its `refresh_stale` outcome into the response's `refresh`
-/// field and, when any project failed, the warning appended to the text.
-fn summarize_refresh(results: Vec<(String, Result<usize, Error>)>) -> RefreshSummary {
-    let mut refreshed = 0usize;
-    let mut failed: Vec<Value> = Vec::new();
-    let mut failed_ids: Vec<String> = Vec::new();
-    for (project_id, result) in results {
-        match result {
-            Ok(_) => refreshed += 1,
-            Err(e) => {
-                failed.push(json!({ "project_id": project_id, "error": e.to_string() }));
-                failed_ids.push(project_id);
-            }
-        }
-    }
-    let warning = if failed_ids.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "warning: refresh failed for {} — results may lag disk for those projects",
-            failed_ids.join(", ")
-        ))
-    };
-    RefreshSummary {
-        structured: json!({ "refreshed": refreshed, "failed": failed }),
-        warning,
-    }
-}
-
-/// `waggledance_projects`: the registry, as-is. `file_count` reflects the
-/// index as it stands and may lag until the next search touches a project
-/// (recorded narrowing of D4 — plan.md Approach 3).
 fn handle_projects(id: Option<Value>, engine: &Engine) -> Value {
     let projects = match engine.list_projects() {
         Ok(p) => p,
@@ -595,7 +369,6 @@ fn handle_projects(id: Option<Value>, engine: &Engine) -> Value {
                 "id": p.id,
                 "name": p.name,
                 "root_path": p.root_path.display().to_string(),
-                "file_count": engine.file_count(&p.id).unwrap_or(0),
                 "last_seen_at": p.last_seen_at
             })
         })
@@ -891,7 +664,7 @@ fn read_fleet_panes(engine: &Engine, orchestration: &mut Option<Orchestration>) 
 /// `mcp.rs`'s own dispatch tests only reach the pre-herdr refusals. Handed a
 /// snapshot and a root, this function is provable with neither.
 ///
-/// Containment is [`server::project_panes`]'s, not a second copy: the panes a
+/// Containment is [`panes::project_panes`]'s, not a second copy: the panes a
 /// project may see are exactly the ones its own board surface shows.
 fn project_panes_value(
     snapshot: &crate::herdr::Snapshot,
@@ -906,15 +679,15 @@ fn project_panes_value(
         // is an empty inventory, not a failure of the whole answer.
         return json!([]);
     };
-    let mut panes = crate::server::project_panes(snapshot, &boundary);
+    let mut panes = crate::panes::project_panes(snapshot, &boundary);
     // `project_panes` deliberately returns bee_state/bee_feature empty and
     // leaves the join to each caller. Applying it here is what makes the two
     // fields worth publishing at all: herdr's `status` is derived from the
     // screen, bee's is what its own hook runtime recorded, and an
     // orchestrator asking "is this pane really idle?" is asking for the
     // second one. Never a policy — the answer is reported, not acted on (D8).
-    let activity = crate::server::project_bee_activity(project, rollup, herdr_sessions);
-    crate::server::apply_bee_activity(&mut panes, &activity.pane);
+    let activity = crate::panes::project_bee_activity(project, rollup, herdr_sessions);
+    crate::panes::apply_bee_activity(&mut panes, &activity);
     Value::Array(
         panes
             .iter()
@@ -955,7 +728,7 @@ fn attach_panes(
         FleetPanes::Snapshot(snapshot) => {
             // The session set is derived from this call's ONE snapshot (D4),
             // so it is built here rather than per project.
-            let sessions = crate::server::herdr_session_ids(Some(snapshot));
+            let sessions = crate::panes::herdr_session_ids(Some(snapshot));
             object.insert(
                 "panes".to_string(),
                 project_panes_value(snapshot, project, rollup, &sessions),
@@ -2116,21 +1889,6 @@ fn handle_runs(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
     )
 }
 
-fn viewable_text(urls: &[String], rel_path: &str, project_id: &str) -> String {
-    let viewable = if urls.len() > 1 {
-        let lines = urls
-            .iter()
-            .map(|u| format!("  {rel_path} → {u}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("Viewable at (pick a reachable IP):\n{lines}")
-    } else {
-        let primary = urls.first().map(String::as_str).unwrap_or_default();
-        format!("Viewable at: {rel_path} → {primary}")
-    };
-    format!("{viewable}\nproject_id: {project_id}")
-}
-
 fn ok(id: Option<Value>, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -2148,51 +1906,6 @@ fn tool_error(id: Option<Value>, msg: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn one_base_renders_a_single_line() {
-        let text = viewable_text(
-            &["http://design-lap:7700/s/a3f9c1d20b74".into()],
-            "docs/history/short-link/DISCUSSION.md",
-            "waggledance",
-        );
-        assert_eq!(
-            text,
-            "Viewable at: docs/history/short-link/DISCUSSION.md → \
-             http://design-lap:7700/s/a3f9c1d20b74\nproject_id: waggledance"
-        );
-        assert_eq!(text.lines().count(), 2);
-    }
-
-    #[test]
-    fn several_bases_render_one_line_each() {
-        let text = viewable_text(
-            &[
-                "http://192.168.1.10:7700/s/a3f9c1d20b74".into(),
-                "http://10.0.0.5:7700/s/a3f9c1d20b74".into(),
-            ],
-            "docs/a.md",
-            "waggledance",
-        );
-        assert!(text.contains("pick a reachable IP"));
-        assert!(text.contains("  docs/a.md → http://192.168.1.10:7700/s/a3f9c1d20b74"));
-        assert!(text.contains("  docs/a.md → http://10.0.0.5:7700/s/a3f9c1d20b74"));
-    }
-
-    /// The whole point of the feature: the emitted line has to stay inside a
-    /// terminal width, which the full path did not.
-    #[test]
-    fn the_short_line_fits_in_a_terminal() {
-        let deep = "docs/history/short-link-for-file-urls/DISCUSSION.md";
-        let text = viewable_text(
-            &["http://design-lap:7700/s/a3f9c1d20b74".into()],
-            deep,
-            "waggledance",
-        );
-        let url_line = text.lines().next().unwrap();
-        let url = url_line.split(" → ").nth(1).unwrap();
-        assert!(url.len() <= 40, "short url grew to {}: {url}", url.len());
-    }
 
     fn write(dir: &Path, rel: &str, body: &str) {
         let p = dir.join(rel);
@@ -2279,24 +1992,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_nine_schemas() {
-        let tools = [
-            view_file_schema(),
-            search_schema(),
-            projects_schema(),
-            bee_upgrade_schema(),
-            ask_state_schema(),
-            dispatch_schema(),
-            await_schema(),
-            runs_schema(),
-            task_schema(),
-        ];
+    fn tools_list_names_exactly_the_supervisor_tools() {
+        let tools = tool_schemas();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
             vec![
-                "waggledance_view_file",
-                "waggledance_search",
                 "waggledance_projects",
                 "waggledance_bee_upgrade",
                 "waggledance_ask_state",
@@ -2306,6 +2007,15 @@ mod tests {
                 "waggledance_task"
             ]
         );
+    }
+
+    #[test]
+    fn the_removed_viewer_tools_are_unknown() {
+        let engine = empty_engine();
+        for name in ["waggledance_view_file", "waggledance_search"] {
+            let resp = call_tool(&engine, name, json!({}));
+            assert_eq!(resp["error"]["message"], "unknown tool", "{resp}");
+        }
     }
 
     fn empty_engine() -> Engine {
@@ -2351,197 +2061,6 @@ mod tests {
     }
 
     #[test]
-    fn search_unfiltered_spans_multiple_projects_by_title() {
-        let (engine, pa, pb) = two_project_engine("search-multi");
-        let resp = call_tool(
-            &engine,
-            "waggledance_search",
-            json!({ "query": "grapefruit" }),
-        );
-        let hits = resp["result"]["structuredContent"]["hits"]
-            .as_array()
-            .unwrap();
-        assert_eq!(hits.len(), 2, "expected a hit from each project: {resp}");
-        let ids: Vec<&str> = hits
-            .iter()
-            .map(|h| h["project_id"].as_str().unwrap())
-            .collect();
-        assert!(ids.contains(&pa.id.as_str()));
-        assert!(ids.contains(&pb.id.as_str()));
-        for h in hits {
-            assert_eq!(h["excerpt"], "");
-        }
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-        std::fs::remove_dir_all(&pb.root_path).ok();
-    }
-
-    #[test]
-    fn search_project_filter_narrows_to_one() {
-        let (engine, pa, pb) = two_project_engine("search-filter");
-        let resp = call_tool(
-            &engine,
-            "waggledance_search",
-            json!({ "query": "grapefruit", "project": pa.id }),
-        );
-        let hits = resp["result"]["structuredContent"]["hits"]
-            .as_array()
-            .unwrap();
-        assert_eq!(hits.len(), 1, "expected only project a's hit: {resp}");
-        assert_eq!(hits[0]["project_id"], pa.id);
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-        std::fs::remove_dir_all(&pb.root_path).ok();
-    }
-
-    #[test]
-    fn search_reflects_a_file_edited_on_disk_since_last_index() {
-        let (engine, pa, pb) = two_project_engine("search-stale");
-        // Edit project a's file after registration (which already indexed
-        // it once) — D4: the next search must see the new content without a
-        // separate refresh call.
-        write(&pa.root_path, "docs/a.md", "# Pineapple A\nNow retitled.");
-        let resp = call_tool(
-            &engine,
-            "waggledance_search",
-            json!({ "query": "pineapple" }),
-        );
-        let hits = resp["result"]["structuredContent"]["hits"]
-            .as_array()
-            .unwrap();
-        assert_eq!(hits.len(), 1, "edited content must be searchable: {resp}");
-        assert_eq!(hits[0]["project_id"], pa.id);
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-        std::fs::remove_dir_all(&pb.root_path).ok();
-    }
-
-    #[test]
-    fn search_matches_a_path_and_zero_hits_say_titles_and_paths() {
-        let (engine, pa, pb) = two_project_engine("search-path");
-        let resp = call_tool(
-            &engine,
-            "waggledance_search",
-            json!({ "query": "docs/a.md" }),
-        );
-        let hits = resp["result"]["structuredContent"]["hits"]
-            .as_array()
-            .unwrap();
-        assert_eq!(hits.len(), 1, "path hit expected: {resp}");
-        assert_eq!(hits[0]["rel_path"], "docs/a.md");
-        let resp = call_tool(&engine, "waggledance_search", json!({ "query": "orchard" }));
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("only titles and paths were searched"),
-            "{text}"
-        );
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-        std::fs::remove_dir_all(&pb.root_path).ok();
-    }
-
-    #[test]
-    fn fts_hostile_query_returns_empty_not_error() {
-        let (engine, pa, pb) = two_project_engine("search-hostile");
-        let resp = call_tool(&engine, "waggledance_search", json!({ "query": "*)(" }));
-        assert!(
-            resp["result"]["isError"].is_null(),
-            "unexpected error: {resp}"
-        );
-        let hits = resp["result"]["structuredContent"]["hits"]
-            .as_array()
-            .unwrap();
-        assert!(
-            hits.is_empty(),
-            "hostile query must not error, and must not match: {resp}"
-        );
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-        std::fs::remove_dir_all(&pb.root_path).ok();
-    }
-
-    #[test]
-    fn search_missing_query_is_a_tool_error() {
-        let (engine, pa, pb) = two_project_engine("search-missing-query");
-        let resp = call_tool(&engine, "waggledance_search", json!({}));
-        assert_eq!(resp["result"]["isError"], true, "{resp}");
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-        std::fs::remove_dir_all(&pb.root_path).ok();
-    }
-
-    #[test]
-    fn search_nonexistent_project_is_a_tool_error_naming_it() {
-        let (engine, pa, pb) = two_project_engine("search-no-project");
-        let resp = call_tool(
-            &engine,
-            "waggledance_search",
-            json!({ "query": "grapefruit", "project": "does-not-exist" }),
-        );
-        assert_eq!(resp["result"]["isError"], true, "{resp}");
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("does-not-exist"), "{text}");
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-        std::fs::remove_dir_all(&pb.root_path).ok();
-    }
-
-    /// Happy path (review P1-2): a clean unfiltered search reports both
-    /// registered projects refreshed and names none as failed.
-    #[test]
-    fn search_reports_a_clean_refresh_outcome() {
-        let (engine, pa, pb) = two_project_engine("search-refresh-happy");
-        let resp = call_tool(
-            &engine,
-            "waggledance_search",
-            json!({ "query": "grapefruit" }),
-        );
-        let refresh = &resp["result"]["structuredContent"]["refresh"];
-        assert!(
-            refresh["refreshed"].as_u64().unwrap() >= 1,
-            "expected at least one project refreshed: {resp}"
-        );
-        assert_eq!(refresh["failed"].as_array().unwrap().len(), 0, "{resp}");
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(!text.contains("warning"), "{text}");
-
-        std::fs::remove_dir_all(&pa.root_path).ok();
-        std::fs::remove_dir_all(&pb.root_path).ok();
-    }
-
-    /// Failure path (review P1-2): `summarize_refresh` is the seam a real
-    /// `refresh_stale` error (DB locked past busy_timeout, store error
-    /// mid-walk) folds through — asserted directly since inducing a real
-    /// store failure from this test would be unreliable.
-    #[test]
-    fn summarize_refresh_surfaces_a_failed_project_and_a_warning() {
-        let summary = summarize_refresh(vec![
-            ("ok-project".to_string(), Ok(3)),
-            (
-                "broken-project".to_string(),
-                Err(Error::Other("db locked".to_string())),
-            ),
-        ]);
-        assert_eq!(summary.structured["refreshed"], 1);
-        let failed = summary.structured["failed"].as_array().unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0]["project_id"], "broken-project");
-        assert_eq!(failed[0]["error"], "db locked");
-        let warning = summary.warning.expect("a failed project must warn");
-        assert!(warning.contains("broken-project"), "{warning}");
-        assert!(warning.contains("may lag disk"), "{warning}");
-    }
-
-    /// A search response with no failed projects carries no warning.
-    #[test]
-    fn summarize_refresh_is_silent_when_nothing_failed() {
-        let summary = summarize_refresh(vec![("a".to_string(), Ok(1)), ("b".to_string(), Ok(0))]);
-        assert_eq!(summary.structured["refreshed"], 2);
-        assert_eq!(summary.structured["failed"].as_array().unwrap().len(), 0);
-        assert!(summary.warning.is_none());
-    }
-
-    #[test]
     fn projects_lists_both_with_counts_and_root() {
         let (engine, pa, pb) = two_project_engine("projects-list");
         let resp = call_tool(&engine, "waggledance_projects", json!({}));
@@ -2550,7 +2069,6 @@ mod tests {
             .unwrap();
         assert_eq!(entries.len(), 2, "{resp}");
         let a = entries.iter().find(|e| e["id"] == pa.id).unwrap();
-        assert_eq!(a["file_count"], 1);
         assert_eq!(a["root_path"], pa.root_path.display().to_string());
         assert!(a["last_seen_at"].as_str().is_some());
 
@@ -2713,7 +2231,7 @@ mod tests {
             ..Default::default()
         };
 
-        let sessions = crate::server::herdr_session_ids(Some(&snapshot));
+        let sessions = crate::panes::herdr_session_ids(Some(&snapshot));
         let value = project_panes_value(&snapshot, &project, &rollup, &sessions);
         let rows = value.as_array().expect("panes is an array");
         assert_eq!(rows.len(), 2, "only the in-boundary panes survive: {value}");

@@ -5,10 +5,7 @@
 //! the `waggledance` binary crate, not `waggledance-core`: `waggledance-core` is enforced
 //! async-runtime-free (`bee::tests::no_web_framework_dependency_declared`
 //! asserts no `tokio`/`axum`/`hyper` in its `Cargo.toml`), and this client
-//! needs `tokio` for the socket I/O. `waggledance` already depends on both tokio
-//! and axum, so it carries the extra weight this port needs no axum for.
-//! `pane_scroller.rs` ports herdr-go's alt-screen scrollback nudger; it has
-//! no route-level consumer yet (see its own module doc).
+//! needs `tokio` for the socket I/O.
 //!
 //! The surface is request/response only (no live stream): snapshot the runtime,
 //! read a pane's screen (polled), and send input as a reply. One trait, two
@@ -19,7 +16,6 @@
 // outside `#[cfg(test)]` ever constructs it, so it is gated the same way.
 #[cfg(test)]
 pub mod fake;
-pub mod pane_scroller;
 pub mod socket;
 pub mod wire;
 
@@ -444,28 +440,8 @@ fn expand_home(raw: &str) -> std::path::PathBuf {
     }
 }
 
-/// Start an agent in a pane of its own: create a tab at `cwd`, find the pane
-/// that tab brought with it, and start the agent there.
-///
-/// This is what protocol 20 turned `agent.start` into. Before it, one call
-/// both made a pane and launched into it; now `agent.start` only ever
-/// attaches to an existing pane, and `tab_created` does not say which pane it
-/// just made — `TabInfo` carries no pane id, and `pane.list` filters by
-/// workspace, not tab. So the hop goes through a fresh snapshot, matching on
-/// `tab_id`.
-///
-/// **Matched on `tab_id` alone.** Not the newest pane, not the focused one,
-/// not the last in the list: each of those picks the wrong pane on a busy
-/// machine, and the cost of picking wrong is an agent typing into somebody
-/// else's session. When no pane matches, this returns
-/// [`HerdrError::TabPaneUnresolved`] and starts nothing — the tab is left
-/// standing and named in the error rather than quietly reused.
-///
-/// One implementation for every caller (the board's spawn, the board's
-/// shell-create, and MCP dispatch) on purpose: a second copy of this hop
-/// would be free to drift into a friendlier fallback, and friendlier is
-/// exactly wrong here.
-pub async fn start_agent_in_new_tab(
+#[cfg(test)]
+pub(crate) async fn start_agent_in_new_tab(
     herdr: &dyn Herdr,
     workspace_id: &str,
     cwd: Option<&str>,

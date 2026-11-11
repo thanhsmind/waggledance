@@ -1,35 +1,19 @@
 # Waggledance Integration (template)
 
 Copy this snippet into your project's `AGENTS.md` or global `~/.claude/CLAUDE.md`
-so agents surface a viewable URL after writing markdown. waggledance runs locally at
-`http://localhost:7700`.
+so agents know what waggledance offers. waggledance runs as a supervisor daemon
+(`waggledance serve`) and exposes its tools over MCP (`waggledance mcp`).
 
 ---
 
-## Documentation Viewing (Waggledance)
+## Waggledance (supervisor)
 
-After creating or updating any markdown file, make it viewable in ONE call —
-no project registration step needed:
+Waggledance supervises agents across registered projects. Use its MCP tools:
 
-### Using MCP (preferred)
+- `waggledance_projects` lists the registered projects.
+- `waggledance_ask_state` reads a project's bee state and live panes.
+- `waggledance_dispatch` hands work to a project's leader or a pane.
+- `waggledance_await`, `waggledance_runs` and `waggledance_task` follow dispatched work.
+- `waggledance_bee_upgrade` previews or applies a bee upgrade.
 
-Call `waggledance_view_file` with:
-
-- `project_root`: absolute path to the project root
-- `relative_path`: the file path relative to that root
-
-It returns a browser `url`. Tell the user: "You can view this at: `<url>`".
-The server auto-registers the project on first use and indexes the file
-immediately.
-
-### Using CLI fallback
-
-```sh
-waggledance open <absolute-path-to-file.md>
-```
-
-### When to render
-
-Spin up a preview for long docs, tables, Mermaid diagrams, multi-file document
-sets, or when the user asks to "preview"/"render". Skip it for short, trivial
-snippets.
+Check the daemon with `waggledance status` and `waggledance doctor`.

@@ -12,8 +12,6 @@ enum Status {
     Fixed,
     Manual,
     Warn,
-    /// The target tool isn't installed on this machine, so nothing was written
-    /// for it (never install blindly).
     Skip,
 }
 
@@ -51,12 +49,11 @@ pub fn run(as_json: bool, dry_run: bool, fix: bool) -> Result<()> {
     checks.push(check_config(dry_run));
     let daemon = check_daemon();
     checks.push(daemon);
-    checks.push(check_index_schema());
     checks.push(check_mcp_claude(dry_run, fix));
     checks.push(check_mcp_codex(dry_run, fix));
     checks.push(check_mcp_antigravity(dry_run, fix));
     checks.push(check_agent_instruction(dry_run, fix));
-    checks.push(check_skill(dry_run, fix));
+    checks.push(check_legacy_viewer_skill(dry_run, fix));
     checks.push(check_supervisor_skill(dry_run, fix));
     checks.push(check_leader_idle_close());
 
@@ -172,16 +169,10 @@ fn check_config(dry_run: bool) -> Check {
 fn check_daemon() -> Check {
     match runtime::running_daemon() {
         Some(info) => {
-            let running = format!(
-                "running on http://{}:{} (pid {})",
-                info.host, info.port, info.pid
-            );
+            let running = format!("running (pid {})", info.pid);
             let expected = env!("CARGO_PKG_VERSION");
-            // Ask the live process, not the lock file: upgrading the binary
-            // leaves an already-serving daemon untouched, and it is that
-            // in-memory process which lacks the newer routes.
-            let reported = waggledance_core::daemon::daemon_version(&info.host, info.port);
-            let (status, detail) = daemon_version_verdict(&running, reported.as_deref(), expected);
+            let (status, detail) =
+                daemon_version_verdict(&running, info.version.as_deref(), expected);
             Check {
                 name: "daemon".into(),
                 status,
@@ -196,11 +187,6 @@ fn check_daemon() -> Check {
     }
 }
 
-/// Compare a running daemon's reported version against this binary's.
-///
-/// Pure so the upgrade case can be tested without a live daemon. `None` means the
-/// daemon answered without a version, which only a build predating that field
-/// does — so it is treated as stale, not as unknown.
 fn daemon_version_verdict(
     running: &str,
     reported: Option<&str>,
@@ -212,7 +198,7 @@ fn daemon_version_verdict(
             Status::Manual,
             format!(
                 "{running} is v{v} but this binary is v{expected} — \
-                 short links will 404 until you run `waggledance restart`"
+                 run `waggledance restart` to load the new build"
             ),
         ),
         None => (
@@ -222,49 +208,6 @@ fn daemon_version_verdict(
                  v{expected} — run `waggledance restart`"
             ),
         ),
-    }
-}
-
-/// Report the index database's migration state.
-///
-/// Opening the store is what migrates it, so this check both reports and (as a
-/// side effect of the normal open path) completes any pending upgrade — there is
-/// no separate `waggledance migrate` command to forget to run.
-fn check_index_schema() -> Check {
-    let path = config::registry_db_path();
-    if !path.exists() {
-        return Check {
-            name: "index schema".into(),
-            status: Status::Skip,
-            detail: format!("no database yet at {}", path.display()),
-        };
-    }
-    match waggledance_core::SqliteStore::open(&path) {
-        Ok(store) => match store.schema_report() {
-            Ok((version, 0)) => Check {
-                name: "index schema".into(),
-                status: Status::Ok,
-                detail: format!("v{version}, every file has a short-link code"),
-            },
-            Ok((version, unhashed)) => Check {
-                name: "index schema".into(),
-                status: Status::Manual,
-                detail: format!(
-                    "v{version}, but {unhashed} file(s) still have no short-link code — \
-                     run `waggledance refresh`"
-                ),
-            },
-            Err(e) => Check {
-                name: "index schema".into(),
-                status: Status::Manual,
-                detail: format!("could not read schema state: {e}"),
-            },
-        },
-        Err(e) => Check {
-            name: "index schema".into(),
-            status: Status::Manual,
-            detail: format!("could not open {}: {e}", path.display()),
-        },
     }
 }
 
@@ -674,61 +617,75 @@ fn check_agent_instruction(dry_run: bool, fix: bool) -> Check {
     }
 }
 
-/// The waggledance Claude Code skill (`/waggledance <path>`), installed
-/// globally so it works in any project. waggledance owns this file entirely,
-/// so the check is a whole-file content match rather than a shared marker
-/// block.
-const SKILL_TEMPLATE: &str = include_str!("../../../docs/waggledance-skill-template.md");
+const LEGACY_VIEWER_SKILL: &str = include_str!("legacy_viewer_skill.md");
 
-/// The cockpit-supervisor skill — relays a spec from the human into a target
-/// project's own backlog via the existing dispatch door. Same install
-/// mechanics as `SKILL_TEMPLATE`: a whole-file content match owned entirely
-/// by waggledance, installed to its own skill directory.
 const SUPERVISOR_SKILL_TEMPLATE: &str =
     include_str!("../../../docs/waggledance-supervisor-skill-template.md");
 
-/// `~/.claude/skills/waggledance/SKILL.md` — the global (not per-project)
-/// skill file.
 fn skill_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude/skills/waggledance/SKILL.md")
 }
 
-/// `~/.claude/skills/waggledance-supervisor/SKILL.md` — the global
-/// cockpit-supervisor skill file, installed beside the viewer skill.
 fn supervisor_skill_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude/skills/waggledance-supervisor/SKILL.md")
 }
 
-/// The pre-rename skill directory sitting beside `path`'s own skill
-/// directory (`…/skills/mdview` next to `…/skills/waggledance`), derived
-/// rather than hardcoded so it stays testable against a temp `path`.
-fn old_skill_dir_for(path: &Path) -> Option<PathBuf> {
-    let skills_dir = path.parent()?.parent()?;
-    Some(skills_dir.join("mdview"))
+fn check_legacy_viewer_skill(dry_run: bool, fix: bool) -> Check {
+    if !claude_present() {
+        return skipped("viewer skill", "Claude Code");
+    }
+    check_legacy_viewer_skill_at(&skill_path(), dry_run, fix)
 }
 
-fn check_skill(dry_run: bool, fix: bool) -> Check {
-    // The skill lives under ~/.claude/skills — only relevant to Claude Code.
-    if !claude_present() {
-        return skipped("Claude skill", "Claude Code");
+fn check_legacy_viewer_skill_at(path: &Path, dry_run: bool, fix: bool) -> Check {
+    let name = "viewer skill";
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Check {
+            name: name.into(),
+            status: Status::Ok,
+            detail: "no legacy viewer skill installed".into(),
+        };
+    };
+    if text != LEGACY_VIEWER_SKILL {
+        return Check {
+            name: name.into(),
+            status: Status::Ok,
+            detail: format!("{} is not waggledance's and is left alone", path.display()),
+        };
     }
-    check_skill_at(
-        &skill_path(),
-        SKILL_TEMPLATE,
-        "skill",
-        "global /waggledance skill",
-        true,
-        dry_run,
-        fix,
-    )
+    if dry_run || !fix {
+        return Check {
+            name: name.into(),
+            status: Status::Manual,
+            detail: format!(
+                "the retired viewer skill is still installed at {} — run `waggledance doctor --fix` to remove it",
+                path.display()
+            ),
+        };
+    }
+    let removed = std::fs::remove_file(path).and_then(|()| match path.parent() {
+        Some(dir) => std::fs::remove_dir(dir).or(Ok(())),
+        None => Ok(()),
+    });
+    match removed {
+        Ok(()) => Check {
+            name: name.into(),
+            status: Status::Fixed,
+            detail: format!("removed the retired viewer skill at {}", path.display()),
+        },
+        Err(e) => Check {
+            name: name.into(),
+            status: Status::Manual,
+            detail: format!("remove failed: {e}"),
+        },
+    }
 }
 
 fn check_supervisor_skill(dry_run: bool, fix: bool) -> Check {
-    // Same install surface as the viewer skill — only relevant to Claude Code.
     if !claude_present() {
         return skipped("supervisor skill", "Claude Code");
     }
@@ -737,46 +694,23 @@ fn check_supervisor_skill(dry_run: bool, fix: bool) -> Check {
         SUPERVISOR_SKILL_TEMPLATE,
         "supervisor skill",
         "global waggledance-supervisor skill",
-        false,
         dry_run,
         fix,
     )
 }
 
-/// Install/verify a global waggledance skill at `path` against `template`,
-/// reporting under `check_name` (must be distinct per skill — it is the
-/// `--json` output's key, so two checks sharing a name would collide into
-/// one row). `label` is the human phrase used in the detail sentences.
-///
-/// When `sweep_old` is set, also remove the stale `.../skills/mdview/`
-/// directory a pre-rename install left behind — otherwise it keeps telling
-/// agents to run a deleted binary and call a tool that no longer exists.
-/// Only the viewer skill's directory ever had a pre-rename life, so every
-/// other skill passes `sweep_old: false` — left unconditional, a skill with
-/// nothing to sweep would still report `Manual` over a viewer-only leftover.
-///
-/// Split from `check_skill`/`check_supervisor_skill` so the write/idempotency
-/// logic is testable without touching the real HOME.
 fn check_skill_at(
     path: &std::path::Path,
     template: &str,
     check_name: &str,
     label: &str,
-    sweep_old: bool,
     dry_run: bool,
     fix: bool,
 ) -> Check {
-    let old_dir = if sweep_old {
-        old_skill_dir_for(path)
-    } else {
-        None
-    };
-    let old_present = old_dir.as_deref().is_some_and(|d| d.exists());
-
     let in_sync = std::fs::read_to_string(path)
         .map(|t| t == template)
         .unwrap_or(false);
-    if in_sync && !old_present {
+    if in_sync {
         return Check {
             name: check_name.into(),
             status: Status::Ok,
@@ -784,34 +718,20 @@ fn check_skill_at(
         };
     }
     if dry_run || !fix {
-        let detail = if in_sync {
-            format!(
-                "stale {} present — run `waggledance doctor --fix` to remove it",
-                old_dir.as_deref().unwrap_or(Path::new("")).display()
-            )
-        } else {
-            format!(
-                "{label} missing or outdated at {} — run `waggledance doctor --fix`",
-                path.display()
-            )
-        };
         return Check {
             name: check_name.into(),
             status: Status::Manual,
-            detail,
+            detail: format!(
+                "{label} missing or outdated at {} — run `waggledance doctor --fix`",
+                path.display()
+            ),
         };
     }
     let write = || -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        config::write_atomic(path, template.as_bytes()).map_err(anyhow::Error::from)?;
-        if let Some(dir) = &old_dir {
-            if dir.exists() {
-                std::fs::remove_dir_all(dir)?;
-            }
-        }
-        Ok(())
+        config::write_atomic(path, template.as_bytes()).map_err(anyhow::Error::from)
     };
     match write() {
         Ok(()) => Check {
@@ -876,125 +796,38 @@ mod agent_instruction_tests {
     #[test]
     fn snippet_strips_preamble() {
         let s = agent_instruction_snippet();
-        assert!(s.starts_with("## Documentation Viewing (Waggledance)"));
+        assert!(s.starts_with("## Waggledance (supervisor)"));
+        assert!(!s.contains("waggledance_view_file"));
         assert!(!s.contains("Copy this snippet"));
     }
 
     #[test]
-    fn skill_template_is_a_valid_skill_file() {
-        assert!(SKILL_TEMPLATE.starts_with("---"));
-        assert!(SKILL_TEMPLATE.contains("name: waggledance"));
-        // Carries the CLI-vs-MCP guidance the feature is about.
-        assert!(SKILL_TEMPLATE.contains("waggledance_view_file"));
-        assert!(SKILL_TEMPLATE.contains("waggledance open"));
-    }
-
-    #[test]
-    fn skill_installs_then_reports_in_sync_idempotently() {
-        let base = tmp_path("skill");
+    fn a_shipped_viewer_skill_is_removed_on_fix_and_a_foreign_one_is_kept() {
+        let base = tmp_path("viewer-skill");
         let path = base.join("skills/waggledance/SKILL.md");
-        // Missing → Manual on a dry run (no write).
-        assert!(matches!(
-            check_skill_at(
-                &path,
-                SKILL_TEMPLATE,
-                "skill",
-                "global /waggledance skill",
-                true,
-                true,
-                false
-            )
-            .status,
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, LEGACY_VIEWER_SKILL).unwrap();
+        assert_eq!(
+            check_legacy_viewer_skill_at(&path, true, false).status,
             Status::Manual
-        ));
+        );
+        assert!(path.exists());
+        assert_eq!(
+            check_legacy_viewer_skill_at(&path, false, true).status,
+            Status::Fixed
+        );
         assert!(!path.exists());
-        // --fix installs the file with the template content verbatim.
-        assert!(matches!(
-            check_skill_at(
-                &path,
-                SKILL_TEMPLATE,
-                "skill",
-                "global /waggledance skill",
-                true,
-                false,
-                true
-            )
-            .status,
-            Status::Fixed
-        ));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_TEMPLATE);
-        // Re-running is a no-op: the file is already in sync.
-        assert!(matches!(
-            check_skill_at(
-                &path,
-                SKILL_TEMPLATE,
-                "skill",
-                "global /waggledance skill",
-                true,
-                false,
-                true
-            )
-            .status,
+        assert_eq!(
+            check_legacy_viewer_skill_at(&path, false, true).status,
             Status::Ok
-        ));
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    /// A pre-rename install left `.../skills/mdview/` behind — it still tells
-    /// agents to run a deleted binary and call a tool that no longer exists,
-    /// so `--fix` must remove the whole directory, not just skip past it.
-    #[test]
-    fn skill_removes_stale_directory_on_fix() {
-        let base = tmp_path("skill-stale");
-        let old_dir = base.join("skills/mdview");
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::write(old_dir.join("SKILL.md"), "old content, old binary").unwrap();
-        let path = base.join("skills/waggledance/SKILL.md");
-
-        // The stale directory alone makes a dry run report Manual, even
-        // before the new skill file exists.
-        assert!(matches!(
-            check_skill_at(
-                &path,
-                SKILL_TEMPLATE,
-                "skill",
-                "global /waggledance skill",
-                true,
-                true,
-                false
-            )
-            .status,
-            Status::Manual
-        ));
-        assert!(matches!(
-            check_skill_at(
-                &path,
-                SKILL_TEMPLATE,
-                "skill",
-                "global /waggledance skill",
-                true,
-                false,
-                true
-            )
-            .status,
-            Status::Fixed
-        ));
-        assert!(!old_dir.exists(), "stale skill directory should be removed");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_TEMPLATE);
-        // Idempotent: nothing left to sweep, so a re-run reports OK.
-        assert!(matches!(
-            check_skill_at(
-                &path,
-                SKILL_TEMPLATE,
-                "skill",
-                "global /waggledance skill",
-                true,
-                false,
-                true
-            )
-            .status,
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "my own skill").unwrap();
+        assert_eq!(
+            check_legacy_viewer_skill_at(&path, false, true).status,
             Status::Ok
-        ));
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "my own skill");
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -1056,7 +889,6 @@ mod agent_instruction_tests {
                 SUPERVISOR_SKILL_TEMPLATE,
                 "supervisor skill",
                 "global waggledance-supervisor skill",
-                false,
                 true,
                 false
             )
@@ -1071,7 +903,6 @@ mod agent_instruction_tests {
                 SUPERVISOR_SKILL_TEMPLATE,
                 "supervisor skill",
                 "global waggledance-supervisor skill",
-                false,
                 false,
                 true
             )
@@ -1089,7 +920,6 @@ mod agent_instruction_tests {
                 SUPERVISOR_SKILL_TEMPLATE,
                 "supervisor skill",
                 "global waggledance-supervisor skill",
-                false,
                 false,
                 true
             )
@@ -1122,7 +952,6 @@ mod agent_instruction_tests {
                 SUPERVISOR_SKILL_TEMPLATE,
                 "supervisor skill",
                 "global waggledance-supervisor skill",
-                false,
                 false,
                 true
             )
