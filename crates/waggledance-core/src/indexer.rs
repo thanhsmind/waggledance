@@ -5,6 +5,7 @@
 use crate::domain::{IndexedFile, Project};
 use crate::error::Result;
 use crate::repository::SqliteStore;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -172,6 +173,60 @@ pub fn bounded_scan_markdown_files(
         }
     }
     ScanBudget::Ok(count)
+}
+
+/// Whether `scan_markdown_files(root, exclude)` would list `path`: false when
+/// a component between `root` and `path` is named in `exclude`, or when the
+/// `.gitignore` in `root` or in any directory between `root` and the file
+/// ignores it or one of its parent directories.
+pub fn walk_would_index(root: &Path, path: &Path, exclude: &[String]) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let names: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return false;
+    }
+    if names
+        .iter()
+        .any(|n| exclude.iter().any(|ex| n.to_string_lossy() == ex.as_str()))
+    {
+        return false;
+    }
+    let mut dir = root.to_path_buf();
+    let mut ignores: Vec<Gitignore> = Vec::new();
+    let last = names.len() - 1;
+    for (i, name) in names.iter().enumerate() {
+        ignores.extend(load_gitignore(&dir));
+        let current = dir.join(name);
+        let is_dir = i < last || current.is_dir();
+        let verdict = ignores
+            .iter()
+            .map(|g| g.matched(&current, is_dir))
+            .filter(|m| !m.is_none())
+            .next_back();
+        if verdict.is_some_and(|m| m.is_ignore()) {
+            return false;
+        }
+        dir = current;
+    }
+    true
+}
+
+fn load_gitignore(dir: &Path) -> Option<Gitignore> {
+    let file = dir.join(".gitignore");
+    if !file.is_file() {
+        return None;
+    }
+    let mut builder = GitignoreBuilder::new(dir);
+    builder.add(&file);
+    builder.build().ok()
 }
 
 fn is_markdown(p: &Path) -> bool {

@@ -7,7 +7,7 @@ bee:
   id: an-fts5-delete-by-unindexed-column-scans-the-whole-table
   lifecycle: active
   areas: [registry]
-  anchors: [crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/engine.rs, crates/waggledance-core/src/indexer.rs]
+  anchors: [crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/engine.rs, crates/waggledance-core/src/indexer.rs, crates/waggledance/src/watch.rs]
   sources: [docs/history/registry-db-lock/CONTEXT.md, docs/history/registry-db-lock/plan.md]
   polarity: pitfall
   critical: true
@@ -27,6 +27,7 @@ Read when: runs fail with "database is locked", registry.db is far larger than i
 - Change detection is a content hash on the `files` row (migration 13, not backfilled), so an unchanged file is never rewritten and an unchanged reconcile writes nothing.
 - The reproduction is a second connection holding `BEGIN IMMEDIATE` while `Engine::refresh` reconciles an indexed, unchanged project: red on the base commit with "database is locked", green after.
 - `reclaim_legacy_index` empties the legacy table's shadow tables in 200-rowid `BEGIN IMMEDIATE` batches, then drops, recreates empty, `VACUUM`s and truncates the WAL. A bare `DROP TABLE` on the full table held the lock 43.5 s.
+- The watcher indexed any markdown path it saw, including ignored and excluded ones the walk never lists. It now indexes a path only when `indexer::walk_would_index` agrees with the walk or the path already has a `files` row, so a known ignored file still reports its change.
 
 ## Rejected
 

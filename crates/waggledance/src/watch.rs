@@ -99,6 +99,22 @@ fn reindex_paths(engine: &Engine, paths: &[std::path::PathBuf]) -> Vec<String> {
                 true
             }
         } else if path.exists() {
+            if !waggledance_core::indexer::walk_would_index(
+                &project.root_path,
+                path,
+                &engine.config.indexing.exclude_patterns,
+            ) && !engine
+                .store
+                .get_file(
+                    &project.id,
+                    &waggledance_core::indexer::rel_path_str(&project.root_path, path),
+                )
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
             // Reindex the file and refresh its outgoing links (keeps backlinks
             // live). Only a genuine content change reports true.
             engine
@@ -432,6 +448,48 @@ mod tests {
         assert!(
             reindex_paths(&engine, std::slice::from_ref(&state)).is_empty(),
             "the same gates after a bad read must still be quiet"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reindex_paths_skips_excluded_and_nested_gitignored_files_but_reports_known_rows() {
+        let dir =
+            std::env::temp_dir().join(format!("waggledance-watch-ign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "docs/a.md", "# A\ncontent");
+
+        let engine = Engine::new(SqliteStore::open_in_memory().unwrap(), Config::default());
+        let project = engine.register(&dir, None).unwrap();
+
+        write(&dir, "node_modules/pkg/readme.md", "# N");
+        write(&dir, "docs/.gitignore", "private/\nsecret.md\n");
+        write(&dir, "docs/private/p.md", "# P");
+        write(&dir, "docs/secret.md", "# S");
+        write(&dir, "docs/ok.md", "# Ok");
+        let skipped = [
+            dir.join("node_modules/pkg/readme.md"),
+            dir.join("docs/private/p.md"),
+            dir.join("docs/secret.md"),
+        ];
+        assert!(reindex_paths(&engine, &skipped).is_empty());
+        for p in &skipped {
+            let rel = waggledance_core::indexer::rel_path_str(&dir, p);
+            assert!(engine.store.get_file(&project.id, &rel).unwrap().is_none());
+        }
+        assert_eq!(
+            reindex_paths(&engine, &[dir.join("docs/ok.md")]),
+            vec![format!("{}/docs/ok.md", project.id)]
+        );
+
+        engine
+            .index_file_incremental(&project, &dir.join("docs/secret.md"))
+            .unwrap();
+        write(&dir, "docs/secret.md", "# S changed");
+        assert_eq!(
+            reindex_paths(&engine, &[dir.join("docs/secret.md")]),
+            vec![format!("{}/docs/secret.md", project.id)]
         );
 
         std::fs::remove_dir_all(&dir).ok();
