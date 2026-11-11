@@ -506,6 +506,8 @@ A leader is held while it has an unexpired `waggledance hold` row or a Paseo chi
 
 A held leader's completed or idle turn end leaves the run `working` and polls `inspect` every `permission_poll` until `UpdatedAt` moves. Paseo's `wait` is never called on an idle leader, and a wake turn is never caught by seeing `running` (polling status every 5 s missed both). When the hold ends the run ends as before; an expiry adds `hold expired after N min (why)` to the transcript header. The idle sweep and the heartbeat skip a held leader. Every leader prompt but a steer note ends with the hold line, appended at send time so the stored task stays the caller's.
 
+A leader turn after its run ended `done` or `lost` is a late reply (D5), found by the five-minute sweep (`pass_on_late_reply`): the newest run the leader carries, an unarchived settled leader whose `UpdatedAt` is later than that run's end, no `late reply` line in the transcript yet. `late_reply_at` is stamped but never read back, because the engine has no reader and the transcript line is the once-only mark. An empty turn records nothing and is read again next sweep. An `openclaw:` caller gets one `progress` mail headed `late reply`, skipped when the task's `last_mail_at` is after the run's end so a result the leader already mailed is not repeated; any other caller gets a run notice naming the late reply.
+
 ## Known limit
 
 A human who types to the leader while a delivery is in flight interrupts that turn —

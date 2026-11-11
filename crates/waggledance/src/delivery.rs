@@ -24,6 +24,7 @@ const NO_REPLY: &str = "[waggledance] the leader ended its turn but left no repl
 const LEADER_RUNNING: [&str; 2] = ["running", "initializing"];
 const UNFINISHED: &str = "timeout";
 const UNREAD_LIMIT: u32 = 3;
+const LATE_REPLY: &str = "[waggledance] late reply";
 
 pub type NotifySlot = Arc<Mutex<Option<Arc<NotifyStore>>>>;
 
@@ -158,6 +159,13 @@ fn minutes_between(from: &str, to: &str) -> i64 {
     }
 }
 
+fn later(at: &str, than: &str) -> bool {
+    let parse = |t: &str| {
+        time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok()
+    };
+    matches!((parse(at), parse(than)), (Some(at), Some(than)) if at > than)
+}
+
 fn leader_reply(logs: &str, task: &str) -> String {
     let head = format!("[User] {}", task.lines().next().unwrap_or_default());
     let Some(at) = logs.rfind(&head) else {
@@ -252,6 +260,7 @@ impl Delivery {
                 }
             };
             let carried = self.carried_runs(&id);
+            self.pass_on_late_reply(&id, &state, &carried).await;
             let limit = self.idle_limit(&carried);
             let Some(idle) = idle_for(&state, now, limit) else {
                 continue;
@@ -275,6 +284,89 @@ impl Delivery {
                     tracing::warn!("idle sweep could not archive leader {id}: {e}")
                 }
             }
+        }
+    }
+
+    async fn pass_on_late_reply(&self, leader: &str, state: &paseo::AgentState, carried: &[Run]) {
+        let Some(run) = carried.first() else { return };
+        if !matches!(run.status.as_str(), "done" | "lost") || !settled(state) {
+            return;
+        }
+        if !state
+            .updated_at
+            .as_deref()
+            .is_some_and(|at| later(at, &run.updated_at))
+        {
+            return;
+        }
+        let known = self
+            .engine
+            .run_final_transcript(&run.id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if known.contains(LATE_REPLY) {
+            return;
+        }
+        let logs = match self.paseo.logs_since(leader, &run.updated_at).await {
+            Ok(logs) => logs,
+            Err(e) => {
+                tracing::warn!("delivery could not read leader {leader} logs: {e}");
+                return;
+            }
+        };
+        let reply = logs
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with("[User]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if reply.is_empty() {
+            return;
+        }
+        let name = self.name_of(run);
+        let caller = match self.engine.run_caller(&run.id) {
+            Ok(Some(caller)) if caller != leader => Some(caller),
+            _ => None,
+        };
+        let notice = caller
+            .as_deref()
+            .filter(|c| !c.starts_with("openclaw:"))
+            .map(|_| {
+                let text = format!(
+                    "[waggledance] {name} leader sent a late reply for run {id} ({status}) — \
+                     read it with waggledance_await {{\"run_id\": \"{id}\"}}.",
+                    id = run.id,
+                    status = run.status,
+                );
+                (text, notice_until())
+            });
+        let transcript = format!("{known}\n\n{LATE_REPLY}\n{reply}");
+        if let Err(e) = self.engine.finish_run(
+            &run.id,
+            &run.status,
+            &run.updated_at,
+            Some(&transcript),
+            notice.as_ref().map(|(t, u)| (t.as_str(), u.as_str())),
+        ) {
+            tracing::warn!("delivery could not record run {}'s late reply: {e}", run.id);
+            return;
+        }
+        if let Err(e) = self.engine.stamp_late_reply(&run.id, &now_rfc3339()) {
+            tracing::warn!("delivery could not stamp run {}'s late reply: {e}", run.id);
+        }
+        let Some(to) = caller.as_deref().and_then(|c| c.strip_prefix("openclaw:")) else {
+            return;
+        };
+        let mailed = paseo::wd_corr(&run.task)
+            .and_then(|corr| self.engine.get_task(corr).ok().flatten())
+            .and_then(|task| task.last_mail_at)
+            .is_some_and(|at| later(&at, &run.updated_at));
+        if !mailed {
+            let body = format!(
+                "late reply: {name} leader {leader} answered after run {} ended {}\n{reply}",
+                run.id, run.status
+            );
+            self.mail(run, to, "progress", &body);
         }
     }
 
@@ -2844,5 +2936,112 @@ mod tests {
         assert_eq!(paseo::task_body(&started[0]), "build it");
         let note = paseo::steer_task("nearby");
         assert_eq!(paseo::with_hold_line(&note), note);
+    }
+
+    fn ended_run(r: &Rig, id: &str, corr: &str, caller: &str, status: &str) {
+        r.queue("proj-1", id, &paseo::wd_task(corr, "one"), Some(caller));
+        r.engine.set_run_pane(id, "paseo:late-lead").unwrap();
+        r.engine
+            .finish_run(id, status, "2026-11-02T10:00:00Z", Some("first"), None)
+            .unwrap();
+    }
+
+    fn late_leader(r: &Rig, logs: &str) {
+        r.fake
+            .add_listed_leader("late-lead", "idle", Some("2026-11-02T11:00:00Z"));
+        r.set_logs("late-lead", logs);
+    }
+
+    fn mails_to(r: &Rig, to: &str) -> Vec<String> {
+        let mut got = Vec::new();
+        while let Some(m) = r.engine.next_inbox_message(to).unwrap() {
+            r.engine.ack_inbox_message(m.seq, &now_rfc3339()).unwrap();
+            got.push(format!("{}: {}", m.kind, m.body));
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn a_late_leader_reply_is_appended_once_and_mailed_to_an_openclaw_caller() {
+        let r = rig();
+        r.engine
+            .insert_task("corr-9", "proj-1", "2026-11-02T09:00:00Z")
+            .unwrap();
+        ended_run(&r, "run-1", "corr-9", "openclaw:cl-1", "done");
+        late_leader(&r, "[User] ping\nthe build finished\n");
+        r.sweep_at(clock(NOW)).await;
+        r.sweep_at(clock(NOW)).await;
+        let transcript = r.transcript("run-1");
+        assert_eq!(transcript.matches(LATE_REPLY).count(), 1, "{transcript}");
+        assert!(transcript.starts_with("first"), "{transcript}");
+        assert!(transcript.contains("the build finished"), "{transcript}");
+        let mail = mails_to(&r, "cl-1");
+        assert_eq!(mail.len(), 1, "{mail:?}");
+        assert!(mail[0].starts_with("progress: late reply"), "{mail:?}");
+        assert!(mail[0].contains("the build finished"), "{mail:?}");
+    }
+
+    #[tokio::test]
+    async fn a_task_mailed_after_the_run_ended_gets_no_late_reply_mail() {
+        let r = rig();
+        r.engine
+            .insert_task("corr-9", "proj-1", "2026-11-02T09:00:00Z")
+            .unwrap();
+        r.engine
+            .mark_task_mail("corr-9", "2026-11-02T10:30:00Z")
+            .unwrap();
+        ended_run(&r, "run-1", "corr-9", "openclaw:cl-1", "done");
+        late_leader(&r, "the build finished\n");
+        r.sweep_at(clock(NOW)).await;
+        assert!(r.transcript("run-1").contains(LATE_REPLY));
+        assert!(mails_to(&r, "cl-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn another_caller_gets_a_run_notice_naming_the_late_reply() {
+        let r = rig();
+        r.fake.add_leader("caller-1", "idle", false);
+        ended_run(&r, "run-1", "corr-9", "caller-1", "lost");
+        late_leader(&r, "the build finished\n");
+        r.sweep_at(clock(NOW)).await;
+        r.tick().await;
+        let sent = r.notices();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "caller-1");
+        assert!(sent[0].1.contains("late reply"), "{sent:?}");
+        assert!(sent[0].1.contains("run-1"), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_leader_that_took_a_newer_run_is_not_read_for_a_late_reply() {
+        let r = rig();
+        ended_run(&r, "run-1", "corr-9", "openclaw:cl-1", "done");
+        r.queue_at(
+            "proj-1",
+            "run-2",
+            &paseo::wd_task("corr-10", "two"),
+            None,
+            "2026-11-02T10:30:00Z",
+        );
+        r.engine.set_run_pane("run-2", "paseo:late-lead").unwrap();
+        late_leader(&r, "the build finished\n");
+        r.sweep_at(clock(NOW)).await;
+        assert!(!r.transcript("run-1").contains(LATE_REPLY));
+        assert!(!r
+            .fake
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::LogsSince(..))));
+        assert!(mails_to(&r, "cl-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_late_turn_records_nothing() {
+        let r = rig();
+        ended_run(&r, "run-1", "corr-9", "openclaw:cl-1", "done");
+        late_leader(&r, "[User] ping\n\n");
+        r.sweep_at(clock(NOW)).await;
+        assert_eq!(r.transcript("run-1"), "first");
+        assert!(mails_to(&r, "cl-1").is_empty());
     }
 }
