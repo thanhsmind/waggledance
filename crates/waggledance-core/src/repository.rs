@@ -1360,7 +1360,9 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         let projects: i64 = c
-            .query_row("SELECT COUNT(*) FROM projects WHERE id='p1'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM projects WHERE id='p1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let runs: i64 = c
             .query_row("SELECT COUNT(*) FROM runs WHERE id='r1'", [], |r| r.get(0))
