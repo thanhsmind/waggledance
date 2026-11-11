@@ -502,6 +502,8 @@ the calling agent, and `paseo run` attaches it to the caller's workspace.
 
 Read when: a leader ends its turn while work it handed out still runs, and its run reads done too soon, its leader is archived, or the heartbeat nudges it.
 
+Locked by leader-delegated-work D1/D2/D3/D4/D5 (`docs/history/leader-delegated-work/CONTEXT.md`).
+
 The leader declares its own wait with `waggledance hold --why <reason> [--minutes N]` (it reads `PASEO_AGENT_ID`, exits 2 naming the variable when absent) and releases it with `--release`. A hold lasts at most `[paseo] hold_max_minutes` (default 120, the 2-hour ceiling) and `--minutes` is capped to it; waggledance never infers delegated work from a provider timeline (D1, D2). A `result` mail from the leader also clears the hold (D4).
 
 A leader is held while it has an unexpired `waggledance hold` row or a Paseo child whose `ParentAgentId` is the leader, running or initializing (`paseo::held_work`). `paseo ls` has no parent field, so the children lookup lists running agents and inspects each; it runs only when a decision needs it, and a hold row decides first.
