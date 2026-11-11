@@ -100,13 +100,17 @@ fn orchestration_handle<'a>(
 
 pub(crate) fn call_tool(name: &str, args: Value) -> Result<Value> {
     let engine = Engine::new(SqliteStore::open(&registry_db_path())?, Config::load());
+    Ok(call_tool_on(&engine, name, args))
+}
+
+pub(crate) fn call_tool_on(engine: &Engine, name: &str, args: Value) -> Value {
     let req = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": { "name": name, "arguments": args }
     });
-    Ok(handle_tool_call(Some(json!(1)), &engine, &mut None, &req))
+    handle_tool_call(Some(json!(1)), engine, &mut None, &req)
 }
 
 pub fn run() -> Result<()> {

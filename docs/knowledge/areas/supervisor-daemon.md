@@ -8,13 +8,13 @@ bee:
   id: supervisor-daemon
   lifecycle: active
   areas: [orchestration]
-  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs]
+  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/agent_cli.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs]
   sources: [docs/history/headless-supervisor/CONTEXT.md, docs/history/headless-supervisor/plan.md]
 ---
 
 # The supervisor daemon is headless and MCP serves seven tools
 
-Read when: you look for the board, the terminal page, a docs or code viewer, `search`, `open`, `refresh`, `/health` or the Paseo sidebar plugin, or you wonder why `status` cannot dial the daemon.
+Read when: you look for the board, the terminal page, a docs or code viewer, `open`, `refresh`, `/health` or the Paseo sidebar plugin, or you wonder why `status` cannot dial the daemon.
 
 ## Boundary
 
@@ -35,3 +35,11 @@ waggledance supervises agents and nothing else. Locked by headless-supervisor D1
 
 - `crates/waggledance/src/watcher.rs` — the bee status watch trigger and notify keep using; it is not the removed file watcher.
 - `crates/waggledance-core/src/repository.rs` — `SCHEMA` and `MIGRATIONS`; the file tables are dropped by migration, not by editing history.
+
+## Agent CLI verbs
+
+Read when: you wonder why `waggledance search` answers again after the viewer was removed, why a CLI verb prints less than its MCP tool, or where the verbs call into MCP.
+
+- `projects`, `state`, `dispatch`, `await`, `runs`, `task`, `schema` and `search` (`agent_cli.rs`) are a thin layer over `mcp::call_tool`: each maps flags to the tool's arguments and shapes `structuredContent`. No tool logic lives in the CLI (agent-cli D1, `docs/history/agent-cli/CONTEXT.md`).
+- `search` here is verb discovery ranked from the clap tree (D3), not the removed viewer search; `tests/e2e_daemon.rs` no longer lists it among removed commands.
+- Default output is a summary; `--full` is the unchanged `structuredContent`, so a drift between CLI and MCP shows up in the `--full` equality tests (D2).
