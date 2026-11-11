@@ -193,12 +193,11 @@ binary must stop importing core modules first); hs-4 last.
    "docs/usage.md",
    "docs/mermaid-demo.md",
    "docs/assets/**",
-   ".github/workflows/release.yml",
    "install.sh",
    "install.ps1"
   ],
-  "action": "Delete crates/waggledance-desktop and integrations/paseo. Change the pi extension description to name the supervisor tools only. Rewrite README.md for the supervisor role: what waggledance does now (project registry, dispatch to a project's leader, await/runs/task, ask_state, bee upgrade, wake/mail/notify), the seven MCP tools, the CLI commands that remain, install; no board, viewer, search, desktop or screenshots. Remove the Documentation Viewing section from CLAUDE.md and AGENTS.md (keep Building). Update or delete docs/usage.md and docs/mermaid-demo.md so no doc tells a reader to open a browser view; drop screenshot assets only the old README used. Remove desktop and plugin mentions from release.yml and the install scripts. Touch nothing under crates/waggledance or crates/waggledance-core or Cargo.toml.",
-  "verify": "! rg -n 'waggledance_view_file|waggledance_search|waggledance open|/api/board|waggledance-desktop' README.md CLAUDE.md AGENTS.md docs/usage.md integrations .github install.sh install.ps1",
+  "action": "Delete crates/waggledance-desktop and integrations/paseo. Change the pi extension description to name the supervisor tools only. Rewrite README.md for the supervisor role: what waggledance does now (project registry, dispatch to a project's leader, await/runs/task, ask_state, bee upgrade, wake/mail/notify), the seven MCP tools, the CLI commands that remain, install; no board, viewer, search, desktop or screenshots. Remove the Documentation Viewing section from CLAUDE.md and AGENTS.md (keep Building). Update or delete docs/usage.md and docs/mermaid-demo.md so no doc tells a reader to open a browser view; drop screenshot assets only the old README used. Remove desktop and plugin mentions from the install scripts. Touch nothing under crates/waggledance or crates/waggledance-core or Cargo.toml.",
+  "verify": "! rg -n 'waggledance_view_file|waggledance_search|waggledance open|/api/board|waggledance-desktop' README.md CLAUDE.md AGENTS.md docs/usage.md integrations install.sh install.ps1",
   "affects_skills": [],
   "affects_specs": [],
   "deps": [],
@@ -300,5 +299,6 @@ artifact confirmed by content.
 ## Out of scope
 
 - A release and version bump.
+- The stale desktop comment in `.github/workflows/release.yml` (an owner-first path; left for the release pass).
 - Removing the `[server]` keys from users' existing config files.
 - Cleaning `~/.waggledance/registry.db` beyond the migration (no VACUUM).
