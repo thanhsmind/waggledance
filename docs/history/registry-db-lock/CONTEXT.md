@@ -74,6 +74,22 @@ decision acf96e76: drop the full-text store entirely.
   long-lived one had a live parent: two `agy` sessions up 2 d 13 h and the
   Claude desktop session up 1 d 10 h. No change.
 
+## Proof (2026-11-11)
+
+Second daemon under a scratch HOME on an un-reclaimed `VACUUM INTO` copy of
+the real registry (Paseo off, live runs marked done), four processes inserting
+runs every 0.2 s with `busy_timeout` 5000 ms for 90 s
+(`.bee/tmp/dblock/live_proof.py`):
+
+| Binary | Inserts ok | "database is locked" | Worst wait | Registry bytes |
+|---|---|---|---|---|
+| 0.5.4 (installed) | 185 | 54 | 5.01 s | 1,040,691,200 → 1,048,126,576 |
+| 0.5.5 (this feature) | 1,720 | 0 | 1.43 s | 1,040,691,200 → 25,591,808 after reclaim |
+
+The 0.5.5 run reclaimed the old index, then reconciled 35 projects in about
+11 s; `integrity_check` ok, 42,951 `files` rows (67 vanished files removed by
+the reconcile) and every `runs` row kept.
+
 ## Read set
 
 ### Knowledge
