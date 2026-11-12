@@ -9,6 +9,7 @@ mod doctor;
 mod heartbeat;
 mod herdr;
 mod hold;
+mod intake;
 mod mail;
 mod mcp;
 mod notify;
