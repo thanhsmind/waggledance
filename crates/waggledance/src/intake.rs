@@ -5,16 +5,21 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::time::{interval_at, MissedTickBehavior};
 use waggledance_core::config::IntakeConfig;
 use waggledance_core::domain::Project;
 use waggledance_core::intake::{IntakeItem, IntakeVerdict};
 use waggledance_core::Engine;
 
+use crate::notify::Notifier;
+
 const ALLOWED_TOOLS: &str =
     "mcp__mcp-gateway__call_tool,mcp__mcp-gateway__get_tool_definition,mcp__mcp-gateway__search_tools";
 const RUN_TIMEOUT: Duration = Duration::from_secs(300);
 const ERROR_HEAD_CHARS: usize = 300;
+const FIRST_PASS_AFTER: Duration = Duration::from_secs(60);
 
 pub trait Runner {
     fn run(&self, prompt: &str) -> Result<String>;
@@ -396,6 +401,68 @@ pub fn run_pass(engine: &Engine) -> Result<Report> {
     pass(engine, &runner, &McpDispatcher { engine })
 }
 
+pub fn every(engine: &Engine) -> Duration {
+    Duration::from_secs(engine.config.intake.interval_minutes.max(1) * 60)
+}
+
+pub async fn announce(engine: &Engine, notifier: &dyn Notifier) -> Result<usize> {
+    let fresh: Vec<IntakeItem> = engine
+        .list_intake_items(IntakeVerdict::Held)?
+        .into_iter()
+        .filter(|i| !i.notified)
+        .collect();
+    if fresh.is_empty() {
+        return Ok(0);
+    }
+    let lines: Vec<String> = fresh
+        .iter()
+        .map(|i| {
+            format!(
+                "{} | project: {} | confidence {:.2} | {}",
+                i.title,
+                i.project.as_deref().unwrap_or("none"),
+                i.confidence,
+                i.url
+            )
+        })
+        .collect();
+    let body = format!("{} held intake items\n{}", fresh.len(), lines.join("\n"));
+    notifier
+        .send("intake", &body)
+        .await
+        .map_err(|e| anyhow!("intake announcement failed: {e}"))?;
+    let keys: Vec<String> = fresh.into_iter().map(|i| i.key).collect();
+    engine.mark_intake_notified(&keys)?;
+    Ok(keys.len())
+}
+
+pub async fn run(engine: Arc<Engine>, notifier: Arc<dyn Notifier>) {
+    let mut ticks = interval_at(
+        tokio::time::Instant::now() + FIRST_PASS_AFTER,
+        every(&engine),
+    );
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticks.tick().await;
+        let e = engine.clone();
+        match tokio::task::spawn_blocking(move || run_pass(&e)).await {
+            Ok(Ok(report)) => tracing::info!(
+                "intake pass: {} dispatched, {} held, {} skipped, {} covered, {} already seen",
+                report.dispatched.len(),
+                report.held.len(),
+                report.skipped.len(),
+                report.covered.len(),
+                report.already_seen.len()
+            ),
+            Ok(Err(e)) => tracing::warn!("intake pass failed: {e}"),
+            Err(e) => tracing::warn!("intake pass task failed: {e}"),
+        }
+        if let Err(e) = announce(&engine, notifier.as_ref()).await {
+            tracing::warn!("{e}");
+        }
+    }
+}
+
 pub fn list(engine: &Engine, verdict: IntakeVerdict) -> Result<Value> {
     let rows: Vec<Value> = engine.list_intake_items(verdict)?.iter().map(row).collect();
     Ok(json!({ "items": rows }))
@@ -574,5 +641,61 @@ mod tests {
         assert!(text.contains("me@example.test"));
         assert!(text.contains("never call any tool that creates"));
         assert!(!ALLOWED_TOOLS.contains("write"));
+    }
+
+    struct Recorded(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl Notifier for Recorded {
+        async fn send(&self, kind: &str, body: &str) -> crate::notify::Result<()> {
+            self.0.lock().unwrap().push((kind.into(), body.into()));
+            Ok(())
+        }
+    }
+
+    fn held(key: &str, project: Option<&str>) -> IntakeItem {
+        IntakeItem {
+            key: key.into(),
+            source: "task".into(),
+            item_id: key.into(),
+            title: format!("title {key}"),
+            url: format!("https://x.test/{key}"),
+            project: project.map(String::from),
+            confidence: 0.5,
+            reason: "unsure".into(),
+            verdict: IntakeVerdict::Held,
+            run_id: None,
+            notified: false,
+            first_seen: waggledance_core::engine::now_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn held_items_are_announced_once_across_passes() {
+        let (engine, _, _dir) = engine();
+        engine
+            .insert_intake_item(&held("task-1", Some("alpha")))
+            .unwrap();
+        engine.insert_intake_item(&held("task-2", None)).unwrap();
+        let notifier = Recorded(Default::default());
+        assert_eq!(announce(&engine, &notifier).await.unwrap(), 2);
+        assert_eq!(announce(&engine, &notifier).await.unwrap(), 0);
+        engine.insert_intake_item(&held("task-3", None)).unwrap();
+        assert_eq!(announce(&engine, &notifier).await.unwrap(), 1);
+        let sent = notifier.0.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].0, "intake");
+        assert!(sent[0]
+            .1
+            .contains("title task-1 | project: alpha | confidence 0.50 | https://x.test/task-1"));
+        assert!(sent[0].1.contains("title task-2 | project: none"));
+        assert!(!sent[1].1.contains("task-1"));
+    }
+
+    #[test]
+    fn the_intake_interval_never_drops_below_a_minute() {
+        let (mut engine, _, _dir) = engine();
+        engine.config.intake.interval_minutes = 0;
+        assert_eq!(every(&engine), Duration::from_secs(60));
     }
 }

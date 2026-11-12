@@ -101,6 +101,7 @@ pub struct TerminalBackground {
     wake: Mutex<Option<JoinHandle<()>>>,
     heartbeat: Mutex<Option<JoinHandle<()>>>,
     sweep: Mutex<Option<JoinHandle<()>>>,
+    intake: Mutex<Option<JoinHandle<()>>>,
     /// The most recently stopped task's handle, kept only until the next
     /// switch-on has waited for it to finish.
     supervisor_stopping: Mutex<Option<JoinHandle<()>>>,
@@ -248,7 +249,34 @@ impl TerminalBackground {
                 .filter(|e| wake::enabled(e) && paseo::paseo_available(&e.config.paseo)),
         );
         self.reconcile_sweep(engine.clone().filter(|e| e.config.worktree_sweep.enabled));
+        self.reconcile_intake(
+            engine.clone().filter(|e| {
+                e.config.intake.enabled && !e.config.intake.user_email.trim().is_empty()
+            }),
+            telegram.clone(),
+        );
         self.reconcile_notify(cfg.notify_enabled, herdr, notify_store, telegram, engine);
+    }
+
+    fn reconcile_intake(
+        &self,
+        engine: Option<Arc<waggledance_core::Engine>>,
+        telegram: Option<(String, String)>,
+    ) {
+        let mut slot = self.intake.lock().unwrap();
+        match (engine, slot.take()) {
+            (Some(_), Some(running)) => *slot = Some(running),
+            (Some(engine), None) => {
+                *slot = Some(tokio::spawn(intake::run(engine, notifier_for(telegram))))
+            }
+            (None, Some(running)) => running.abort(),
+            (None, None) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn intake_running(&self) -> bool {
+        self.intake.lock().unwrap().is_some()
     }
 
     fn reconcile_sweep(&self, engine: Option<Arc<waggledance_core::Engine>>) {
@@ -639,15 +667,7 @@ impl TerminalBackground {
             (true, None) => {
                 *self.notify_store.lock().unwrap() = Some(store.clone());
                 let previous = self.notify_stopping.lock().unwrap().take();
-                let notifier: Arc<dyn notify::Notifier> = match telegram {
-                    Some((token, chat_id)) => {
-                        match notify::TelegramNotifier::new(Some(token), Some(chat_id)) {
-                            Some(t) => Arc::new(t),
-                            None => Arc::new(notify::NullNotifier),
-                        }
-                    }
-                    None => Arc::new(notify::NullNotifier),
-                };
+                let notifier = notifier_for(telegram);
                 // The engine is both the run-ownership oracle and the
                 // registry of project roots bee activity is read from (A5)
                 // -- no new plumbing, and the roots are re-asked each tick
@@ -764,6 +784,16 @@ fn is_pane_owned_by_run(engine: &waggledance_core::Engine, pane_id: &str) -> boo
     }
 }
 
+fn notifier_for(telegram: Option<(String, String)>) -> Arc<dyn notify::Notifier> {
+    match telegram {
+        Some((token, chat_id)) => match notify::TelegramNotifier::new(Some(token), Some(chat_id)) {
+            Some(t) => Arc::new(t),
+            None => Arc::new(notify::NullNotifier),
+        },
+        None => Arc::new(notify::NullNotifier),
+    }
+}
+
 impl Drop for TerminalBackground {
     /// Belt-and-suspenders: a live task's runtime is already torn down with
     /// the process (or, in tests, with the single-test `#[tokio::test]`
@@ -776,6 +806,9 @@ impl Drop for TerminalBackground {
             t.handle.abort();
         }
         if let Some(h) = self.notify.lock().unwrap().take() {
+            h.abort();
+        }
+        if let Some(h) = self.intake.lock().unwrap().take() {
             h.abort();
         }
         if let Some(t) = self.reaper.lock().unwrap().take() {
@@ -1290,6 +1323,39 @@ mod terminal_background_tests {
         ));
         bg.reconcile(&TerminalConfig::default(), fake, store(), None, Some(off));
         assert!(!bg.sweep_running(), "enabled = false stops the sweep");
+    }
+
+    #[tokio::test]
+    async fn the_intake_loop_runs_when_enabled_with_an_email_and_stops_when_disabled() {
+        let bg = TerminalBackground::new();
+        let fake = Arc::new(FakeHerdr::new());
+        let with = |enabled: bool, email: &str| {
+            let mut config = waggledance_core::Config::default();
+            config.paseo.enabled = Some(false);
+            config.intake.enabled = enabled;
+            config.intake.user_email = email.into();
+            Arc::new(waggledance_core::Engine::new(
+                waggledance_core::SqliteStore::open_in_memory().unwrap(),
+                config,
+            ))
+        };
+        let reconcile = |e| {
+            bg.reconcile(
+                &TerminalConfig::default(),
+                fake.clone(),
+                store(),
+                None,
+                Some(e),
+            )
+        };
+        reconcile(with(true, ""));
+        assert!(!bg.intake_running(), "no email keeps the intake loop off");
+        reconcile(with(false, "me@example.test"));
+        assert!(!bg.intake_running(), "disabled keeps the intake loop off");
+        reconcile(with(true, "me@example.test"));
+        assert!(bg.intake_running(), "enabled with an email starts the loop");
+        reconcile(with(false, "me@example.test"));
+        assert!(!bg.intake_running(), "enabled = false stops the loop");
     }
 
     #[test]
