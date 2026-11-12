@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::domain::{InboxMessage, LeaderHold, PermissionRequest, Project, Run, WdTask};
 use crate::error::{Error, Result};
+use crate::intake::{IntakeItem, IntakeVerdict};
 use crate::project_settings::{self, ProjectSettings};
 use crate::repository::SqliteStore;
 use std::collections::HashMap;
@@ -264,6 +265,18 @@ impl Engine {
 
     pub fn list_open_tasks(&self) -> Result<Vec<WdTask>> {
         self.store.list_open_tasks()
+    }
+
+    pub fn insert_intake_item(&self, item: &IntakeItem) -> Result<bool> {
+        self.store.insert_intake_item(item)
+    }
+
+    pub fn list_intake_items(&self, verdict: IntakeVerdict) -> Result<Vec<IntakeItem>> {
+        self.store.list_intake_items(verdict)
+    }
+
+    pub fn mark_intake_notified(&self, keys: &[String]) -> Result<()> {
+        self.store.mark_intake_notified(keys)
     }
 
     pub fn mark_task_delivered(&self, corr: &str, leader_id: &str, at: &str) -> Result<()> {

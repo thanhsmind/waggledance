@@ -8,7 +8,7 @@ bee:
   id: supervisor-daemon
   lifecycle: active
   areas: [orchestration]
-  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/agent_cli.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs]
+  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/agent_cli.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/intake.rs, crates/waggledance-core/src/config.rs]
   sources: [docs/history/headless-supervisor/CONTEXT.md, docs/history/headless-supervisor/plan.md, docs/history/agent-cli/CONTEXT.md, docs/history/agent-cli/plan.md]
 ---
 
@@ -54,3 +54,11 @@ Read when: a caller reads `task` from `waggledance_runs` and finds `task_summary
 - `waggledance_runs` rows carry `task_summary`; the full `task` comes only from the `run_id` argument. `waggledance_ask_state` without `project` drops `sessions` and `recent_decisions` per project and adds `session_count`; with `project` the answer is unchanged (agent-cli D4, `mcp.rs`).
 - Why: on 2026-11-11 the rollup measured 324,669 bytes and the run list 587,737, mostly session lists and task text no caller needed to choose a next step.
 - Rejected: trimming only in the CLI left MCP callers paying the full cost; a separate `wg` binary duplicated install and logic. `wg` stays a user-made symlink because the name collides with WireGuard (D5).
+
+## Intake ledger
+
+Read when: an anphabe item is dispatched twice, a held item is announced again, or `intake_items` is missing from a fresh registry.
+
+- `intake_items` (migration 15, `repository.rs`) is keyed by `<source>-<id>`; `insert_intake_item` is insert-if-absent and returns false on a repeat, so the first verdict and title stay and a retry cannot send twice (anphabe-intake D4).
+- The table is created only by the migration, which also runs on a fresh database, the way `inbox` and `tasks` are; the cell asked for it in `SCHEMA` too, and a second definition would have been a duplicate home.
+- `[intake]` in `config.rs` is off by default, and `user_email` stays empty in code: the pass refuses to run until the host sets it (D2, D7).
