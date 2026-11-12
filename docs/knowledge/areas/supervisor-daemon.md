@@ -3,13 +3,13 @@ type: bee.area
 title: The supervisor daemon is headless and MCP serves seven tools
 description: "waggledance serve runs the supervisor loops with no HTTP listener; waggledance mcp serves seven tools over stdio; nothing indexes or serves other projects' files"
 tags: [supervisor, daemon, mcp]
-timestamp: 2026-11-11
+timestamp: 2026-11-12
 bee:
   id: supervisor-daemon
   lifecycle: active
   areas: [orchestration]
-  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/agent_cli.rs, crates/waggledance/src/intake.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/intake.rs, crates/waggledance-core/src/config.rs]
-  sources: [docs/history/headless-supervisor/CONTEXT.md, docs/history/headless-supervisor/plan.md, docs/history/agent-cli/CONTEXT.md, docs/history/agent-cli/plan.md]
+  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/agent_cli.rs, crates/waggledance/src/intake.rs, crates/waggledance/src/main.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/intake.rs, crates/waggledance-core/src/config.rs]
+  sources: [docs/history/headless-supervisor/CONTEXT.md, docs/history/headless-supervisor/plan.md, docs/history/agent-cli/CONTEXT.md, docs/history/agent-cli/plan.md, docs/history/anphabe-intake/CONTEXT.md, docs/history/anphabe-intake/plan.md]
 ---
 
 # The supervisor daemon is headless and MCP serves seven tools
@@ -59,7 +59,7 @@ Read when: a caller reads `task` from `waggledance_runs` and finds `task_summary
 
 Read when: an anphabe item is dispatched twice, a held item is announced again, or `intake_items` is missing from a fresh registry.
 
-- `intake_items` (migration 15, `repository.rs`) is keyed by `<source>-<id>`; `insert_intake_item` is insert-if-absent and returns false on a repeat, so the first verdict and title stay and a retry cannot send twice (anphabe-intake D4).
+- `intake_items` (migration 15, `repository.rs`) is keyed by `<source>-<id>` and holds one verdict per item: `dispatched`, `held`, `skipped` (not code) or `covered` (twin of a dispatched key), the enum in `waggledance-core/src/intake.rs`; `insert_intake_item` is insert-if-absent and returns false on a repeat, so the first verdict and title stay and a retry cannot send twice (anphabe-intake D4).
 - The table is created only by the migration, which also runs on a fresh database, the way `inbox` and `tasks` are; the cell asked for it in `SCHEMA` too, and a second definition would have been a duplicate home.
 - `[intake]` in `config.rs` is off by default, and `user_email` stays empty in code: the pass refuses to run until the host sets it (D2, D7).
 
@@ -70,6 +70,6 @@ Read when: an intake item was dispatched to the wrong project, a pass records no
 - One pass (`intake.rs`) runs Haiku through a runner trait, parses a JSON array, and decides each item in Rust: not code is skipped, a twin of a dispatched key is covered, a registered project at or above `min_confidence` is dispatched through `mcp::call_tool_on` with `leader: true` and `request_id` `intake-<key>`, everything else is held. The model only classifies (D4).
 - Unparseable output fails the pass before any ledger write; the error carries the first 300 characters. A dispatch error holds the item with the error as its reason, and a later pass skips it because the key is already in the ledger.
 - The prompt is stdin because `--allowedTools` swallows a trailing prompt argument; the allowed list has only the three mcp-gateway tools, so no anphabe write is reachable (D6).
-- The daemon loop (`intake::run`, slot in `TerminalBackground`) runs only with `[intake] enabled` and a non-empty `user_email`, first pass 60 seconds after start, then every `interval_minutes` (floor one minute), missed ticks skipped. The pass runs under `spawn_blocking` because the claude subprocess blocks; a failed pass logs a warning and the loop goes on (D3, D5).
+- The daemon loop (`intake::run`, slot in `TerminalBackground` in `main.rs`) runs only with `[intake] enabled` and a non-empty `user_email`, first pass 60 seconds after start, then every `interval_minutes` (floor one minute), missed ticks skipped. The pass runs under `spawn_blocking` because the claude subprocess blocks; a failed pass logs a warning and the loop goes on (D3, D5).
 - Held items with `notified` false go out as one `intake` notifier message and are marked notified only after the send succeeds, so a failed send is retried on the next tick and a delivered item is never repeated. With no Telegram credentials the notifier is the null one, which only logs.
 - `intake run|list` are agent verbs listed in `schema` and `search`; an empty `[intake] user_email` exits 1 naming it.
