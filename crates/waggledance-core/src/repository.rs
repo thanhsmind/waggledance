@@ -3,6 +3,7 @@
 
 use crate::domain::{InboxMessage, LeaderHold, LeaderRun, PermissionRequest, Project, Run, WdTask};
 use crate::error::Result;
+use crate::intake::{IntakeItem, IntakeVerdict};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -931,6 +932,67 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn insert_intake_item(&self, i: &IntakeItem) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        Ok(c.execute(
+            "INSERT OR IGNORE INTO intake_items
+                 (item_key, source, item_id, title, url, project, confidence, reason,
+                  verdict, run_id, notified, first_seen)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                i.key,
+                i.source,
+                i.item_id,
+                i.title,
+                i.url,
+                i.project,
+                i.confidence,
+                i.reason,
+                i.verdict.as_str(),
+                i.run_id,
+                i.notified,
+                i.first_seen
+            ],
+        )? == 1)
+    }
+
+    pub fn list_intake_items(&self, verdict: IntakeVerdict) -> Result<Vec<IntakeItem>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT item_key, source, item_id, title, url, project, confidence, reason,
+                    verdict, run_id, notified, first_seen
+             FROM intake_items WHERE verdict=?1 ORDER BY first_seen, rowid",
+        )?;
+        let rows = stmt.query_map(params![verdict.as_str()], |r| {
+            Ok(IntakeItem {
+                key: r.get(0)?,
+                source: r.get(1)?,
+                item_id: r.get(2)?,
+                title: r.get(3)?,
+                url: r.get(4)?,
+                project: r.get(5)?,
+                confidence: r.get(6)?,
+                reason: r.get(7)?,
+                verdict,
+                run_id: r.get(9)?,
+                notified: r.get(10)?,
+                first_seen: r.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn mark_intake_notified(&self, keys: &[String]) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        for key in keys {
+            c.execute(
+                "UPDATE intake_items SET notified=1 WHERE item_key=?1",
+                params![key],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn prune_tasks(&self, before: &str) -> Result<usize> {
         let c = self.conn.lock().unwrap();
         let tasks = c.execute(
@@ -971,10 +1033,11 @@ const MIGRATIONS: &[MigrationStep] = &[
     (11, migration_11_runs_handoff),
     (12, migration_12_leader_holds),
     (14, migration_14_drop_file_store),
+    (15, migration_15_intake_items),
 ];
 
 /// Schema version this build expects — the last entry in [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Bring an existing database up to [`SCHEMA_VERSION`].
 ///
@@ -992,6 +1055,27 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", target)?;
         version = *target;
     }
+    Ok(())
+}
+
+fn migration_15_intake_items(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS intake_items (
+             item_key TEXT PRIMARY KEY,
+             source TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             title TEXT NOT NULL,
+             url TEXT NOT NULL,
+             project TEXT,
+             confidence REAL NOT NULL,
+             reason TEXT NOT NULL,
+             verdict TEXT NOT NULL,
+             run_id TEXT,
+             notified INTEGER NOT NULL DEFAULT 0,
+             first_seen TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_intake_verdict ON intake_items(verdict, first_seen);",
+    )?;
     Ok(())
 }
 
@@ -2075,6 +2159,89 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(ids, ["h-hand", "h-root"]);
+    }
+
+    fn intake_item(key: &str, verdict: IntakeVerdict, title: &str) -> IntakeItem {
+        IntakeItem {
+            key: key.into(),
+            source: "comment".into(),
+            item_id: key.trim_start_matches("comment-").into(),
+            title: title.into(),
+            url: "https://example.test/x".into(),
+            project: Some("p1".into()),
+            confidence: 0.9,
+            reason: "why".into(),
+            verdict,
+            run_id: None,
+            notified: false,
+            first_seen: "2026-11-12T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn migrate_adds_the_intake_ledger_to_a_v14_database_keeping_its_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task TEXT NOT NULL);
+             INSERT INTO runs(id, project_id, task) VALUES ('r-old', 'p1', 'old task');
+             PRAGMA user_version = 14;",
+        )
+        .unwrap();
+        super::migrate(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+        let runs: i64 = conn
+            .query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+            .unwrap();
+        let items: i64 = conn
+            .query_row("SELECT count(*) FROM intake_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((runs, items), (1, 0));
+    }
+
+    #[test]
+    fn insert_intake_item_keeps_the_first_row_and_reports_the_repeat() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s
+            .insert_intake_item(&intake_item("comment-1", IntakeVerdict::Held, "first"))
+            .unwrap());
+        assert!(!s
+            .insert_intake_item(&intake_item(
+                "comment-1",
+                IntakeVerdict::Dispatched,
+                "second"
+            ))
+            .unwrap());
+        let held = s.list_intake_items(IntakeVerdict::Held).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].title, "first");
+        assert!(s
+            .list_intake_items(IntakeVerdict::Dispatched)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn list_intake_items_filters_by_verdict_and_notified_sticks() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.insert_intake_item(&intake_item("comment-1", IntakeVerdict::Held, "a"))
+            .unwrap();
+        s.insert_intake_item(&intake_item("comment-2", IntakeVerdict::Dispatched, "b"))
+            .unwrap();
+        s.insert_intake_item(&intake_item("comment-3", IntakeVerdict::Held, "c"))
+            .unwrap();
+        s.mark_intake_notified(&["comment-1".to_string()]).unwrap();
+        let held = s.list_intake_items(IntakeVerdict::Held).unwrap();
+        let keys: Vec<_> = held.iter().map(|i| (i.key.as_str(), i.notified)).collect();
+        assert_eq!(keys, [("comment-1", true), ("comment-3", false)]);
+        assert_eq!(
+            s.list_intake_items(IntakeVerdict::Dispatched)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

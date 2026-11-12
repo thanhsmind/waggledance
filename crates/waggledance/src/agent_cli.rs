@@ -1,11 +1,14 @@
-use crate::cli::{Cli, Command, OutputArgs, RunsAction, TaskVerb};
+use crate::cli::{Cli, Command, IntakeAction, OutputArgs, RunsAction, TaskVerb};
 use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, ValueEnum};
 use serde_json::{json, Map, Value};
 use std::io::{IsTerminal, Read};
+use waggledance_core::config::registry_db_path;
+use waggledance_core::intake::IntakeVerdict;
+use waggledance_core::{Config, Engine, SqliteStore};
 
-const VERBS: [&str; 8] = [
-    "projects", "state", "dispatch", "await", "runs", "task", "schema", "search",
+const VERBS: [&str; 9] = [
+    "projects", "state", "dispatch", "await", "runs", "task", "intake", "schema", "search",
 ];
 const DELTA_TAIL_LINES: usize = 20;
 const RECENT_DECISIONS_KEPT: usize = 3;
@@ -34,6 +37,7 @@ pub fn run(command: Command) -> Result<()> {
     let value = match &command {
         Command::Schema { verb } => schema(verb.as_deref())?,
         Command::Search { text } => search(&text.join(" ")),
+        Command::Intake { action } => intake(action)?,
         other => {
             let call = build(other)?;
             let response = crate::mcp::call_tool(call.tool, call.args.clone())?;
@@ -41,6 +45,20 @@ pub fn run(command: Command) -> Result<()> {
         }
     };
     print_json(&value)
+}
+
+fn intake(action: &IntakeAction) -> Result<Value> {
+    let engine = Engine::new(SqliteStore::open(&registry_db_path())?, Config::load());
+    match action {
+        IntakeAction::Run => Ok(serde_json::to_value(crate::intake::run_pass(&engine)?)?),
+        IntakeAction::List { verdict } => {
+            let name = verdict
+                .to_possible_value()
+                .map(|v| v.get_name().to_string())
+                .unwrap_or_default();
+            crate::intake::list(&engine, IntakeVerdict::parse(&name)?)
+        }
+    }
 }
 
 fn print_json(value: &Value) -> Result<()> {

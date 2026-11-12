@@ -14,7 +14,7 @@ use waggledance_core::Config;
     name = "waggledance",
     version,
     about = "Supervisor for AI agent workflows",
-    after_help = "Agent verbs: projects, state, dispatch, await, runs, task, schema, search.\nFind the verb for a job with `waggledance search <text>`; `waggledance schema` lists every verb and flag as JSON."
+    after_help = "Agent verbs: projects, state, dispatch, await, runs, task, intake, schema, search.\nFind the verb for a job with `waggledance search <text>`; `waggledance schema` lists every verb and flag as JSON."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -183,6 +183,13 @@ pub enum Command {
         #[command(flatten)]
         out: OutputArgs,
     },
+    #[command(
+        about = "Pull code work from anphabe: `intake run` makes one pass and prints the report; `intake list` prints ledger rows."
+    )]
+    Intake {
+        #[command(subcommand)]
+        action: IntakeAction,
+    },
     #[command(about = "Print every agent verb, or one verb, with its flags and help as JSON.")]
     Schema { verb: Option<String> },
     #[command(about = "Find the agent verb for a job: ranks verbs by the words you give.")]
@@ -215,6 +222,34 @@ pub struct OutputArgs {
 pub enum RunsAction {
     #[command(about = "Print one run in full, including its whole task.")]
     Show { run_id: String },
+}
+
+#[derive(Subcommand)]
+pub enum IntakeAction {
+    #[command(
+        about = "Make one intake pass now and print what was dispatched, held, skipped and covered."
+    )]
+    Run,
+    #[command(
+        about = "Print intake ledger rows as JSON; held items unless --verdict says otherwise."
+    )]
+    List {
+        #[arg(
+            long,
+            value_enum,
+            default_value = "held",
+            help = "Which verdict to list"
+        )]
+        verdict: IntakeVerdictArg,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+pub enum IntakeVerdictArg {
+    Held,
+    Dispatched,
+    Skipped,
+    Covered,
 }
 
 #[derive(ValueEnum, Clone, Copy)]

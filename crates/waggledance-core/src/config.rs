@@ -19,6 +19,7 @@ pub struct Config {
     pub paseo: PaseoConfig,
     pub openclaw: OpenClawConfig,
     pub worktree_sweep: WorktreeSweepConfig,
+    pub intake: IntakeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +101,30 @@ impl Default for WorktreeSweepConfig {
             enabled: true,
             interval_hours: 6,
             older_than_days: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct IntakeConfig {
+    pub enabled: bool,
+    pub interval_minutes: u64,
+    pub user_email: String,
+    pub model: String,
+    pub claude_binary: String,
+    pub min_confidence: f64,
+}
+
+impl Default for IntakeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: 15,
+            user_email: String::new(),
+            model: "claude-haiku-5-5".into(),
+            claude_binary: "claude".into(),
+            min_confidence: 0.8,
         }
     }
 }
@@ -720,6 +745,31 @@ mod tests {
         let off: Config = toml::from_str("[worktree_sweep]\nenabled = false\n").unwrap();
         assert!(!off.worktree_sweep.enabled);
         assert_eq!(off.worktree_sweep.interval_hours, 6);
+    }
+
+    #[test]
+    fn intake_defaults_off_and_an_explicit_section_overrides() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            c.intake,
+            IntakeConfig {
+                enabled: false,
+                interval_minutes: 15,
+                user_email: String::new(),
+                model: "claude-haiku-5-5".into(),
+                claude_binary: "claude".into(),
+                min_confidence: 0.8
+            }
+        );
+        let on: Config = toml::from_str(
+            "[intake]\nenabled = true\ninterval_minutes = 5\nuser_email = \"a@b.c\"\nmin_confidence = 0.9\n",
+        )
+        .unwrap();
+        assert!(on.intake.enabled);
+        assert_eq!(on.intake.interval_minutes, 5);
+        assert_eq!(on.intake.user_email, "a@b.c");
+        assert_eq!(on.intake.min_confidence, 0.9);
+        assert_eq!(on.intake.model, "claude-haiku-5-5");
     }
 
     #[test]
