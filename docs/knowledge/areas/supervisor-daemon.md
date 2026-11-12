@@ -61,15 +61,15 @@ Read when: an anphabe item is dispatched twice, a held item is announced again, 
 
 - `intake_items` (migration 15, `repository.rs`) is keyed by `<source>-<id>` and holds one verdict per item: `dispatched`, `held`, `skipped` (not code) or `covered` (twin of a dispatched key), the enum in `waggledance-core/src/intake.rs`; `insert_intake_item` is insert-if-absent and returns false on a repeat, so the first verdict and title stay and a retry cannot send twice (anphabe-intake D4).
 - The table is created only by the migration, which also runs on a fresh database, the way `inbox` and `tasks` are; the cell asked for it in `SCHEMA` too, and a second definition would have been a duplicate home.
-- `[intake]` in `config.rs` is off by default, and `user_email` stays empty in code: the pass refuses to run until the host sets it (D2, D7).
+- `[intake]` in `config.rs` is off by default, and `user_email` stays empty in code: the pass refuses to run until the host sets it (anphabe-intake D2, D7).
 
 ## Intake pass
 
 Read when: an intake item was dispatched to the wrong project, a pass records nothing, or you wonder why the model never calls `waggledance_dispatch`.
 
-- One pass (`intake.rs`) runs Haiku through a runner trait, parses a JSON array, and decides each item in Rust: not code is skipped, a twin of a dispatched key is covered, a registered project at or above `min_confidence` is dispatched through `mcp::call_tool_on` with `leader: true` and `request_id` `intake-<key>`, everything else is held. The model only classifies (D4).
+- One pass (`intake.rs`) runs Haiku through a runner trait, parses a JSON array, and decides each item in Rust: not code is skipped, a twin of a dispatched key is covered, a registered project at or above `min_confidence` is dispatched through `mcp::call_tool_on` with `leader: true` and `request_id` `intake-<key>`, everything else is held. Only code work is brought in, and a dispatched item is the leader's to do, not to file (anphabe-intake D1). The model only classifies (anphabe-intake D4).
 - Unparseable output fails the pass before any ledger write; the error carries the first 300 characters. A dispatch error holds the item with the error as its reason, and a later pass skips it because the key is already in the ledger.
-- The prompt is stdin because `--allowedTools` swallows a trailing prompt argument; the allowed list has only the three mcp-gateway tools, so no anphabe write is reachable (D6).
-- The daemon loop (`intake::run`, slot in `TerminalBackground` in `main.rs`) runs only with `[intake] enabled` and a non-empty `user_email`, first pass 60 seconds after start, then every `interval_minutes` (floor one minute), missed ticks skipped. The pass runs under `spawn_blocking` because the claude subprocess blocks; a failed pass logs a warning and the loop goes on (D3, D5).
+- The prompt is stdin because `--allowedTools` swallows a trailing prompt argument; the allowed list has only the three mcp-gateway tools, but `call_tool` proxies every anphabe tool, writes included, so keeping writes out (anphabe-intake D6) rests on the prompt until mcp-gateway offers a read-only profile.
+- The daemon loop (`intake::run`, slot in `TerminalBackground` in `main.rs`) runs only with `[intake] enabled` and a non-empty `user_email`, first pass 60 seconds after start, then every `interval_minutes` (floor one minute), missed ticks skipped. The pass runs under `spawn_blocking` because the claude subprocess blocks; a failed pass logs a warning and the loop goes on (anphabe-intake D3, D5).
 - Held items with `notified` false go out as one `intake` notifier message and are marked notified only after the send succeeds, so a failed send is retried on the next tick and a delivered item is never repeated. With no Telegram credentials the notifier is the null one, which only logs.
 - `intake run|list` are agent verbs listed in `schema` and `search`; an empty `[intake] user_email` exits 1 naming it.
