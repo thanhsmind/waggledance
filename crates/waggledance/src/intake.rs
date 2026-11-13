@@ -157,19 +157,31 @@ impl Dispatcher for McpDispatcher<'_> {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct Candidate {
+    #[serde(deserialize_with = "text_of")]
     source: String,
     #[serde(deserialize_with = "text_of")]
     id: String,
+    #[serde(deserialize_with = "text_of")]
     title: String,
+    #[serde(deserialize_with = "text_of")]
     url: String,
+    #[serde(deserialize_with = "text_of")]
     body: String,
+    #[serde(deserialize_with = "text_of")]
     page_url: String,
+    #[serde(deserialize_with = "text_of")]
     selector: String,
+    #[serde(deserialize_with = "texts_of")]
     image_urls: Vec<String>,
+    #[serde(deserialize_with = "maybe_text_of")]
     project: Option<String>,
+    #[serde(deserialize_with = "number_of")]
     confidence: f64,
+    #[serde(deserialize_with = "text_of")]
     reason: String,
+    #[serde(deserialize_with = "flag_of")]
     is_code: bool,
+    #[serde(deserialize_with = "maybe_text_of")]
     twin_of: Option<String>,
 }
 
@@ -193,11 +205,53 @@ impl Default for Candidate {
     }
 }
 
-fn text_of<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
-    Ok(match Value::deserialize(d)? {
+fn plain_text(v: Value) -> String {
+    match v {
         Value::String(s) => s,
         Value::Null => String::new(),
         other => other.to_string(),
+    }
+}
+
+fn text_of<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    Ok(plain_text(Value::deserialize(d)?))
+}
+
+fn maybe_text_of<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let text = plain_text(Value::deserialize(d)?);
+    let trimmed = text.trim();
+    Ok((!trimmed.is_empty() && trimmed != "null").then(|| trimmed.to_string()))
+}
+
+fn texts_of<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Array(items) => items
+            .into_iter()
+            .map(plain_text)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Value::Null => Vec::new(),
+        other => vec![plain_text(other)],
+    })
+}
+
+fn number_of<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<f64, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::String(s) => s.trim().parse().unwrap_or(0.0),
+        _ => 0.0,
+    })
+}
+
+fn flag_of<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Bool(b) => b,
+        Value::String(s) => s.trim().eq_ignore_ascii_case("true"),
+        _ => false,
     })
 }
 
@@ -223,18 +277,19 @@ fn head(text: &str) -> String {
 fn parse(output: &str) -> Result<Vec<Candidate>> {
     let text = output.trim();
     let from_slice = |s: &str| serde_json::from_str::<Vec<Candidate>>(s);
-    if let Ok(items) = from_slice(text) {
-        return Ok(items);
-    }
-    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
-        if start < end {
-            if let Ok(items) = from_slice(&text[start..=end]) {
-                return Ok(items);
-            }
-        }
-    }
+    let first = match from_slice(text) {
+        Ok(items) => return Ok(items),
+        Err(e) => e,
+    };
+    let why = match (text.find('['), text.rfind(']')) {
+        (Some(start), Some(end)) if start < end => match from_slice(&text[start..=end]) {
+            Ok(items) => return Ok(items),
+            Err(e) => e,
+        },
+        _ => first,
+    };
     Err(anyhow!(
-        "the intake run did not return a JSON array: {}",
+        "the intake run did not return a JSON array ({why}): {}",
         head(text)
     ))
 }
@@ -535,6 +590,20 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].key(), b[0].key());
         assert_eq!(a[0].title, b[0].title);
+    }
+
+    #[test]
+    fn null_fields_from_the_model_parse_as_empty() {
+        let mut task = item("task", "2", None, 0.7);
+        for field in ["url", "body", "page_url", "selector", "image_urls", "reason", "title"] {
+            task[field] = Value::Null;
+        }
+        let fenced = format!("```json\n{}\n```", bare(vec![task]));
+        let items = parse(&fenced).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].selector, "");
+        assert!(items[0].image_urls.is_empty());
+        assert_eq!(items[0].project, None);
     }
 
     #[test]
