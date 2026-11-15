@@ -191,7 +191,8 @@ fn bee_upgrade_schema() -> Value {
             "type": "object",
             "properties": {
                 "apply": { "type": "boolean", "default": false, "description": "Run the upgrade and commit; false previews" },
-                "projects": { "type": "array", "items": { "type": "string" }, "description": "Project ids to narrow the run to; required with apply" }
+                "projects": { "type": "array", "items": { "type": "string" }, "description": "Project ids to narrow the run to; required with apply" },
+                "skillstation": { "type": "boolean", "default": false, "description": "Also pass --skillstation to bee onboard, publishing bee's skillstation skills into the hub" }
             }
         }
     })
@@ -409,6 +410,11 @@ fn handle_bee_upgrade(id: Option<Value>, engine: &Engine, args: &Value) -> Value
         Some(Value::Bool(b)) => *b,
         Some(_) => return tool_error(id, "apply must be a boolean"),
     };
+    let skillstation = match args.get("skillstation") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return tool_error(id, "skillstation must be a boolean"),
+    };
     let only: Vec<String> = match args.get("projects") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(items)) => match items
@@ -434,6 +440,7 @@ fn handle_bee_upgrade(id: Option<Value>, engine: &Engine, args: &Value) -> Value
     let opts = waggledance_core::bee_upgrade::UpgradeOptions {
         apply,
         only,
+        skillstation,
         ..Default::default()
     };
     let report = match waggledance_core::bee_upgrade::run(&projects, &opts) {
@@ -2082,6 +2089,19 @@ mod tests {
             let text = resp["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains("projects"), "{text}");
         }
+    }
+
+    #[test]
+    fn bee_upgrade_non_boolean_skillstation_is_refused() {
+        let engine = empty_engine();
+        let resp = call_tool(
+            &engine,
+            "waggledance_bee_upgrade",
+            json!({ "skillstation": "yes" }),
+        );
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("skillstation"), "{text}");
     }
 
     #[test]

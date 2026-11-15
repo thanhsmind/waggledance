@@ -284,6 +284,11 @@ pub enum BeeAction {
         apply: bool,
         #[arg(long = "project")]
         project: Vec<String>,
+        #[arg(
+            long,
+            help = "Also pass --skillstation to bee onboard: publish bee's skillstation skills into the hub"
+        )]
+        skillstation: bool,
         #[arg(long)]
         json: bool,
     },
@@ -334,8 +339,9 @@ pub fn run(cli: Cli) -> Result<()> {
             BeeAction::Upgrade {
                 apply,
                 project,
+                skillstation,
                 json,
-            } => cmd_bee_upgrade(apply, project, json),
+            } => cmd_bee_upgrade(apply, project, skillstation, json),
         },
         Command::Version => {
             // Single source of truth: the workspace Cargo package version.
@@ -420,12 +426,13 @@ fn cmd_config_edit() -> Result<()> {
     Ok(())
 }
 
-fn cmd_bee_upgrade(apply: bool, only: Vec<String>, json: bool) -> Result<()> {
+fn cmd_bee_upgrade(apply: bool, only: Vec<String>, skillstation: bool, json: bool) -> Result<()> {
     let engine = runtime::build_engine()?;
     let projects = engine.list_projects()?;
     let opts = UpgradeOptions {
         apply,
         only,
+        skillstation,
         ..Default::default()
     };
     let report = bee_upgrade::run(&projects, &opts).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -779,6 +786,7 @@ mod bee_upgrade_text_tests {
             source_dirty: dirty,
             target_version: Some("1.0.0".to_string()),
             applied,
+            skillstation: false,
             projects,
         }
     }

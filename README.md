@@ -120,9 +120,11 @@ stdio (`waggledance mcp`) and exposes seven tools:
   project's leader. `reply` and `redo` queue the user's words for that leader; `accept`
   closes the task and archives its leader when nothing else uses it; `allow` and `deny`
   answer the leader's permission request.
-- **`waggledance_bee_upgrade(apply?, projects?)`** → upgrade bee in the registered projects
+- **`waggledance_bee_upgrade(apply?, projects?, skillstation?)`** → upgrade bee in the registered projects
   that already use it. Previews by default; `apply: true` runs `bee onboard --apply` and
   commits only bee's files, and requires a non-empty `projects` list the human approved.
+  `skillstation: true` adds `--skillstation` to every `bee onboard` call, so bee's skills are
+  also published into the Skillstation hub.
 
 Drop the snippet from [`docs/waggledance-agents-template.md`](docs/waggledance-agents-template.md)
 into your project's `AGENTS.md` / `CLAUDE.md` so its agents know the supervisor tools exist.
@@ -219,7 +221,7 @@ waggledance search <text> | schema [verb] # find an agent verb
 waggledance setup <pi|openclaw>           # install an integration
 waggledance mail send --to ... --corr ... --kind ...   # a leader reports back
 waggledance hold --why ... [--minutes N]  # tell the daemon this leader is waiting
-waggledance bee upgrade [--apply]         # upgrade bee across registered projects
+waggledance bee upgrade [--apply] [--skillstation]  # upgrade bee across registered projects
 waggledance config edit                   # edit ~/.waggledance/config.toml in $EDITOR
 ```
 
