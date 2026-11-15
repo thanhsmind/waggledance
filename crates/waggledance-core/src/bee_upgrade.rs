@@ -22,6 +22,7 @@ const MANAGED_PREFIXES: [&str; 4] = [
 pub struct UpgradeOptions {
     pub apply: bool,
     pub only: Vec<String>,
+    pub skillstation: bool,
     pub timeout: Duration,
 }
 
@@ -30,6 +31,7 @@ impl Default for UpgradeOptions {
         Self {
             apply: false,
             only: Vec::new(),
+            skillstation: false,
             timeout: Duration::from_secs(120),
         }
     }
@@ -49,6 +51,7 @@ pub struct UpgradeReport {
     pub source_dirty: bool,
     pub target_version: Option<String>,
     pub applied: bool,
+    pub skillstation: bool,
     pub projects: Vec<ProjectUpgrade>,
 }
 
@@ -134,6 +137,7 @@ pub fn run(projects: &[Project], opts: &UpgradeOptions) -> Result<UpgradeReport,
         source_root: source.root,
         target_version: rows.iter().find_map(|r| r.to_version.clone()),
         applied: opts.apply,
+        skillstation: opts.skillstation,
         projects: rows,
     })
 }
@@ -191,7 +195,7 @@ fn classify(row: &mut ProjectUpgrade, source: &BeeSource, opts: &UpgradeOptions)
         return skipped("live bee session");
     }
 
-    let plan = match onboard(source, &root, false, t) {
+    let plan = match onboard(source, &root, false, opts.skillstation, t) {
         Ok(plan) => plan,
         Err(error) => return Outcome::Failed { error },
     };
@@ -221,7 +225,14 @@ fn classify(row: &mut ProjectUpgrade, source: &BeeSource, opts: &UpgradeOptions)
     if !opts.apply {
         return Outcome::Pending { files };
     }
-    apply(&root, source, &files, row.to_version.as_deref(), t)
+    apply(
+        &root,
+        source,
+        &files,
+        row.to_version.as_deref(),
+        opts.skillstation,
+        t,
+    )
 }
 
 fn apply(
@@ -229,6 +240,7 @@ fn apply(
     source: &BeeSource,
     planned: &[String],
     version: Option<&str>,
+    skillstation: bool,
     t: Duration,
 ) -> Outcome {
     match merge_or_rebase_in_progress(root, t) {
@@ -251,7 +263,7 @@ fn apply(
             files: other.into_iter().collect(),
         };
     }
-    match onboard(source, root, true, t) {
+    match onboard(source, root, true, skillstation, t) {
         Ok(v) if v.get("status").and_then(Value::as_str) == Some("applied") => {}
         Ok(v) => {
             return Outcome::Failed {
@@ -315,7 +327,13 @@ fn apply(
     }
 }
 
-fn onboard(source: &BeeSource, root: &Path, apply: bool, t: Duration) -> Result<Value, String> {
+fn onboard(
+    source: &BeeSource,
+    root: &Path,
+    apply: bool,
+    skillstation: bool,
+    t: Duration,
+) -> Result<Value, String> {
     let mut cmd = Command::new(&source.bin);
     cmd.current_dir(&source.root)
         .arg("onboard")
@@ -324,6 +342,9 @@ fn onboard(source: &BeeSource, root: &Path, apply: bool, t: Duration) -> Result<
         .arg("--json");
     if apply {
         cmd.arg("--apply");
+    }
+    if skillstation {
+        cmd.arg("--skillstation");
     }
     let out =
         run_with_deadline(&mut cmd, None, t, OUTPUT_CAP).map_err(|e| describe("bee onboard", e))?;
@@ -677,6 +698,7 @@ JSON
         UpgradeOptions {
             apply,
             only: Vec::new(),
+            skillstation: false,
             timeout: Duration::from_secs(30),
         }
     }
@@ -877,6 +899,50 @@ JSON
             git_in(&a.root_path, &["log", "-1", "--format=%s"]).trim(),
             "Upgrade bee to 9.9.9"
         );
+    }
+
+    #[test]
+    fn skillstation_is_forwarded_to_the_plan_and_the_apply_onboard() {
+        let tmp = TempDir::new().unwrap();
+        let src = source(tmp.path());
+        let a = repo(tmp.path(), "a");
+        let report = run(
+            &[src.clone(), a],
+            &UpgradeOptions {
+                only: strings(&["a"]),
+                skillstation: true,
+                ..opts(true)
+            },
+        )
+        .unwrap();
+        assert!(report.skillstation);
+        assert!(matches!(
+            report.projects[0].outcome,
+            Outcome::Upgraded { .. }
+        ));
+        let log = calls(&src);
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(lines[0].ends_with("--json --skillstation"), "{log}");
+        assert!(lines[1].ends_with("--json --apply --skillstation"), "{log}");
+    }
+
+    #[test]
+    fn without_skillstation_onboard_never_gets_the_flag() {
+        let tmp = TempDir::new().unwrap();
+        let src = source(tmp.path());
+        let a = repo(tmp.path(), "a");
+        let report = run(
+            &[src.clone(), a],
+            &UpgradeOptions {
+                only: strings(&["a"]),
+                ..opts(true)
+            },
+        )
+        .unwrap();
+        assert!(!report.skillstation);
+        assert_eq!(calls(&src).lines().count(), 2);
+        assert!(!calls(&src).contains("--skillstation"));
     }
 
     #[test]

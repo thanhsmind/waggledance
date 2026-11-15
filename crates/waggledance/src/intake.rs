@@ -225,9 +225,7 @@ fn maybe_text_of<'de, D: serde::Deserializer<'de>>(
     Ok((!trimmed.is_empty() && trimmed != "null").then(|| trimmed.to_string()))
 }
 
-fn texts_of<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<Vec<String>, D::Error> {
+fn texts_of<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
     Ok(match Value::deserialize(d)? {
         Value::Array(items) => items
             .into_iter()
@@ -595,7 +593,15 @@ mod tests {
     #[test]
     fn null_fields_from_the_model_parse_as_empty() {
         let mut task = item("task", "2", None, 0.7);
-        for field in ["url", "body", "page_url", "selector", "image_urls", "reason", "title"] {
+        for field in [
+            "url",
+            "body",
+            "page_url",
+            "selector",
+            "image_urls",
+            "reason",
+            "title",
+        ] {
             task[field] = Value::Null;
         }
         let fenced = format!("```json\n{}\n```", bare(vec![task]));
