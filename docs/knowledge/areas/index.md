@@ -10,7 +10,7 @@ never a generation timestamp or any other wall-clock value.
 
 ## Concepts
 
-- [The supervisor daemon is headless and MCP serves seven tools](supervisor-daemon.md) — waggledance serve runs the supervisor loops with no HTTP listener; waggledance mcp serves seven tools over stdio; nothing indexes or serves other projects' files
+- [The supervisor daemon is headless and MCP serves eight tools](supervisor-daemon.md) — waggledance serve runs the supervisor loops with no HTTP listener; waggledance mcp serves seven tools over stdio; nothing indexes or serves other projects' files
 
 ## Sections
 

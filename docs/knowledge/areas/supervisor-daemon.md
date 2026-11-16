@@ -1,18 +1,18 @@
 ---
 type: bee.area
-title: The supervisor daemon is headless and MCP serves seven tools
-description: "waggledance serve runs the supervisor loops with no HTTP listener; waggledance mcp serves seven tools over stdio; nothing indexes or serves other projects' files"
+title: The supervisor daemon is headless and MCP serves eight tools
+description: "waggledance serve runs the supervisor loops with no HTTP listener; waggledance mcp serves eight tools over stdio; nothing indexes or serves other projects' files"
 tags: [supervisor, daemon, mcp]
 timestamp: 2026-11-12
 bee:
   id: supervisor-daemon
   lifecycle: active
   areas: [orchestration]
-  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/agent_cli.rs, crates/waggledance/src/intake.rs, crates/waggledance/src/main.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/intake.rs, crates/waggledance-core/src/config.rs]
+  anchors: [crates/waggledance/src/daemon.rs, crates/waggledance/src/mcp.rs, crates/waggledance/src/runtime.rs, crates/waggledance/src/cli.rs, crates/waggledance/src/agent_cli.rs, crates/waggledance/src/intake.rs, crates/waggledance/src/main.rs, crates/waggledance/src/watcher.rs, crates/waggledance-core/src/repository.rs, crates/waggledance-core/src/intake.rs, crates/waggledance-core/src/config.rs, crates/waggledance-core/src/bee_global_config.rs]
   sources: [docs/history/headless-supervisor/CONTEXT.md, docs/history/headless-supervisor/plan.md, docs/history/agent-cli/CONTEXT.md, docs/history/agent-cli/plan.md, docs/history/anphabe-intake/CONTEXT.md, docs/history/anphabe-intake/plan.md]
 ---
 
-# The supervisor daemon is headless and MCP serves seven tools
+# The supervisor daemon is headless and MCP serves eight tools
 
 Read when: you look for the board, the terminal page, a docs or code viewer, `open`, `refresh`, `/health` or the Paseo sidebar plugin, or you wonder why `status` cannot dial the daemon.
 
@@ -21,7 +21,7 @@ Read when: you look for the board, the terminal page, a docs or code viewer, `op
 waggledance supervises agents and nothing else. Locked by headless-supervisor D1-D5 (`docs/history/headless-supervisor/CONTEXT.md`).
 
 - `waggledance serve` (`daemon.rs`) hosts the background loops and binds no socket, not even `/health`. Liveness is the lock file's pid, read through `waggledance status` and `waggledance doctor`; see [a TCP health probe reads a listenerless daemon as dead](../patterns/a-tcp-health-probe-reads-a-listenerless-daemon-as-dead.md).
-- `waggledance mcp` (`mcp.rs`) is stdio and registers seven tools: `waggledance_projects`, `waggledance_ask_state`, `waggledance_dispatch`, `waggledance_await`, `waggledance_runs`, `waggledance_task`, `waggledance_bee_upgrade`. `waggledance_view_file` and `waggledance_search` are gone.
+- `waggledance mcp` (`mcp.rs`) is stdio and registers eight tools: `waggledance_projects`, `waggledance_ask_state`, `waggledance_dispatch`, `waggledance_await`, `waggledance_runs`, `waggledance_task`, `waggledance_bee_upgrade`, `waggledance_bee_config`. `waggledance_view_file` and `waggledance_search` are gone.
 - Agents are driven through Paseo or herdr directly. Leader mail keeps flowing through `mail` and notify.
 - The pi extension and the OpenClaw `wd-bridge` stay because they speak MCP over stdio. The Paseo plugin and the desktop app are gone.
 
@@ -73,3 +73,19 @@ Read when: an intake item was dispatched to the wrong project, a pass records no
 - The daemon loop (`intake::run`, slot in `TerminalBackground` in `main.rs`) runs only with `[intake] enabled` and a non-empty `user_email`, first pass 60 seconds after start, then every `interval_minutes` (floor one minute), missed ticks skipped. The pass runs under `spawn_blocking` because the claude subprocess blocks; a failed pass logs a warning and the loop goes on (anphabe-intake D3, D5).
 - Held items with `notified` false go out as one `intake` notifier message and are marked notified only after the send succeeds, so a failed send is retried on the next tick and a delivered item is never repeated. With no Telegram credentials the notifier is the null one, which only logs.
 - `intake run|list` are agent verbs listed in `schema` and `search`; an empty `[intake] user_email` exits 1 naming it.
+
+## Bee global config
+
+Read when: a bee setting should apply to every project, `waggledance bee config` refuses a key, or you wonder why the MCP tool cannot write it.
+
+- `waggledance bee config path|show|get|set|unset|explain` (`cli.rs`, logic in `bee_global_config.rs`) edits bee's user-global file. The path is fixed by beehive D12: `$BEEHIVE_CONFIG_DIR/config.json`, else `$XDG_CONFIG_HOME/beehive/config.json`, else `~/.config/beehive/config.json`, an empty variable counting as unset. The directory also holds `performance.jsonl`, which this code never touches.
+- The document has the keys of a project's `.bee/config.json`, written as 2-space pretty JSON plus a newline through `config::write_atomic`, key order kept. `set` parses the value as JSON and stores a string when it does not parse. A missing file reads as `{}`; a malformed or non-object file is an error naming the path and is never overwritten.
+- `guards`, `gate_bypass` and `hooks` are per-project only. `set` of one is refused and `save` refuses any document still holding one; `unset` of one is allowed so a hand-edited file can be cleaned.
+- `explain` runs each project's `.bee/bin/bee config explain --key <key> --json` through `run_with_deadline`; a project whose bee fails or lacks the verb reports the error on its own row. Precedence: built-in default < global file < project `.bee/config.json` < `.bee/team.json` < `.bee/config.local.json`.
+- `waggledance_bee_config` (`mcp.rs`) is read-only (`show|get|explain`). Writes stay on the owner's CLI: an agent changing a setting for every project is the owner's call.
+
+## Pointers (bee global config)
+
+- `crates/waggledance-core/src/bee_global_config.rs` — path resolver, `KeyPath`, forbidden-key check, load/set/unset/save, `explain`.
+- `crates/waggledance/src/cli.rs` — `BeeConfigAction` and `cmd_bee_config`.
+- `crates/waggledance/src/mcp.rs` — `bee_config_schema` and `handle_bee_config`.

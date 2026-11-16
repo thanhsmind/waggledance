@@ -6,6 +6,7 @@ use crate::runtime;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
+use waggledance_core::bee_global_config::{self, GlobalConfig, KeyPath};
 use waggledance_core::bee_upgrade::{self, Outcome, UpgradeOptions, UpgradeReport};
 use waggledance_core::Config;
 
@@ -292,6 +293,49 @@ pub enum BeeAction {
         #[arg(long)]
         json: bool,
     },
+    #[command(
+        about = "View and edit bee's user-global config file.",
+        long_about = "View and edit bee's user-global config file: $BEEHIVE_CONFIG_DIR/config.json, else $XDG_CONFIG_HOME/beehive/config.json, else ~/.config/beehive/config.json. Precedence, lowest to highest: built-in default < global file < project .bee/config.json < .bee/team.json < .bee/config.local.json. The keys guards, gate_bypass and hooks are per-project only and are refused."
+    )]
+    Config {
+        #[command(subcommand)]
+        action: BeeConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BeeConfigAction {
+    #[command(about = "Print the resolved global config path and whether it exists.")]
+    Path,
+    #[command(about = "Print the whole global config document.")]
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Print one value as JSON; exits non-zero when the key is absent.")]
+    Get {
+        key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(
+        about = "Set a dotted key; the value is parsed as JSON, else stored as a string.",
+        long_about = "Set a dotted key (e.g. herding.agents) in the global file. The value is parsed as JSON; when it is not valid JSON it is stored as a JSON string. guards, gate_bypass and hooks are refused."
+    )]
+    Set { key: String, value: String },
+    #[command(about = "Remove a dotted key from the global config.")]
+    Unset { key: String },
+    #[command(
+        about = "Show, per project, which layer supplies a key and its value.",
+        long_about = "Run each registered project's `.bee/bin/bee config explain --key <key> --json` and report the source (global|tracked|team|local|unset) and value per project. Precedence: built-in default < global file < project .bee/config.json < .bee/team.json < .bee/config.local.json."
+    )]
+    Explain {
+        key: String,
+        #[arg(long = "project")]
+        project: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -342,6 +386,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 skillstation,
                 json,
             } => cmd_bee_upgrade(apply, project, skillstation, json),
+            BeeAction::Config { action } => cmd_bee_config(action),
         },
         Command::Version => {
             // Single source of truth: the workspace Cargo package version.
@@ -440,6 +485,75 @@ fn cmd_bee_upgrade(apply: bool, only: Vec<String>, skillstation: bool, json: boo
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", render_upgrade_text(&report));
+    }
+    Ok(())
+}
+
+fn cmd_bee_config(action: BeeConfigAction) -> Result<()> {
+    let path = bee_global_config::config_path()?;
+    match action {
+        BeeConfigAction::Path => {
+            let state = if path.exists() {
+                "exists"
+            } else {
+                "does not exist"
+            };
+            println!("{} ({state})", path.display());
+        }
+        BeeConfigAction::Show { json } => {
+            let cfg = GlobalConfig::load(&path)?;
+            println!("{}", serde_json::to_string_pretty(cfg.document())?);
+            if !cfg.exists() && !json {
+                println!("note: {} does not exist", path.display());
+            }
+        }
+        BeeConfigAction::Get { key, json: _ } => {
+            let key = KeyPath::parse(&key)?;
+            let cfg = GlobalConfig::load(&path)?;
+            match cfg.get(&key) {
+                Some(v) => println!("{}", serde_json::to_string_pretty(v)?),
+                None => anyhow::bail!("{} is not set in {}", key.dotted(), path.display()),
+            }
+        }
+        BeeConfigAction::Set { key, value } => {
+            let key = KeyPath::parse(&key)?;
+            let value = serde_json::from_str::<serde_json::Value>(&value)
+                .unwrap_or(serde_json::Value::String(value));
+            let mut cfg = GlobalConfig::load(&path)?;
+            cfg.set(&key, value.clone())?;
+            cfg.save()?;
+            println!("{} = {}", key.dotted(), value);
+        }
+        BeeConfigAction::Unset { key } => {
+            let key = KeyPath::parse(&key)?;
+            let mut cfg = GlobalConfig::load(&path)?;
+            if cfg.unset(&key) {
+                cfg.save()?;
+                println!("unset {}", key.dotted());
+            } else {
+                println!("{} was not set", key.dotted());
+            }
+        }
+        BeeConfigAction::Explain { key, project, json } => {
+            let key = KeyPath::parse(&key)?;
+            let engine = runtime::build_engine()?;
+            let rows = bee_global_config::explain(&engine.list_projects()?, &key, &project)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                for r in &rows {
+                    match &r.error {
+                        Some(e) => println!("{}  error  {e}", r.id),
+                        None => println!(
+                            "{}  {}  {}",
+                            r.id,
+                            r.source.as_deref().unwrap_or("-"),
+                            r.value.as_ref().map_or("-".to_string(), |v| v.to_string())
+                        ),
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
