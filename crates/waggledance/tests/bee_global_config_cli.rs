@@ -317,3 +317,65 @@ fn mcp_lists_a_read_only_bee_config_tool_that_returns_the_value() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+fn stub_project(env: &Env, name: &str, script: &str) -> String {
+    let root = env.home.path().join(name);
+    let bin = root.join(".bee/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let bee = bin.join("bee");
+    std::fs::write(&bee, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bee, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = ok(env
+        .cmd()
+        .args(["register", root.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap());
+    let v: Value = serde_json::from_str(&out).unwrap();
+    v["project_id"].as_str().unwrap().to_string()
+}
+
+const EXPLAIN_STUB: &str = "#!/bin/sh\nprintf '%s\\n' '{\"key\":\"team\",\"effective\":{\"claude\":{}},\"source\":\"global\",\"tracked\":null,\"local\":null}'\n";
+const FAILING_STUB: &str = "#!/bin/sh\necho 'stub explain broke' >&2\nexit 3\n";
+
+fn explain_rows(env: &Env, extra: &[&str]) -> Vec<Value> {
+    let mut args = vec!["explain", "team", "--json"];
+    args.extend_from_slice(extra);
+    let rows: Value = serde_json::from_str(&ok(env.run(&args))).unwrap();
+    rows.as_array().unwrap().clone()
+}
+
+#[test]
+fn explain_reports_the_effective_value_and_source_from_each_project_bee() {
+    let env = Env::new();
+    let good = stub_project(&env, "good", EXPLAIN_STUB);
+
+    let rows = explain_rows(&env, &[]);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["id"], json!(good));
+    assert_eq!(rows[0]["source"], json!("global"));
+    assert_eq!(rows[0]["value"], json!({"claude": {}}));
+    assert_eq!(rows[0]["error"], Value::Null);
+
+    let bad = stub_project(&env, "bad", FAILING_STUB);
+    let rows = explain_rows(&env, &[]);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let row = |id: &str| rows.iter().find(|r| r["id"] == json!(id)).unwrap().clone();
+    let g = row(&good);
+    assert_eq!(g["source"], json!("global"));
+    assert_eq!(g["value"], json!({"claude": {}}));
+    assert_eq!(g["error"], Value::Null);
+    let b = row(&bad);
+    assert_eq!(b["source"], Value::Null);
+    assert_eq!(b["value"], Value::Null);
+    let err = b["error"].as_str().unwrap();
+    assert!(err.contains("stub explain broke"), "{err}");
+
+    let only = explain_rows(&env, &["--project", &good]);
+    assert_eq!(only.len(), 1);
+    assert_eq!(only[0]["id"], json!(good));
+
+    let o = env.run(&["explain", "team", "--json", "--project", "no-such-project"]);
+    assert!(!o.status.success(), "{}", stdout(&o));
+    assert!(stderr(&o).contains("no-such-project"), "{}", stderr(&o));
+}
