@@ -448,7 +448,7 @@ mod tests {
             last_seen_at: String::new(),
             orchestration_enabled: false,
         };
-        let rows = explain(&[project.clone()], &key("a.b"), &[]).unwrap();
+        let rows = explain(std::slice::from_ref(&project), &key("a.b"), &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].error.is_some() && rows[0].source.is_none());
         assert!(explain(&[project], &key("a"), &["nope".to_string()]).is_err());
