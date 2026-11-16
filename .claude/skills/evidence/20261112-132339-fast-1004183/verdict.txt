@@ -1,0 +1,12 @@
+PASS doctor before drive
+PASS registry: list on an empty registry exits 0
+PASS registry: register exits 0
+PASS registry: register echoes the scratch root
+PASS registry: registry.db holds the row (side effect)
+PASS registry: list shows the project
+PASS registry: projects JSON names verify-scratch
+PASS registry: status counts one project
+PASS registry: unregister exits 0
+PASS registry: registry.db no longer holds the row (side effect)
+PASS registry: scratch repo files survive unregister
+PASS doctor after drive

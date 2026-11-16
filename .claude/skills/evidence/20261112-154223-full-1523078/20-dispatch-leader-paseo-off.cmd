@@ -1,0 +1,1 @@
+env -i HOME=/mnt/data/Projects/goglbe/waggledance/.bee/tmp/verify-app/20261112-154223-full-1523078/home PATH=/usr/bin:/bin LANG=C.UTF-8 TERM=dumb RUST_LOG=info /mnt/data/Projects/goglbe/waggledance/target/fast/waggledance dispatch --project repo --leader --task verify-app\ probe --request-id verify-app-1 

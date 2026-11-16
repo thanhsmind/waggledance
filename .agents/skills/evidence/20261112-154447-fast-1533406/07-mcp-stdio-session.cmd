@@ -1,0 +1,1 @@
+env -i HOME=/mnt/data/Projects/goglbe/waggledance/.bee/tmp/verify-app/20261112-154447-fast-1533406/home PATH=/usr/bin:/bin LANG=C.UTF-8 TERM=dumb RUST_LOG=info /mnt/data/Projects/goglbe/waggledance/target/fast/waggledance mcp 

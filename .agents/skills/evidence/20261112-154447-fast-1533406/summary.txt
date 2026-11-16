@@ -1,0 +1,5 @@
+result: green
+scope: fast
+features: registry mcp-server
+checks: 24 passed, 0 failed
+evidence: /mnt/data/Projects/goglbe/waggledance/.bee/verify/evidence/20261112-154447-fast-1533406

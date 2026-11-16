@@ -1,0 +1,3 @@
+error: recipient `someone` is not accepted; the only recipient is wd
+error: kind `gossip` is not one a leader may send; accepted kinds: result, question, progress, error
+error: no run found for corr `no-such-corr`

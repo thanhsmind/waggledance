@@ -1,0 +1,1 @@
+env -i HOME=/mnt/data/Projects/goglbe/waggledance/.bee/tmp/verify-app/20261112-154223-full-1523078/home PATH=/usr/bin:/bin LANG=C.UTF-8 TERM=dumb RUST_LOG=info /mnt/data/Projects/goglbe/waggledance/target/fast/waggledance mail send --to someone --corr no-such-corr --kind gossip 

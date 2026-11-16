@@ -1,0 +1,24 @@
+PASS binary carries the change literal 'A waggledance daemon is already running.'
+PASS doctor before drive
+PASS registry: list on an empty registry exits 0
+PASS registry: register exits 0
+PASS registry: register echoes the scratch root
+PASS registry: registry.db holds the row (side effect)
+PASS registry: list shows the project
+PASS registry: projects JSON names verify-scratch
+PASS registry: status counts one project
+PASS registry: unregister exits 0
+PASS registry: registry.db no longer holds the row (side effect)
+PASS registry: scratch repo files survive unregister
+PASS mcp: initialize answers serverInfo waggledance
+PASS mcp: tools/list exposes waggledance_projects
+PASS mcp: tools/list exposes waggledance_ask_state
+PASS mcp: tools/list exposes waggledance_dispatch
+PASS mcp: tools/list exposes waggledance_await
+PASS mcp: tools/list exposes waggledance_runs
+PASS mcp: tools/list exposes waggledance_task
+PASS mcp: tools/list exposes waggledance_bee_upgrade
+PASS mcp: waggledance_projects returns the scratch project only
+PASS mcp: waggledance_ask_state answers for repo
+PASS mcp: an unknown tool is an error, not a crash
+PASS doctor after drive

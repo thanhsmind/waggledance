@@ -1,0 +1,5 @@
+result: green
+scope: fast
+features: registry
+checks: 12 passed, 0 failed
+evidence: /mnt/data/Projects/goglbe/waggledance/.bee/verify/evidence/20261112-132339-fast-1004183

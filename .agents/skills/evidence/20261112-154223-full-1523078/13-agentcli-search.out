@@ -1,0 +1,1 @@
+{"matches":[{"verb":"projects","score":7,"help":"List registered projects as JSON.","usage":"waggledance projects [OPTIONS]"},{"verb":"runs","score":2,"help":"List dispatched runs with a one-line task summary; `runs show` prints one run in full.","usage":"waggledance runs [OPTIONS] [COMMAND]"}]}

@@ -1,0 +1,6 @@
+result: green
+scope: full
+features: daemon-lifecycle registry agent-cli mcp-server leader-mail-and-dispatch
+checks: 45 passed, 0 failed
+SKIPPED live leader dispatch, await, task and accepted mail — they need a live Paseo or herdr agent
+evidence: /mnt/data/Projects/goglbe/waggledance/.bee/verify/evidence/20261112-154223-full-1523078

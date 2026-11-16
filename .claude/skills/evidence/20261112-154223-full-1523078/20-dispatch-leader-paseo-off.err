@@ -1,0 +1,1 @@
+error: Paseo leader dispatch is off — `enabled = false` under `[paseo]` in ~/.waggledance/config.toml; remove that line to let waggledance detect the Paseo CLI

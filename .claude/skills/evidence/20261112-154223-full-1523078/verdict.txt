@@ -1,0 +1,46 @@
+PASS doctor before drive
+PASS lifecycle: status --json reports running
+PASS lifecycle: a second serve says already running and exits 0
+PASS lifecycle: the first daemon is untouched
+PASS lifecycle: restart exits 0
+PASS lifecycle: restart replaced the pid (1523129 -> 1523236)
+PASS lifecycle: old pid is gone
+PASS lifecycle: stop exits 0
+PASS lifecycle: status reports not running
+PASS lifecycle: the stopped pid is gone
+PASS lifecycle: serve starts again after stop
+PASS registry: list on an empty registry exits 0
+PASS registry: register exits 0
+PASS registry: register echoes the scratch root
+PASS registry: registry.db holds the row (side effect)
+PASS registry: list shows the project
+PASS registry: projects JSON names verify-scratch
+PASS registry: status counts one project
+PASS registry: unregister exits 0
+PASS registry: registry.db no longer holds the row (side effect)
+PASS registry: scratch repo files survive unregister
+PASS agent-cli: search ranks projects first
+PASS agent-cli: schema state is JSON naming --fields
+PASS agent-cli: state rolls up the scratch project
+PASS agent-cli: --fields keeps only the asked keys
+PASS agent-cli: runs on a fresh registry exits 0
+PASS agent-cli: a misspelt verb exits non-zero
+PASS mcp: initialize answers serverInfo waggledance
+PASS mcp: tools/list exposes waggledance_projects
+PASS mcp: tools/list exposes waggledance_ask_state
+PASS mcp: tools/list exposes waggledance_dispatch
+PASS mcp: tools/list exposes waggledance_await
+PASS mcp: tools/list exposes waggledance_runs
+PASS mcp: tools/list exposes waggledance_task
+PASS mcp: tools/list exposes waggledance_bee_upgrade
+PASS mcp: waggledance_projects returns the scratch project only
+PASS mcp: waggledance_ask_state answers for repo
+PASS mcp: an unknown tool is an error, not a crash
+PASS dispatch: --leader with Paseo off refuses
+PASS dispatch: the refusal names Paseo
+PASS dispatch: no run row was written (side effect)
+PASS mail: unknown corr exits 2
+PASS mail: refusal names the corr
+PASS mail: bad recipient and kind are both named
+SKIPPED live leader dispatch, await, task and accepted mail — they need a live Paseo or herdr agent
+PASS doctor after drive
