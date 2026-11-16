@@ -3,6 +3,7 @@
 pub mod agent_usage;
 pub mod ansi;
 pub mod bee;
+pub mod bee_global_config;
 pub mod bee_upgrade;
 pub mod config;
 pub mod domain;

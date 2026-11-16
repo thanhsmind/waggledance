@@ -93,7 +93,7 @@ waggledance doctor --fix
 
 Registers an MCP server for whichever of **Claude Code, Codex, and Antigravity** it detects
 on your machine — it never writes config for a tool you don't have. The server runs over
-stdio (`waggledance mcp`) and exposes seven tools:
+stdio (`waggledance mcp`) and exposes eight tools:
 
 - **`waggledance_projects()`** → every registered project's `id`, `name`, `root_path` and
   `last_seen_at`.
@@ -252,7 +252,7 @@ outside every registered project root become visible. Per project,
 
 ## Status
 
-Actively developed. The supervisor daemon, the seven MCP tools, the CLI and `doctor` work
+Actively developed. The supervisor daemon, the eight MCP tools, the CLI and `doctor` work
 end-to-end. The board, the terminal page, the docs and code reader, search and the desktop
 app were removed; see [PRD.md](PRD.md) for the original design, which predates that change.
 

@@ -1,6 +1,7 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
 //! Exposes the supervisor surface: the read-only query tools
 //! `waggledance_projects` and `waggledance_ask_state`, `waggledance_bee_upgrade`,
+//! the read-only `waggledance_bee_config`,
 //! and the orchestrator-dispatch write surface
 //! (`docs/history/orchestrator-dispatch/plan.md` D2): `waggledance_dispatch`,
 //! `waggledance_await`, `waggledance_runs`, `waggledance_task`. Hand-rolled to
@@ -160,6 +161,7 @@ fn tool_schemas() -> Vec<Value> {
     vec![
         projects_schema(),
         bee_upgrade_schema(),
+        bee_config_schema(),
         ask_state_schema(),
         dispatch_schema(),
         await_schema(),
@@ -194,6 +196,27 @@ fn bee_upgrade_schema() -> Value {
                 "projects": { "type": "array", "items": { "type": "string" }, "description": "Project ids to narrow the run to; required with apply" },
                 "skillstation": { "type": "boolean", "default": false, "description": "Also pass --skillstation to bee onboard, publishing bee's skillstation skills into the hub" }
             }
+        }
+    })
+}
+
+fn bee_config_schema() -> Value {
+    json!({
+        "name": "waggledance_bee_config",
+        "description": "Read bee's user-global config file (BEEHIVE_CONFIG_DIR, else \
+    XDG_CONFIG_HOME/beehive, else ~/.config/beehive, config.json). Read-only: `show` \
+    returns the whole document, `get` one dotted `key`, `explain` the layer that \
+    supplies `key` in each project (global|tracked|team|local|unset). Precedence: \
+    built-in default < global file < project .bee/config.json < .bee/team.json < \
+    .bee/config.local.json. Writes stay on the owner's `waggledance bee config` CLI.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["show", "get", "explain"], "description": "What to read" },
+                "key": { "type": "string", "description": "Dotted key, e.g. herding.agents; required for get and explain" },
+                "projects": { "type": "array", "items": { "type": "string" }, "description": "Project ids to narrow explain to" }
+            },
+            "required": ["action"]
         }
     })
 }
@@ -367,6 +390,7 @@ fn handle_tool_call(
     match name {
         "waggledance_projects" => handle_projects(id, engine),
         "waggledance_bee_upgrade" => handle_bee_upgrade(id, engine, &args),
+        "waggledance_bee_config" => handle_bee_config(id, engine, &args),
         "waggledance_ask_state" => handle_ask_state(id, engine, orchestration, &args),
         "waggledance_dispatch" => handle_dispatch(id, engine, orchestration, &args),
         "waggledance_await" => {
@@ -459,6 +483,82 @@ fn handle_bee_upgrade(id: Option<Value>, engine: &Engine, args: &Value) -> Value
         .collect::<Vec<_>>()
         .join(", ");
     let text = format!("{} project(s): {per_status}", report.projects.len());
+    ok(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": structured
+        }),
+    )
+}
+
+fn handle_bee_config(id: Option<Value>, engine: &Engine, args: &Value) -> Value {
+    use waggledance_core::bee_global_config::{self as bgc, GlobalConfig, KeyPath};
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    if !["show", "get", "explain"].contains(&action) {
+        return tool_error(id, "action must be one of show, get, explain");
+    }
+    let key = match args.get("key") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(k)) => match KeyPath::parse(k) {
+            Ok(k) => Some(k),
+            Err(e) => return tool_error(id, &e.to_string()),
+        },
+        Some(_) => return tool_error(id, "key must be a string"),
+    };
+    let path = match bgc::config_path() {
+        Ok(p) => p,
+        Err(e) => return tool_error(id, &e.to_string()),
+    };
+    let structured = match (action, key) {
+        ("show", _) => match GlobalConfig::load(&path) {
+            Ok(cfg) => json!({
+                "path": path.display().to_string(),
+                "exists": cfg.exists(),
+                "config": cfg.document()
+            }),
+            Err(e) => return tool_error(id, &e.to_string()),
+        },
+        (_, None) => return tool_error(id, "key is required for get and explain"),
+        ("get", Some(key)) => match GlobalConfig::load(&path) {
+            Ok(cfg) => json!({
+                "path": path.display().to_string(),
+                "key": key.dotted(),
+                "found": cfg.get(&key).is_some(),
+                "value": cfg.get(&key)
+            }),
+            Err(e) => return tool_error(id, &e.to_string()),
+        },
+        (_, Some(key)) => {
+            let only: Vec<String> = match args.get("projects") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => match items
+                    .iter()
+                    .map(|v| v.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                {
+                    Some(ids) => ids,
+                    None => {
+                        return tool_error(id, "projects must be an array of project id strings")
+                    }
+                },
+                Some(_) => {
+                    return tool_error(id, "projects must be an array of project id strings")
+                }
+            };
+            let projects = match engine.list_projects() {
+                Ok(p) => p,
+                Err(e) => {
+                    return tool_error(id, &format!("could not list registered projects: {e}"))
+                }
+            };
+            match bgc::explain(&projects, &key, &only) {
+                Ok(rows) => json!({ "key": key.dotted(), "projects": rows }),
+                Err(e) => return tool_error(id, &e.to_string()),
+            }
+        }
+    };
+    let text = format!("bee config {action}: {}", path.display());
     ok(
         id,
         json!({
@@ -2053,6 +2153,7 @@ mod tests {
             vec![
                 "waggledance_projects",
                 "waggledance_bee_upgrade",
+                "waggledance_bee_config",
                 "waggledance_ask_state",
                 "waggledance_dispatch",
                 "waggledance_await",

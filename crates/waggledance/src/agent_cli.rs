@@ -489,7 +489,7 @@ fn search(text: &str) -> Value {
         .map(|c| (score(&c, &terms), c))
         .filter(|(s, _)| *s > 0)
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
     let matches: Vec<Value> = scored
         .iter()
         .take(SEARCH_MATCHES)
@@ -609,13 +609,10 @@ mod tests {
         let rows = out["runs"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         for row in rows {
-            assert_eq!(
-                row["task_summary"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("first line"),
-                true
-            );
+            assert!(row["task_summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("first line"));
             assert!(row.get("task").is_none() && row.get("pane_id").is_none());
         }
         let full = exec(&engine, &["runs", "--full"]).unwrap();
