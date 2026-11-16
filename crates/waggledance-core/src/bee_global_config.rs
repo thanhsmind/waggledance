@@ -199,6 +199,18 @@ pub struct ExplainRow {
     pub error: Option<String>,
 }
 
+fn parse_explain_stdout(text: &str) -> Option<(Option<String>, Option<Value>)> {
+    let start = text.find('{')?;
+    let v = serde_json::from_str::<Value>(text[start..].trim()).ok()?;
+    let source = v.get("source").and_then(Value::as_str).map(str::to_string);
+    let value = v
+        .get("effective")
+        .or_else(|| v.get("value"))
+        .filter(|x| !x.is_null())
+        .cloned();
+    Some((source, value))
+}
+
 fn explain_project(project: &Project, key: &str) -> ExplainRow {
     let row = |source, value, error| ExplainRow {
         id: project.id.clone(),
@@ -221,15 +233,8 @@ fn explain_project(project: &Project, key: &str) -> ExplainRow {
         }
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    let parsed = text
-        .find('{')
-        .and_then(|i| serde_json::from_str::<Value>(text[i..].trim()).ok());
-    match (out.ok, parsed) {
-        (true, Some(v)) => row(
-            v.get("source").and_then(Value::as_str).map(str::to_string),
-            v.get("value").cloned(),
-            None,
-        ),
+    match (out.ok, parse_explain_stdout(&text)) {
+        (true, Some((source, value))) => row(source, value, None),
         (true, None) => row(None, None, Some("bee printed no JSON object".into())),
         (false, _) => {
             let detail = out.stderr.trim();
@@ -278,6 +283,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn explain_stdout_reads_the_effective_value_and_source() {
+        let text = r#"{"key":"commands.test","effective":["a"],"source":"tracked","tracked":["a"],"local":null}"#;
+        assert_eq!(
+            parse_explain_stdout(text),
+            Some((Some("tracked".into()), Some(json!(["a"]))))
+        );
+    }
+
+    #[test]
+    fn explain_stdout_skips_a_leading_non_json_line() {
+        let text = "notice: something\n{\"effective\":1,\"source\":\"local\"}\n";
+        assert_eq!(
+            parse_explain_stdout(text),
+            Some((Some("local".into()), Some(json!(1))))
+        );
+    }
+
+    #[test]
+    fn explain_stdout_yields_null_for_a_null_effective_and_no_source() {
+        assert_eq!(
+            parse_explain_stdout(r#"{"key":"k","effective":null}"#),
+            Some((None, None))
+        );
     }
 
     fn key(s: &str) -> KeyPath {
