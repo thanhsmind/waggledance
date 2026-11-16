@@ -60,7 +60,12 @@ fn stderr(o: &Output) -> String {
 }
 
 fn ok(o: Output) -> String {
-    assert!(o.status.success(), "stdout={} stderr={}", stdout(&o), stderr(&o));
+    assert!(
+        o.status.success(),
+        "stdout={} stderr={}",
+        stdout(&o),
+        stderr(&o)
+    );
     stdout(&o)
 }
 
@@ -147,7 +152,11 @@ fn get_of_a_missing_key_exits_non_zero() {
 #[test]
 fn per_project_keys_are_refused_and_leave_the_file_untouched() {
     let env = Env::new();
-    for (key, value) in [("guards.x", "true"), ("gate_bypass", "full"), ("hooks", "{}")] {
+    for (key, value) in [
+        ("guards.x", "true"),
+        ("gate_bypass", "full"),
+        ("hooks", "{}"),
+    ] {
         let o = env.run(&["set", key, value]);
         assert!(!o.status.success(), "{key} was accepted");
         let first = key.split('.').next().unwrap();
@@ -157,10 +166,18 @@ fn per_project_keys_are_refused_and_leave_the_file_untouched() {
 
     ok(env.run(&["set", "keep", "1"]));
     let before = std::fs::read(env.file()).unwrap();
-    for (key, value) in [("guards.x", "true"), ("gate_bypass", "full"), ("hooks", "{}")] {
+    for (key, value) in [
+        ("guards.x", "true"),
+        ("gate_bypass", "full"),
+        ("hooks", "{}"),
+    ] {
         let o = env.run(&["set", key, value]);
         assert!(!o.status.success(), "{key} was accepted");
-        assert_eq!(std::fs::read(env.file()).unwrap(), before, "{key} changed the file");
+        assert_eq!(
+            std::fs::read(env.file()).unwrap(),
+            before,
+            "{key} changed the file"
+        );
     }
 }
 
@@ -190,7 +207,10 @@ fn unset_of_a_missing_key_reports_it() {
     ok(env.run(&["set", "keep", "1"]));
     let before = std::fs::read(env.file()).unwrap();
     let out = ok(env.run(&["unset", "absent.deep"]));
-    assert!(out.contains("absent.deep") && out.contains("not set"), "{out}");
+    assert!(
+        out.contains("absent.deep") && out.contains("not set"),
+        "{out}"
+    );
     assert_eq!(std::fs::read(env.file()).unwrap(), before);
 }
 
