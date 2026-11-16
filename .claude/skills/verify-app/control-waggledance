@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+FEATURES_ALL=(daemon-lifecycle registry agent-cli mcp-server leader-mail-and-dispatch)
+FAST_DEFAULT=(registry)
+
+usage() {
+  cat <<'EOF'
+control-waggledance — drive a disposable waggledance installation and keep the evidence.
+
+  bash control-waggledance build                    build the fast profile, print the artifact path
+  bash control-waggledance launch [--run ID]        scratch HOME + scratch repo + detached daemon
+  bash control-waggledance doctor --run ID          read-only: is this instance ours and worth driving?
+  bash control-waggledance drive --fast [FEATURE…] [--expect-literal TEXT]
+  bash control-waggledance drive --full [--expect-literal TEXT]
+  bash control-waggledance cleanup --run ID         stop our daemon, delete scratch, keep evidence
+  bash control-waggledance features                 list feature ids
+
+drive builds, launches, runs doctor, drives the features, cleans up, and prints
+the evidence directory. FEATURE ids: daemon-lifecycle registry agent-cli
+mcp-server leader-mail-and-dispatch. --fast with no feature drives: registry.
+--expect-literal greps the built binary for a string only your change contains.
+EOF
+}
+
+die() { echo "control-waggledance: $*" >&2; exit 2; }
+
+ROOT="${VERIFY_APP_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}" || true
+[ -n "$ROOT" ] || die "run from inside the waggledance checkout (or set VERIFY_APP_ROOT)"
+[ -f "$ROOT/crates/waggledance/Cargo.toml" ] || die "$ROOT is not a waggledance checkout"
+SCRATCH_BASE="$ROOT/.bee/tmp/verify-app"
+EVIDENCE_BASE="$ROOT/.bee/verify/evidence"
+SAFE_PATH="/usr/bin:/bin"
+
+run_dirs() {
+  RUN="$1"
+  S="$SCRATCH_BASE/$RUN"
+  H="$S/home"
+  REPO="$S/repo"
+  E="$EVIDENCE_BASE/$RUN"
+}
+
+build() {
+  local json exe
+  json=$(cd "$ROOT" && PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" cargo build --profile fast -p waggledance --message-format=json 2>/dev/null) \
+    || die "cargo build --profile fast -p waggledance failed; run it by hand to see the error"
+  exe=$(printf '%s\n' "$json" | grep '"compiler-artifact"' | grep -o '"executable":"[^"]*waggledance[^"]*"' | tail -1 | sed 's/^"executable":"//; s/"$//')
+  [ -n "$exe" ] && [ -x "$exe" ] || die "cargo reported no waggledance executable"
+  printf '%s\n' "$exe"
+}
+
+wd() {
+  env -i HOME="$H" PATH="$SAFE_PATH" LANG=C.UTF-8 TERM=dumb RUST_LOG=info "$BIN" "$@"
+}
+
+STEP=0
+FAILS=0
+step() {
+  local name="$1"; shift
+  STEP=$((STEP + 1))
+  local base; base=$(printf '%s/%02d-%s' "$E" "$STEP" "$name")
+  if [ "$1" = wd ]; then
+    shift
+    set -- env -i HOME="$H" PATH="$SAFE_PATH" LANG=C.UTF-8 TERM=dumb RUST_LOG=info "$BIN" "$@"
+  fi
+  printf '%q ' "$@" > "$base.cmd"; echo >> "$base.cmd"
+  if [ -n "${STDIN_FILE:-}" ]; then
+    timeout 30 "$@" < "$STDIN_FILE" > "$base.out" 2> "$base.err"
+  else
+    timeout 30 "$@" < /dev/null > "$base.out" 2> "$base.err"
+  fi
+  local rc=$?
+  echo "$rc" > "$base.exit"
+  LAST_OUT="$base.out"; LAST_ERR="$base.err"; LAST_RC=$rc
+  {
+    echo "### $(printf '%02d' "$STEP") $name  (exit $rc)"
+    echo '```'; echo "\$ $(sed 's#'"$H"'#$SCRATCH_HOME#g' "$base.cmd")"
+    head -c 4000 "$base.out" | sed 's/\x1b\[[0-9;]*m//g'
+    if [ -s "$base.err" ]; then echo "--- stderr"; head -c 2000 "$base.err" | sed 's/\x1b\[[0-9;]*m//g'; fi
+    echo '```'
+  } >> "$E/transcript.md"
+}
+
+check() {
+  local label="$1" ok="$2"
+  if [ "$ok" = 0 ]; then
+    echo "PASS $label" | tee -a "$E/verdict.txt"
+  else
+    echo "FAIL $label" | tee -a "$E/verdict.txt"
+    FAILS=$((FAILS + 1))
+  fi
+}
+has() { grep -q -- "$2" "$1"; }
+rc_is() { [ "$LAST_RC" = "$1" ]; }
+db() { sqlite3 -readonly "$H/.waggledance/registry.db" "$1" 2>/dev/null; }
+
+lock_pid() { sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$H/.waggledance/daemon.lock" 2>/dev/null | head -1; }
+ours() {
+  local pid="$1"
+  [ -n "$pid" ] && [ -r "/proc/$pid/environ" ] || return 1
+  tr '\0' '\n' < "/proc/$pid/environ" | grep -qx "HOME=$H"
+}
+
+load_run() {
+  run_dirs "$1"
+  [ -d "$S" ] || die "no scratch for run $1 under $SCRATCH_BASE"
+  BIN=$(cat "$S/binary")
+}
+
+launch() {
+  local run="${1:-$(date +%Y%m%d-%H%M%S)-$$}"
+  run_dirs "$run"
+  [ -e "$S" ] && die "run $run already exists at $S"
+  if [ -z "${BIN:-}" ]; then BIN=$(build) || exit 2; fi
+  if PATH="$SAFE_PATH" command -v paseo >/dev/null 2>&1; then
+    echo "control-waggledance: paseo is on $SAFE_PATH; a scratch daemon would list and sweep the user's live Paseo workspaces. Refusing." >&2
+    return 1
+  fi
+  mkdir -p "$H/.waggledance" "$REPO" "$E"
+  printf '%s\n' "$BIN" > "$S/binary"
+  printf '[paseo]\nenabled = false\n\n[worktree_sweep]\nenabled = false\n' > "$H/.waggledance/config.toml"
+  git -C "$REPO" init -q
+  git -C "$REPO" -c user.name=verify -c user.email=verify@localhost commit -q --allow-empty -m "verify-app scratch repo"
+  wd list > /dev/null 2>&1 || { echo "control-waggledance: first registry open failed" >&2; return 1; }
+  local attempt
+  for attempt in 1 2; do
+    start_daemon && { echo "$run"; return 0; }
+    if [ "$attempt" = 1 ] && grep -q 'xShmMap' "$S/serve.log"; then
+      echo "launch attempt 1 hit the SQLite xShmMap I/O error; retried once" >> "$S/launch-retries"
+      cp "$S/serve.log" "$S/serve.attempt1.log"
+      continue
+    fi
+    break
+  done
+  echo "control-waggledance: daemon never reported running; serve.log:" >&2
+  sed 's/\x1b\[[0-9;]*m//g' "$S/serve.log" >&2
+  return 1
+}
+
+start_daemon() {
+  (
+    cd "$S" || exit 1
+    env -i HOME="$H" PATH="$SAFE_PATH" LANG=C.UTF-8 TERM=dumb RUST_LOG=info setsid "$BIN" serve > "$S/serve.log" 2>&1 < /dev/null &
+    echo $! > "$S/serve.pid"
+  )
+  local i
+  for i in $(seq 1 50); do
+    wd status --json 2>/dev/null | grep -q '"running":true' && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+doctor() {
+  local bad=0 pid
+  [ -x "$BIN" ] || { echo "doctor: binary missing: $BIN"; bad=1; }
+  pid=$(lock_pid)
+  if ! ours "$pid"; then echo "doctor: daemon.lock pid '${pid:-none}' is not a live process with HOME=$H"; bad=1; fi
+  local st; st=$(wd status --json 2>/dev/null)
+  echo "$st" | grep -q '"running":true' || { echo "doctor: status --json does not report running: $st"; bad=1; }
+  local v; v=$("$BIN" --version | awk '{print $2}')
+  echo "$st" | grep -q "\"version\":\"$v\"" || { echo "doctor: daemon version differs from binary $v: $st"; bad=1; }
+  if grep -q 'Paseo CLI detected' "$S/serve.log"; then echo "doctor: scratch daemon found a Paseo CLI — it can reach the user's live workspaces"; bad=1; fi
+  [ "$(db 'select count(*) from projects')" = "$(cat "$S/expected_projects" 2>/dev/null || echo 0)" ] \
+    || { echo "doctor: scratch registry holds $(db 'select count(*) from projects') projects, expected $(cat "$S/expected_projects" 2>/dev/null || echo 0)"; bad=1; }
+  if [ "$bad" = 0 ]; then echo "doctor: ok pid=$pid version=$v home=$H"; fi
+  return "$bad"
+}
+
+cleanup() {
+  local pid
+  if [ -d "$H" ]; then
+    wd stop > "$S/stop.out" 2>&1 || true
+    for _ in $(seq 1 25); do
+      pid=$(lock_pid)
+      ours "$pid" || break
+      sleep 0.2
+    done
+    pid=$(lock_pid)
+    if ours "$pid"; then kill "$pid" 2>/dev/null; sleep 0.5; fi
+    local started; started=$(cat "$S/serve.pid" 2>/dev/null)
+    if ours "$started"; then kill "$started" 2>/dev/null; fi
+  fi
+  if [ -d "$E" ]; then
+    local f
+    for f in serve.before-stop.log serve.attempt1.log serve.log launch-retries; do
+      [ -f "$S/$f" ] && sed 's/\x1b\[[0-9;]*m//g' "$S/$f" > "$E/$f"
+    done
+  fi
+  case "$S" in
+    "$SCRATCH_BASE"/?*) rm -rf -- "$S" ;;
+    *) die "refusing to delete $S" ;;
+  esac
+  echo "cleaned $RUN; evidence kept at $E"
+}
+
+feature_registry() {
+  echo "== registry" >> "$E/transcript.md"
+  step registry-list-empty wd list
+  check "registry: list on an empty registry exits 0" "$(rc_is 0; echo $?)"
+  step registry-register wd register "$REPO" --name verify-scratch --json
+  check "registry: register exits 0" "$(rc_is 0; echo $?)"
+  check "registry: register echoes the scratch root" "$(has "$LAST_OUT" "\"root_path\":\"$REPO\""; echo $?)"
+  echo 1 > "$S/expected_projects"
+  check "registry: registry.db holds the row (side effect)" "$([ "$(db "select count(*) from projects where root_path='$REPO'")" = 1 ]; echo $?)"
+  step registry-list wd list
+  check "registry: list shows the project" "$(has "$LAST_OUT" "$REPO"; echo $?)"
+  step registry-projects-json wd projects
+  check "registry: projects JSON names verify-scratch" "$(has "$LAST_OUT" '"name":"verify-scratch"'; echo $?)"
+  step registry-status wd status
+  check "registry: status counts one project" "$(has "$LAST_OUT" 'projects: 1'; echo $?)"
+  step registry-unregister wd unregister repo
+  check "registry: unregister exits 0" "$(rc_is 0; echo $?)"
+  echo 0 > "$S/expected_projects"
+  check "registry: registry.db no longer holds the row (side effect)" "$([ "$(db 'select count(*) from projects')" = 0 ]; echo $?)"
+  check "registry: scratch repo files survive unregister" "$([ -d "$REPO/.git" ]; echo $?)"
+  wd register "$REPO" --name verify-scratch > /dev/null 2>&1; echo 1 > "$S/expected_projects"
+}
+
+feature_daemon_lifecycle() {
+  echo "== daemon-lifecycle" >> "$E/transcript.md"
+  step lifecycle-status-json wd status --json
+  check "lifecycle: status --json reports running" "$(has "$LAST_OUT" '"running":true'; echo $?)"
+  local before; before=$(lock_pid)
+  step lifecycle-second-serve wd serve
+  check "lifecycle: a second serve says already running and exits 0" "$(rc_is 0 && has "$LAST_OUT" 'already running'; echo $?)"
+  check "lifecycle: the first daemon is untouched" "$([ "$(lock_pid)" = "$before" ] && ours "$before"; echo $?)"
+  step lifecycle-restart wd restart
+  check "lifecycle: restart exits 0" "$(rc_is 0; echo $?)"
+  local after=""
+  for _ in $(seq 1 50); do after=$(lock_pid); { [ -n "$after" ] && [ "$after" != "$before" ] && ours "$after"; } && break; sleep 0.2; done
+  check "lifecycle: restart replaced the pid ($before -> $after)" "$([ -n "$after" ] && [ "$after" != "$before" ] && ours "$after"; echo $?)"
+  check "lifecycle: old pid is gone" "$(ours "$before" && echo 1 || echo 0)"
+  step lifecycle-stop wd stop
+  check "lifecycle: stop exits 0" "$(rc_is 0; echo $?)"
+  sleep 0.5
+  step lifecycle-status-after-stop wd status
+  check "lifecycle: status reports not running" "$(has "$LAST_OUT" 'running: no'; echo $?)"
+  check "lifecycle: the stopped pid is gone" "$(ours "$after" && echo 1 || echo 0)"
+  cp "$S/serve.log" "$S/serve.before-stop.log"
+  start_daemon
+  step lifecycle-serve-again wd status --json
+  check "lifecycle: serve starts again after stop" "$(has "$LAST_OUT" '"running":true'; echo $?)"
+}
+
+feature_agent_cli() {
+  echo "== agent-cli" >> "$E/transcript.md"
+  step agentcli-search wd search list projects
+  check "agent-cli: search ranks projects first" "$(head -c 200 "$LAST_OUT" | grep -q '"verb":"projects"'; echo $?)"
+  step agentcli-schema wd schema state
+  check "agent-cli: schema state is JSON naming --fields" "$(has "$LAST_OUT" 'fields'; echo $?)"
+  step agentcli-state wd state
+  check "agent-cli: state rolls up the scratch project" "$(has "$LAST_OUT" '"project_id":"repo"'; echo $?)"
+  step agentcli-state-fields wd state --fields project_id,phase
+  check "agent-cli: --fields keeps only the asked keys" "$(has "$LAST_OUT" '"project_id"' && ! has "$LAST_OUT" 'cell_counts'; echo $?)"
+  step agentcli-runs wd runs
+  check "agent-cli: runs on a fresh registry exits 0" "$(rc_is 0; echo $?)"
+  step agentcli-unknown-verb wd sttae
+  check "agent-cli: a misspelt verb exits non-zero" "$(rc_is 0 && echo 1 || echo 0)"
+}
+
+mcp_session() {
+  local f="$S/mcp-in.jsonl"
+  {
+    echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"verify-app","version":"0"}}}'
+    echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+    echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"waggledance_projects","arguments":{}}}'
+    echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"waggledance_ask_state","arguments":{"project":"repo"}}}'
+    echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"waggledance_no_such_tool","arguments":{}}}'
+  } > "$f"
+  cp "$f" "$E/mcp-request.jsonl"
+  STDIN_FILE="$f" step mcp-stdio-session wd mcp
+}
+
+feature_mcp_server() {
+  echo "== mcp-server" >> "$E/transcript.md"
+  mcp_session
+  local o="$LAST_OUT"
+  check "mcp: initialize answers serverInfo waggledance" "$(grep '"id":1' "$o" | grep -q '"name":"waggledance"'; echo $?)"
+  local t
+  for t in waggledance_projects waggledance_ask_state waggledance_dispatch waggledance_await waggledance_runs waggledance_task waggledance_bee_upgrade; do
+    check "mcp: tools/list exposes $t" "$(grep '"id":2' "$o" | grep -q "\"name\":\"$t\""; echo $?)"
+  done
+  check "mcp: waggledance_projects returns the scratch project only" "$(grep '"id":3' "$o" | grep -q "1 registered project"; echo $?)"
+  check "mcp: waggledance_ask_state answers for repo" "$(grep '"id":4' "$o" | grep -q '"result"'; echo $?)"
+  check "mcp: an unknown tool is an error, not a crash" "$(grep '"id":5' "$o" | grep -qi 'error'; echo $?)"
+}
+
+feature_leader_mail_and_dispatch() {
+  echo "== leader-mail-and-dispatch (refusal paths only; live agents are not driven)" >> "$E/transcript.md"
+  step dispatch-leader-paseo-off wd dispatch --project repo --leader --task "verify-app probe" --request-id verify-app-1
+  check "dispatch: --leader with Paseo off refuses" "$(rc_is 0 && echo 1 || echo 0)"
+  check "dispatch: the refusal names Paseo" "$(cat "$LAST_OUT" "$LAST_ERR" | grep -qi 'paseo'; echo $?)"
+  check "dispatch: no run row was written (side effect)" "$([ "$(db 'select count(*) from runs' || echo 0)" = 0 ] || [ -z "$(db 'select count(*) from runs')" ]; echo $?)"
+  printf 'Done: x\n' > "$S/mail-body.txt"
+  STDIN_FILE="$S/mail-body.txt" step mail-send-unknown-corr wd mail send --to wd --corr no-such-corr --kind result
+  check "mail: unknown corr exits 2" "$(rc_is 2; echo $?)"
+  check "mail: refusal names the corr" "$(has "$LAST_ERR" 'no run found for corr'; echo $?)"
+  STDIN_FILE="$S/mail-body.txt" step mail-send-bad-recipient wd mail send --to someone --corr no-such-corr --kind gossip
+  check "mail: bad recipient and kind are both named" "$(has "$LAST_ERR" 'recipient' && has "$LAST_ERR" 'kind'; echo $?)"
+  echo "SKIPPED live leader dispatch, await, task and accepted mail — they need a live Paseo or herdr agent" >> "$E/verdict.txt"
+}
+
+drive() {
+  local scope="" literal="" feats=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fast) scope=fast ;;
+      --full) scope=full ;;
+      --expect-literal) literal="${2:-}"; shift ;;
+      -*) die "unknown flag $1" ;;
+      *) feats+=("$1") ;;
+    esac
+    shift
+  done
+  [ -n "$scope" ] || die "drive needs --fast [FEATURE…] or --full"
+  if [ "$scope" = full ]; then
+    [ ${#feats[@]} = 0 ] || die "--full takes no feature ids"
+    feats=("${FEATURES_ALL[@]}")
+  elif [ ${#feats[@]} = 0 ]; then
+    feats=("${FAST_DEFAULT[@]}")
+  fi
+  local f
+  for f in "${feats[@]}"; do
+    printf '%s\n' "${FEATURES_ALL[@]}" | grep -qx "$f" || die "unknown feature '$f' (see: features)"
+  done
+
+  BIN=$(build) || exit 2
+  local run; run="$(date +%Y%m%d-%H%M%S)-$scope-$$"
+  run_dirs "$run"
+  mkdir -p "$E"
+  {
+    echo "# verify-app drive $run"
+    echo "scope: $scope; features: ${feats[*]}"
+    echo "checkout: $ROOT @ $(git -C "$ROOT" rev-parse --short HEAD)$(git -C "$ROOT" diff --quiet HEAD -- crates Cargo.toml Cargo.lock || echo ' +uncommitted crate changes')"
+    echo "binary: $BIN"
+    echo "binary sha256: $(sha256sum "$BIN" | cut -d' ' -f1)  mtime: $(date -r "$BIN" -Iseconds)"
+    echo "binary version: $("$BIN" --version)"
+    echo
+  } > "$E/transcript.md"
+  : > "$E/verdict.txt"
+  if [ -n "$literal" ]; then
+    check "binary carries the change literal '$literal'" "$(strings "$BIN" | grep -F -- "$literal" > /dev/null; echo $?)"
+  fi
+
+  echo "▸ launch $run"
+  if ! launch "$run" > /dev/null; then
+    check "launch: daemon reports running" 1
+    cleanup; summarize "$scope" "${feats[*]}"; return 1
+  fi
+  echo "▸ doctor"
+  local d; d=$(doctor); local drc=$?
+  echo "$d" | tee -a "$E/transcript.md"
+  check "doctor before drive" "$drc"
+  if [ "$drc" = 0 ]; then
+    for f in "${feats[@]}"; do
+      echo "▸ $f"
+      "feature_${f//-/_}"
+    done
+    echo "▸ doctor after drive"
+    d=$(doctor); drc=$?
+    echo "$d" | tee -a "$E/transcript.md"
+    check "doctor after drive" "$drc"
+  fi
+  cleanup
+  summarize "$scope" "${feats[*]}"
+  [ "$FAILS" = 0 ]
+}
+
+summarize() {
+  local pass; pass=$(grep -c '^PASS' "$E/verdict.txt")
+  local result=green; [ "$FAILS" = 0 ] || result=red
+  {
+    echo "result: $result"
+    echo "scope: $1"
+    echo "features: $2"
+    echo "checks: $pass passed, $FAILS failed"
+    grep '^SKIPPED' "$E/verdict.txt" || true
+    echo "evidence: $E"
+  } | tee "$E/summary.txt"
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  build) build ;;
+  launch)
+    r=""; [ "${1:-}" = --run ] && r="${2:-}"
+    launch "$r" ;;
+  doctor)
+    [ "${1:-}" = --run ] && [ -n "${2:-}" ] || die "doctor --run ID"
+    load_run "$2"; doctor ;;
+  cleanup)
+    [ "${1:-}" = --run ] && [ -n "${2:-}" ] || die "cleanup --run ID"
+    load_run "$2"; cleanup ;;
+  drive) drive "$@" ;;
+  features) printf '%s\n' "${FEATURES_ALL[@]}" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac

@@ -53,3 +53,17 @@ code, confirm the artifact by content (`strings <path> | rg '<a literal only the
 change contains>'`), never by its version string. Two further disguises of the
 same trap, including one that defeats the JSON path itself, are in
 `docs/knowledge/patterns/the-binary-you-ran-is-not-the-one-you-built.md`.
+
+<!-- waggledance:START -->
+## Waggledance (supervisor)
+
+Waggledance supervises agents across registered projects. Use its MCP tools:
+
+- `waggledance_projects` lists the registered projects.
+- `waggledance_ask_state` reads a project's bee state and live panes.
+- `waggledance_dispatch` hands work to a project's leader or a pane.
+- `waggledance_await`, `waggledance_runs` and `waggledance_task` follow dispatched work.
+- `waggledance_bee_upgrade` previews or applies a bee upgrade.
+
+Check the daemon with `waggledance status` and `waggledance doctor`.
+<!-- waggledance:END -->
