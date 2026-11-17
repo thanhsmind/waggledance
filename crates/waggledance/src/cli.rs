@@ -336,6 +336,21 @@ pub enum BeeConfigAction {
         #[arg(long)]
         json: bool,
     },
+    #[command(
+        about = "Remove a key from every project's bee config layers so the global value applies.",
+        long_about = "Remove a dotted key from each registered project's .bee/config.json, .bee/config.local.json and .bee/team.json, and any parent object the removal empties, so the global value applies. A dry run unless --apply. Refuses when the global file does not set the key. A layer whose value differs from the global one is reported as differs and kept unless --force. Never commits; guards, gate_bypass and hooks are refused."
+    )]
+    Prune {
+        key: String,
+        #[arg(long = "project")]
+        project: Vec<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -554,8 +569,64 @@ fn cmd_bee_config(action: BeeConfigAction) -> Result<()> {
                 }
             }
         }
+        BeeConfigAction::Prune {
+            key,
+            project,
+            force,
+            apply,
+            json,
+        } => {
+            let key = KeyPath::parse(&key)?;
+            let global = GlobalConfig::load(&path)?;
+            let engine = runtime::build_engine()?;
+            let rows = bee_global_config::prune(
+                &engine.list_projects()?,
+                &global,
+                &key,
+                &project,
+                force,
+                apply,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                print!("{}", render_prune_text(&rows, apply));
+            }
+        }
     }
     Ok(())
+}
+
+fn render_prune_text(rows: &[bee_global_config::PruneRow], apply: bool) -> String {
+    use bee_global_config::PruneAction;
+    let mut out = String::new();
+    if !apply {
+        out.push_str("dry run: nothing written; pass --apply\n");
+    }
+    for r in rows {
+        let detail = match (&r.detail, &r.file) {
+            (Some(d), _) => d.clone(),
+            (None, Some(f)) if r.applied => format!("wrote {}", f.display()),
+            (None, Some(f)) => format!("would write {}", f.display()),
+            (None, None) => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "{}  {}  {}  {detail}\n",
+            r.id,
+            r.layer.map_or("-", |l| l.label()),
+            r.action.label()
+        ));
+    }
+    let count = |a: PruneAction| rows.iter().filter(|r| r.action == a).count();
+    out.push_str(&format!(
+        "{} pruned, {} differs, {} absent, {} skipped, {} error\n",
+        count(PruneAction::Pruned),
+        count(PruneAction::Differs),
+        count(PruneAction::Absent),
+        count(PruneAction::Skipped),
+        count(PruneAction::Error)
+    ));
+    out
 }
 
 fn status_word(outcome: &Outcome) -> &'static str {

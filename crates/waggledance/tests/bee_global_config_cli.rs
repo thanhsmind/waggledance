@@ -379,3 +379,57 @@ fn explain_reports_the_effective_value_and_source_from_each_project_bee() {
     assert!(!o.status.success(), "{}", stdout(&o));
     assert!(stderr(&o).contains("no-such-project"), "{}", stderr(&o));
 }
+
+#[test]
+fn prune_dry_runs_then_applies_and_refuses_without_a_global_value() {
+    let env = Env::new();
+    let id = stub_project(&env, "proj", "#!/bin/sh\n");
+    let bee = env.home.path().join("proj/.bee");
+    let tracked = bee.join("config.json");
+    let local = bee.join("config.local.json");
+    std::fs::write(&tracked, r#"{"team":{"claude":{}},"keep":1}"#).unwrap();
+    std::fs::write(&local, r#"{"team":{"other":{}}}"#).unwrap();
+
+    let o = env.run(&["prune", "team"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("waggledance bee config set"),
+        "{}",
+        stderr(&o)
+    );
+
+    ok(env.run(&["set", "team", r#"{"claude":{}}"#]));
+    let before = std::fs::read_to_string(&tracked).unwrap();
+    let out = ok(env.run(&["prune", "team"]));
+    assert!(
+        out.starts_with("dry run: nothing written; pass --apply\n"),
+        "{out}"
+    );
+    assert!(out.contains(&format!("{id}  tracked  pruned")), "{out}");
+    assert!(out.contains(&format!("{id}  local  differs")), "{out}");
+    assert!(out.contains("1 pruned, 1 differs"), "{out}");
+    assert_eq!(std::fs::read_to_string(&tracked).unwrap(), before);
+
+    let out = ok(env.run(&["prune", "team", "--apply"]));
+    assert!(!out.contains("dry run"), "{out}");
+    assert!(out.contains(&tracked.display().to_string()), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap(),
+        "{\n  \"keep\": 1\n}\n"
+    );
+    assert!(std::fs::read_to_string(&local).unwrap().contains("other"));
+
+    let rows: Value = serde_json::from_str(&ok(
+        env.run(&["prune", "team", "--force", "--apply", "--json"])
+    ))
+    .unwrap();
+    assert_eq!(rows[0]["layer"], json!("local"));
+    assert_eq!(rows[0]["action"], json!("pruned"));
+    assert_eq!(rows[0]["applied"], json!(true));
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "{}\n");
+
+    let o = env.run(&["prune", "guards"]);
+    assert!(!o.status.success());
+    let o = env.run(&["prune", "team", "--project", "no-such-project"]);
+    assert!(stderr(&o).contains("no-such-project"), "{}", stderr(&o));
+}
