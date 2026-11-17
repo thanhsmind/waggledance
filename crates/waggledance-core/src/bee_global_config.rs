@@ -133,12 +133,7 @@ impl GlobalConfig {
     }
 
     pub fn get(&self, key: &KeyPath) -> Option<&Value> {
-        let mut segs = key.0.iter();
-        let mut cur = self.doc.get(segs.next()?)?;
-        for seg in segs {
-            cur = cur.as_object()?.get(seg)?;
-        }
-        Some(cur)
+        lookup(&self.doc, key)
     }
 
     pub fn set(&mut self, key: &KeyPath, value: Value) -> Result<()> {
@@ -267,6 +262,219 @@ pub fn explain(projects: &[Project], key: &KeyPath, only: &[String]) -> Result<V
         .filter(|p| only.is_empty() || only.contains(&p.id))
         .map(|p| explain_project(p, &dotted))
         .collect())
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PruneLayer {
+    Tracked,
+    Local,
+    Team,
+}
+
+impl PruneLayer {
+    const ALL: [PruneLayer; 3] = [Self::Tracked, Self::Local, Self::Team];
+
+    pub fn file_name(self) -> &'static str {
+        match self {
+            Self::Tracked => "config.json",
+            Self::Local => "config.local.json",
+            Self::Team => "team.json",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tracked => "tracked",
+            Self::Local => "local",
+            Self::Team => "team",
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PruneAction {
+    Pruned,
+    Differs,
+    Absent,
+    Skipped,
+    Error,
+}
+
+impl PruneAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pruned => "pruned",
+            Self::Differs => "differs",
+            Self::Absent => "absent",
+            Self::Skipped => "skipped",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct PruneRow {
+    pub id: String,
+    pub layer: Option<PruneLayer>,
+    pub action: PruneAction,
+    pub file: Option<PathBuf>,
+    pub applied: bool,
+    pub detail: Option<String>,
+}
+
+pub fn prune_decision(layer_value: &Value, global_value: &Value, force: bool) -> PruneAction {
+    if force || layer_value == global_value {
+        PruneAction::Pruned
+    } else {
+        PruneAction::Differs
+    }
+}
+
+fn remove_path(map: &mut Map<String, Value>, segs: &[String]) -> bool {
+    let (head, rest) = segs.split_first().expect("KeyPath is never empty");
+    if rest.is_empty() {
+        return map.shift_remove(head).is_some();
+    }
+    let Some(child) = map.get_mut(head).and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let removed = remove_path(child, rest);
+    if removed && child.is_empty() {
+        map.shift_remove(head);
+    }
+    removed
+}
+
+fn lookup<'a>(doc: &'a Map<String, Value>, key: &KeyPath) -> Option<&'a Value> {
+    let mut segs = key.0.iter();
+    let mut cur = doc.get(segs.next()?)?;
+    for seg in segs {
+        cur = cur.as_object()?.get(seg)?;
+    }
+    Some(cur)
+}
+
+fn prune_layer(
+    project: &Project,
+    layer: PruneLayer,
+    key: &KeyPath,
+    global_value: &Value,
+    force: bool,
+    apply: bool,
+) -> Option<PruneRow> {
+    let file = project.root_path.join(".bee").join(layer.file_name());
+    let row = |action, applied, detail| {
+        Some(PruneRow {
+            id: project.id.clone(),
+            layer: Some(layer),
+            action,
+            file: Some(file.clone()),
+            applied,
+            detail,
+        })
+    };
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return row(PruneAction::Error, false, Some(e.to_string())),
+    };
+    let mut doc = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(doc)) => doc,
+        Ok(_) => return row(PruneAction::Error, false, Some("not a JSON object".into())),
+        Err(e) => {
+            return row(
+                PruneAction::Error,
+                false,
+                Some(format!("not valid JSON ({e})")),
+            )
+        }
+    };
+    let held = lookup(&doc, key)?;
+    let action = prune_decision(held, global_value, force);
+    if action == PruneAction::Differs {
+        return row(action, false, Some(format!("holds {held}")));
+    }
+    if !apply {
+        return row(action, false, None);
+    }
+    remove_path(&mut doc, &key.0);
+    let written = serde_json::to_string_pretty(&doc)
+        .map_err(|e| e.to_string())
+        .and_then(|mut t| {
+            t.push('\n');
+            write_atomic(&file, t.as_bytes()).map_err(|e| e.to_string())
+        });
+    match written {
+        Ok(()) => row(action, true, None),
+        Err(e) => row(PruneAction::Error, false, Some(e)),
+    }
+}
+
+pub fn prune(
+    projects: &[Project],
+    global: &GlobalConfig,
+    key: &KeyPath,
+    only: &[String],
+    force: bool,
+    apply: bool,
+) -> Result<Vec<PruneRow>> {
+    if key.is_forbidden() {
+        return Err(forbidden_error(&[key.first()]));
+    }
+    let unknown: Vec<&str> = only
+        .iter()
+        .filter(|id| !projects.iter().any(|p| &p.id == *id))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(Error::ProjectNotFound(unknown.join(", ")));
+    }
+    let global_value = global.get(key).ok_or_else(|| {
+        Error::Config(format!(
+            "{} is not set in {}; run `waggledance bee config set {} <value>` first so no project is left without a value",
+            key.dotted(),
+            global.path().display(),
+            key.dotted()
+        ))
+    })?;
+    let mut rows = Vec::new();
+    for project in projects
+        .iter()
+        .filter(|p| only.is_empty() || only.contains(&p.id))
+    {
+        let note = |detail: &str| PruneRow {
+            id: project.id.clone(),
+            layer: None,
+            action: PruneAction::Skipped,
+            file: None,
+            applied: false,
+            detail: Some(detail.into()),
+        };
+        if !project.root_path.is_dir() {
+            rows.push(note("root missing"));
+            continue;
+        }
+        if !project.root_path.join(".bee").is_dir() {
+            rows.push(note("no bee"));
+            continue;
+        }
+        let before = rows.len();
+        rows.extend(
+            PruneLayer::ALL
+                .into_iter()
+                .filter_map(|l| prune_layer(project, l, key, global_value, force, apply)),
+        );
+        if rows.len() == before {
+            rows.push(PruneRow {
+                action: PruneAction::Absent,
+                detail: None,
+                ..note("")
+            });
+        }
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -483,5 +691,236 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].error.is_some() && rows[0].source.is_none());
         assert!(explain(&[project], &key("a"), &["nope".to_string()]).is_err());
+    }
+
+    fn project_in(dir: &Path, id: &str, files: &[(&str, &str)]) -> Project {
+        let root = dir.join(id);
+        std::fs::create_dir_all(root.join(".bee")).unwrap();
+        for (name, body) in files {
+            std::fs::write(root.join(".bee").join(name), body).unwrap();
+        }
+        Project {
+            id: id.into(),
+            name: id.into(),
+            root_path: root,
+            created_at: String::new(),
+            last_seen_at: String::new(),
+            orchestration_enabled: false,
+        }
+    }
+
+    fn global_with(dir: &Path, body: &str) -> GlobalConfig {
+        let path = dir.join("global.json");
+        std::fs::write(&path, body).unwrap();
+        GlobalConfig::load(&path).unwrap()
+    }
+
+    fn read(p: &Project, name: &str) -> String {
+        std::fs::read_to_string(p.root_path.join(".bee").join(name)).unwrap()
+    }
+
+    #[test]
+    fn decision_prunes_equal_or_forced_and_keeps_a_difference() {
+        assert_eq!(
+            prune_decision(&json!({"a": 1}), &json!({"a": 1}), false),
+            PruneAction::Pruned
+        );
+        assert_eq!(
+            prune_decision(&json!(1), &json!(2), false),
+            PruneAction::Differs
+        );
+        assert_eq!(
+            prune_decision(&json!(1), &json!(2), true),
+            PruneAction::Pruned
+        );
+    }
+
+    #[test]
+    fn prune_removes_an_equal_value_and_keeps_other_keys_in_order() {
+        let dir = tmp("prune-equal");
+        let p = project_in(
+            &dir,
+            "p",
+            &[("config.json", r#"{"zeta":1,"team":{"a":1},"alpha":2}"#)],
+        );
+        let g = global_with(&dir, r#"{"team":{"a":1}}"#);
+        let rows = prune(std::slice::from_ref(&p), &g, &key("team"), &[], false, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, PruneAction::Pruned);
+        assert_eq!(rows[0].layer, Some(PruneLayer::Tracked));
+        assert!(rows[0].applied);
+        assert_eq!(
+            read(&p, "config.json"),
+            "{\n  \"zeta\": 1,\n  \"alpha\": 2\n}\n"
+        );
+    }
+
+    #[test]
+    fn prune_applies_to_all_three_layers_and_keeps_guards_and_hooks_exactly() {
+        let dir = tmp("prune-layers");
+        let tracked = "{\n  \"guards\": {\n    \"z\": [\n      1,\n      2\n    ],\n    \"a\": true\n  },\n  \"team\": {\n    \"claude\": {}\n  },\n  \"hooks\": {\n    \"pre\": \"x\"\n  },\n  \"gate_bypass\": \"off\"\n}\n";
+        let p = project_in(
+            &dir,
+            "p",
+            &[
+                ("config.json", tracked),
+                ("config.local.json", r#"{"team":{"claude":{}},"mine":0}"#),
+                ("team.json", r#"{"b":1,"team":{"claude":{}},"a":2}"#),
+            ],
+        );
+        let g = global_with(&dir, r#"{"team":{"claude":{}}}"#);
+        let rows = prune(std::slice::from_ref(&p), &g, &key("team"), &[], false, true).unwrap();
+        let layers: Vec<_> = rows
+            .iter()
+            .map(|r| (r.layer, r.action, r.applied))
+            .collect();
+        assert_eq!(
+            layers,
+            [
+                (Some(PruneLayer::Tracked), PruneAction::Pruned, true),
+                (Some(PruneLayer::Local), PruneAction::Pruned, true),
+                (Some(PruneLayer::Team), PruneAction::Pruned, true),
+            ]
+        );
+        assert_eq!(
+            read(&p, "config.json"),
+            "{\n  \"guards\": {\n    \"z\": [\n      1,\n      2\n    ],\n    \"a\": true\n  },\n  \"hooks\": {\n    \"pre\": \"x\"\n  },\n  \"gate_bypass\": \"off\"\n}\n"
+        );
+        assert_eq!(read(&p, "config.local.json"), "{\n  \"mine\": 0\n}\n");
+        assert_eq!(read(&p, "team.json"), "{\n  \"b\": 1,\n  \"a\": 2\n}\n");
+        let again = prune(std::slice::from_ref(&p), &g, &key("team"), &[], false, true).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].action, PruneAction::Absent);
+    }
+
+    #[test]
+    fn prune_keeps_a_different_value_unless_forced() {
+        let dir = tmp("prune-differs");
+        let body = r#"{"team":{"a":2}}"#;
+        let p = project_in(&dir, "p", &[("config.local.json", body)]);
+        let g = global_with(&dir, r#"{"team":{"a":1}}"#);
+        let rows = prune(std::slice::from_ref(&p), &g, &key("team"), &[], false, true).unwrap();
+        assert_eq!(rows[0].action, PruneAction::Differs);
+        assert_eq!(rows[0].layer, Some(PruneLayer::Local));
+        assert!(!rows[0].applied);
+        assert_eq!(read(&p, "config.local.json"), body);
+        let rows = prune(std::slice::from_ref(&p), &g, &key("team"), &[], true, true).unwrap();
+        assert_eq!(rows[0].action, PruneAction::Pruned);
+        assert_eq!(read(&p, "config.local.json"), "{}\n");
+    }
+
+    #[test]
+    fn prune_of_a_nested_key_drops_the_parent_it_empties() {
+        let dir = tmp("prune-nested");
+        let p = project_in(
+            &dir,
+            "p",
+            &[
+                ("team.json", r#"{"herding":{"agents":["a"]},"keep":1}"#),
+                (
+                    "config.json",
+                    r#"{"herding":{"agents":["a"],"other":true}}"#,
+                ),
+            ],
+        );
+        let g = global_with(&dir, r#"{"herding":{"agents":["a"]}}"#);
+        let rows = prune(
+            std::slice::from_ref(&p),
+            &g,
+            &key("herding.agents"),
+            &[],
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(read(&p, "team.json"), "{\n  \"keep\": 1\n}\n");
+        assert_eq!(
+            read(&p, "config.json"),
+            "{\n  \"herding\": {\n    \"other\": true\n  }\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_writes_nothing_and_an_unheld_key_is_absent() {
+        let dir = tmp("prune-dry");
+        let body = r#"{"team":1}"#;
+        let held = project_in(&dir, "held", &[("config.json", body)]);
+        let bare = project_in(&dir, "bare", &[]);
+        let g = global_with(&dir, r#"{"team":1}"#);
+        let projects = [held.clone(), bare];
+        let rows = prune(&projects, &g, &key("team"), &[], false, false).unwrap();
+        assert_eq!(rows[0].action, PruneAction::Pruned);
+        assert!(!rows[0].applied);
+        assert_eq!(rows[1].action, PruneAction::Absent);
+        assert_eq!(rows[1].layer, None);
+        assert_eq!(read(&held, "config.json"), body);
+    }
+
+    #[test]
+    fn prune_refuses_a_key_the_global_file_does_not_set() {
+        let dir = tmp("prune-noglobal");
+        let body = r#"{"team":1}"#;
+        let p = project_in(&dir, "p", &[("config.json", body)]);
+        let g = global_with(&dir, "{}");
+        let err = prune(std::slice::from_ref(&p), &g, &key("team"), &[], false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("waggledance bee config set"), "{err}");
+        assert_eq!(read(&p, "config.json"), body);
+    }
+
+    #[test]
+    fn prune_refuses_forbidden_keys_and_unknown_projects() {
+        let dir = tmp("prune-refuse");
+        let p = project_in(&dir, "p", &[]);
+        let g = global_with(&dir, "{}");
+        for k in ["guards", "gate_bypass.x", "hooks"] {
+            assert!(prune(std::slice::from_ref(&p), &g, &key(k), &[], false, true).is_err());
+        }
+        let g = global_with(&dir, r#"{"team":1}"#);
+        let err = prune(
+            std::slice::from_ref(&p),
+            &g,
+            &key("team"),
+            &["nope".to_string()],
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ProjectNotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn prune_reports_invalid_json_and_missing_roots_without_touching_files() {
+        let dir = tmp("prune-bad");
+        let bad = project_in(
+            &dir,
+            "bad",
+            &[("config.json", "{nope"), ("team.json", "[1]")],
+        );
+        let nobee = Project {
+            root_path: dir.join("nobee"),
+            id: "nobee".into(),
+            ..bad.clone()
+        };
+        std::fs::create_dir_all(&nobee.root_path).unwrap();
+        let gone = Project {
+            root_path: dir.join("gone"),
+            id: "gone".into(),
+            ..bad.clone()
+        };
+        let g = global_with(&dir, r#"{"team":1}"#);
+        let projects = [bad.clone(), nobee, gone];
+        let rows = prune(&projects, &g, &key("team"), &[], false, true).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].action, PruneAction::Error);
+        assert_eq!(rows[0].layer, Some(PruneLayer::Tracked));
+        assert_eq!(rows[1].action, PruneAction::Error);
+        assert_eq!(rows[1].layer, Some(PruneLayer::Team));
+        assert_eq!(rows[2].detail.as_deref(), Some("no bee"));
+        assert_eq!(rows[3].detail.as_deref(), Some("root missing"));
+        assert_eq!(read(&bad, "config.json"), "{nope");
+        assert_eq!(read(&bad, "team.json"), "[1]");
     }
 }
