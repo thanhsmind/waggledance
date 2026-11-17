@@ -78,14 +78,15 @@ Read when: an intake item was dispatched to the wrong project, a pass records no
 
 Read when: a bee setting should apply to every project, `waggledance bee config` refuses a key, or you wonder why the MCP tool cannot write it.
 
-- `waggledance bee config path|show|get|set|unset|explain` (`cli.rs`, logic in `bee_global_config.rs`) edits bee's user-global file. The path is fixed by beehive D12: `$BEEHIVE_CONFIG_DIR/config.json`, else `$XDG_CONFIG_HOME/beehive/config.json`, else `~/.config/beehive/config.json`, an empty variable counting as unset. The directory also holds `performance.jsonl`, which this code never touches.
+- `waggledance bee config path|show|get|set|unset|explain|prune` (`cli.rs`, logic in `bee_global_config.rs`) edits bee's user-global file (and `prune` cleans project layers). The path is fixed by beehive D12: `$BEEHIVE_CONFIG_DIR/config.json`, else `$XDG_CONFIG_HOME/beehive/config.json`, else `~/.config/beehive/config.json`, an empty variable counting as unset. The directory also holds `performance.jsonl`, which this code never touches.
 - The document has the keys of a project's `.bee/config.json`, written as 2-space pretty JSON plus a newline through `config::write_atomic`, key order kept. `set` parses the value as JSON and stores a string when it does not parse. A missing file reads as `{}`; a malformed or non-object file is an error naming the path and is never overwritten.
 - `guards`, `gate_bypass` and `hooks` are per-project only. `set` of one is refused and `save` refuses any document still holding one; `unset` of one is allowed so a hand-edited file can be cleaned.
 - `explain` runs each project's `.bee/bin/bee config explain --key <key> --json` through `run_with_deadline`; a project whose bee fails or lacks the verb reports the error on its own row. Precedence: built-in default < global file < project `.bee/config.json` < `.bee/team.json` < `.bee/config.local.json`.
+- `prune <key> [--project <id>]... [--force] [--apply] [--json]` removes a dotted key (such as `team` or `herding`) and any parent objects the removal empties from each registered project's tracked (`.bee/config.json`), local (`.bee/config.local.json`) and team (`.bee/team.json`) layers so the global value applies. It refuses when the key is `guards`, `gate_bypass` or `hooks` or when the global file does not set it; a layer whose value differs from global is reported as `differs` and kept unless `--force`. Dry run unless `--apply`, writes atomically with 2-space pretty JSON and key order kept, and never commits in target repos.
 - `waggledance_bee_config` (`mcp.rs`) is read-only (`show|get|explain`). Writes stay on the owner's CLI: an agent changing a setting for every project is the owner's call.
 
 ## Pointers (bee global config)
 
-- `crates/waggledance-core/src/bee_global_config.rs` — path resolver, `KeyPath`, forbidden-key check, load/set/unset/save, `explain`.
+- `crates/waggledance-core/src/bee_global_config.rs` — path resolver, `KeyPath`, forbidden-key check, load/set/unset/save, `explain`, `prune`.
 - `crates/waggledance/src/cli.rs` — `BeeConfigAction` and `cmd_bee_config`.
 - `crates/waggledance/src/mcp.rs` — `bee_config_schema` and `handle_bee_config`.
