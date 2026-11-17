@@ -433,3 +433,40 @@ fn prune_dry_runs_then_applies_and_refuses_without_a_global_value() {
     let o = env.run(&["prune", "team", "--project", "no-such-project"]);
     assert!(stderr(&o).contains("no-such-project"), "{}", stderr(&o));
 }
+
+#[test]
+fn prune_apply_clears_local_and_team_layers_and_leaves_guards_and_hooks_alone() {
+    let env = Env::new();
+    let id = stub_project(&env, "proj", "#!/bin/sh\n");
+    let bee = env.home.path().join("proj/.bee");
+    let tracked = bee.join("config.json");
+    let local = bee.join("config.local.json");
+    let team = bee.join("team.json");
+    let tracked_body = r#"{"guards":{"b":1,"a":2},"herding":{"agents":["x"]},"hooks":{"h":"y"}}"#;
+    std::fs::write(&tracked, tracked_body).unwrap();
+    std::fs::write(&local, r#"{"herding":{"agents":["x"]}}"#).unwrap();
+    std::fs::write(&team, r#"{"herding":{"agents":["x"],"agent_command":"c"}}"#).unwrap();
+
+    let o = env.run(&["prune", "herding.agents", "--apply"]);
+    assert!(!o.status.success());
+    assert_eq!(std::fs::read_to_string(&tracked).unwrap(), tracked_body);
+
+    ok(env.run(&["set", "herding.agents", r#"["x"]"#]));
+    let out = ok(env.run(&["prune", "herding.agents", "--apply"]));
+    for (layer, file) in [("tracked", &tracked), ("local", &local), ("team", &team)] {
+        assert!(
+            out.contains(&format!("{id}  {layer}  pruned  wrote {}", file.display())),
+            "{out}"
+        );
+    }
+    assert!(out.contains("3 pruned, 0 differs"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap(),
+        "{\n  \"guards\": {\n    \"b\": 1,\n    \"a\": 2\n  },\n  \"hooks\": {\n    \"h\": \"y\"\n  }\n}\n"
+    );
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "{}\n");
+    assert_eq!(
+        std::fs::read_to_string(&team).unwrap(),
+        "{\n  \"herding\": {\n    \"agent_command\": \"c\"\n  }\n}\n"
+    );
+}

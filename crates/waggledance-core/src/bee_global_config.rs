@@ -756,6 +756,44 @@ mod tests {
     }
 
     #[test]
+    fn prune_applies_to_all_three_layers_and_keeps_guards_and_hooks_exactly() {
+        let dir = tmp("prune-layers");
+        let tracked = "{\n  \"guards\": {\n    \"z\": [\n      1,\n      2\n    ],\n    \"a\": true\n  },\n  \"team\": {\n    \"claude\": {}\n  },\n  \"hooks\": {\n    \"pre\": \"x\"\n  },\n  \"gate_bypass\": \"off\"\n}\n";
+        let p = project_in(
+            &dir,
+            "p",
+            &[
+                ("config.json", tracked),
+                ("config.local.json", r#"{"team":{"claude":{}},"mine":0}"#),
+                ("team.json", r#"{"b":1,"team":{"claude":{}},"a":2}"#),
+            ],
+        );
+        let g = global_with(&dir, r#"{"team":{"claude":{}}}"#);
+        let rows = prune(std::slice::from_ref(&p), &g, &key("team"), &[], false, true).unwrap();
+        let layers: Vec<_> = rows
+            .iter()
+            .map(|r| (r.layer, r.action, r.applied))
+            .collect();
+        assert_eq!(
+            layers,
+            [
+                (Some(PruneLayer::Tracked), PruneAction::Pruned, true),
+                (Some(PruneLayer::Local), PruneAction::Pruned, true),
+                (Some(PruneLayer::Team), PruneAction::Pruned, true),
+            ]
+        );
+        assert_eq!(
+            read(&p, "config.json"),
+            "{\n  \"guards\": {\n    \"z\": [\n      1,\n      2\n    ],\n    \"a\": true\n  },\n  \"hooks\": {\n    \"pre\": \"x\"\n  },\n  \"gate_bypass\": \"off\"\n}\n"
+        );
+        assert_eq!(read(&p, "config.local.json"), "{\n  \"mine\": 0\n}\n");
+        assert_eq!(read(&p, "team.json"), "{\n  \"b\": 1,\n  \"a\": 2\n}\n");
+        let again = prune(std::slice::from_ref(&p), &g, &key("team"), &[], false, true).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].action, PruneAction::Absent);
+    }
+
+    #[test]
     fn prune_keeps_a_different_value_unless_forced() {
         let dir = tmp("prune-differs");
         let body = r#"{"team":{"a":2}}"#;
